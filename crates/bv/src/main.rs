@@ -38,6 +38,19 @@ fn main() -> ExitCode {
         return ExitCode::from(0);
     }
 
+    // Drift / baseline dispatch (Phase 3d).
+    if presence.has("check-drift") {
+        return run_check_drift();
+    }
+    if let Some(desc) = args
+        .iter()
+        .zip(args.iter().skip(1))
+        .find(|(a, _)| a.as_str() == "--save-baseline")
+        .map(|(_, v)| v.clone())
+    {
+        return run_save_baseline(&desc);
+    }
+
     // Triage family dispatch (Phase 3c first slice).
     let triage_family = [
         "robot-triage",
@@ -111,6 +124,154 @@ fn run_robot_triage() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn capture_baseline(
+) -> Result<(bv_analysis::drift::BaselineStats, Vec<Vec<String>>, String), String> {
+    use bv_analysis::algorithms::{cycles::tarjan_scc, pagerank::pagerank_default};
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let (issues, _stats) =
+        bv_core::discovery::load_issues_from_repo(&cwd).map_err(|e| e.to_string())?;
+    let hash = bv_core::data_hash::compute_data_hash(&issues);
+    let g = bv_analysis::analyzer::build_graph(&issues);
+    let p1 = bv_analysis::analyzer::analyze_phase1(&g);
+    let blocked = bv_analysis::triage::compute_blocked_set(&issues);
+    let actionable = issues
+        .iter()
+        .filter(|i| i.status.is_open() && !blocked.contains(&i.id))
+        .count();
+
+    let scc = tarjan_scc(&g);
+    let mut new_cycles: Vec<Vec<String>> = Vec::new();
+    // Non-trivial SCCs (size > 1) are cycles; single-node self-loops don't
+    // exist in this graph model.
+    for comp in &scc.components {
+        if comp.len() > 1 {
+            new_cycles.push(
+                comp.iter()
+                    .map(|i| g.node_id(*i).unwrap_or_default().to_string())
+                    .collect(),
+            );
+        }
+    }
+    let mut pr_map = std::collections::BTreeMap::new();
+    for (i, v) in pagerank_default(&g).into_iter().enumerate() {
+        pr_map.insert(g.node_id(i).unwrap_or_default().to_string(), v);
+    }
+    Ok((
+        bv_analysis::drift::BaselineStats {
+            node_count: p1.node_count,
+            edge_count: p1.edge_count,
+            density: p1.density,
+            open: issues
+                .iter()
+                .filter(|i| matches!(i.status, bv_core::model::Status::Open))
+                .count(),
+            closed: issues.iter().filter(|i| i.status.is_closed()).count(),
+            blocked: blocked.len(),
+            cycle_count: new_cycles.len(),
+            actionable,
+            pagerank: pr_map,
+        },
+        new_cycles,
+        hash,
+    ))
+}
+
+const BASELINE_PATH: &str = ".bv/baseline.json";
+
+fn run_save_baseline(desc: &str) -> ExitCode {
+    match capture_baseline() {
+        Err(e) => {
+            eprintln!("Error: {e}");
+            ExitCode::from(1)
+        }
+        Ok((stats, cycles, hash)) => {
+            let doc = serde_json::json!({
+                "version": 1,
+                "created_at": jiff_now(),
+                "description": desc,
+                "stats": stats,
+                "commit_sha": "",
+                "branch": "",
+                "cycles": cycles,
+                "data_hash": hash,
+            });
+            std::fs::create_dir_all(".bv").ok();
+            match std::fs::write(BASELINE_PATH, serde_json::to_vec_pretty(&doc).unwrap()) {
+                Ok(_) => {
+                    println!("Baseline saved to {BASELINE_PATH} (desc: {desc})");
+                    ExitCode::from(0)
+                }
+                Err(e) => {
+                    eprintln!("Error writing baseline: {e}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+    }
+}
+
+fn run_check_drift() -> ExitCode {
+    let baseline_doc = match std::fs::read_to_string(BASELINE_PATH) {
+        Ok(raw) => raw,
+        Err(_) => {
+            eprintln!("No baseline found at {BASELINE_PATH}. Save one with --save-baseline.");
+            return ExitCode::from(1);
+        }
+    };
+    let base: serde_json::Value = serde_json::from_str(&baseline_doc).expect("baseline parses");
+    let base_stats: bv_analysis::drift::BaselineStats =
+        serde_json::from_value(base["stats"].clone()).expect("baseline stats shape");
+    let old_cycles: Vec<Vec<String>> = base
+        .get("cycles")
+        .and_then(|c| serde_json::from_value(c.clone()).ok())
+        .unwrap_or_default();
+
+    let (current, new_cycles, _hash) = match capture_baseline() {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let norm: std::collections::HashSet<String> = old_cycles
+        .iter()
+        .map(|c| {
+            let mut v = c.clone();
+            v.sort();
+            v.join("|")
+        })
+        .collect();
+    let fresh_cycles: Vec<Vec<String>> = new_cycles
+        .into_iter()
+        .filter(|c| {
+            let mut v = c.clone();
+            v.sort();
+            !norm.contains(&v.join("|"))
+        })
+        .collect();
+
+    let result = bv_analysis::drift::calculate(
+        &base_stats,
+        &current,
+        &bv_analysis::drift::DriftConfig::default(),
+        &fresh_cycles,
+    );
+    println!(
+        "{}",
+        serde_json::json!({
+            "has_drift": result.has_drift,
+            "exit_code": result.exit_code(),
+            "summary": format!(
+                "{} critical, {} warning, {} info",
+                result.critical_count, result.warning_count, result.info_count
+            ),
+            "alerts": result.alerts,
+        })
+    );
+    ExitCode::from(result.exit_code())
 }
 
 fn jiff_now() -> String {

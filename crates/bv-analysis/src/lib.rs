@@ -8,6 +8,7 @@
 pub mod algorithms;
 pub mod analyzer;
 pub mod cache;
+pub mod drift;
 pub mod graph;
 pub mod impact;
 #[path = "../../bv-graph-wasm/src/reachability.rs"]
