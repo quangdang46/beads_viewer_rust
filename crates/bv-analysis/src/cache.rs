@@ -72,13 +72,23 @@ impl AnalysisCache {
 
     pub fn get(&mut self, data_hash16: &str, config_hash16: &str) -> Option<&[u8]> {
         let key = cache_key(data_hash16, config_hash16);
-        let entry = self.entries.get_mut(&key)?;
-        if entry.created_at.elapsed() > MAX_AGE {
+        // Age check + touch must not hold a mutable borrow across remove().
+        if self
+            .entries
+            .get(&key)
+            .map(|e| e.created_at.elapsed() > MAX_AGE)
+            .unwrap_or(false)
+        {
             self.entries.remove(&key);
             return None;
         }
-        entry.last_access = Instant::now();
-        Some(entry.payload.as_slice())
+        match self.entries.get_mut(&key) {
+            Some(entry) => {
+                entry.last_access = Instant::now();
+                Some(entry.payload.as_slice())
+            }
+            None => None,
+        }
     }
 
     pub fn put(&mut self, data_hash16: &str, config_hash16: &str, payload: Vec<u8>) {
