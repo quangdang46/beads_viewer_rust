@@ -11,6 +11,7 @@ members = [
     "crates/bv",
 ]
 exclude = [
+    "fuzz",
     # Verbatim upstream copy — self-contained wasm crate with its own lockfile.
     # Becomes part of the workspace in Phase 9 (bv-graph-core extraction).
     "crates/bv-graph-wasm",
