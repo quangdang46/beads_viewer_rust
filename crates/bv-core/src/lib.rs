@@ -6,4 +6,5 @@ pub mod model;
 pub use model::{Comment, Dependency, DependencyType, Issue, Status, ValidationError};
 
 pub mod data_hash;
+pub mod discovery;
 pub mod loader;
