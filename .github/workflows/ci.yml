@@ -23,22 +23,17 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
-  # Differential gate vs the Go oracle runs on a separate job so local-style
-  # failures (fmt/clippy) don't mask parity regressions.
+  # Placeholder differential gate: goldens are frozen; the Rust side gains
+  # real comparison logic with Phase 1 acceptance work. This job fails loudly
+  # if the golden corpus goes missing.
   differential:
-    name: Differential vs Go oracle
+    name: Golden corpus integrity
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.25"
-      # Golden fixtures are frozen; this job only verifies the Rust side still
-      # reproduces them. Full live-differential (build Go bv + compare) lands
-      # with bead p1-model-loader acceptance work.
-      - run: |
-          if [ -d golden ]; then
-            echo "Golden suite present — wiring live differential in Phase 1"
-          else
-            echo "No golden/ yet (Phase 0 pending) — placeholder pass"
-          fi
+      - name: Verify golden corpus present and non-empty
+        run: |
+          count=$(find golden -type f | wc -l)
+          echo "golden files: $count"
+          [ "$count" -ge 70 ] || { echo "::error::Golden corpus missing/thin ($count < 70)"; exit 1; }
+          grep -q "go_commit: 9ace029" golden/METADATA.txt

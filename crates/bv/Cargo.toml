@@ -1,0 +1,12 @@
+[package]
+name = "bv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "bvr"
+path = "src/main.rs"
+
+[dependencies]

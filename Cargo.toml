@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/bv-core",
+    "crates/bv-analysis",
+    "crates/bv-correlation",
+    "crates/bv-search",
+    "crates/bv-export",
+    "crates/bv-robot",
+    "crates/bv-tui",
+    "crates/bv",
+]
+exclude = [
+    # Verbatim upstream copy — self-contained wasm crate with its own lockfile.
+    # Becomes part of the workspace in Phase 9 (bv-graph-core extraction).
+    "crates/bv-graph-wasm",
+]
+
+[workspace.package]
+version = "0.21.0"
+edition = "2021"
+license = "MIT"
+authors = ["Tran Quang Dang <tranquangdang21@gmail.com>"]
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+jiff = { version = "=0.2", features = ["serde"] }
+rayon = "1.10"
+crossbeam-channel = "0.5"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
