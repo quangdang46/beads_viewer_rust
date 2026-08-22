@@ -10,3 +10,5 @@ ratatui = "0.29"
 crossterm = "0.28"
 bv-core = { path = "../bv-core" }
 bv-analysis = { path = "../bv-analysis" }
+crossbeam-channel = { workspace = true }
+jiff = { workspace = true }

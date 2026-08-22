@@ -456,3 +456,4 @@ mod tests {
 }
 
 pub mod views;
+pub mod worker;
