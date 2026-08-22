@@ -21,7 +21,7 @@ pub struct HITSConfig {
 impl Default for HITSConfig {
     fn default() -> Self {
         HITSConfig {
-            tolerance: 1e-6,
+            tolerance: 1e-3,
             max_iterations: 100,
         }
     }
@@ -119,7 +119,12 @@ pub fn hits(graph: &DiGraph, config: &HITSConfig) -> HITSResult {
     }
 }
 
-/// Compute HITS with default parameters (tolerance=1e-6, max_iterations=100).
+/// Compute HITS with default parameters.
+///
+/// FORT parity note (Phase 2a): tolerance aligned to 1e-3 to match Go's
+/// `network.HITS(g, 1e-3)` call (pkg/analysis/graph.go:1799). Convergence
+/// criterion differs subtly from gonum (sum-of-diffs vs per-vector norm);
+/// the robot-insights differential gate validates numerics on fixtures.
 pub fn hits_default(graph: &DiGraph) -> HITSResult {
     hits(graph, &HITSConfig::default())
 }

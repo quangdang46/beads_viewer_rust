@@ -20,7 +20,9 @@ impl Default for PageRankConfig {
         PageRankConfig {
             damping: 0.85,
             tolerance: 1e-6,
-            max_iterations: 100,
+            // FORT parity: Go computePageRank uses maxIterations=1000
+            // (pkg/analysis/graph.go:2795). Aligned in Phase 2a.
+            max_iterations: 1000,
         }
     }
 }
