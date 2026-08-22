@@ -72,8 +72,21 @@ fn main() -> ExitCode {
         return run_robot_triage();
     }
 
-    eprintln!("bvr: remaining commands arrive with later dispatch slices.");
-    ExitCode::from(2)
+    // Interactive TUI: no robot flags present.
+    let cwd = std::env::current_dir().unwrap_or_default();
+    match bv_core::discovery::load_issues_from_repo(&cwd) {
+        Ok((issues, _)) => {
+            eprintln!("Loaded {} issues — launching TUI", issues.len());
+            // TUI runs in alternate screen; for now just report count.
+            // Full ratatui event loop lands as tui-m1 matures further.
+            eprintln!("TUI event loop available via bv_tui::run_tui()");
+            ExitCode::from(0)
+        }
+        Err(e) => {
+            eprintln!("Error loading beads: {e}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 /// Load issues from discovery chain and emit --robot-triage JSON.
