@@ -6,3 +6,5 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+bv-core = { path = "../bv-core" }
+jiff = { workspace = true }

@@ -143,6 +143,10 @@ dependencies = [
 [[package]]
 name = "bv-export"
 version = "0.21.0"
+dependencies = [
+ "bv-core",
+ "jiff",
+]
 
 [[package]]
 name = "bv-robot"
