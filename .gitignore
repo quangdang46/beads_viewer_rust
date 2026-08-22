@@ -1,0 +1,24 @@
+# Build
+target/
+crates/*/target/
+
+# Node (static site export artifacts)
+node_modules/
+dist/
+
+# Beads local DB state (JSONL export IS committed; DB is not)
+.beads/*.db
+.beads/*.db-journal
+
+# Upstream reference clone (local only — do not publish Go source in Rust repo)
+beads_viewer/
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Env
+.env
+.env.*
