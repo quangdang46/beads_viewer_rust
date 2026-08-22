@@ -298,3 +298,61 @@ mod tests {
         assert!((s - (1.0 * 0.7 + (1.0 - 60.0 / 480.0) * 0.3)).abs() < 1e-9);
     }
 }
+
+/// Explainable scoring: human-readable reasons for a recommendation.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScoreReason {
+    pub reason: String,
+    pub component: String,
+    pub value: f64,
+}
+
+/// Generate reasons from a breakdown for a specific issue.
+use crate::scoring::{ScoreBreakdown, WEIGHT_PAGE_RANK};
+
+pub fn explain_score(
+    breakdown: &ScoreBreakdown,
+    blockers: usize,
+    days_stale: f64,
+) -> Vec<ScoreReason> {
+    let mut reasons = Vec::new();
+    if breakdown.pagerank > 0.15 {
+        reasons.push(ScoreReason {
+            reason: format!(
+                "high pagerank ({:.2})",
+                breakdown.pagerank / WEIGHT_PAGE_RANK
+            ),
+            component: "pagerank".into(),
+            value: breakdown.pagerank,
+        });
+    }
+    if breakdown.betweenness > 0.10 {
+        reasons.push(ScoreReason {
+            reason: "high betweenness (bridge node)".into(),
+            component: "betweenness".into(),
+            value: breakdown.betweenness,
+        });
+    }
+    if blockers > 0 {
+        reasons.push(ScoreReason {
+            reason: format!("blocks {blockers} issues"),
+            component: "blocker_ratio".into(),
+            value: breakdown.blocker_ratio,
+        });
+    }
+    if breakdown.staleness > 0.03 {
+        reasons.push(ScoreReason {
+            reason: format!("stale {days_stale:.0} days"),
+            component: "staleness".into(),
+            value: breakdown.staleness,
+        });
+    }
+    if breakdown.priority_boost > 0.05 {
+        reasons.push(ScoreReason {
+            reason: "high priority".into(),
+            component: "priority_boost".into(),
+            value: breakdown.priority_boost,
+        });
+    }
+    reasons
+}
