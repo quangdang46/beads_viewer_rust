@@ -113,6 +113,7 @@ dependencies = [
  "bv-analysis",
  "bv-core",
  "bv-correlation",
+ "bv-graph-core",
  "bv-robot",
  "clap",
  "jiff",
@@ -125,6 +126,7 @@ name = "bv-analysis"
 version = "0.21.0"
 dependencies = [
  "bv-core",
+ "bv-graph-core",
  "getrandom",
  "jiff",
  "serde",
@@ -167,6 +169,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bv-graph-core"
+version = "0.21.0"
+dependencies = [
+ "getrandom",
+ "serde",
+]
+
+[[package]]
 name = "bv-robot"
 version = "0.21.0"
 dependencies = [
@@ -189,6 +199,7 @@ version = "0.21.0"
 dependencies = [
  "bv-analysis",
  "bv-core",
+ "bv-graph-core",
  "crossbeam-channel",
  "crossterm",
  "jiff",

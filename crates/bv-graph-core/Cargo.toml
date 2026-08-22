@@ -1,15 +1,11 @@
 [package]
-name = "bv-analysis"
+name = "bv-graph-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+description = "Pure-Rust graph algorithms extracted from the upstream wasm crate"
 
 [dependencies]
 serde = { workspace = true }
-serde_json = { workspace = true }
-
 getrandom = "0.4"
-bv-core = { path = "../bv-core" }
-jiff = { workspace = true }
-bv-graph-core = { path = "../bv-graph-core" }

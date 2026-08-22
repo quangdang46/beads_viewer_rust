@@ -1,8 +1,8 @@
 //! Composite impact scoring — port of Go `pkg/analysis/priority.go`
 //! ComputeImpactScoresFromStats + component functions.
 
-use crate::graph::DiGraph;
 use bv_core::model::{Issue, Status};
+use bv_graph_core::DiGraph;
 use serde::Serialize;
 use std::collections::BTreeMap;
 

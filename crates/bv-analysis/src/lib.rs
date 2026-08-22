@@ -1,19 +1,14 @@
-//! bv-analysis: graph algorithms (imported verbatim from the upstream wasm
-//! crate), two-phase analyzer, cache, scoring. See plan §4.3.
-//!
-//! PARITY RULE: algorithm modules are included by #[path] from
-//! crates/bv-graph-wasm/src/algorithms — the ONLY change is that crate::graph
-//! resolves to our native DiGraph shim (same layout/API, no wasm-bindgen).
+//! bv-analysis: two-phase analyzer, cache, scoring, drift.
+//! Graph algorithms come from bv-graph-core (extracted from upstream wasm crate).
 
-pub mod algorithms;
 pub mod analyzer;
 pub mod cache;
 pub mod drift;
-pub mod graph;
 pub mod impact;
-#[path = "../../bv-graph-wasm/src/reachability.rs"]
-pub mod reachability;
 pub mod scoring;
 pub mod triage;
 
-pub use graph::DiGraph;
+pub use bv_graph_core::DiGraph;
+
+// Re-export algorithm modules for convenience
+pub use bv_graph_core::algorithms;

@@ -1,9 +1,9 @@
 //! Triage payload assembly — port of Go triage output shapes:
 //! quick_ref (#165 strict semantics), project_health, commands.
 
-use crate::graph::DiGraph;
 use crate::impact::{compute_impact_scores, ImpactInputs};
 use bv_core::model::{Issue, Status};
+use bv_graph_core::DiGraph;
 use serde::Serialize;
 use std::collections::BTreeMap;
 

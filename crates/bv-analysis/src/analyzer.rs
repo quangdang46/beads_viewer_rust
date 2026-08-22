@@ -14,7 +14,7 @@ use crate::algorithms::{
     pagerank::pagerank_default,
     topo::topological_sort,
 };
-use crate::graph::DiGraph;
+use bv_graph_core::DiGraph;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
