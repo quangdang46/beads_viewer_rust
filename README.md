@@ -21,7 +21,7 @@
 <div align="center">
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/OWNER/bv/main/install.sh?$(date +%s)" \
+curl -fsSL "https://raw.githubusercontent.com/quangdang46/beads_viewer_rust/main/install.sh?$(date +%s)" \
   | bash -s -- --easy-mode
 ```
 
@@ -153,8 +153,8 @@ brew install quangdang46/tap/bvr
 ### Windows (planned)
 
 ```powershell
-scoop bucket add OWNER https://github.com/quangdang46/scoop-bucket
-scoop install OWNER/bv
+scoop bucket add quangdang46 https://github.com/quangdang46/scoop-bucket
+scoop install quangdang46/bvr
 ```
 
 Requirements: any platform with a C compiler for bundled SQLite (FTS5 included).
@@ -204,8 +204,8 @@ Screenshots (inherited UX from Go bv):
 
 | | |
 |---|---|
-| ![Main split view](beads_viewer/screenshots/screenshot_01__main_screen.webp) | ![Insights](beads_viewer/screenshots/screenshot_02__insights_view.webp) |
-| ![Kanban](beads_viewer/screenshots/screenshot_03__kanban_view.webp) | ![Graph](beads_viewer/screenshots/screenshot_04__graph_view.webp) |
+| ![Main split view](screenshots/screenshot_01__main_screen.webp) | ![Insights](screenshots/screenshot_02__insights_view.webp) |
+| ![Kanban](screenshots/screenshot_03__kanban_view.webp) | ![Graph](screenshots/screenshot_04__graph_view.webp) |
 
 ---
 
