@@ -6,12 +6,7 @@
 /// Rewrite raw args into canonical form.
 pub fn rewrite_args(args: &[String]) -> Vec<String> {
     let mut out = Vec::with_capacity(args.len());
-    for (idx, arg) in args.iter().enumerate() {
-        // idx 0 is program name — never rewritten
-        if idx == 0 {
-            out.push(arg.clone());
-            continue;
-        }
+    for arg in args {
         // single-dash long flag: starts with exactly one '-', len > 2, not a
         // known short cluster, and the rest matches a long-flag pattern.
         if arg.len() > 2
@@ -39,15 +34,18 @@ pub fn rewrite_args(args: &[String]) -> Vec<String> {
         ("graph", "--robot-graph"),
         ("history", "--robot-history"),
     ];
-    for slot in out.iter_mut().skip(1) {
-        let matched = ALIASES.iter().find(|(a, _)| slot == a);
-        if let Some((_, flag)) = matched {
-            *slot = flag.to_string();
-            break; // only the first positional is rewritten
-        }
-        // stop scanning once we hit any flag: aliases only valid as first arg
-        if slot.starts_with('-') {
+    // Input here is argv-minus-program; scan from index 0.
+    let mut replaced = false;
+    for slot in out.iter_mut() {
+        if replaced {
             break;
+        }
+        if slot.starts_with('-') {
+            break; // aliases only valid as first positional
+        }
+        if let Some((_, flag)) = ALIASES.iter().find(|(a, _)| slot == a) {
+            *slot = flag.to_string();
+            replaced = true;
         }
     }
     out

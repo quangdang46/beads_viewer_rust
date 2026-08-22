@@ -13,5 +13,6 @@ pub mod impact;
 #[path = "../../bv-graph-wasm/src/reachability.rs"]
 pub mod reachability;
 pub mod scoring;
+pub mod triage;
 
 pub use graph::DiGraph;

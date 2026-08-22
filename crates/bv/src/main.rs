@@ -38,9 +38,83 @@ fn main() -> ExitCode {
         return ExitCode::from(0);
     }
 
-    eprintln!("bvr: command dispatch arrives with Phase 3c (bead p3-dispatch-3lv).");
-    eprintln!("Recognized flags validated OK; use --version or --robot-help meanwhile.");
+    // Triage family dispatch (Phase 3c first slice).
+    let triage_family = [
+        "robot-triage",
+        "robot-next",
+        "robot-triage-by-track",
+        "robot-triage-by-label",
+    ]
+    .iter()
+    .any(|f| presence.has(f));
+    if triage_family {
+        return run_robot_triage();
+    }
+
+    eprintln!("bvr: remaining commands arrive with later dispatch slices.");
     ExitCode::from(2)
+}
+
+/// Load issues from discovery chain and emit --robot-triage JSON.
+fn run_robot_triage() -> ExitCode {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let issues = match bv_core::discovery::load_issues_from_repo(&cwd) {
+        Ok((issues, _stats)) => issues,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if issues.is_empty() {
+        // Go: zero-issues exit 0 with empty payload
+        println!(
+            "{{\"generated_at\":\"{}\",\"data_hash\":\"empty\",\"triage\":{{}}}}",
+            jiff_now()
+        );
+        return ExitCode::from(0);
+    }
+    let data_hash = bv_core::data_hash::compute_data_hash(&issues);
+    let g = std::sync::Arc::new(bv_analysis::analyzer::build_graph(&issues));
+    let out = bv_analysis::triage::build_triage(&issues, &g, jiff::Timestamp::now());
+
+    let env = bv_robot::RobotEnvelope::new(
+        data_hash,
+        env!("CARGO_PKG_VERSION"),
+        None,
+        bv_robot::OutputFormat::Json,
+    );
+    // Field order: envelope fields first, then triage payload — matches golden.
+    let payload = serde_json::json!({
+        "generated_at": env.generated_at,
+        "data_hash": env.data_hash,
+        "output_format": env.output_format,
+        "version": env.version,
+        "triage": {
+            "meta": {
+                "version": bv_robot::ROBOT_CONTRACT_VERSION,
+                "generated_at": env.generated_at,
+                "phase2_ready": true,
+                "issue_count": out.counts.total,
+            },
+            "status": bv_analysis::analyzer::MetricStatus::default().to_json_map(),
+            "quick_ref": out.quick_ref,
+            "recommendations": out.recommendations,
+        },
+    });
+    match serde_json::to_string(&payload) {
+        Ok(s) => {
+            println!("{s}");
+            ExitCode::from(0)
+        }
+        Err(e) => {
+            eprintln!("Error: serialization failed: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn jiff_now() -> String {
+    jiff::Timestamp::now().to_string()
 }
 
 fn print_robot_help() {

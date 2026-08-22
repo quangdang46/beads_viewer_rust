@@ -62,6 +62,23 @@ impl Status {
     pub fn is_tombstone(self) -> bool {
         self == Status::Tombstone
     }
+
+    /// Parse from raw string (trim+lowercase like Go normalizeIssueStatus).
+    pub fn parse(raw: &str) -> Option<Status> {
+        match raw.trim().to_lowercase().as_str() {
+            "open" => Some(Status::Open),
+            "in_progress" => Some(Status::InProgress),
+            "blocked" => Some(Status::Blocked),
+            "deferred" => Some(Status::Deferred),
+            "draft" => Some(Status::Draft),
+            "pinned" => Some(Status::Pinned),
+            "hooked" => Some(Status::Hooked),
+            "review" => Some(Status::Review),
+            "closed" => Some(Status::Closed),
+            "tombstone" => Some(Status::Tombstone),
+            _ => None,
+        }
+    }
 }
 
 /// Dependency type. Legacy compat: an EMPTY type string is blocking,

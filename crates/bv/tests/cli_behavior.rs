@@ -37,20 +37,32 @@ fn exclusive_primaries_exit_one() {
 }
 
 #[test]
-fn valid_invocation_reaches_dispatch_notice() {
-    let (code, _, stderr) = run(&["--robot-triage"]);
-    assert_eq!(code, 2); // dispatch not yet implemented
-    assert!(stderr.contains("Phase 3c"), "{stderr}");
+fn valid_triage_dispatches_and_exits_zero() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_bvr"))
+        .arg("--robot-triage")
+        .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+        .output()
+        .expect("binary runs");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("\"quick_ref\""), "{stdout}");
+    assert!(stdout.contains("\"data_hash\""));
 }
 
 #[test]
 fn argv_alias_triage_works() {
-    let (code, _, stderr) = run(&["triage"]);
-    assert_eq!(code, 2);
-    assert!(
-        stderr.contains("Phase 3c"),
-        "alias must rewrite to --robot-triage: {stderr}"
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_bvr"))
+        .args(["triage"])
+        .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+        .output()
+        .expect("binary runs");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "alias rewrites to --robot-triage"
     );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("quick_ref"));
 }
 
 #[test]

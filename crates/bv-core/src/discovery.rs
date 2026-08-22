@@ -6,7 +6,7 @@ use crate::model::Issue;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, RwLock};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub const BEADS_DB_ENV: &str = "BEADS_DB";
@@ -260,11 +260,29 @@ pub fn find_jsonl_path_with_warnings(
     Ok(Some(beads_dir.join(&candidates[0])))
 }
 
-/// Convenience: discovery + file pick + tolerant load.
+/// Convenience: discovery + source selection + tolerant load.
+/// SQLite preferred when present (Go datasource priority 100 > JSONL);
+/// falls back to JSONL when beads.db is absent or fails to open.
 pub fn load_issues_from_repo(
     repo_path: &Path,
 ) -> Result<(Vec<Issue>, crate::loader::ParseStats), DiscoveryError> {
     let beads_dir = get_beads_dir(repo_path)?;
+
+    let db_path = beads_dir.join("beads.db");
+    if db_path.exists() {
+        if let Ok(issues) = crate::sqlite::load_issues_sqlite(&db_path) {
+            let count = issues.len();
+            return Ok((
+                issues,
+                crate::loader::ParseStats {
+                    valid: count,
+                    errors: 0,
+                    skipped: 0,
+                },
+            ));
+        }
+    }
+
     let jsonl = find_jsonl_path_with_warnings(&beads_dir, |_| {})?.ok_or_else(|| {
         DiscoveryError::Git(format!("no beads JSONL found in {}", beads_dir.display()))
     })?;
@@ -335,8 +353,7 @@ impl GitLoader {
         let out = self.git(&["rev-list", "-1", &format!("--before={t}"), "HEAD"])?;
         if out.is_empty() {
             return Err(DiscoveryError::Git(format!(
-                "no commit found at or before {}",
-                t
+                "no commit found at or before {t}"
             )));
         }
         Ok(out)
@@ -345,7 +362,6 @@ impl GitLoader {
     /// Load issues at a revision (SHA / branch / tag / HEAD~N / date string).
     pub fn load_at(&self, revision: &str) -> Result<Vec<Issue>, DiscoveryError> {
         let sha = self.resolve_revision(revision)?;
-        // TTL cache lookup
         if let Ok(cache) = self.cache.lock() {
             if let Some(entry) = cache.get(&sha) {
                 if entry.loaded_at.elapsed() < self.max_age {
@@ -385,29 +401,23 @@ impl GitLoader {
     }
 
     fn git_show(&self, sha: &str, path: &str) -> Result<String, DiscoveryError> {
-        self.git(&["show", &format!("{}:{}", sha, path)])
+        self.git(&["show", &format!("{sha}:{path}")])
     }
 }
 
-/// Go: `parseDateString` — RFC3339, then date-only/datetime layouts in LOCAL time.
+/// Go: `parseDateString` — RFC3339 first, then naive layouts in local tz.
 fn parse_date_string(s: &str) -> Option<jiff::Timestamp> {
     use jiff::civil;
-    // RFC3339 with offset parses directly to Timestamp.
     if let Ok(ts) = s.parse::<jiff::Timestamp>() {
         return Some(ts);
     }
-    // Naive layouts: interpret in local timezone like Go ParseInLocation.
     for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"] {
         if let Ok(dt) = civil::DateTime::strptime(fmt, s) {
             let tz = jiff::tz::TimeZone::system();
-            if let Ok(ts) = dt.to_zoned(tz) {
-                return Some(ts.into());
+            if let Ok(zoned) = dt.to_zoned(tz) {
+                return Some(zoned.into());
             }
         }
     }
     None
 }
-
-// Silence unused warning until SQLite reader lands (deferred bead note).
-#[allow(dead_code)]
-fn _placeholder(_x: Option<RwLock<()>>) {}

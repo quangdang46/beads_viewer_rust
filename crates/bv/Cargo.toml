@@ -16,3 +16,4 @@ bv-analysis = { path = "../bv-analysis" }
 bv-robot = { path = "../bv-robot" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+jiff = { workspace = true }

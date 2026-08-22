@@ -8,3 +8,4 @@ pub use model::{Comment, Dependency, DependencyType, Issue, Status, ValidationEr
 pub mod data_hash;
 pub mod discovery;
 pub mod loader;
+pub mod sqlite;

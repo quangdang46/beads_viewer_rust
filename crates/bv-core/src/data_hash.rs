@@ -71,11 +71,14 @@ impl<'a> HashIssue<'a> {
                     crate::model::DependencyType::ParentChild => "parent-child".into(),
                     crate::model::DependencyType::DiscoveredFrom => "discovered-from".into(),
                 },
+                // Go: Dependency.CreatedAt is a non-pointer time.Time; absent
+                // JSON field decodes to zero time which formats as the
+                // constant below (verified via instrumented upstream).
                 created_at: d
                     .created_at
                     .as_deref()
                     .and_then(normalize_rfc3339_nano)
-                    .unwrap_or_default(),
+                    .unwrap_or_else(|| GO_ZERO_TIME.to_string()),
                 created_by: d.created_by.clone(),
             })
             .collect();
@@ -98,7 +101,7 @@ impl<'a> HashIssue<'a> {
                     .created_at
                     .as_deref()
                     .and_then(normalize_rfc3339_nano)
-                    .unwrap_or_default(),
+                    .unwrap_or_else(|| GO_ZERO_TIME.to_string()),
             })
             .collect();
         comments.sort_by(|a, b| {
@@ -131,6 +134,10 @@ impl<'a> HashIssue<'a> {
         })
     }
 }
+
+/// Go zero time formatted as RFC3339Nano — used when timestamps are absent
+/// because Go hashes `t.UTC().Format(RFC3339Nano)` unconditionally.
+const GO_ZERO_TIME: &str = "0001-01-01T00:00:00Z";
 
 fn write_field(h: &mut Sha256, field: &[u8]) {
     h.update(field);
@@ -173,13 +180,13 @@ pub fn compute_data_hash(issues: &[Issue]) -> String {
             h.update(est.to_string().as_bytes());
         }
         h.update([0u8]);
-        if let Some(c) = &hi.created_at {
-            h.update(c.as_bytes());
-        }
+        // Created/Updated are non-pointer time.Time in Go: ALWAYS written
+        // (zero time when absent). ClosedAt is a POINTER: written only when set.
+        let c = hi.created_at.as_deref().unwrap_or(GO_ZERO_TIME);
+        h.update(c.as_bytes());
         h.update([0u8]);
-        if let Some(u) = &hi.updated_at {
-            h.update(u.as_bytes());
-        }
+        let u = hi.updated_at.as_deref().unwrap_or(GO_ZERO_TIME);
+        h.update(u.as_bytes());
         h.update([0u8]);
         if let Some(cl) = &hi.closed_at {
             h.update(cl.as_bytes());
