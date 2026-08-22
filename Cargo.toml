@@ -29,6 +29,7 @@ thiserror = "2.0"
 jiff = { version = "=0.2", features = ["serde"] }
 rayon = "1.10"
 crossbeam-channel = "0.5"
+sha2 = "0.10"
 
 [profile.release]
 opt-level = 3

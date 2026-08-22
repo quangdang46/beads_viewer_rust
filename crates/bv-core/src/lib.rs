@@ -1,1 +1,8 @@
-//! bv-core: see COMPREHENSIVE_PLAN_FOR_FORT_BEADS_VIEWER.md for scope.
+//! bv-core: frozen data model, tolerant JSONL loader, datasource discovery.
+//! Contracts here are api-freeze-v1 — see AGENTS.md and plan §3.1.
+
+pub mod model;
+
+pub use model::{Comment, Dependency, DependencyType, Issue, Status, ValidationError};
+
+pub mod data_hash;
