@@ -124,6 +124,11 @@ dependencies = [
 [[package]]
 name = "bv-correlation"
 version = "0.21.0"
+dependencies = [
+ "jiff",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "bv-export"
