@@ -2,6 +2,8 @@
 //! message-pattern suspicion scoring with exact weights.
 
 use regex::Regex;
+use std::path::Path;
+use std::process::Command;
 use std::sync::LazyLock;
 
 /// One message pattern + its contribution weight (Go orphanMessagePatterns).
@@ -123,4 +125,82 @@ mod tests {
         let ids = extract_bv_ids("resolves BV-ab12cd34 quickly");
         assert_eq!(ids, vec!["bv-ab12cd34"]);
     }
+}
+
+/// One orphan-commit candidate with computed suspicion.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OrphanCandidate {
+    pub sha: String,
+    #[serde(rename = "short_sha")]
+    pub short_sha: String,
+    pub message: String,
+    pub author: String,
+    pub timestamp: String,
+    pub suspicion_score: i32,
+    pub signals: Vec<String>,
+}
+
+impl OrphanCandidate {
+    pub fn into_json(self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+/// Scan `git log` (excluding beads-file-only commits) for orphan candidates:
+/// commits whose message scores >= min_score but which never touched the
+/// beads JSONL in the same commit (i.e., no bead update co-committed).
+pub fn scan_orphan_candidates(
+    repo: &Path,
+    correlated_events: &[super::extractor::BeadEvent],
+    min_score: i32,
+) -> Vec<OrphanCandidate> {
+    // SHAs that already updated the beads file = correlated commits.
+    let correlated: std::collections::HashSet<&str> = correlated_events
+        .iter()
+        .map(|e| e.commit_sha.as_str())
+        .collect();
+
+    let out = Command::new("git")
+        .args(["log", "--no-merges", "--format=%H%x00%aI%x00%an%x00%s"])
+        .current_dir(repo)
+        .output();
+    let Ok(out) = out else { return Vec::new() };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+
+    let mut candidates = Vec::new();
+    for line in text.split('\n') {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('\u{0}').collect();
+        if parts.len() < 4 {
+            continue;
+        }
+        let sha = parts[0];
+        if correlated.contains(sha) {
+            continue; // already linked to a bead
+        }
+        let timestamp = parts[1].to_string();
+        let author = parts[2].to_string();
+        let message = parts[3].to_string();
+
+        let (score, signals) = message_suspicion(&message);
+        if score >= min_score {
+            candidates.push(OrphanCandidate {
+                short_sha: sha.chars().take(7).collect(),
+                sha: sha.to_string(),
+                message,
+                author,
+                timestamp,
+                suspicion_score: score,
+                signals,
+            });
+        }
+    }
+    // Highest suspicion first.
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.suspicion_score));
+    candidates
 }

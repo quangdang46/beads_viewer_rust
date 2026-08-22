@@ -51,6 +51,14 @@ fn main() -> ExitCode {
         return run_save_baseline(&desc);
     }
 
+    // Correlation-family dispatch (Phase 3e).
+    if presence.has("robot-history") || presence.has("bead-history") {
+        return run_robot_history();
+    }
+    if presence.has("robot-orphans") {
+        return run_robot_orphans();
+    }
+
     // Triage family dispatch (Phase 3c first slice).
     let triage_family = [
         "robot-triage",
@@ -273,6 +281,107 @@ fn run_check_drift() -> ExitCode {
     );
     ExitCode::from(result.exit_code())
 }
+
+fn run_robot_history() -> ExitCode {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let (issues, _) = match bv_core::discovery::load_issues_from_repo(&cwd) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let data_hash = bv_core::data_hash::compute_data_hash(&issues);
+    let repo = std::env::current_dir().unwrap_or_default();
+
+    let limit = 500; // Go --history-limit default
+    let events = match bv_correlation::extract(
+        &repo,
+        &bv_correlation::ExtractOptions {
+            limit,
+            ..Default::default()
+        },
+    ) {
+        Ok(e) => e,
+        Err(err) => {
+            eprintln!("Error: extraction failed: {err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    // Group events by bead.
+    let mut by_bead: std::collections::BTreeMap<String, Vec<&bv_correlation::BeadEvent>> =
+        std::collections::BTreeMap::new();
+    for e in &events {
+        by_bead.entry(e.bead_id.clone()).or_default().push(e);
+    }
+
+    // Method distribution: all events from this path are explicit-message
+    // correlations in the legacy extractor (Go method_distribution parity).
+    let payload = serde_json::json!({
+        "generated_at": jiff_now(),
+        "data_hash": data_hash,
+        "output_format": "json",
+        "version": env!("CARGO_PKG_VERSION"),
+        "stats": {
+            "total_events": events.len(),
+            "beads_with_commits": by_bead.len(),
+        },
+        "histories": by_bead.iter().map(|(id, evs)| {
+            serde_json::json!({
+                "bead_id": id,
+                "events": evs,
+            })
+        }).collect::<Vec<_>>(),
+    });
+    println!("{payload}");
+    ExitCode::from(0)
+}
+
+fn run_robot_orphans() -> ExitCode {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let (issues, _) = match bv_core::discovery::load_issues_from_repo(&cwd) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let data_hash = bv_core::data_hash::compute_data_hash(&issues);
+    let repo = std::env::current_dir().unwrap_or_default();
+
+    let min_score: i32 = std::env::var("BV_ORPHANS_MIN_SCORE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+
+    let events = match bv_correlation::extract(&repo, &ExtractOptionsAlias::default()) {
+        Ok(e) => e,
+        Err(err) => {
+            eprintln!("Error: extraction failed: {err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let candidates: Vec<serde_json::Value> =
+        bv_correlation::orphan::scan_orphan_candidates(&repo, &events, min_score)
+            .into_iter()
+            .map(|c| c.into_json())
+            .collect();
+
+    let payload = serde_json::json!({
+        "generated_at": jiff_now(),
+        "data_hash": data_hash,
+        "output_format": "json",
+        "version": env!("CARGO_PKG_VERSION"),
+        "candidates_count": candidates.len(),
+        "candidates": candidates,
+    });
+    println!("{payload}");
+    ExitCode::from(0)
+}
+
+type ExtractOptionsAlias = bv_correlation::ExtractOptions;
 
 fn jiff_now() -> String {
     jiff::Timestamp::now().to_string()

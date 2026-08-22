@@ -100,6 +100,7 @@ version = "0.21.0"
 dependencies = [
  "bv-analysis",
  "bv-core",
+ "bv-correlation",
  "bv-robot",
  "clap",
  "jiff",
