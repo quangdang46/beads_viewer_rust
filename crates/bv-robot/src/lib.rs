@@ -1,1 +1,5 @@
-//! bv-robot: see COMPREHENSIVE_PLAN_FOR_FORT_BEADS_VIEWER.md for scope.
+//! bv-robot: robot command registry, envelope, TOON/JSON encoding.
+
+pub mod envelope;
+
+pub use envelope::{encode_payload, OutputFormat, RobotEnvelope, RobotLoadStats};

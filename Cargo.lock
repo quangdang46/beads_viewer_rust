@@ -52,6 +52,12 @@ version = "0.21.0"
 [[package]]
 name = "bv-robot"
 version = "0.21.0"
+dependencies = [
+ "bv-core",
+ "jiff",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "bv-search"
