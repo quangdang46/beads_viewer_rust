@@ -177,6 +177,9 @@ dependencies = [
 [[package]]
 name = "bv-search"
 version = "0.21.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "bv-tui"
