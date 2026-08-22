@@ -22,3 +22,18 @@ pub mod subgraph;
 
 #[path = "../../../bv-graph-wasm/src/whatif.rs"]
 pub mod whatif;
+
+#[path = "../../../bv-graph-wasm/src/algorithms/hits.rs"]
+pub mod hits;
+
+#[path = "../../../bv-graph-wasm/src/algorithms/kcore.rs"]
+pub mod kcore;
+
+#[path = "../../../bv-graph-wasm/src/algorithms/eigenvector.rs"]
+pub mod eigenvector;
+
+#[path = "../../../bv-graph-wasm/src/algorithms/articulation.rs"]
+pub mod articulation;
+
+#[path = "../../../bv-graph-wasm/src/algorithms/slack.rs"]
+pub mod slack;

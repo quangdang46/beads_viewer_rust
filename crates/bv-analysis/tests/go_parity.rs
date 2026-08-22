@@ -8,8 +8,9 @@ fn small_chain() -> DiGraph {
     for i in 1..=12 {
         g.add_node(&format!("FIX-{i}"));
     }
-    for i in 2..=12 {
-        g.add_edge(i - 1, i);
+    // Indexes 0-based; consecutive-index edges form the chain.
+    for j in 0..11 {
+        g.add_edge(j, j + 1);
     }
     g
 }

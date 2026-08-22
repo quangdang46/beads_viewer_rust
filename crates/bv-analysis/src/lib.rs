@@ -6,6 +6,7 @@
 //! resolves to our native DiGraph shim (same layout/API, no wasm-bindgen).
 
 pub mod algorithms;
+pub mod analyzer;
 pub mod graph;
 #[path = "../../bv-graph-wasm/src/reachability.rs"]
 pub mod reachability;
