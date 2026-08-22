@@ -3,3 +3,5 @@
 pub mod mermaid;
 
 pub mod preview;
+
+pub mod hooks;

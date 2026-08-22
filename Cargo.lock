@@ -160,6 +160,7 @@ version = "0.21.0"
 dependencies = [
  "bv-core",
  "jiff",
+ "serde",
  "serde_json",
  "thiserror",
  "tiny_http",

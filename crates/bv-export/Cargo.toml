@@ -11,3 +11,4 @@ jiff = { workspace = true }
 tiny-http = { version = "0.12", package = "tiny_http" }
 thiserror = { workspace = true }
 serde_json = { workspace = true }
+serde = { workspace = true }
