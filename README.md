@@ -9,7 +9,7 @@
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)
 ![Rust](https://img.shields.io/badge/Rust-stable-orange.svg)
 ![License](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)
-![Release](https://img.shields.io/github/v/release/OWNER/bv?include_prereleases)
+![Release](https://img.shields.io/github/v/release/quangdang46/bv?include_prereleases)
 [![Upstream](https://img.shields.io/badge/upstream-Dicklesworthstone%2Fbeads__viewer-8A2BE2)](https://github.com/Dicklesworthstone/beads_viewer)
 
 </div>
@@ -139,7 +139,7 @@ bvr --diff-since HEAD~5      # what changed in the last 5 commits
 ### From source
 
 ```bash
-git clone https://github.com/OWNER/bv.git
+git clone https://github.com/quangdang46/beads_viewer_rust.git
 cd bv
 cargo install --path crates/bv
 ```
@@ -147,13 +147,13 @@ cargo install --path crates/bv
 ### Homebrew (planned at release)
 
 ```bash
-brew install OWNER/tap/bv
+brew install quangdang46/tap/bvr
 ```
 
 ### Windows (planned)
 
 ```powershell
-scoop bucket add OWNER https://github.com/OWNER/scoop-bucket
+scoop bucket add OWNER https://github.com/quangdang46/scoop-bucket
 scoop install OWNER/bv
 ```
 
