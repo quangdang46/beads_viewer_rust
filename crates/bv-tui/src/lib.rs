@@ -455,5 +455,6 @@ mod tests {
     }
 }
 
+pub mod chrome;
 pub mod views;
 pub mod worker;
