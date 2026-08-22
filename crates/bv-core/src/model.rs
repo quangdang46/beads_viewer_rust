@@ -298,6 +298,10 @@ impl Issue {
 pub enum ValidationError {
     #[error("missing required field: {0}")]
     MissingField(&'static str),
+    #[error("invalid status: {0}")]
+    InvalidStatus(String),
+    #[error("invalid dependency type")]
+    InvalidDependencyType,
     #[error("updated_at cannot be before created_at")]
     InvertedTimestamps,
 }
