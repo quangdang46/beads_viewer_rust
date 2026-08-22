@@ -454,3 +454,5 @@ mod tests {
         assert!(app.quit_requested);
     }
 }
+
+pub mod views;
