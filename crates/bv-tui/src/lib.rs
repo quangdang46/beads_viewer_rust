@@ -101,6 +101,7 @@ pub enum ViewMode {
     Tree,
     Graph,
     Insights,
+    Alerts,
 }
 
 impl App {
@@ -232,6 +233,14 @@ impl App {
                 };
                 true
             }
+            KeyCode::Char('!') => {
+                self.current_view = if self.current_view == ViewMode::Alerts {
+                    ViewMode::List
+                } else {
+                    ViewMode::Alerts
+                };
+                true
+            }
             KeyCode::Char('E') => {
                 self.current_view = if self.current_view == ViewMode::Tree {
                     ViewMode::List
@@ -282,6 +291,11 @@ pub fn render(f: &mut Frame, app: &App) {
                 &Default::default(),
                 &Default::default(),
             );
+            render_status_bar(f, app);
+            return;
+        }
+        ViewMode::Alerts => {
+            crate::views::alerts::render_alerts(f, &[], 0, f.area());
             render_status_bar(f, app);
             return;
         }
