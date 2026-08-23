@@ -745,7 +745,38 @@ fn render_detail(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                         critical_path: 0.0,
                     })
             });
-            crate::detail::build_detail_lines_from_row(row, &graph_scores)
+            // TODO: pass all_issues from App when available
+            {
+                // Convert ListRow fields into Issue for detail rendering
+                let issue = bv_core::model::Issue {
+                    id: row.id.clone(),
+                    content_hash: String::new(),
+                    title: row.title.clone(),
+                    description: String::new(), // populated from full issue data
+                    design: String::new(),
+                    acceptance_criteria: String::new(),
+                    notes: String::new(),
+                    status: row.status,
+                    priority: row.priority,
+                    issue_type: row.issue_type.clone(),
+                    assignee: String::new(),
+                    estimated_minutes: None,
+                    created_at: None,
+                    updated_at: None,
+                    due_date: None,
+                    closed_at: None,
+                    external_ref: None,
+                    compaction_level: 0,
+                    compacted_at: None,
+                    compacted_at_commit: None,
+                    original_size: 0,
+                    labels: row.labels.clone(),
+                    dependencies: vec![],
+                    comments: vec![],
+                    source_repo: String::new(),
+                };
+                crate::detail::build_detail_lines(&issue, graph_scores.as_ref(), None)
+            }
         }
         None => vec![
             Line::from(""),
