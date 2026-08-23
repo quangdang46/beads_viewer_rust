@@ -192,7 +192,7 @@ fn main() -> ExitCode {
             let g = bv_analysis::build_graph(&issues);
             let pr = bv_graph_core::pagerank_default(&g);
             let bw = bv_graph_core::betweenness(&g);
-            let ev = bv_graph_core::eigenvector_default(&g);
+            let _ev = bv_graph_core::eigenvector_default(&g);
             let hits_result = bv_graph_core::hits_default(&g);
 
             let to_map = |scores: &[f64]| -> std::collections::BTreeMap<String, f64> {
@@ -876,7 +876,7 @@ fn run_robot_priority() -> ExitCode {
     let pr = bv_graph_core::pagerank_default(&g);
     let bw = bv_graph_core::betweenness(&g);
     let cp = bv_graph_core::critical_path_heights(&g);
-    let ev = bv_graph_core::eigenvector_default(&g);
+    let _ev = bv_graph_core::eigenvector_default(&g);
 
     let pr_map: std::collections::BTreeMap<String, f64> = pr
         .iter()
