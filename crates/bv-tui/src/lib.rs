@@ -101,6 +101,10 @@ pub struct App {
     /// Current search query.
     pub search_query: String,
     pub show_sidebar: bool,
+    /// Which panel has focus: false = list, true = detail
+    pub focus_detail: bool,
+    /// Scroll offset for the detail pane
+    pub detail_scroll: u16,
 }
 
 /// Which view is currently displayed.
@@ -149,6 +153,8 @@ impl App {
             searching: false,
             search_query: String::new(),
             show_sidebar: false,
+            focus_detail: false,
+            detail_scroll: 0,
         };
         app.apply_filter();
         app
@@ -237,14 +243,18 @@ impl App {
                 true
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                // Click selects the row under cursor (approximate: click row = list area offset)
-                // For now, just move cursor to clicked position if within bounds
-                let row = mouse.row as usize;
-                let header_lines = 2; // border + title
-                if row > header_lines && mouse.row > 0 {
-                    let idx = row - header_lines - 1;
-                    if idx < self.filtered_indices.len() {
-                        self.cursor = idx;
+                let header_lines = 2;
+                if mouse.row > header_lines {
+                    // Click in left 40% → select list item
+                    if mouse.column < (self.width as f64 * 0.4) as u16 {
+                        let idx = (mouse.row - header_lines - 1) as usize;
+                        if idx < self.filtered_indices.len() {
+                            self.cursor = idx;
+                            self.focus_detail = false;
+                        }
+                    } else {
+                        // Click on right panel → focus detail
+                        self.focus_detail = true;
                     }
                 }
                 true
@@ -275,6 +285,10 @@ impl App {
             return self.handle_search_key(code);
         }
         match code {
+            KeyCode::Tab => {
+                self.focus_detail = !self.focus_detail;
+                true
+            }
             KeyCode::Char('q') => {
                 self.quit_requested = true;
                 true
@@ -288,13 +302,19 @@ impl App {
                 true
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                if self.cursor + 1 < self.filtered_indices.len() {
+                if self.focus_detail {
+                    self.detail_scroll = self.detail_scroll.saturating_add(1);
+                } else if self.cursor + 1 < self.filtered_indices.len() {
                     self.cursor += 1;
                 }
                 true
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.cursor = self.cursor.saturating_sub(1);
+                if self.focus_detail {
+                    self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                } else {
+                    self.cursor = self.cursor.saturating_sub(1);
+                }
                 true
             }
             KeyCode::Char('o') => {
@@ -656,8 +676,18 @@ fn render_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         app.filtered_indices.len(),
         app.sort_mode.label()
     );
+    let list_border_color = if !app.focus_detail {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(Style::default().fg(list_border_color)),
+        )
         .highlight_style(Style::default().bg(Color::DarkGray))
         .highlight_symbol(">");
 
@@ -696,9 +726,25 @@ fn render_detail(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             )),
         ],
     };
+    let focused_border = if app.focus_detail {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+    let title = if app.focus_detail {
+        " DETAIL ◄ FOCUSED "
+    } else {
+        " DETAIL "
+    };
     let para = ratatui::widgets::Paragraph::new(content)
         .wrap(ratatui::widgets::Wrap { trim: false })
-        .block(Block::default().borders(Borders::ALL).title(" DETAIL "));
+        .scroll((app.detail_scroll as u16, 0))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(Style::default().fg(focused_border)),
+        );
     f.render_widget(para, area);
 }
 
