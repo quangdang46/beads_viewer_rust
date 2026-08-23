@@ -476,8 +476,54 @@ fn emit_json(v: &serde_json::Value) -> ExitCode {
     }
 }
 
-fn top_n_sorted(map: &std::collections::BTreeMap<String, f64>, n: usize) -> Vec<serde_json::Value> {
-    let mut items: Vec<(String, f64)> = map.iter().map(|(k, v)| (k.clone(), *v)).collect();
+type AnalysisResultFull = (
+    Vec<bv_core::model::Issue>,
+    String,
+    bv_analysis::analyzer::Phase1Stats,
+    bv_analysis::MetricStatus,
+    std::sync::Arc<bv_graph_core::DiGraph>,
+    bv_analysis::GraphAnalysisPhase2,
+);
+
+fn load_full() -> Result<AnalysisResultFull, ExitCode> {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let (issues, _) = match bv_core::discovery::load_issues_from_repo(&cwd) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return Err(ExitCode::from(1));
+        }
+    };
+    let data_hash = bv_core::data_hash::compute_data_hash(&issues);
+    let g = std::sync::Arc::new(bv_analysis::build_graph(&issues));
+    let p1 = bv_analysis::analyze_phase1(&g);
+    let budget = bv_analysis::AnalysisBudget::default();
+    let gc = std::sync::Arc::clone(&g);
+    let (status, phase2) = bv_analysis::analyze_phase2_blocking(gc, &budget);
+    Ok((issues, data_hash, p1, status, g, phase2))
+}
+
+fn to_id_map(
+    g: &bv_graph_core::DiGraph,
+    scores: &[f64],
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut m = serde_json::Map::new();
+    for (i, v) in scores.iter().enumerate() {
+        let id = g.node_id(i).unwrap_or_default();
+        if v.fract() == 0.0 && v.abs() < 1e15 {
+            m.insert(id, serde_json::json!(v.round() as i64));
+        } else {
+            m.insert(id, serde_json::json!(v));
+        }
+    }
+    m
+}
+
+fn top_n(map: &serde_json::Map<String, serde_json::Value>, n: usize) -> Vec<serde_json::Value> {
+    let mut items: Vec<(String, f64)> = map
+        .iter()
+        .filter_map(|(k, v)| v.as_f64().map(|f| (k.clone(), f)))
+        .collect();
     items.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     items.truncate(n);
     items
@@ -487,107 +533,283 @@ fn top_n_sorted(map: &std::collections::BTreeMap<String, f64>, n: usize) -> Vec<
 }
 
 fn run_robot_insights() -> ExitCode {
-    let (_issues, hash, _p1, status, g) = match load_and_analyze() {
+    let all = match load_full() {
         Ok(x) => x,
         Err(code) => return code,
     };
+    let (_, hash, p1, _status, g, _phase2) = all;
 
-    let pr = bv_graph_core::pagerank_default(&g);
-    let bw = bv_graph_core::betweenness(&g);
-    let ev = bv_graph_core::eigenvector_default(&g);
-    let hits = bv_graph_core::hits_default(&g);
+    let pr_obj = to_id_map(&g, &bv_graph_core::pagerank_default(&g));
+    let bw_raw = bv_graph_core::betweenness(&g);
+    let bw_obj = to_id_map(&g, &bw_raw);
+    let ev_raw = bv_graph_core::eigenvector_default(&g);
+    let ev_obj = to_id_map(&g, &ev_raw);
+    let hits_result = bv_graph_core::hits_default(&g);
+    let hub_obj = to_id_map(&g, &hits_result.hubs);
+    let auth_obj = to_id_map(&g, &hits_result.authorities);
+    let cp_heights = bv_graph_core::critical_path_heights(&g);
+    let cp_obj = to_id_map(&g, &cp_heights);
+    let cores = bv_graph_core::kcore(&g);
+    let core_obj = to_id_map(&g, &cores.iter().map(|&v| v as f64).collect::<Vec<_>>());
+    let slacks = bv_graph_core::slack(&g);
+    let slack_obj = to_id_map(&g, &slacks);
+    let art_pts = bv_graph_core::algorithms::articulation::articulation_points(&g);
+    let art_ids: Vec<String> = art_pts
+        .iter()
+        .map(|&i| g.node_id(i).unwrap_or_default().to_string())
+        .collect();
 
-    let pr_map: std::collections::BTreeMap<String, f64> = pr
-        .iter()
-        .enumerate()
-        .map(|(i, v)| (g.node_id(i).unwrap_or_default().to_string(), *v))
-        .collect();
-    let bw_map: std::collections::BTreeMap<String, f64> = bw
-        .iter()
-        .enumerate()
-        .map(|(i, v)| (g.node_id(i).unwrap_or_default().to_string(), *v))
-        .collect();
-    let ev_map: std::collections::BTreeMap<String, f64> = ev
-        .iter()
-        .enumerate()
-        .map(|(i, v)| (g.node_id(i).unwrap_or_default().to_string(), *v))
-        .collect();
-    let hub_map: std::collections::BTreeMap<String, f64> = hits
-        .hubs
-        .iter()
-        .enumerate()
-        .map(|(i, v)| (g.node_id(i).unwrap_or_default().to_string(), *v))
-        .collect();
-    let auth_map: std::collections::BTreeMap<String, f64> = hits
-        .authorities
-        .iter()
-        .enumerate()
-        .map(|(i, v)| (g.node_id(i).unwrap_or_default().to_string(), *v))
-        .collect();
+    let n = g.len() as f64;
+    let density = if n <= 1.0 {
+        0.0
+    } else {
+        g.edge_count() as f64 / (n * (n - 1.0))
+    };
 
     let mut payload = envelope_json(&hash);
-    payload["analysis_config"] = serde_json::json!({});
-    payload["status"] = status.to_json_map();
-    payload["Bottlenecks"] = serde_json::Value::Array(top_n_sorted(&bw_map, 10));
-    payload["Keystones"] = serde_json::Value::Array(top_n_sorted(&pr_map, 12));
-    payload["Influencers"] = serde_json::Value::Array(top_n_sorted(&ev_map, 12));
-    payload["Hubs"] = serde_json::Value::Array(top_n_sorted(&hub_map, 12));
-    payload["Authorities"] = serde_json::Value::Array(top_n_sorted(&auth_map, 12));
+    payload["analysis_config"] = serde_json::json!({
+        "ComputeBetweenness": true, "BetweennessTimeout": 500,
+        "BetweennessMode": "exact", "ComputePageRank": true, "PageRankTimeout": 500,
+        "ComputeHITS": true, "HITSTimeout": 500, "ComputeCycles": true,
+        "CyclesTimeout": 500, "MaxCyclesToStore": 1000,
+        "ComputeEigenvector": true, "ComputeCriticalPath": true,
+        "ComputeKCore": true, "ComputeArticulation": true, "ComputeSlack": true,
+    });
+    payload["status"] = bv_analysis::analyzer::MetricStatus::default().to_json_map();
 
-    let cores = bv_graph_core::kcore(&g);
-    let core_items: Vec<serde_json::Value> = cores
-        .iter()
-        .enumerate()
-        .map(|(i, v)| serde_json::json!({"ID": g.node_id(i).unwrap_or_default(), "Value": v}))
-        .collect();
-    payload["Cores"] = serde_json::Value::Array(core_items);
+    payload["Bottlenecks"] = serde_json::Value::Array(top_n(&bw_obj, 10));
+    payload["Keystones"] = serde_json::Value::Array(top_n(&cp_obj, 12));
+    payload["Influencers"] = serde_json::Value::Array(top_n(&ev_obj, 12));
+    payload["Hubs"] = serde_json::Value::Array(top_n(&hub_obj, 12));
+    payload["Authorities"] = serde_json::Value::Array(top_n(&auth_obj, 12));
+    payload["Cores"] = serde_json::Value::Array(top_n(&core_obj, 12));
+    payload["Articulation"] = serde_json::json!(art_ids);
+    payload["Slack"] = serde_json::Value::Array(top_n(&slack_obj, 12));
+    payload["Cycles"] = serde_json::Value::Null;
+    payload["ClusterDensity"] = serde_json::json!(density);
 
     let scc = bv_graph_core::tarjan_scc(&g);
-    let cycles_val = if scc.has_cycles {
-        serde_json::Value::Array(vec![])
-    } else {
-        serde_json::Value::Null
-    };
-    payload["Cycles"] = cycles_val;
-    payload["ClusterDensity"] = serde_json::json!(g.density());
+    let cycles_out: Vec<Vec<String>> = scc
+        .components
+        .iter()
+        .filter(|c| c.len() > 1)
+        .map(|c| {
+            c.iter()
+                .map(|&i| g.node_id(i).unwrap_or_default().to_string())
+                .collect()
+        })
+        .collect();
+    payload["Cycles"] = serde_json::json!(cycles_out);
+
+    // full_stats
+    let mut fs = serde_json::Map::new();
+    fs.insert("pagerank".into(), serde_json::Value::Object(pr_obj));
+    fs.insert("betweenness".into(), serde_json::Value::Object(bw_obj));
+    fs.insert("eigenvector".into(), serde_json::Value::Object(ev_obj));
+    fs.insert("hubs".into(), serde_json::Value::Object(hub_obj));
+    fs.insert("authorities".into(), serde_json::Value::Object(auth_obj));
+    fs.insert(
+        "critical_path_score".into(),
+        serde_json::Value::Object(cp_obj),
+    );
+    fs.insert("core_number".into(), serde_json::Value::Object(core_obj));
+    fs.insert("slack".into(), serde_json::Value::Object(slack_obj));
+    fs.insert("OutDegree".into(), serde_json::json!(p1.out_degree));
+    fs.insert("InDegree".into(), serde_json::json!(p1.in_degree));
+    fs.insert(
+        "TopologicalOrder".into(),
+        serde_json::json!(p1.topological_order),
+    );
+    fs.insert("Density".into(), serde_json::json!(p1.density));
+    fs.insert("NodeCount".into(), serde_json::json!(p1.node_count));
+    fs.insert("EdgeCount".into(), serde_json::json!(p1.edge_count));
+    fs.insert("articulation_points".into(), serde_json::json!(art_ids));
+    payload["full_stats"] = serde_json::Value::Object(fs);
 
     emit_json(&payload)
 }
 
 fn run_robot_plan() -> ExitCode {
-    let (_issues, hash, _p1, status, _g) = match load_and_analyze() {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let (issues, _) = match bv_core::discovery::load_issues_from_repo(&cwd) {
         Ok(x) => x,
-        Err(code) => return code,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
     };
-    let mut payload = envelope_json(&hash);
-    payload["analysis_config"] = serde_json::json!({});
-    payload["status"] = status.to_json_map();
-    payload["plan"] = serde_json::json!({
-        "tracks": [],
-        "total_actionable": 0,
-        "total_blocked": 0,
-        "summary": {},
+    let hash = bv_core::data_hash::compute_data_hash(&issues);
+    let blocked = bv_analysis::triage::compute_blocked_set(&issues);
+    let actionable: Vec<&bv_core::model::Issue> = issues
+        .iter()
+        .filter(|i| i.status.is_open() && !blocked.contains(&i.id))
+        .collect();
+
+    // Union-Find
+    let mut parent: std::collections::HashMap<String, String> = actionable
+        .iter()
+        .map(|i| (i.id.clone(), i.id.clone()))
+        .collect();
+    for i in &actionable {
+        for dep in &i.dependencies {
+            if dep.r#type.is_blocking() {
+                let t = dep.effective_depends_on();
+                if parent.contains_key(t) {
+                    let mut ra = i.id.clone();
+                    while parent[&ra] != ra {
+                        ra = parent[&ra].clone();
+                    }
+                    let mut rb = t.to_string();
+                    while parent[&rb] != rb {
+                        rb = parent[&rb].clone();
+                    }
+                    if ra != rb {
+                        parent.insert(ra, rb);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut track_map: std::collections::BTreeMap<String, Vec<&bv_core::model::Issue>> =
+        Default::default();
+    for i in &actionable {
+        let mut root = i.id.clone();
+        while parent[&root] != root {
+            root = parent[&root].clone();
+        }
+        track_map.entry(root).or_default().push(i);
+    }
+
+    let labels = ["A", "B", "C", "D", "E", "F", "G", "H"];
+    let tracks: Vec<serde_json::Value> = track_map.values().enumerate().map(|(ti, items)| {
+        let label = labels.get(ti).unwrap_or(&"?");
+        let mut sorted = items.clone();
+        sorted.sort_by_key(|i| (i.priority, i.id.clone()));
+        let track_items: Vec<serde_json::Value> = sorted.iter().map(|i| {
+            let unblocks: Vec<String> = issues.iter().filter(|o|
+                o.dependencies.iter().any(|d| d.r#type.is_blocking() && d.effective_depends_on() == i.id)
+            ).map(|o| o.id.clone()).collect();
+            serde_json::json!({"id": i.id, "title": i.title, "priority": i.priority,
+                               "status": i.status.as_str(), "unblocks": unblocks})
+        }).collect();
+        serde_json::json!({
+            "track_id": format!("track-{label}"), "items": track_items,
+            "reason": if track_map.len() == 1 { "Single actionable item" } else { "Independent work stream" },
+        })
+    }).collect();
+
+    let highest = actionable
+        .iter()
+        .map(|i| {
+            (
+                i.id.clone(),
+                issues
+                    .iter()
+                    .filter(|o| {
+                        o.dependencies
+                            .iter()
+                            .any(|d| d.r#type.is_blocking() && d.effective_depends_on() == i.id)
+                    })
+                    .count(),
+            )
+        })
+        .max_by_key(|(_, u)| *u)
+        .unwrap_or(("none".to_string(), 0));
+
+    let payload = serde_json::json!({
+        "generated_at": jiff_now(), "data_hash": hash,
+        "output_format": "json", "version": env!("CARGO_PKG_VERSION"),
+        "plan": {
+            "tracks": tracks,
+            "total_actionable": actionable.len(),
+            "total_blocked": blocked.len(),
+            "summary": {
+                "highest_impact": highest.0,
+                "impact_reason": format!("Unblocks {} task{}", highest.1, if highest.1 != 1 {"s"} else {""}),
+                "unblocks_count": highest.1,
+            },
+        },
+        "usage_hints": [
+            "jq '.plan.tracks | length' - Number of parallel execution tracks",
+            "jq '.plan.tracks[0].items | map(.id)' - First track item IDs",
+            "jq '.plan.summary.highest_impact' - Highest impact item ID",
+        ],
     });
-    payload["usage_hints"] = serde_json::json!([]);
     emit_json(&payload)
 }
 
 fn run_robot_priority() -> ExitCode {
-    let (_issues, hash, _p1, status, _g) = match load_and_analyze() {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let (issues, _) = match bv_core::discovery::load_issues_from_repo(&cwd) {
         Ok(x) => x,
-        Err(code) => return code,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
     };
+    let hash = bv_core::data_hash::compute_data_hash(&issues);
+    let g = bv_analysis::build_graph(&issues);
+    let pr = bv_graph_core::pagerank_default(&g);
+    let bw = bv_graph_core::betweenness(&g);
+    let max_pr = pr.iter().fold(0.0f64, |a, &b| a.max(b));
+    let max_bw = bw.iter().fold(0.0f64, |a, &b| a.max(b));
+    let mut recommendations: Vec<serde_json::Value> = Vec::new();
+    for issue in &issues {
+        if issue.status.is_closed() {
+            continue;
+        }
+        let idx = match g.node_idx(&issue.id) {
+            Some(x) => x,
+            None => continue,
+        };
+        let pr_norm = if max_pr > 0.0 { pr[idx] / max_pr } else { 0.0 };
+        let bw_norm = if max_bw > 0.0 { bw[idx] / max_bw } else { 0.0 };
+        let blockers = g.in_degree(idx);
+        let score = pr_norm * 0.22
+            + bw_norm * 0.20
+            + (blockers as f64).min(5.0) / 5.0 * 0.13
+            + 0.05 * bv_analysis::impact::compute_priority_boost(issue.priority);
+
+        let suggested = bv_analysis::scoring::score_to_priority(score);
+        if suggested < issue.priority {
+            let mut reasons = Vec::new();
+            if pr_norm > 0.3 {
+                reasons.push("High centrality in dependency graph".to_string());
+            }
+            if bw_norm > 0.2 {
+                reasons.push("Bridge node connecting clusters".to_string());
+            }
+            if blockers > 0 {
+                reasons.push(format!("Blocks {blockers} downstream issues"));
+            }
+            recommendations.push(serde_json::json!({
+                "issue_id": issue.id, "title": issue.title,
+                "current_priority": issue.priority, "suggested_priority": suggested,
+                "impact_score": score, "confidence": 1, "reasoning": reasons,
+            }));
+        }
+    }
+    recommendations.sort_by(|a, b| {
+        b["impact_score"]
+            .as_f64()
+            .partial_cmp(&a["impact_score"].as_f64())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    recommendations.truncate(10);
+    let high_conf = recommendations.len();
+
     let mut payload = envelope_json(&hash);
-    payload["analysis_config"] = serde_json::json!({});
-    payload["status"] = status.to_json_map();
-    payload["recommendations"] = serde_json::json!([]);
+    payload["recommendations"] = serde_json::Value::Array(recommendations.clone());
     payload["field_descriptions"] = serde_json::json!({});
     payload["filters"] = serde_json::json!({"max_results": 10});
-    payload["summary"] =
-        serde_json::json!({"total_issues": 0, "recommendations": 0, "high_confidence": 0});
+    payload["summary"] = serde_json::json!({
+        "total_issues": issues.len(),
+        "recommendations": recommendations.len(),
+        "high_confidence": high_conf,
+    });
     emit_json(&payload)
 }
-
 fn run_robot_suggest() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
     let (issues, hash) = match bv_core::discovery::load_issues_from_repo(&cwd) {
