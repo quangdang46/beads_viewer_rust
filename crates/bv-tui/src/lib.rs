@@ -738,7 +738,7 @@ fn render_detail(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     };
     let para = ratatui::widgets::Paragraph::new(content)
         .wrap(ratatui::widgets::Wrap { trim: false })
-        .scroll((app.detail_scroll as u16, 0))
+        .scroll((app.detail_scroll, 0))
         .block(
             Block::default()
                 .borders(Borders::ALL)
