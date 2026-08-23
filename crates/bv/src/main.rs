@@ -38,6 +38,33 @@ fn main() -> ExitCode {
         return ExitCode::from(0);
     }
 
+    // Export markdown (Phase 5a).
+    if let Some(output_path_idx) = args.iter().position(|a| a == "--export-md") {
+        let output_path = args
+            .get(output_path_idx + 1)
+            .cloned()
+            .unwrap_or_else(|| "report.md".to_string());
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let (issues, _) = match bv_core::discovery::load_issues_from_repo(&cwd) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        let md = bv_export::mermaid::generate_markdown(&issues, "Beads Report");
+        match std::fs::write(&output_path, &md) {
+            Ok(_) => {
+                println!("Exported {} issues to {}", issues.len(), output_path);
+                return ExitCode::from(0);
+            }
+            Err(e) => {
+                eprintln!("Error writing {}: {e}", output_path);
+                return ExitCode::from(1);
+            }
+        }
+    }
+
     // Drift / baseline dispatch (Phase 3d).
     if presence.has("check-drift") {
         return run_check_drift();

@@ -113,6 +113,7 @@ dependencies = [
  "bv-analysis",
  "bv-core",
  "bv-correlation",
+ "bv-export",
  "bv-graph-core",
  "bv-robot",
  "clap",

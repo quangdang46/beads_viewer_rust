@@ -19,3 +19,4 @@ thiserror = { workspace = true }
 jiff = { workspace = true }
 bv-correlation = { path = "../bv-correlation" }
 bv-graph-core = { path = "../bv-graph-core" }
+bv-export = { path = "../bv-export" }
