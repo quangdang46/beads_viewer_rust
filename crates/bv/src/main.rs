@@ -186,7 +186,32 @@ fn main() -> ExitCode {
     match bv_core::discovery::load_issues_from_repo(&cwd) {
         Ok((issues, _)) => {
             eprintln!("Loaded {} issues — launching TUI", issues.len());
-            match bv_tui::run_tui(&mut bv_tui::App::new(issues)) {
+            let mut app = bv_tui::App::new(issues.clone());
+
+            // Compute graph metrics for insights view
+            let g = bv_analysis::build_graph(&issues);
+            let pr = bv_graph_core::pagerank_default(&g);
+            let bw = bv_graph_core::betweenness(&g);
+            let ev = bv_graph_core::eigenvector_default(&g);
+            let hits_result = bv_graph_core::hits_default(&g);
+
+            let to_map = |scores: &[f64]| -> std::collections::BTreeMap<String, f64> {
+                scores
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (g.node_id(i).unwrap_or_default().to_string(), *v))
+                    .collect()
+            };
+
+            app.graph_metrics = Some(bv_tui::GraphMetrics {
+                pagerank: to_map(&pr),
+                betweenness: to_map(&bw),
+                eigenvector: to_map(&ev),
+                hubs: to_map(&hits_result.hubs),
+                authorities: to_map(&hits_result.authorities),
+            });
+
+            match bv_tui::run_tui(&mut app) {
                 Ok(_) => ExitCode::from(0),
                 Err(e) => {
                     eprintln!("TUI error: {e}");

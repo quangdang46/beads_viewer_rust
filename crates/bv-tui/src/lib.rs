@@ -9,6 +9,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     Frame,
 };
+use std::collections::BTreeMap;
 use std::io;
 
 /// Issue status (re-exported for view rendering).
@@ -81,6 +82,16 @@ pub struct ListRow {
 }
 
 /// Application state (Elm model).
+/// Stores computed graph metrics for rendering views.
+#[derive(Default, Clone)]
+pub struct GraphMetrics {
+    pub pagerank: BTreeMap<String, f64>,
+    pub betweenness: BTreeMap<String, f64>,
+    pub eigenvector: BTreeMap<String, f64>,
+    pub hubs: BTreeMap<String, f64>,
+    pub authorities: BTreeMap<String, f64>,
+}
+
 pub struct App {
     pub rows: Vec<ListRow>,
     pub filtered_indices: Vec<usize>,
@@ -105,6 +116,8 @@ pub struct App {
     pub focus_detail: bool,
     /// Scroll offset for the detail pane
     pub detail_scroll: u16,
+    /// Graph metric maps from analysis (for insights rendering)
+    pub graph_metrics: Option<GraphMetrics>,
 }
 
 /// Which view is currently displayed.
@@ -155,6 +168,7 @@ impl App {
             show_sidebar: false,
             focus_detail: false,
             detail_scroll: 0,
+            graph_metrics: None,
         };
         app.apply_filter();
         app
@@ -290,11 +304,21 @@ impl App {
                 true
             }
             KeyCode::Char('q') => {
-                self.quit_requested = true;
+                if self.focus_detail {
+                    self.focus_detail = false;
+                } else {
+                    self.quit_requested = true;
+                }
                 true
             }
             KeyCode::Esc => {
-                if self.show_detail {
+                if self.searching {
+                    self.searching = false;
+                    self.search_query.clear();
+                    self.apply_filter();
+                } else if self.focus_detail {
+                    self.focus_detail = false;
+                } else if self.show_detail {
                     self.show_detail = false;
                 } else {
                     self.quit_requested = true;
@@ -480,13 +504,13 @@ pub fn render(f: &mut Frame, app: &App) {
             return;
         }
         ViewMode::Insights => {
-            crate::views::insights::render_insights(
-                f,
-                &Default::default(),
-                &Default::default(),
-                &Default::default(),
-                &Default::default(),
-            );
+            let empty = BTreeMap::new();
+            let (pr, bw, hub, auth) = if let Some(ref gm) = app.graph_metrics {
+                (&gm.pagerank, &gm.betweenness, &gm.hubs, &gm.authorities)
+            } else {
+                (&empty, &empty, &empty, &empty)
+            };
+            crate::views::insights::render_insights(f, pr, bw, hub, auth);
             render_status_bar(f, app);
             return;
         }
