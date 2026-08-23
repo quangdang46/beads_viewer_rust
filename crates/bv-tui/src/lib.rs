@@ -94,6 +94,8 @@ pub struct GraphMetrics {
 
 pub struct App {
     pub rows: Vec<ListRow>,
+    /// Full issue data keyed by ID (for detail pane rendering)
+    pub issue_map: std::collections::HashMap<String, bv_core::model::Issue>,
     pub filtered_indices: Vec<usize>,
     pub cursor: usize,
     pub filter_mode: FilterMode,
@@ -135,6 +137,8 @@ pub enum ViewMode {
 
 impl App {
     pub fn new(issues: Vec<bv_core::model::Issue>) -> Self {
+        let issue_map: std::collections::HashMap<String, bv_core::model::Issue> =
+            issues.iter().map(|i| (i.id.clone(), i.clone())).collect();
         let rows: Vec<ListRow> = issues
             .iter()
             .map(|i| ListRow {
@@ -152,6 +156,7 @@ impl App {
             .collect();
         let mut app = App {
             rows,
+            issue_map,
             filtered_indices: Vec::new(),
             cursor: 0,
             filter_mode: FilterMode::All,
@@ -731,8 +736,6 @@ fn render_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 fn render_detail(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let content: Vec<Line> = match app.selected() {
         Some(row) => {
-            // Build graph scores if available
-            // Look up actual graph metrics for this issue
             let graph_scores = app.graph_metrics.as_ref().and_then(|gm| {
                 gm.pagerank
                     .get(&row.id)
@@ -745,37 +748,16 @@ fn render_detail(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                         critical_path: 0.0,
                     })
             });
-            // TODO: pass all_issues from App when available
-            {
-                // Convert ListRow fields into Issue for detail rendering
-                let issue = bv_core::model::Issue {
-                    id: row.id.clone(),
-                    content_hash: String::new(),
-                    title: row.title.clone(),
-                    description: String::new(), // populated from full issue data
-                    design: String::new(),
-                    acceptance_criteria: String::new(),
-                    notes: String::new(),
-                    status: row.status,
-                    priority: row.priority,
-                    issue_type: row.issue_type.clone(),
-                    assignee: String::new(),
-                    estimated_minutes: None,
-                    created_at: None,
-                    updated_at: None,
-                    due_date: None,
-                    closed_at: None,
-                    external_ref: None,
-                    compaction_level: 0,
-                    compacted_at: None,
-                    compacted_at_commit: None,
-                    original_size: 0,
-                    labels: row.labels.clone(),
-                    dependencies: vec![],
-                    comments: vec![],
-                    source_repo: String::new(),
-                };
-                crate::detail::build_detail_lines(&issue, graph_scores.as_ref(), None)
+
+            // Use full issue data from issue_map for detail rendering
+            if let Some(full_issue) = app.issue_map.get(&row.id) {
+                crate::detail::build_detail_lines(
+                    full_issue,
+                    graph_scores.as_ref(),
+                    Some(&app.issue_map),
+                )
+            } else {
+                vec![Line::from(""), Line::from("Issue not found in map")]
             }
         }
         None => vec![
@@ -820,13 +802,15 @@ fn render_sidebar(f: &mut Frame, _app: &App) {
 }
 
 fn render_status_bar(f: &mut Frame, app: &App) {
+    let area = ratatui::layout::Rect {
+        x: 0,
+        y: f.area().height - 1,
+        width: f.area().width,
+        height: 1,
+    };
+
+    // Search mode
     if app.searching {
-        let area = ratatui::layout::Rect {
-            x: 0,
-            y: f.area().height - 1,
-            width: f.area().width,
-            height: 1,
-        };
         let bar = Paragraph::new(Line::from(vec![
             Span::styled("/", Style::default().fg(Color::Yellow)),
             Span::styled(&app.search_query, Style::default().fg(Color::White)),
@@ -835,27 +819,148 @@ fn render_status_bar(f: &mut Frame, app: &App) {
         f.render_widget(bar, area);
         return;
     }
-    let area = ratatui::layout::Rect {
-        x: 0,
-        y: f.area().height - 1,
-        width: f.area().width,
-        height: 1,
+
+    let mut spans: Vec<Span> = Vec::new();
+
+    // Filter badge (colored bg like Go)
+    let (filter_icon, filter_txt) = match app.filter_mode {
+        FilterMode::All => ("📋", "ALL"),
+        FilterMode::Open => ("📂", "OPEN"),
+        FilterMode::Closed => ("✅", "CLOSED"),
+        FilterMode::Ready => ("🚀", "READY"),
     };
-    let filter_label = app.filter_mode.label();
-    let msg = if app.status_msg.is_empty() {
-        format!(
-            " {} issues | filter:{} | sort:{} | q:quit",
-            app.filtered_indices.len(),
-            filter_label,
-            app.sort_mode.label()
-        )
-    } else {
-        format!(" {}", app.status_msg)
-    };
-    let bar = Paragraph::new(Line::from(vec![Span::styled(
-        msg,
+    spans.push(Span::styled(
+        format!(" {filter_icon} {filter_txt} "),
+        Style::default()
+            .bg(Color::Cyan)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD),
+    ));
+
+    // Sort badge (only when not default)
+    if app.sort_mode != SortMode::Default {
+        spans.push(Span::styled(
+            format!(" ↕ {} ", app.sort_mode.label()),
+            Style::default().bg(Color::DarkGray).fg(Color::Cyan),
+        ));
+    }
+
+    // Stats section with colored indicators
+    let open_count = app
+        .rows
+        .iter()
+        .filter(|r| matches!(r.status, Status::Open))
+        .count();
+    let ready_count = app.filtered_indices.len();
+    let blocked_count = app
+        .rows
+        .iter()
+        .filter(|r| matches!(r.status, Status::Blocked))
+        .count();
+    let closed_count = app.rows.iter().filter(|r| r.status.is_closed()).count();
+
+    spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled(
+        format!("○{open_count} "),
+        Style::default().fg(Color::Green),
+    ));
+    spans.push(Span::styled(
+        format!("◉{ready_count} "),
+        Style::default().fg(Color::Cyan),
+    ));
+    spans.push(Span::styled(
+        format!("◈{blocked_count} "),
+        Style::default().fg(Color::Yellow),
+    ));
+    spans.push(Span::styled(
+        format!("●{closed_count}"),
         Style::default().fg(Color::DarkGray),
-    )]));
+    ));
+
+    // Keyboard hints (context-aware)
+    spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+
+    if app.focus_detail {
+        spans.push(Span::styled(
+            "esc",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" back"));
+    } else if app.show_detail {
+        spans.push(Span::styled(
+            "tab",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" focus"));
+        spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            "j/k",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" scroll"));
+    } else if app.current_view == ViewMode::Board {
+        spans.push(Span::styled(
+            "h/l",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" col"));
+        spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            "b",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" list"));
+    } else {
+        spans.push(Span::styled(
+            "⏎",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" details"));
+        spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            "/",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" search"));
+        spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            "b/E/i",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" views"));
+    }
+
+    // Count badge (right side)
+    let count_text = format!("{} issues", app.filtered_indices.len());
+    let count_width = count_text.len() as u16;
+    let filler_width = area.width.saturating_sub(
+        spans.iter().map(|s| s.width() as u16).sum::<u16>() + count_width as u16 + 2,
+    );
+    if filler_width > 0 {
+        spans.push(Span::raw(" ".repeat(filler_width as usize)));
+    }
+    spans.push(Span::styled(
+        count_text,
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let bar = Paragraph::new(Line::from(spans));
     f.render_widget(bar, area);
 }
 
