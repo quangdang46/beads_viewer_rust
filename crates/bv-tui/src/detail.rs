@@ -148,38 +148,40 @@ pub fn build_detail_lines(
         lines.push(Line::from(""));
     }
 
-    // Dependencies with icons
+    // Dependency Graph (tree format, matching Go BuildDependencyTree)
     if !issue.dependencies.is_empty() {
-        lines.push(section_line("🔗 Dependencies"));
-        for dep in &issue.dependencies {
-            let target_id = dep.effective_depends_on().to_string();
-            let dt = dep_type_icon(dep.r#type.as_str());
-            let arrow = if dep.r#type.is_blocking() {
-                "→ blocked by"
-            } else {
-                "→ related to"
-            };
+        lines.push(section_line("Dependency Graph"));
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(issue.id.clone());
 
-            // Look up target for status icon + title
-            if let Some(all) = all_issues {
-                if let Some(target) = all.get(&target_id) {
-                    let _s = status_icon(target.status.as_str());
-                    lines.push(Line::from(vec![
-                        Span::raw("  "),
-                        Span::raw(dt),
-                        Span::raw(" "),
-                        Span::styled(arrow.to_string(), dim),
-                        Span::raw(" "),
-                        Span::styled(target_id.clone(), Style::default().fg(Color::Cyan)),
-                        Span::raw(" "),
-                        Span::styled(target.title.clone(), Style::default().fg(Color::White)),
-                        Span::styled(format!(" ({})", target.status.as_str()), dim),
-                    ]));
-                    continue;
-                }
-            }
-            lines.push(indent(&format!("{arrow} {target_id}")));
-        }
+        // Root node
+        let root_icon = status_icon(issue.status.as_str());
+        let root_type = type_icon_md(&issue.issue_type);
+        lines.push(Line::from(vec![
+            Span::raw(format!("\u{1f4cd} {root_icon} {root_type} ")),
+            Span::styled(issue.id.clone(), Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!(
+                    " {} ({})",
+                    truncate_title(&issue.title, 40),
+                    issue.status.as_str()
+                ),
+                dim,
+            ),
+            Span::styled(" [root]", Style::default().fg(Color::DarkGray)),
+        ]));
+
+        // Render children recursively
+        render_tree_children(
+            &issue.id,
+            &issue.dependencies,
+            all_issues,
+            &mut visited,
+            0,  // depth
+            3,  // max_depth (same as Go)
+            "", // prefix
+            &mut lines,
+        );
         lines.push(Line::from(""));
     }
 
@@ -237,4 +239,106 @@ pub fn build_detail_lines(
     }
 
     lines
+}
+
+fn truncate_title(title: &str, max: usize) -> String {
+    let chars: Vec<char> = title.chars().collect();
+    if chars.len() > max {
+        format!(
+            "{}...",
+            chars[..max.saturating_sub(3)].iter().collect::<String>()
+        )
+    } else {
+        title.to_string()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_tree_children(
+    _parent_id: &str,
+    deps: &[bv_core::model::Dependency],
+    all_issues: Option<&std::collections::HashMap<String, bv_core::model::Issue>>,
+    visited: &mut std::collections::HashSet<String>,
+    depth: usize,
+    max_depth: usize,
+    prefix: &str,
+    lines: &mut Vec<Line<'static>>,
+) {
+    for (i, dep) in deps.iter().enumerate() {
+        let target_id = dep.effective_depends_on().to_string();
+        let is_last = i == deps.len() - 1;
+
+        let connector = if is_last {
+            "\u{2514}\u{2500}\u{2500} "
+        } else {
+            "\u{251c}\u{2500}\u{2500} "
+        };
+
+        // Cycle detection
+        if visited.contains(&target_id) {
+            lines.push(Line::from(Span::styled(
+                format!("{prefix}{connector}\u{26aa} {target_id} (cycle)"),
+                Style::default().fg(Color::DarkGray),
+            )));
+            continue;
+        }
+
+        // Depth limit
+        if max_depth > 0 && depth >= max_depth {
+            lines.push(Line::from(Span::styled(
+                format!("{prefix}{connector}\u{26aa} {target_id} (max depth)"),
+                Style::default().fg(Color::DarkGray),
+            )));
+            continue;
+        }
+
+        // Look up target issue
+        if let Some(target) = all_issues.and_then(|m| m.get(&target_id)) {
+            visited.insert(target_id.clone());
+
+            let s_icon = status_icon(target.status.as_str());
+            let dt_icon = dep_type_icon(dep.r#type.as_str());
+            let title = truncate_title(&target.title, 40);
+            let status_str = target.status.as_str();
+
+            lines.push(Line::from(vec![
+                Span::raw(format!("{prefix}{connector}")),
+                Span::raw(s_icon),
+                Span::raw(" "),
+                Span::raw(dt_icon),
+                Span::raw(" "),
+                Span::styled(target_id.clone(), Style::default().fg(Color::Cyan)),
+                Span::raw(" "),
+                Span::styled(title, Style::default()),
+                Span::styled(
+                    format!(" ({}) [{}]", status_str, dep.r#type.as_str()),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+
+            // Recurse into target's dependencies
+            let child_prefix = if is_last {
+                format!("{prefix}    ")
+            } else {
+                format!("{prefix}\u{2502}   ")
+            };
+            render_tree_children(
+                &target_id,
+                &target.dependencies,
+                all_issues,
+                visited,
+                depth + 1,
+                max_depth,
+                &child_prefix,
+                lines,
+            );
+
+            visited.remove(&target_id);
+        } else {
+            lines.push(Line::from(Span::styled(
+                format!("{prefix}{connector}? {target_id} (not found)"),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
 }
