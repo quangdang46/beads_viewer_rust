@@ -116,6 +116,7 @@ dependencies = [
  "bv-export",
  "bv-graph-core",
  "bv-robot",
+ "bv-tui",
  "clap",
  "jiff",
  "serde_json",

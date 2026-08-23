@@ -33,6 +33,29 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
+    if args.iter().any(|a| a == "--help" || a == "-h")
+        && !args.iter().any(|a| a.starts_with("--robot"))
+    {
+        println!("bvr — Beads Viewer in Rust");
+        println!();
+        println!("USAGE:");
+        println!("  bvr                    Launch interactive TUI");
+        println!("  bvr --robot-triage     Unified triage (mega-command)");
+        println!("  bvr --robot-next       Single top pick + claim command");
+        println!("  bvr --robot-insights   Graph metrics + top-N lists");
+        println!("  bvr --robot-plan       Dependency-respecting execution plan");
+        println!("  bvr --robot-graph      Dependency graph as JSON/DOT/Mermaid");
+        println!("  bvr --robot-history    Bead-commit correlation from git log");
+        println!("  bvr --robot-orphans    Orphan commit detection");
+        println!("  bvr --robot-alerts     Drift + proactive warnings");
+        println!("  bvr --export-md FILE   Export markdown report");
+        println!("  bvr --save-baseline    Save current state as baseline");
+        println!("  bvr --check-drift      Check drift vs baseline (exit 0/1/2)");
+        println!("  bvr --version          Show version");
+        println!();
+        return ExitCode::from(0);
+    }
+
     if presence.has("robot-help") {
         print_robot_help();
         return ExitCode::from(0);
@@ -137,10 +160,13 @@ fn main() -> ExitCode {
     match bv_core::discovery::load_issues_from_repo(&cwd) {
         Ok((issues, _)) => {
             eprintln!("Loaded {} issues — launching TUI", issues.len());
-            // TUI runs in alternate screen; for now just report count.
-            // Full ratatui event loop lands as tui-m1 matures further.
-            eprintln!("TUI event loop available via bv_tui::run_tui()");
-            ExitCode::from(0)
+            match bv_tui::run_tui(&mut bv_tui::App::new(issues)) {
+                Ok(_) => ExitCode::from(0),
+                Err(e) => {
+                    eprintln!("TUI error: {e}");
+                    ExitCode::from(1)
+                }
+            }
         }
         Err(e) => {
             eprintln!("Error loading beads: {e}");
