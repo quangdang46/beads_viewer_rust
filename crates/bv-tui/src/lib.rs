@@ -95,6 +95,7 @@ pub struct App {
     pub searching: bool,
     /// Current search query.
     pub search_query: String,
+    pub show_sidebar: bool,
 }
 
 /// Which view is currently displayed.
@@ -106,6 +107,7 @@ pub enum ViewMode {
     Graph,
     Insights,
     Alerts,
+    TimeTravel,
 }
 
 impl App {
@@ -135,6 +137,7 @@ impl App {
             current_view: ViewMode::List,
             searching: false,
             search_query: String::new(),
+            show_sidebar: false,
         };
         app.apply_filter();
         app
@@ -320,6 +323,18 @@ impl App {
                 };
                 true
             }
+            KeyCode::Char(';') => {
+                self.show_sidebar = !self.show_sidebar;
+                true
+            }
+            KeyCode::Char('t') => {
+                self.current_view = if self.current_view == ViewMode::TimeTravel {
+                    ViewMode::List
+                } else {
+                    ViewMode::TimeTravel
+                };
+                true
+            }
             KeyCode::Char('!') => {
                 self.current_view = if self.current_view == ViewMode::Alerts {
                     ViewMode::List
@@ -416,6 +431,10 @@ pub fn render(f: &mut Frame, app: &App) {
         render_detail(f, app, chunks[1]);
     }
 
+    if app.show_sidebar {
+        render_sidebar(f, app);
+    }
+
     render_status_bar(f, app);
 }
 
@@ -501,6 +520,17 @@ fn render_detail(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let para =
         Paragraph::new(content).block(Block::default().borders(Borders::ALL).title(" DETAIL "));
     f.render_widget(para, area);
+}
+
+fn render_sidebar(f: &mut Frame, app: &App) {
+    let entries = crate::chrome::default_help_entries();
+    let area = ratatui::layout::Rect {
+        x: f.area().width.saturating_sub(34),
+        y: 0,
+        width: 34.min(f.area().width),
+        height: f.area().height,
+    };
+    crate::chrome::render_sidebar(f, area, &[("Navigation", entries)]);
 }
 
 fn render_status_bar(f: &mut Frame, app: &App) {
