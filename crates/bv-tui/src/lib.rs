@@ -74,6 +74,7 @@ pub struct ListRow {
     pub priority: i32,
     pub issue_type: String,
     pub labels: Vec<String>,
+    pub created_at: Option<String>,
 }
 
 /// Application state (Elm model).
@@ -124,6 +125,7 @@ impl App {
                 priority: i.priority,
                 issue_type: i.issue_type.clone(),
                 labels: i.labels.clone(),
+                created_at: i.created_at.clone(),
             })
             .collect();
         let mut app = App {
@@ -383,7 +385,63 @@ impl App {
     }
 }
 
-/// Render the UI frame.
+fn type_icon(issue_type: &str) -> (&'static str, Color) {
+    match issue_type {
+        "bug" => ("🐛", Color::Red),
+        "feature" => ("✨", Color::Green),
+        "task" => ("📋", Color::Blue),
+        "epic" => ("🚀", Color::Magenta),
+        "chore" => ("🧹", Color::Gray),
+        _ => ("•", Color::DarkGray),
+    }
+}
+
+fn prio_badge_style(priority: i32) -> (Color, Color) {
+    match priority {
+        0 => (Color::White, Color::Red),
+        1 => (Color::White, Color::LightRed),
+        2 => (Color::Black, Color::Yellow),
+        3 => (Color::White, Color::Blue),
+        _ => (Color::Gray, Color::DarkGray),
+    }
+}
+
+fn status_badge(status: &str) -> (&'static str, Color) {
+    match status {
+        "open" => ("OPEN", Color::Green),
+        "in_progress" => ("PROG", Color::Yellow),
+        "blocked" => ("BLKD", Color::Red),
+        "deferred" => ("DEFR", Color::Cyan),
+        "draft" => ("DRFT", Color::Cyan),
+        "pinned" => ("PIN", Color::Magenta),
+        "hooked" => ("HOOK", Color::Cyan),
+        "review" => ("REVW", Color::Blue),
+        "closed" => ("DONE", Color::DarkGray),
+        "tombstone" => ("TOMB", Color::DarkGray),
+        _ => ("????", Color::Gray),
+    }
+}
+
+fn age_str(created_at: &Option<String>) -> String {
+    if let Some(ca) = created_at {
+        if let Ok(t) = ca.parse::<jiff::Timestamp>() {
+            let now = jiff::Timestamp::now();
+            let days = (now - t).total(jiff::Unit::Second).unwrap_or(0.0) / 86400.0;
+            if days < 1.0 {
+                return "today".into();
+            }
+            if days < 30.0 {
+                return format!("{days:.0}d");
+            }
+            if days < 365.0 {
+                return format!("{:.0}w", days / 7.0);
+            }
+            return format!("{:.0}y", days / 365.0);
+        }
+    }
+    String::new()
+}
+
 pub fn render(f: &mut Frame, app: &App) {
     match app.current_view {
         ViewMode::Tree => {
@@ -493,6 +551,25 @@ fn status_color(s: Status) -> Color {
 }
 
 fn render_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let inner_width = area.width.saturating_sub(2) as usize;
+
+    // Header row matching Go: "  TYPE PRI STATUS      ID                     TITLE"
+    let header = ratatui::widgets::Paragraph::new(Line::from(Span::styled(
+        "  TYPE PRI STATUS      ID                     TITLE",
+        Style::default()
+            .bg(Color::Cyan)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD),
+    )));
+    let header_area = ratatui::layout::Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: 1,
+    };
+    f.render_widget(header, header_area);
+
+    // List items
     let items: Vec<ListItem> = app
         .filtered_indices
         .iter()
@@ -500,24 +577,84 @@ fn render_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .map(|(vis_idx, &row_idx)| {
             let row = &app.rows[row_idx];
             let selected = vis_idx == app.cursor;
-            let prefix = if selected { "> " } else { "  " };
-            let color = status_color(row.status);
-            ListItem::new(Line::from(vec![
-                Span::raw(prefix),
-                Span::styled(format!("{:<24}", row.id), Style::default().fg(Color::Cyan)),
-                Span::styled(
-                    format!("P{}", row.priority),
-                    Style::default().fg(if row.priority <= 1 {
-                        Color::Red
-                    } else {
-                        Color::Gray
-                    }),
-                ),
-                Span::raw(" "),
-                Span::styled(&row.title, Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw("  "),
-                Span::styled(row.status.as_str().to_string(), Style::default().fg(color)),
-            ]))
+            let (icon, icon_color) = type_icon(&row.issue_type);
+
+            // Priority badge
+            let (pfg, pbg) = prio_badge_style(row.priority);
+            let prio_label = format!("P{}", row.priority);
+
+            // Status badge
+            let status_str = row.status.as_str();
+            let (slabel, scolor) = status_badge(status_str);
+
+            // Age
+            let age = age_str(&row.created_at);
+
+            let mut spans = vec![];
+
+            // Selection indicator
+            if selected {
+                spans.push(Span::styled(
+                    "▸ ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::raw("  "));
+            }
+
+            // Type icon
+            spans.push(Span::styled(icon, Style::default().fg(icon_color)));
+            spans.push(Span::raw(" "));
+
+            // Priority badge
+            spans.push(Span::styled(
+                format!("{:<3}", prio_label),
+                Style::default()
+                    .fg(pfg)
+                    .bg(pbg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw(" "));
+
+            // Status badge
+            spans.push(Span::styled(
+                format!("{:<4}", slabel),
+                Style::default().fg(scolor),
+            ));
+            spans.push(Span::raw(" "));
+
+            // ID
+            spans.push(Span::styled(
+                format!("{:<20}", row.id),
+                Style::default().fg(Color::Cyan),
+            ));
+            spans.push(Span::raw(" "));
+
+            // Title (truncated to fit)
+            let title_width = inner_width.saturating_sub(45);
+            let title = if row.title.len() > title_width {
+                format!("{}…", &row.title[..title_width.saturating_sub(1)])
+            } else {
+                format!("{:<width$}", row.title, width = title_width)
+            };
+            spans.push(Span::styled(
+                title,
+                Style::default().add_modifier(if selected {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+            ));
+
+            // Age (right-aligned)
+            if !age.is_empty() {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(age, Style::default().fg(Color::DarkGray)));
+            }
+
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
@@ -530,9 +667,18 @@ fn render_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(Style::default().bg(Color::DarkGray))
         .highlight_symbol(">");
+
+    // Offset by 1 for the header row
+    let list_area = ratatui::layout::Rect {
+        x: area.x,
+        y: area.y + 1,
+        width: area.width,
+        height: area.height.saturating_sub(1),
+    };
+
     let mut state = ListState::default();
     state.select(Some(app.cursor));
-    f.render_stateful_widget(list, area, &mut state);
+    f.render_stateful_widget(list, list_area, &mut state);
 }
 
 fn render_detail(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
