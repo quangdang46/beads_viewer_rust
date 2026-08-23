@@ -89,6 +89,18 @@ pub struct App {
     /// True when terminal width > 100 (split view threshold).
     pub split_view: bool,
     pub status_msg: String,
+    /// Current active view (list is default, toggled by b/E/g/i/etc).
+    pub current_view: ViewMode,
+}
+
+/// Which view is currently displayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    List,
+    Board,
+    Tree,
+    Graph,
+    Insights,
 }
 
 impl App {
@@ -115,6 +127,7 @@ impl App {
             height: 40,
             split_view: true,
             status_msg: String::new(),
+            current_view: ViewMode::List,
         };
         app.apply_filter();
         app
@@ -203,6 +216,14 @@ impl App {
                 self.apply_filter();
                 true
             }
+            KeyCode::Char('b') => {
+                self.current_view = if self.current_view == ViewMode::Board {
+                    ViewMode::List
+                } else {
+                    ViewMode::Board
+                };
+                true
+            }
             KeyCode::Char('a') => {
                 self.filter_mode = FilterMode::All;
                 self.apply_filter();
@@ -224,6 +245,20 @@ impl App {
 
 /// Render the UI frame.
 pub fn render(f: &mut Frame, app: &App) {
+    match app.current_view {
+        ViewMode::Board => {
+            crate::views::board::render_board(
+                f,
+                app,
+                f.area(),
+                crate::views::board::SwimlaneMode::Status,
+            );
+            render_status_bar(f, app);
+            return;
+        }
+        _ => {}
+    }
+
     let chunks = if app.split_view && app.width > 100 {
         Layout::default()
             .direction(Direction::Horizontal)
