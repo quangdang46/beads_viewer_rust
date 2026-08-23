@@ -543,16 +543,6 @@ pub fn render(f: &mut Frame, app: &App) {
     render_status_bar(f, app);
 }
 
-fn status_color(s: Status) -> Color {
-    match s {
-        Status::Open => Color::Green,
-        Status::InProgress => Color::Yellow,
-        Status::Blocked => Color::Red,
-        Status::Closed | Status::Tombstone => Color::DarkGray,
-        _ => Color::Cyan,
-    }
-}
-
 fn render_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let inner_width = area.width.saturating_sub(2) as usize;
 
@@ -685,83 +675,28 @@ fn render_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 }
 
 fn render_detail(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let content = match app.selected() {
+    let content: Vec<Line> = match app.selected() {
         Some(row) => {
-            let mut lines = vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    &row.title,
-                    Style::default().add_modifier(Modifier::BOLD),
-                )),
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled("ID:       ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(&row.id, Style::default().fg(Color::Cyan)),
-                ]),
-                Line::from(vec![
-                    Span::styled("Status:   ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        row.status.as_str(),
-                        Style::default().fg(status_color(row.status)),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled("Priority: ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        format!("P{}", row.priority),
-                        Style::default().fg(if row.priority <= 1 {
-                            Color::Red
-                        } else {
-                            Color::White
-                        }),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled("Type:     ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(&row.issue_type),
-                ]),
-            ];
-            if !row.labels.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    format!("Labels:  {}", row.labels.join(", ")),
-                    Style::default().fg(Color::Cyan),
-                )));
-            }
-            if !row.assignee.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    format!("Assignee: {}", row.assignee),
-                    Style::default().fg(Color::Yellow),
-                )));
-            }
-            if !row.description.is_empty() {
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    "Description:",
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD),
-                )));
-                for desc_line in row.description.lines() {
-                    lines.push(Line::from(Span::raw(format!("  {desc_line}"))));
-                }
-            }
-            if !row.notes.is_empty() {
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    "Notes:",
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD),
-                )));
-                for note_line in row.notes.lines() {
-                    lines.push(Line::from(Span::raw(format!("  {note_line}"))));
-                }
-            }
-            lines
+            // Build graph scores if available
+            let graph_scores = crate::detail::GraphScores {
+                pagerank: 0.0,
+                betweenness: 0.0,
+                eigenvector: 0.0,
+                hubs: 0.0,
+                authorities: 0.0,
+                critical_path: 0.0,
+            };
+            crate::detail::build_detail_lines_from_row(row, &Some(graph_scores))
         }
-        None => vec![Line::from(""), Line::from("Select an issue to see details")],
+        None => vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "No issue selected",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ],
     };
-    let para = Paragraph::new(content)
+    let para = ratatui::widgets::Paragraph::new(content)
         .wrap(ratatui::widgets::Wrap { trim: false })
         .block(Block::default().borders(Borders::ALL).title(" DETAIL "));
     f.render_widget(para, area);
@@ -942,5 +877,6 @@ mod tests {
 }
 
 pub mod chrome;
+pub mod detail;
 pub mod views;
 pub mod worker;
