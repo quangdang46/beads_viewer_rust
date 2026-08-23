@@ -110,6 +110,7 @@ pub enum ViewMode {
     Insights,
     Alerts,
     TimeTravel,
+    Tutorial,
 }
 
 impl App {
@@ -327,6 +328,14 @@ impl App {
                 };
                 true
             }
+            KeyCode::Char('`') => {
+                self.current_view = if self.current_view == ViewMode::Tutorial {
+                    ViewMode::List
+                } else {
+                    ViewMode::Tutorial
+                };
+                true
+            }
             KeyCode::Char(';') => {
                 self.show_sidebar = !self.show_sidebar;
                 true
@@ -403,6 +412,37 @@ pub fn render(f: &mut Frame, app: &App) {
         ViewMode::Alerts => {
             crate::views::alerts::render_alerts(f, &[], 0, f.area());
             render_status_bar(f, app);
+            return;
+        }
+        ViewMode::Tutorial => {
+            let help = crate::chrome::default_help_entries();
+            let lines: Vec<Line> = vec![
+                Line::from(Span::styled(
+                    "bvr Tutorial",
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from("Navigation:"),
+                Line::from(Span::styled("  j/k     Move down/up", Style::default())),
+                Line::from(Span::styled(
+                    "  g/G     Jump to top/bottom",
+                    Style::default(),
+                )),
+                Line::from(""),
+                Line::from("Views:"),
+            ]
+            .into_iter()
+            .chain(
+                help.iter()
+                    .map(|(k, d)| Line::from(Span::raw(format!("  {k:<12} {d}")))),
+            )
+            .collect();
+            let para = Paragraph::new(lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" \u{1f4d6} TUTORIAL — Press ` to close "),
+            );
+            f.render_widget(para, f.area());
             return;
         }
         ViewMode::Board => {
