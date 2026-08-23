@@ -75,6 +75,9 @@ pub struct ListRow {
     pub issue_type: String,
     pub labels: Vec<String>,
     pub created_at: Option<String>,
+    pub description: String,
+    pub notes: String,
+    pub assignee: String,
 }
 
 /// Application state (Elm model).
@@ -86,7 +89,6 @@ pub struct App {
     pub sort_mode: SortMode,
     pub show_detail: bool,
     pub quit_requested: bool,
-    pub quit_confirmed: bool,
     pub width: u16,
     pub height: u16,
     /// True when terminal width > 100 (split view threshold).
@@ -126,6 +128,9 @@ impl App {
                 issue_type: i.issue_type.clone(),
                 labels: i.labels.clone(),
                 created_at: i.created_at.clone(),
+                description: i.description.clone(),
+                notes: i.notes.clone(),
+                assignee: i.assignee.clone(),
             })
             .collect();
         let mut app = App {
@@ -136,7 +141,6 @@ impl App {
             sort_mode: SortMode::Default,
             show_detail: false,
             quit_requested: false,
-            quit_confirmed: false,
             width: 120,
             height: 40,
             split_view: true,
@@ -276,13 +280,12 @@ impl App {
                 true
             }
             KeyCode::Esc => {
-                if self.quit_confirmed {
-                    self.quit_confirmed = false;
-                    true
+                if self.show_detail {
+                    self.show_detail = false;
                 } else {
                     self.quit_requested = true;
-                    true
                 }
+                true
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 if self.cursor + 1 < self.filtered_indices.len() {
@@ -719,20 +722,41 @@ fn render_detail(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 ]),
             ];
             if !row.labels.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("Labels:  {}", row.labels.join(", ")),
+                    Style::default().fg(Color::Cyan),
+                )));
+            }
+            if !row.assignee.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("Assignee: {}", row.assignee),
+                    Style::default().fg(Color::Yellow),
+                )));
+            }
+            if !row.description.is_empty() {
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
-                    "Labels:",
-                    Style::default().fg(Color::DarkGray),
+                    "Description:",
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
                 )));
-                for label in &row.labels {
-                    lines.push(Line::from(Span::raw(format!("  \u{1f3f7} {label}"))));
+                for desc_line in row.description.lines() {
+                    lines.push(Line::from(Span::raw(format!("  {desc_line}"))));
                 }
             }
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "Press Enter to go back",
-                Style::default().fg(Color::DarkGray),
-            )));
+            if !row.notes.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "Notes:",
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                for note_line in row.notes.lines() {
+                    lines.push(Line::from(Span::raw(format!("  {note_line}"))));
+                }
+            }
             lines
         }
         None => vec![Line::from(""), Line::from("Select an issue to see details")],
@@ -808,12 +832,19 @@ pub fn run_tui(app: &mut App) -> io::Result<()> {
 
     loop {
         terminal.draw(|f| render(f, app))?;
-        if app.quit_requested && app.quit_confirmed {
+        if app.quit_requested {
             break;
         }
         match event::read()? {
             CEvent::Key(key) => {
                 if key.kind == KeyEventKind::Press {
+                    if key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL)
+                        && key.code == KeyCode::Char('c')
+                    {
+                        break;
+                    }
                     app.handle_key(key.code);
                 }
             }
