@@ -1,4 +1,4 @@
-use bv_tui::{App, FilterMode, SortMode};
+use bv_tui::App;
 use crossterm::event::KeyCode;
 
 fn make_app(n: usize) -> App {
@@ -83,7 +83,7 @@ fn search_filters_by_title() {
     // Simulate typing "1" via handle_key
     app.handle_key(KeyCode::Char('1'));
     // Issues with "1" in title or id: T-1, T-10 (if n>=10), etc.
-    assert!(app.filtered_indices.len() > 0);
+    assert!(!app.filtered_indices.is_empty());
     assert!(app.filtered_indices.len() < 9);
 }
 
