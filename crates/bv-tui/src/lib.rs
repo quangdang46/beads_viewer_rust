@@ -522,7 +522,7 @@ fn render_detail(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     f.render_widget(para, area);
 }
 
-fn render_sidebar(f: &mut Frame, app: &App) {
+fn render_sidebar(f: &mut Frame, _app: &App) {
     let entries = crate::chrome::default_help_entries();
     let area = ratatui::layout::Rect {
         x: f.area().width.saturating_sub(34),
