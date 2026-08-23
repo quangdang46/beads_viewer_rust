@@ -1,6 +1,5 @@
 //! Differential tests against Go golden metric files.
 use bv_graph_core::DiGraph;
-use std::collections::BTreeMap;
 
 fn load_expected(name: &str) -> serde_json::Value {
     let path = concat!(
