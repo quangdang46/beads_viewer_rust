@@ -224,6 +224,14 @@ impl App {
                 };
                 true
             }
+            KeyCode::Char('E') => {
+                self.current_view = if self.current_view == ViewMode::Tree {
+                    ViewMode::List
+                } else {
+                    ViewMode::Tree
+                };
+                true
+            }
             KeyCode::Char('a') => {
                 self.filter_mode = FilterMode::All;
                 self.apply_filter();
@@ -246,6 +254,18 @@ impl App {
 /// Render the UI frame.
 pub fn render(f: &mut Frame, app: &App) {
     match app.current_view {
+        ViewMode::Tree => {
+            let lines = crate::views::tree::render_tree_lines(&[]);
+            let block = ratatui::widgets::Block::default()
+                .borders(ratatui::widgets::Borders::ALL)
+                .title(" TREE VIEW ");
+            f.render_widget(
+                ratatui::widgets::Paragraph::new(lines).block(block),
+                f.area(),
+            );
+            render_status_bar(f, app);
+            return;
+        }
         ViewMode::Board => {
             crate::views::board::render_board(
                 f,
