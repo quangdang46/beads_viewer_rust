@@ -872,46 +872,76 @@ fn run_robot_priority() -> ExitCode {
     };
     let hash = bv_core::data_hash::compute_data_hash(&issues);
     let g = bv_analysis::build_graph(&issues);
+
     let pr = bv_graph_core::pagerank_default(&g);
     let bw = bv_graph_core::betweenness(&g);
-    let max_pr = pr.iter().fold(0.0f64, |a, &b| a.max(b));
-    let max_bw = bw.iter().fold(0.0f64, |a, &b| a.max(b));
-    let mut recommendations: Vec<serde_json::Value> = Vec::new();
-    for issue in &issues {
-        if issue.status.is_closed() {
-            continue;
-        }
-        let idx = match g.node_idx(&issue.id) {
-            Some(x) => x,
-            None => continue,
-        };
-        let pr_norm = if max_pr > 0.0 { pr[idx] / max_pr } else { 0.0 };
-        let bw_norm = if max_bw > 0.0 { bw[idx] / max_bw } else { 0.0 };
-        let blockers = g.in_degree(idx);
-        let score = pr_norm * 0.22
-            + bw_norm * 0.20
-            + (blockers as f64).min(5.0) / 5.0 * 0.13
-            + 0.05 * bv_analysis::impact::compute_priority_boost(issue.priority);
+    let cp = bv_graph_core::critical_path_heights(&g);
+    let ev = bv_graph_core::eigenvector_default(&g);
 
-        let suggested = bv_analysis::scoring::score_to_priority(score);
-        if suggested < issue.priority {
-            let mut reasons = Vec::new();
-            if pr_norm > 0.3 {
-                reasons.push("High centrality in dependency graph".to_string());
+    let pr_map: std::collections::BTreeMap<String, f64> = pr
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (g.node_id(i).unwrap_or_default().to_string(), *v))
+        .collect();
+    let bw_map: std::collections::BTreeMap<String, f64> = bw
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (g.node_id(i).unwrap_or_default().to_string(), *v))
+        .collect();
+    let cp_map: std::collections::BTreeMap<String, f64> = cp
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (g.node_id(i).unwrap_or_default().to_string(), *v))
+        .collect();
+
+    let now = jiff::Timestamp::now();
+    let inputs = bv_analysis::impact::ImpactInputs {
+        issues: &issues,
+        pagerank: &pr_map,
+        betweenness: &bw_map,
+        critical_path: &cp_map,
+        g: &g,
+        now,
+    };
+
+    // Use the full impact scoring engine
+    let impact_results = bv_analysis::impact::compute_impact_scores(&inputs);
+
+    // Convert to recommendations (only where suggested < current)
+    let mut recommendations: Vec<serde_json::Value> = Vec::new();
+    for r in &impact_results {
+        if let Some(issue) = issues.iter().find(|i| i.id == r.id) {
+            let suggested = bv_analysis::scoring::score_to_priority(r.score);
+            if suggested < issue.priority {
+                let reasons: Vec<String> = {
+                    let mut reasons = Vec::new();
+                    if r.breakdown.pagerank > 0.15 {
+                        reasons.push("High centrality in dependency graph".to_string());
+                    }
+                    if r.breakdown.betweenness > 0.10 {
+                        reasons.push("Critical path bottleneck".to_string());
+                    }
+                    if r.breakdown.blocker_ratio > 0.05 {
+                        reasons.push("Blocks multiple downstream tasks".to_string());
+                    }
+                    if r.breakdown.staleness > 0.03 {
+                        reasons.push("Stale issue needs attention".to_string());
+                    }
+                    reasons
+                };
+                recommendations.push(serde_json::json!({
+                    "issue_id": r.id,
+                    "title": r.title,
+                    "current_priority": issue.priority,
+                    "suggested_priority": suggested,
+                    "impact_score": r.score,
+                    "confidence": 1,
+                    "reasoning": reasons,
+                }));
             }
-            if bw_norm > 0.2 {
-                reasons.push("Bridge node connecting clusters".to_string());
-            }
-            if blockers > 0 {
-                reasons.push(format!("Blocks {blockers} downstream issues"));
-            }
-            recommendations.push(serde_json::json!({
-                "issue_id": issue.id, "title": issue.title,
-                "current_priority": issue.priority, "suggested_priority": suggested,
-                "impact_score": score, "confidence": 1, "reasoning": reasons,
-            }));
         }
     }
+
     recommendations.sort_by(|a, b| {
         b["impact_score"]
             .as_f64()
@@ -919,7 +949,6 @@ fn run_robot_priority() -> ExitCode {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     recommendations.truncate(10);
-    let high_conf = recommendations.len();
 
     let mut payload = envelope_json(&hash);
     payload["recommendations"] = serde_json::Value::Array(recommendations.clone());
@@ -928,10 +957,13 @@ fn run_robot_priority() -> ExitCode {
     payload["summary"] = serde_json::json!({
         "total_issues": issues.len(),
         "recommendations": recommendations.len(),
-        "high_confidence": high_conf,
+        "high_confidence": recommendations.iter()
+            .filter(|r| r["impact_score"].as_f64().unwrap_or(0.0) > 0.5)
+            .count(),
     });
     emit_json(&payload)
 }
+
 fn run_robot_suggest() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
     let (issues, hash) = match bv_core::discovery::load_issues_from_repo(&cwd) {
