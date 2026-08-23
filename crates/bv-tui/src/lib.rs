@@ -72,6 +72,8 @@ pub struct ListRow {
     pub title: String,
     pub status: Status,
     pub priority: i32,
+    pub issue_type: String,
+    pub labels: Vec<String>,
 }
 
 /// Application state (Elm model).
@@ -119,6 +121,8 @@ impl App {
                 title: i.title.clone(),
                 status: i.status,
                 priority: i.priority,
+                issue_type: i.issue_type.clone(),
+                labels: i.labels.clone(),
             })
             .collect();
         let mut app = App {
@@ -493,32 +497,63 @@ fn render_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
 fn render_detail(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let content = match app.selected() {
-        Some(row) => vec![
-            Line::from(vec![
-                Span::styled("ID: ", Style::default().fg(Color::DarkGray)),
-                Span::raw(&row.id),
-            ]),
-            Line::from(vec![
-                Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    row.status.as_str(),
-                    Style::default().fg(status_color(row.status)),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("Priority: ", Style::default().fg(Color::DarkGray)),
-                Span::raw(format!("P{}", row.priority)),
-            ]),
-            Line::from(""),
-            Line::from(Span::styled(
-                &row.title,
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-        ],
-        None => vec![Line::from("No issue selected")],
+        Some(row) => {
+            let mut lines = vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    &row.title,
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("ID:       ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(&row.id, Style::default().fg(Color::Cyan)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Status:   ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        row.status.as_str(),
+                        Style::default().fg(status_color(row.status)),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("Priority: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("P{}", row.priority),
+                        Style::default().fg(if row.priority <= 1 {
+                            Color::Red
+                        } else {
+                            Color::White
+                        }),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("Type:     ", Style::default().fg(Color::DarkGray)),
+                    Span::raw(&row.issue_type),
+                ]),
+            ];
+            if !row.labels.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "Labels:",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                for label in &row.labels {
+                    lines.push(Line::from(Span::raw(format!("  \u{1f3f7} {label}"))));
+                }
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Press Enter to go back",
+                Style::default().fg(Color::DarkGray),
+            )));
+            lines
+        }
+        None => vec![Line::from(""), Line::from("Select an issue to see details")],
     };
-    let para =
-        Paragraph::new(content).block(Block::default().borders(Borders::ALL).title(" DETAIL "));
+    let para = Paragraph::new(content)
+        .wrap(ratatui::widgets::Wrap { trim: false })
+        .block(Block::default().borders(Borders::ALL).title(" DETAIL "));
     f.render_widget(para, area);
 }
 
