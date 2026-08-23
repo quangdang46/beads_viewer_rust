@@ -208,6 +208,37 @@ impl App {
         self.cursor = 0;
     }
 
+    /// Handle mouse events (wheel scroll + click select).
+    pub fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) -> bool {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        match mouse.kind {
+            MouseEventKind::ScrollDown => {
+                if self.cursor + 1 < self.filtered_indices.len() {
+                    self.cursor += 1;
+                }
+                true
+            }
+            MouseEventKind::ScrollUp => {
+                self.cursor = self.cursor.saturating_sub(1);
+                true
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Click selects the row under cursor (approximate: click row = list area offset)
+                // For now, just move cursor to clicked position if within bounds
+                let row = mouse.row as usize;
+                let header_lines = 2; // border + title
+                if row > header_lines && mouse.row > 0 {
+                    let idx = row - header_lines - 1;
+                    if idx < self.filtered_indices.len() {
+                        self.cursor = idx;
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn cycle_filter(&mut self) {
         self.filter_mode = match self.filter_mode {
             FilterMode::All => FilterMode::Open,
@@ -516,7 +547,11 @@ fn render_status_bar(f: &mut Frame, app: &App) {
 pub fn run_tui(app: &mut App) -> io::Result<()> {
     let mut stdout = io::stdout();
     crossterm::terminal::enable_raw_mode()?;
-    crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
+    crossterm::execute!(
+        stdout,
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::event::EnableMouseCapture
+    )?;
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
 
@@ -525,14 +560,24 @@ pub fn run_tui(app: &mut App) -> io::Result<()> {
         if app.quit_requested && app.quit_confirmed {
             break;
         }
-        if let CEvent::Key(key) = event::read()? {
-            if key.kind == KeyEventKind::Press {
-                app.handle_key(key.code);
+        match event::read()? {
+            CEvent::Key(key) => {
+                if key.kind == KeyEventKind::Press {
+                    app.handle_key(key.code);
+                }
             }
+            CEvent::Mouse(mouse) => {
+                app.handle_mouse(mouse);
+            }
+            _ => {}
         }
     }
 
-    crossterm::execute!(io::stdout(), crossterm::terminal::LeaveAlternateScreen)?;
+    crossterm::execute!(
+        io::stdout(),
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::event::DisableMouseCapture
+    )?;
     crossterm::terminal::disable_raw_mode()?;
     Ok(())
 }
