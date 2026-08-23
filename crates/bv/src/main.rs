@@ -170,7 +170,7 @@ fn main() -> ExitCode {
             }
         };
 
-        std::fs::create_dir_all(format!("{out_dir}")).ok();
+        std::fs::create_dir_all(&out_dir).ok();
         let index_html = format!(
             "<!DOCTYPE html>\n<html>\n<head><title>Beads Dashboard</title></head>\n<body>\n<h1>Beads Dashboard</h1>\n<p>{} issues</p>\n</body>\n</html>",
             issues.len()
