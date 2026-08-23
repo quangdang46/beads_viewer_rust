@@ -15,7 +15,7 @@ fn main() -> ExitCode {
 
     // --version handled before validation (Go parity).
     if args.iter().any(|a| a == "--version") {
-        println!("bvr 0.21.0 (FORT pre-release scaffold)");
+        println!("bvr 0.1.0");
         return ExitCode::from(0);
     }
 
