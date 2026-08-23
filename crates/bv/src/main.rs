@@ -203,6 +203,10 @@ fn main() -> ExitCode {
                     .collect()
             };
 
+            eprintln!(
+                "DEBUG: setting graph_metrics with {} pagerank entries",
+                pr.len()
+            );
             app.graph_metrics = Some(bv_tui::GraphMetrics {
                 pagerank: to_map(&pr),
                 betweenness: to_map(&bw),

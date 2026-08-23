@@ -41,6 +41,12 @@ pub fn render_insights(
     hubs: &BTreeMap<String, f64>,
     authorities: &BTreeMap<String, f64>,
 ) {
+    eprintln!(
+        "DEBUG insights: pr={} bw={} hubs={}",
+        page_rank.len(),
+        betweenness.len(),
+        hubs.len()
+    );
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])

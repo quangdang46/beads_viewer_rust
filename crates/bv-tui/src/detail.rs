@@ -89,7 +89,24 @@ pub fn build_detail_lines(issue: &Issue, graph_scores: Option<&GraphScores>) -> 
         lines.push(Line::from(""));
     }
 
-    // Dependencies
+    // Dependencies (tree format like Go)
+    if !issue.dependencies.is_empty() {
+        lines.push(section_line("🔗 Dependencies"));
+        for dep in &issue.dependencies {
+            let arrow = if dep.r#type.is_blocking() {
+                "→ blocked by"
+            } else {
+                "→ related to"
+            };
+            lines.push(indent_line(format!(
+                "{arrow} {}",
+                dep.effective_depends_on()
+            )));
+        }
+        lines.push(Line::from(""));
+    }
+
+    // Related dependencies (old block)
     if !issue.dependencies.is_empty() {
         lines.push(section_line("🔗 Dependencies"));
         for dep in &issue.dependencies {
