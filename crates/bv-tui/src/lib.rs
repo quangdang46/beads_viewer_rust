@@ -732,15 +732,20 @@ fn render_detail(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let content: Vec<Line> = match app.selected() {
         Some(row) => {
             // Build graph scores if available
-            let graph_scores = crate::detail::GraphScores {
-                pagerank: 0.0,
-                betweenness: 0.0,
-                eigenvector: 0.0,
-                hubs: 0.0,
-                authorities: 0.0,
-                critical_path: 0.0,
-            };
-            crate::detail::build_detail_lines_from_row(row, &Some(graph_scores))
+            // Look up actual graph metrics for this issue
+            let graph_scores = app.graph_metrics.as_ref().and_then(|gm| {
+                gm.pagerank
+                    .get(&row.id)
+                    .map(|&pr| crate::detail::GraphScores {
+                        pagerank: pr,
+                        betweenness: gm.betweenness.get(&row.id).copied().unwrap_or(0.0),
+                        eigenvector: gm.eigenvector.get(&row.id).copied().unwrap_or(0.0),
+                        hubs: gm.hubs.get(&row.id).copied().unwrap_or(0.0),
+                        authorities: gm.authorities.get(&row.id).copied().unwrap_or(0.0),
+                        critical_path: 0.0,
+                    })
+            });
+            crate::detail::build_detail_lines_from_row(row, &graph_scores)
         }
         None => vec![
             Line::from(""),
