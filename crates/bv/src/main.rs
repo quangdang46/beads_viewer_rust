@@ -65,7 +65,21 @@ fn main() -> ExitCode {
         }
     }
 
-    // Drift / baseline dispatch (Phase 3d).
+    // Format validation (Go: exit 2 on invalid)
+    if presence.has("format") {
+        let fmt_val = args
+            .iter()
+            .position(|a| a == "--format")
+            .and_then(|i| args.get(i + 1))
+            .unwrap_or(&"json".to_string())
+            .clone();
+        if fmt_val != "json" && fmt_val != "toon" {
+            eprintln!("Invalid --format \"{fmt_val}\" (expected json|toon)");
+            return ExitCode::from(2);
+        }
+    }
+
+    // Export markdown (Phase 5a).
     if presence.has("check-drift") {
         return run_check_drift();
     }
