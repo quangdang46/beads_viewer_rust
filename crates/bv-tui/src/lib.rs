@@ -91,6 +91,10 @@ pub struct App {
     pub status_msg: String,
     /// Current active view (list is default, toggled by b/E/g/i/etc).
     pub current_view: ViewMode,
+    /// Search mode active (/ pressed).
+    pub searching: bool,
+    /// Current search query.
+    pub search_query: String,
 }
 
 /// Which view is currently displayed.
@@ -129,6 +133,8 @@ impl App {
             split_view: true,
             status_msg: String::new(),
             current_view: ViewMode::List,
+            searching: false,
+            search_query: String::new(),
         };
         app.apply_filter();
         app
@@ -160,6 +166,48 @@ impl App {
         }
     }
 
+    fn handle_search_key(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Esc => {
+                self.searching = false;
+                self.search_query.clear();
+                self.apply_filter();
+                true
+            }
+            KeyCode::Enter => {
+                self.searching = false;
+                self.apply_filter();
+                true
+            }
+            KeyCode::Backspace => {
+                self.search_query.pop();
+                self.apply_search();
+                true
+            }
+            KeyCode::Char(c) => {
+                self.search_query.push(c);
+                self.apply_search();
+                true
+            }
+            _ => true,
+        }
+    }
+
+    fn apply_search(&mut self) {
+        let q = self.search_query.to_lowercase();
+        if q.is_empty() {
+            self.filtered_indices = (0..self.rows.len()).collect();
+        } else {
+            self.filtered_indices = (0..self.rows.len())
+                .filter(|&i| {
+                    let r = &self.rows[i];
+                    r.id.to_lowercase().contains(&q) || r.title.to_lowercase().contains(&q)
+                })
+                .collect();
+        }
+        self.cursor = 0;
+    }
+
     pub fn cycle_filter(&mut self) {
         self.filter_mode = match self.filter_mode {
             FilterMode::All => FilterMode::Open,
@@ -178,6 +226,9 @@ impl App {
 
     /// Handle a key event; returns true if the event was consumed.
     pub fn handle_key(&mut self, code: KeyCode) -> bool {
+        if self.searching {
+            return self.handle_search_key(code);
+        }
         match code {
             KeyCode::Char('q') => {
                 self.quit_requested = true;
@@ -215,6 +266,11 @@ impl App {
             KeyCode::Char('r') => {
                 self.filter_mode = FilterMode::Ready;
                 self.apply_filter();
+                true
+            }
+            KeyCode::Char('/') => {
+                self.searching = true;
+                self.search_query.clear();
                 true
             }
             KeyCode::Char('b') => {
@@ -417,6 +473,21 @@ fn render_detail(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 }
 
 fn render_status_bar(f: &mut Frame, app: &App) {
+    if app.searching {
+        let area = ratatui::layout::Rect {
+            x: 0,
+            y: f.area().height - 1,
+            width: f.area().width,
+            height: 1,
+        };
+        let bar = Paragraph::new(Line::from(vec![
+            Span::styled("/", Style::default().fg(Color::Yellow)),
+            Span::styled(&app.search_query, Style::default().fg(Color::White)),
+            Span::styled("_", Style::default().fg(Color::Yellow)),
+        ]));
+        f.render_widget(bar, area);
+        return;
+    }
     let area = ratatui::layout::Rect {
         x: 0,
         y: f.area().height - 1,

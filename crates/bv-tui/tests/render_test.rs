@@ -74,3 +74,23 @@ fn quit_works() {
     app.handle_key(KeyCode::Char('q'));
     assert!(app.quit_requested);
 }
+
+#[test]
+fn search_filters_by_title() {
+    let mut app = make_app(9);
+    // Enter search mode
+    app.searching = true;
+    // Simulate typing "1" via handle_key
+    app.handle_key(KeyCode::Char('1'));
+    // Issues with "1" in title or id: T-1, T-10 (if n>=10), etc.
+    assert!(app.filtered_indices.len() > 0);
+    assert!(app.filtered_indices.len() < 9);
+}
+
+#[test]
+fn esc_exits_search_mode() {
+    let mut app = make_app(3);
+    app.searching = true;
+    app.handle_key(KeyCode::Esc);
+    assert!(!app.searching);
+}
