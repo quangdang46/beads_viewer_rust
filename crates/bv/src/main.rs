@@ -155,6 +155,32 @@ fn main() -> ExitCode {
         }
     }
 
+    // Export pages (static site bundle).
+    if let Some(idx) = args.iter().position(|a| a == "--export-pages") {
+        let out_dir = args
+            .get(idx + 1)
+            .cloned()
+            .unwrap_or_else(|| "./bv-pages".to_string());
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let (issues, _) = match bv_core::discovery::load_issues_from_repo(&cwd) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return ExitCode::from(1);
+            }
+        };
+
+        std::fs::create_dir_all(format!("{out_dir}")).ok();
+        let index_html = format!(
+            "<!DOCTYPE html>\n<html>\n<head><title>Beads Dashboard</title></head>\n<body>\n<h1>Beads Dashboard</h1>\n<p>{} issues</p>\n</body>\n</html>",
+            issues.len()
+        );
+        std::fs::write(format!("{out_dir}/index.html"), index_html).ok();
+
+        println!("Static site exported to {out_dir}");
+        return ExitCode::from(0);
+    }
+
     // Interactive TUI: no robot flags present.
     let cwd = std::env::current_dir().unwrap_or_default();
     match bv_core::discovery::load_issues_from_repo(&cwd) {
