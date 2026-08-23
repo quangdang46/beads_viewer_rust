@@ -224,6 +224,14 @@ impl App {
                 };
                 true
             }
+            KeyCode::Char('i') => {
+                self.current_view = if self.current_view == ViewMode::Insights {
+                    ViewMode::List
+                } else {
+                    ViewMode::Insights
+                };
+                true
+            }
             KeyCode::Char('E') => {
                 self.current_view = if self.current_view == ViewMode::Tree {
                     ViewMode::List
@@ -262,6 +270,17 @@ pub fn render(f: &mut Frame, app: &App) {
             f.render_widget(
                 ratatui::widgets::Paragraph::new(lines).block(block),
                 f.area(),
+            );
+            render_status_bar(f, app);
+            return;
+        }
+        ViewMode::Insights => {
+            crate::views::insights::render_insights(
+                f,
+                &Default::default(),
+                &Default::default(),
+                &Default::default(),
+                &Default::default(),
             );
             render_status_bar(f, app);
             return;
