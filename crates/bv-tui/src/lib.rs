@@ -120,6 +120,10 @@ pub struct App {
     pub detail_scroll: u16,
     /// Graph metric maps from analysis (for insights rendering)
     pub graph_metrics: Option<GraphMetrics>,
+    /// Active drift alerts (critical, warning, total) for footer badge
+    pub alerts_critical: usize,
+    pub alerts_warning: usize,
+    pub alerts_total: usize,
 }
 
 /// Which view is currently displayed.
@@ -139,6 +143,33 @@ impl App {
     pub fn new(issues: Vec<bv_core::model::Issue>) -> Self {
         let issue_map: std::collections::HashMap<String, bv_core::model::Issue> =
             issues.iter().map(|i| (i.id.clone(), i.clone())).collect();
+        // Compute proactive alerts (Go computeAlerts): cycles-driven drift
+        let g_alerts = bv_analysis::build_graph(&issues);
+        let has_cycle = bv_graph_core::algorithms::cycles::has_cycles(&g_alerts);
+        let (a_crit, mut a_warn, a_info) = (0usize, 0usize, 0usize);
+        if has_cycle {
+            a_crit = 1; // one critical alert for cycles (Go pushes one alert per check)
+        }
+        // Staleness check: open issues untouched for a long time (Go drift engine check)
+        let now = jiff::Timestamp::now();
+        for i in &issues {
+            if matches!(
+                i.status,
+                bv_core::model::Status::Open
+                    | bv_core::model::Status::InProgress
+                    | bv_core::model::Status::Blocked
+            ) {
+                if let Some(updated) = &i.updated_at {
+                    if let Ok(t) = updated.parse::<jiff::Timestamp>() {
+                        let age = now.since(t).map(|d| d.get_days()).unwrap_or(0);
+                        if age > 30 {
+                            a_warn += 1;
+                        }
+                    }
+                }
+            }
+        }
+        let alerts_total = a_crit + a_warn + a_info;
         let rows: Vec<ListRow> = issues
             .iter()
             .map(|i| ListRow {
@@ -157,6 +188,9 @@ impl App {
         let mut app = App {
             rows,
             issue_map,
+            alerts_critical: a_crit,
+            alerts_warning: a_warn,
+            alerts_total,
             filtered_indices: Vec::new(),
             cursor: 0,
             filter_mode: FilterMode::All,
@@ -876,6 +910,31 @@ fn render_status_bar(f: &mut Frame, app: &App) {
         format!("●{closed_count}"),
         Style::default().fg(Color::DarkGray),
     ));
+
+    // Alerts badge (Go alertsSection, bv-168)
+    if app.alerts_total > 0 {
+        let (bg, fg) = if app.alerts_critical > 0 {
+            (Color::Red, Color::White)
+        } else {
+            (Color::DarkGray, Color::Yellow)
+        };
+        spans.push(Span::styled(
+            format!(" \u{26a0} {} alerts (!) ", app.alerts_total),
+            Style::default().bg(bg).fg(fg).add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    // Label hint (Go labelHint: "L:labels * h:detail")
+    if app.current_view != ViewMode::Board {
+        spans.push(Span::styled(
+            " \u{2502} ",
+            Style::default().fg(Color::DarkGray),
+        ));
+        spans.push(Span::styled(
+            "L:labels * h:detail",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
 
     // Keyboard hints (context-aware, matching Go footer)
     spans.push(Span::styled(
