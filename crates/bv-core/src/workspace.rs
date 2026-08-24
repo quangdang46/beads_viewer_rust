@@ -93,19 +93,15 @@ pub fn load_workspace(path: &Path) -> Result<WorkspaceConfig, String> {
     if config.repos.is_empty() && config.discovery.as_ref().is_some_and(|d| !d.enabled) {
         return Err("workspace requires at least 1 repo or discovery.enabled".into());
     }
-
-    // Check for duplicate prefixes
+    // Check for duplicate prefixes (effective, like Go Validate → GetPrefix)
     let mut prefixes = std::collections::HashSet::new();
     for repo in &config.repos {
         if repo.path.is_empty() {
             return Err("repo.path is required".into());
         }
-        let prefix = repo.prefix.as_deref().unwrap_or("").to_lowercase();
-        if !prefixes.insert(prefix) {
-            return Err(format!(
-                "duplicate prefix: {}",
-                repo.prefix.as_deref().unwrap_or("")
-            ));
+        let prefix = repo.get_prefix().to_lowercase();
+        if !prefixes.insert(prefix.clone()) {
+            return Err(format!("duplicate prefix: {prefix}"));
         }
     }
     Ok(config)

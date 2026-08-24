@@ -269,11 +269,14 @@ fn load_issues_auto(cwd: &std::path::Path) -> Result<(Vec<bv_core::model::Issue>
             .and_then(|p| p.parent())
             .unwrap_or(cwd)
             .to_path_buf();
-        if let Ok(cfg) = bv_core::workspace::load_workspace(&ws_path) {
-            if let Ok((issues, _)) = bv_core::workspace::load_all(&cfg, &ws_root) {
+        match bv_core::workspace::load_workspace(&ws_path)
+            .and_then(|cfg| bv_core::workspace::load_all(&cfg, &ws_root))
+        {
+            Ok((issues, _)) => {
                 let hash = bv_core::data_hash::compute_data_hash(&issues);
                 return Ok((issues, hash));
             }
+            Err(e) => eprintln!("workspace load failed, falling back: {e}"),
         }
     }
     let (issues, _) = bv_core::discovery::load_issues_from_repo(cwd).map_err(|e| e.to_string())?;
