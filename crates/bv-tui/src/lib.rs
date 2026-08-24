@@ -116,6 +116,8 @@ pub struct App {
     pub show_sidebar: bool,
     /// Which panel has focus: false = list, true = detail
     pub focus_detail: bool,
+    pub show_help: bool,
+    pub label_filter: Option<String>,
     /// Scroll offset for the detail pane
     pub detail_scroll: u16,
     /// Graph metric maps from analysis (for insights rendering)
@@ -206,6 +208,8 @@ impl App {
             search_query: String::new(),
             show_sidebar: false,
             focus_detail: false,
+            show_help: false,
+            label_filter: None,
             detail_scroll: 0,
             graph_metrics: None,
         };
@@ -214,15 +218,20 @@ impl App {
     }
 
     pub fn apply_filter(&mut self) {
+        let label_filter = self.label_filter.clone();
         self.filtered_indices = (0..self.rows.len())
             .filter(|&i| {
                 let r = &self.rows[i];
-                match self.filter_mode {
+                let mode_ok = match self.filter_mode {
                     FilterMode::All => true,
                     FilterMode::Open => matches!(r.status, Status::Open | Status::InProgress),
                     FilterMode::Closed => r.status.is_closed(),
                     FilterMode::Ready => matches!(r.status, Status::Open),
-                }
+                };
+                mode_ok
+                    && label_filter
+                        .as_ref()
+                        .is_none_or(|label| r.labels.iter().any(|l| l == label))
             })
             .collect();
         // Apply sort
@@ -336,6 +345,10 @@ impl App {
     pub fn handle_key(&mut self, code: KeyCode) -> bool {
         if self.searching {
             return self.handle_search_key(code);
+        }
+        if self.show_help {
+            self.show_help = false;
+            return true;
         }
         match code {
             KeyCode::Tab => {
@@ -466,7 +479,177 @@ impl App {
                 self.show_detail = !self.show_detail;
                 true
             }
+            KeyCode::Char('x') => {
+                self.export_markdown();
+                true
+            }
+            KeyCode::Char('C') => {
+                self.copy_issue_to_clipboard();
+                true
+            }
+            KeyCode::Char('O') => {
+                self.open_in_editor();
+                true
+            }
+            KeyCode::Char('?') => {
+                self.show_help = !self.show_help;
+                true
+            }
+            KeyCode::Char('S') => {
+                self.sort_mode = SortMode::Priority;
+                self.apply_filter();
+                self.status_msg = "Sorted by triage score".to_string();
+                true
+            }
+            KeyCode::Char('L') => {
+                self.cycle_label_filter();
+                true
+            }
             _ => false,
+        }
+    }
+
+    /// Handle a Ctrl-modified key event; returns true if consumed.
+    pub fn handle_ctrl_key(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                self.reload_from_disk();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Export all issues to beads_report_<project>_<date>.md (Go exportToMarkdown).
+    fn export_markdown(&mut self) {
+        let issues: Vec<bv_core::model::Issue> = self.issue_map.values().cloned().collect();
+
+        let project = std::env::current_dir()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .unwrap_or_else(|| "beads".to_string());
+        let sanitized: String = project
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let today = jiff::Timestamp::now().strftime("%Y-%m-%d").to_string();
+        let filename = format!("beads_report_{sanitized}_{today}.md");
+
+        let md = bv_export::mermaid::generate_markdown(&issues, "Beads Report");
+        match std::fs::write(&filename, md) {
+            Ok(_) => {
+                self.status_msg = format!("Exported {} issues to {filename}", issues.len());
+            }
+            Err(e) => {
+                self.status_msg = format!("Export failed: {e}");
+            }
+        }
+    }
+
+    /// Copy selected issue details to clipboard (Go copyIssueToClipboard).
+    fn copy_issue_to_clipboard(&mut self) {
+        let Some(row) = self.selected() else { return };
+        let text = format!(
+            "{}: {}\nStatus: {} | Priority: P{} | Type: {}\n{}",
+            row.id,
+            row.title,
+            row.status.as_str(),
+            row.priority,
+            row.issue_type,
+            row.description,
+        );
+        let (cmd, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
+            ("pbcopy", &[])
+        } else if std::env::var("WAYLAND_DISPLAY").is_ok() {
+            ("wl-copy", &[])
+        } else {
+            ("xclip", &["-selection", "clipboard"])
+        };
+        match std::process::Command::new(cmd)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(mut child) => {
+                use std::io::Write;
+                if let Some(stdin) = child.stdin.as_mut() {
+                    let _ = stdin.write_all(text.as_bytes());
+                }
+                let _ = child.wait();
+                self.status_msg = format!("Copied {} to clipboard", row.id);
+            }
+            Err(e) => {
+                self.status_msg = format!("Clipboard failed: {e}");
+            }
+        }
+    }
+
+    /// Open selected issue in $EDITOR (Go "O" edit).
+    fn open_in_editor(&mut self) {
+        let Some(row) = self.selected() else { return };
+        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+        let path = std::env::temp_dir().join(format!("bead_{}.md", row.id));
+        let body = format!(
+            "# {}: {}\n\n## Description\n\n{}\n\n## Notes\n\n{}\n",
+            row.id, row.title, row.description, row.notes
+        );
+        if std::fs::write(&path, &body).is_ok() {
+            let _ = std::process::Command::new(&editor).arg(&path).status();
+            self.status_msg = format!("Opened {} in {editor}", row.id);
+        }
+    }
+
+    /// Cycle label filter through available labels (Go label picker, simplified).
+    fn cycle_label_filter(&mut self) {
+        let mut labels: Vec<String> = self
+            .rows
+            .iter()
+            .flat_map(|r| r.labels.iter().cloned())
+            .collect();
+        labels.sort();
+        labels.dedup();
+        if labels.is_empty() {
+            self.status_msg = "No labels".to_string();
+            return;
+        }
+        match &self.label_filter {
+            None => {
+                self.label_filter = Some(labels[0].clone());
+                self.status_msg = format!("Filter: label={}", labels[0]);
+            }
+            Some(current) => match labels.iter().position(|l| l == current) {
+                Some(i) if i + 1 < labels.len() => {
+                    self.label_filter = Some(labels[i + 1].clone());
+                    self.status_msg = format!("Filter: label={}", labels[i + 1]);
+                }
+                _ => {
+                    self.label_filter = None;
+                    self.status_msg = "Filter: all labels".to_string();
+                }
+            },
+        }
+        self.apply_filter();
+    }
+
+    /// Reload issues from disk (Go Ctrl+R refresh).
+    pub fn reload_from_disk(&mut self) {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        match bv_core::discovery::load_issues_from_repo(&cwd) {
+            Ok((issues, _)) => {
+                let fresh = App::new(issues);
+                *self = fresh;
+                self.status_msg = "Refreshed".to_string();
+            }
+            Err(e) => {
+                self.status_msg = format!("Refresh failed: {e}");
+            }
         }
     }
 }
@@ -624,6 +807,64 @@ pub fn render(f: &mut Frame, app: &App) {
     }
 
     render_status_bar(f, app);
+
+    // Help overlay (Go "?" help)
+    if app.show_help {
+        let help_lines = vec![
+            Line::from(Span::styled(
+                " Keyboard Shortcuts ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from("  j/k, \u{2191}\u{2193}     Navigate list / scroll detail"),
+            Line::from("  \u{23ce}          Toggle detail pane"),
+            Line::from("  tab         Focus detail pane"),
+            Line::from("  esc         Back / quit"),
+            Line::from("  /           Search"),
+            Line::from("  a/o/c/r     Filter: all/open/closed/ready"),
+            Line::from("  s           Cycle sort mode"),
+            Line::from("  S           Triage sort (priority)"),
+            Line::from("  L           Cycle label filter"),
+            Line::from("  b           Toggle board view"),
+            Line::from("  i           Toggle insights view"),
+            Line::from("  t           Toggle time-travel view"),
+            Line::from("  E           Toggle tree view"),
+            Line::from("  !           Toggle alerts view"),
+            Line::from("  `           Toggle tutorial"),
+            Line::from("  ;           Toggle sidebar"),
+            Line::from("  x           Export markdown report"),
+            Line::from("  C           Copy issue to clipboard"),
+            Line::from("  O           Open issue in $EDITOR"),
+            Line::from("  Ctrl+R      Refresh from disk"),
+            Line::from("  q           Quit"),
+            Line::from(""),
+            Line::from(Span::styled(
+                " Press any key to close ",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        let w = 50.min(app.width.saturating_sub(4));
+        let h = help_lines.len() as u16 + 2;
+        let x = (app.width.saturating_sub(w)) / 2;
+        let y = (app.height.saturating_sub(h)) / 2;
+        let popup = ratatui::layout::Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        };
+        f.render_widget(ratatui::widgets::Clear, popup);
+        f.render_widget(
+            ratatui::widgets::Paragraph::new(help_lines).block(
+                ratatui::widgets::Block::default()
+                    .borders(ratatui::widgets::Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan)),
+            ),
+            popup,
+        );
+    }
 }
 
 fn render_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
@@ -871,6 +1112,14 @@ fn render_status_bar(f: &mut Frame, app: &App) {
             .add_modifier(Modifier::BOLD),
     ));
 
+    // Label filter badge (Go searchBadge area)
+    if let Some(label) = &app.label_filter {
+        spans.push(Span::styled(
+            format!(" #{label} "),
+            Style::default().bg(Color::DarkGray).fg(Color::Cyan),
+        ));
+    }
+
     // Sort badge (only when not default)
     if app.sort_mode != SortMode::Default {
         spans.push(Span::styled(
@@ -1026,7 +1275,14 @@ pub fn run_tui(app: &mut App) -> io::Result<()> {
                     {
                         break;
                     }
-                    app.handle_key(key.code);
+                    if key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL)
+                    {
+                        app.handle_ctrl_key(key.code);
+                    } else {
+                        app.handle_key(key.code);
+                    }
                 }
             }
             CEvent::Mouse(mouse) => {

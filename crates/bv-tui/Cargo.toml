@@ -9,6 +9,7 @@ authors.workspace = true
 ratatui = "0.29"
 crossterm = "0.28"
 bv-core = { path = "../bv-core" }
+bv-export = { path = "../bv-export" }
 bv-analysis = { path = "../bv-analysis" }
 crossbeam-channel = { workspace = true }
 jiff = { workspace = true }

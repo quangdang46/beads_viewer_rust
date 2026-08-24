@@ -201,6 +201,7 @@ version = "0.1.0"
 dependencies = [
  "bv-analysis",
  "bv-core",
+ "bv-export",
  "bv-graph-core",
  "crossbeam-channel",
  "crossterm",
