@@ -9,6 +9,13 @@ mod validation;
 
 use std::process::ExitCode;
 
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 fn main() -> ExitCode {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let args = argv::rewrite_args(&raw);
@@ -88,6 +95,66 @@ fn main() -> ExitCode {
         }
     }
 
+    // Export graph (Go --export-graph: .html interactive / json|dot|mermaid).
+    if let Some(idx) = args.iter().position(|a| a == "--export-graph") {
+        let output_path = args.get(idx + 1).cloned().unwrap_or_default();
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let (issues, hash) = match load_issues_auto(&cwd) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return ExitCode::from(1);
+            }
+        };
+
+        // Format inferred from extension (Go: .html interactive, .dot, else json).
+        // Note: --graph-format/--graph-depth are robot-graph-only in Go validation.
+        let fmt = if output_path.ends_with(".html") {
+            "html".to_string()
+        } else if output_path.ends_with(".dot") {
+            "dot".to_string()
+        } else if output_path.ends_with(".md") {
+            "mermaid".to_string()
+        } else {
+            "json".to_string()
+        };
+        let issues: Vec<bv_core::model::Issue> = issues;
+
+        let content = match fmt.as_str() {
+            "dot" => bv_export::graph_export::generate_dot(&issues, None),
+            "mermaid" => bv_export::graph_export::generate_mermaid_graph(&issues),
+            "html" => {
+                let mermaid = bv_export::graph_export::generate_mermaid_graph(&issues);
+                format!(
+                    "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<title>Beads Graph</title>\n<script src=\"https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js\"></script>\n<script>mermaid.initialize({{startOnLoad:true}});</script>\n</head>\n<body>\n<h1>Beads Dependency Graph</h1>\n<pre class=\"mermaid\">\n{mermaid}</pre>\n</body>\n</html>\n"
+                )
+            }
+            _ => serde_json::to_string_pretty(&serde_json::json!({
+                "format": "json",
+                "graph": bv_export::graph_export::generate_adjacency(&issues),
+                "nodes": issues.len(),
+                "data_hash": hash,
+            }))
+            .unwrap_or_default(),
+        };
+
+        let out = if output_path.is_empty() {
+            format!("beads_graph.{fmt}")
+        } else {
+            output_path
+        };
+        match std::fs::write(&out, &content) {
+            Ok(_) => {
+                println!("Exported {} issues to {} ({fmt})", issues.len(), out);
+                return ExitCode::from(0);
+            }
+            Err(e) => {
+                eprintln!("Error writing {out}: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+
     // Format validation (Go: exit 2 on invalid)
     if presence.has("format") {
         let fmt_val = args
@@ -137,32 +204,52 @@ fn main() -> ExitCode {
     }
 
     // Insights / Plan / Priority / Suggest / Alerts / Graph / Recipes / Label trio
-    let analysis_cmds = [
-        ("robot-insights", run_robot_insights as fn() -> ExitCode),
-        ("robot-plan", run_robot_plan),
-        ("robot-priority", run_robot_priority),
-        ("robot-suggest", run_robot_suggest),
-        ("robot-alerts", run_robot_alerts),
-        ("robot-graph", run_robot_graph),
-        ("robot-recipes", run_robot_recipes),
-        ("robot-label-health", run_robot_label_health),
-        ("robot-label-flow", run_robot_label_flow),
-        ("robot-label-attention", run_robot_label_attention),
-    ];
-    for (flag, func) in &analysis_cmds {
-        if presence.has(flag) {
-            return func();
-        }
+    if presence.has("robot-insights") {
+        return run_robot_insights();
+    }
+    if presence.has("robot-plan") {
+        return run_robot_plan();
+    }
+    if presence.has("robot-priority") {
+        return run_robot_priority();
+    }
+    if presence.has("robot-suggest") {
+        return run_robot_suggest();
+    }
+    if presence.has("robot-alerts") {
+        return run_robot_alerts();
+    }
+    if presence.has("robot-graph") {
+        return run_robot_graph(&args);
+    }
+    if presence.has("robot-recipes") {
+        return run_robot_recipes();
+    }
+    if presence.has("robot-label-health") {
+        return run_robot_label_health();
+    }
+    if presence.has("robot-label-flow") {
+        return run_robot_label_flow();
+    }
+    if presence.has("robot-label-attention") {
+        return run_robot_label_attention();
     }
 
-    // Export pages (static site bundle).
+    // Export pages (static site bundle, Go --export-pages).
     if let Some(idx) = args.iter().position(|a| a == "--export-pages") {
         let out_dir = args
             .get(idx + 1)
             .cloned()
             .unwrap_or_else(|| "./bv-pages".to_string());
+        let title = args
+            .iter()
+            .position(|a| a == "--pages-title")
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+            .unwrap_or_else(|| "Beads Dashboard".to_string());
+        let include_closed = args.iter().any(|a| a == "--pages-include-closed");
         let cwd = std::env::current_dir().unwrap_or_default();
-        let (issues, _) = match bv_core::discovery::load_issues_from_repo(&cwd) {
+        let (issues, hash) = match load_issues_auto(&cwd) {
             Ok(x) => x,
             Err(e) => {
                 eprintln!("Error: {e}");
@@ -170,15 +257,114 @@ fn main() -> ExitCode {
             }
         };
 
-        std::fs::create_dir_all(&out_dir).ok();
-        let index_html = format!(
-            "<!DOCTYPE html>\n<html>\n<head><title>Beads Dashboard</title></head>\n<body>\n<h1>Beads Dashboard</h1>\n<p>{} issues</p>\n</body>\n</html>",
-            issues.len()
-        );
-        std::fs::write(format!("{out_dir}/index.html"), index_html).ok();
+        let visible: Vec<&bv_core::model::Issue> = issues
+            .iter()
+            .filter(|i| include_closed || !i.status.is_closed())
+            .collect();
 
-        println!("Static site exported to {out_dir}");
-        return ExitCode::from(0);
+        let open = visible
+            .iter()
+            .filter(|i| matches!(i.status, bv_core::model::Status::Open))
+            .count();
+        let in_prog = visible
+            .iter()
+            .filter(|i| matches!(i.status, bv_core::model::Status::InProgress))
+            .count();
+        let blocked = visible
+            .iter()
+            .filter(|i| matches!(i.status, bv_core::model::Status::Blocked))
+            .count();
+        let closed = issues.iter().filter(|i| i.status.is_closed()).count();
+
+        let mermaid = bv_export::graph_export::generate_mermaid_graph(&issues);
+        let rows: String = visible
+            .iter()
+            .map(|i| {
+                format!(
+                    "<tr><td>{}</td><td>{}</td><td>{}</td><td>P{}</td><td>{}</td></tr>\n",
+                    i.id,
+                    html_escape(&i.title),
+                    i.status.as_str(),
+                    i.priority,
+                    i.issue_type
+                )
+            })
+            .collect();
+
+        let html = format!(
+            r#"<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>{title}</title>
+<style>
+body {{ font-family: -apple-system, sans-serif; margin: 2rem; background: #282a36; color: #f8f8f2; }}
+h1 {{ color: #bd93f9; }}
+.stats span {{ margin-right: 1rem; padding: 0.2rem 0.6rem; border-radius: 4px; background: #44475a; }}
+table {{ border-collapse: collapse; width: 100%; margin-top: 1rem; }}
+td, th {{ border: 1px solid #44475a; padding: 0.4rem 0.6rem; text-align: left; }}
+th {{ background: #44475a; }}
+.mermaid {{ background: #f8f8f2; padding: 1rem; border-radius: 8px; margin-top: 1rem; }}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({{startOnLoad:true, theme:'dark'}});</script>
+</head>
+<body>
+<h1>{title}</h1>
+<p class="stats">
+<span>○ Open: {open}</span><span>◐ In-Progress: {in_prog}</span><span>◈ Blocked: {blocked}</span><span>● Closed: {closed}</span>
+</p>
+<table>
+<tr><th>ID</th><th>Title</th><th>Status</th><th>Priority</th><th>Type</th></tr>
+{rows}</table>
+<div class="mermaid">
+{mermaid}</div>
+<p><small>data_hash: {hash} | Generated by bvr</small></p>
+</body>
+</html>
+"#
+        );
+
+        std::fs::create_dir_all(&out_dir).ok();
+        match std::fs::write(format!("{out_dir}/index.html"), html) {
+            Ok(_) => {
+                println!("Static site exported to {out_dir}");
+                return ExitCode::from(0);
+            }
+            Err(e) => {
+                eprintln!("Error writing {out_dir}/index.html: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+
+    // Preview pages (Go --preview-pages): export then serve with livereload.
+    if let Some(idx) = args.iter().position(|a| a == "--preview-pages") {
+        let dir = args
+            .get(idx + 1)
+            .cloned()
+            .unwrap_or_else(|| "./bv-pages".to_string());
+        if !std::path::Path::new(&dir).join("index.html").exists() {
+            eprintln!("No index.html in {dir} — run --export-pages first");
+            return ExitCode::from(1);
+        }
+        let root = std::path::PathBuf::from(&dir);
+        match bv_export::preview::start_preview(
+            &root,
+            |port| {
+                println!("Preview serving at http://127.0.0.1:{port} (Ctrl+C to stop)");
+            },
+            true,
+        ) {
+            Ok(()) => {
+                std::thread::sleep(std::time::Duration::MAX);
+                return ExitCode::from(0);
+            }
+            Err(e) => {
+                eprintln!("Preview failed: {e}");
+                return ExitCode::from(1);
+            }
+        }
     }
 
     // Interactive TUI: no robot flags present.
@@ -1072,7 +1258,7 @@ fn run_robot_alerts() -> ExitCode {
     emit_json(&payload)
 }
 
-fn run_robot_graph() -> ExitCode {
+fn run_robot_graph(args: &[String]) -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
     let (issues, hash) = match load_issues_auto(&cwd) {
         Ok(x) => x,
@@ -1082,6 +1268,47 @@ fn run_robot_graph() -> ExitCode {
         }
     };
     let _g = bv_analysis::build_graph(&issues);
+
+    let fmt = args
+        .iter()
+        .position(|a| a == "--graph-format")
+        .and_then(|i| args.get(i + 1))
+        .map(|s| s.to_lowercase())
+        .unwrap_or_else(|| "json".to_string());
+    if fmt != "json" && fmt != "dot" && fmt != "mermaid" {
+        eprintln!("Invalid --graph-format \"{fmt}\" (expected json|dot|mermaid)");
+        return ExitCode::from(2);
+    }
+
+    let mut issues: Vec<bv_core::model::Issue> = issues;
+    if let Some(gi) = args.iter().position(|a| a == "--graph-root") {
+        let root = args.get(gi + 1).cloned().unwrap_or_default();
+        let depth = args
+            .iter()
+            .position(|a| a == "--graph-depth")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(usize::MAX);
+        let refs: Vec<&bv_core::model::Issue> = issues.iter().collect();
+        issues = bv_export::graph_export::subgraph(&refs, &root, depth)
+            .into_iter()
+            .cloned()
+            .collect();
+    }
+
+    if fmt != "json" {
+        let content = if fmt == "dot" {
+            bv_export::graph_export::generate_dot(&issues, None)
+        } else {
+            bv_export::graph_export::generate_mermaid_graph(&issues)
+        };
+        let mut payload = envelope_json(&hash);
+        payload["format"] = serde_json::json!(fmt);
+        payload["graph"] = serde_json::json!(content);
+        payload["nodes"] = serde_json::json!(issues.len());
+        emit_json(&payload);
+        return ExitCode::from(0);
+    }
 
     let nodes: Vec<serde_json::Value> = issues
         .iter()
