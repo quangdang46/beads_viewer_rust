@@ -261,11 +261,31 @@ fn launch_tui(app: &mut bv_tui::App, issues: &[bv_core::model::Issue]) -> ExitCo
     }
 }
 
+/// Load issues from cwd, honoring workspace config if present (multi-repo).
+fn load_issues_auto(cwd: &std::path::Path) -> Result<(Vec<bv_core::model::Issue>, String), String> {
+    if let Some(ws_path) = bv_core::workspace::find_workspace_config(cwd) {
+        let ws_root = ws_path
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap_or(cwd)
+            .to_path_buf();
+        if let Ok(cfg) = bv_core::workspace::load_workspace(&ws_path) {
+            if let Ok((issues, _)) = bv_core::workspace::load_all(&cfg, &ws_root) {
+                let hash = bv_core::data_hash::compute_data_hash(&issues);
+                return Ok((issues, hash));
+            }
+        }
+    }
+    let (issues, _) = bv_core::discovery::load_issues_from_repo(cwd).map_err(|e| e.to_string())?;
+    let hash = bv_core::data_hash::compute_data_hash(&issues);
+    Ok((issues, hash))
+}
+
 /// Load issues from discovery chain and emit --robot-triage JSON.
 fn run_robot_triage() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let issues = match bv_core::discovery::load_issues_from_repo(&cwd) {
-        Ok((issues, _stats)) => issues,
+    let issues = match load_issues_auto(&cwd) {
+        Ok((issues, _hash)) => issues,
         Err(e) => {
             eprintln!("Error: {e}");
             return ExitCode::from(1);
@@ -321,10 +341,9 @@ fn run_robot_triage() -> ExitCode {
 
 fn capture_baseline(
 ) -> Result<(bv_analysis::drift::BaselineStats, Vec<Vec<String>>, String), String> {
-    use bv_analysis::algorithms::{cycles::tarjan_scc, pagerank::pagerank_default};
+    use bv_analysis::algorithms::cycles::tarjan_scc;
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (issues, _stats) =
-        bv_core::discovery::load_issues_from_repo(&cwd).map_err(|e| e.to_string())?;
+    let (issues, _hash) = load_issues_auto(&cwd)?;
     let hash = bv_core::data_hash::compute_data_hash(&issues);
     let g = bv_analysis::analyzer::build_graph(&issues);
     let p1 = bv_analysis::analyzer::analyze_phase1(&g);
@@ -348,7 +367,10 @@ fn capture_baseline(
         }
     }
     let mut pr_map = std::collections::BTreeMap::new();
-    for (i, v) in pagerank_default(&g).into_iter().enumerate() {
+    for (i, v) in bv_analysis::algorithms::pagerank::pagerank_default(&g)
+        .into_iter()
+        .enumerate()
+    {
         pr_map.insert(g.node_id(i).unwrap_or_default().to_string(), v);
     }
     Ok((
@@ -469,7 +491,7 @@ fn run_check_drift() -> ExitCode {
 
 fn run_robot_history() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (issues, _) = match bv_core::discovery::load_issues_from_repo(&cwd) {
+    let (issues, _) = match load_issues_auto(&cwd) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -525,7 +547,7 @@ fn run_robot_history() -> ExitCode {
 
 fn run_robot_orphans() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (issues, _) = match bv_core::discovery::load_issues_from_repo(&cwd) {
+    let (issues, _) = match load_issues_auto(&cwd) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -784,7 +806,7 @@ fn run_robot_insights() -> ExitCode {
 
 fn run_robot_plan() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (issues, _) = match bv_core::discovery::load_issues_from_repo(&cwd) {
+    let (issues, _) = match load_issues_auto(&cwd) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -894,7 +916,7 @@ fn run_robot_plan() -> ExitCode {
 
 fn run_robot_priority() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (issues, _) = match bv_core::discovery::load_issues_from_repo(&cwd) {
+    let (issues, _) = match load_issues_auto(&cwd) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -996,11 +1018,8 @@ fn run_robot_priority() -> ExitCode {
 
 fn run_robot_suggest() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (issues, hash) = match bv_core::discovery::load_issues_from_repo(&cwd) {
-        Ok((issues, _)) => {
-            let h = bv_core::data_hash::compute_data_hash(&issues);
-            (issues, h)
-        }
+    let (issues, hash) = match load_issues_auto(&cwd) {
+        Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
             return ExitCode::from(1);
@@ -1020,11 +1039,8 @@ fn run_robot_suggest() -> ExitCode {
 }
 fn run_robot_alerts() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (issues, hash) = match bv_core::discovery::load_issues_from_repo(&cwd) {
-        Ok((issues, _)) => {
-            let h = bv_core::data_hash::compute_data_hash(&issues);
-            (issues, h)
-        }
+    let (issues, hash) = match load_issues_auto(&cwd) {
+        Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
             return ExitCode::from(1);
@@ -1055,11 +1071,8 @@ fn run_robot_alerts() -> ExitCode {
 
 fn run_robot_graph() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (issues, hash) = match bv_core::discovery::load_issues_from_repo(&cwd) {
-        Ok((issues, _)) => {
-            let h = bv_core::data_hash::compute_data_hash(&issues);
-            (issues, h)
-        }
+    let (issues, hash) = match load_issues_auto(&cwd) {
+        Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
             return ExitCode::from(1);
