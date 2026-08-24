@@ -134,8 +134,11 @@ pub struct App {
     pub dataset_warning: Option<String>,
     /// cass session count for selected bead (Go bv-y836)
     pub session_count: usize,
-    /// New version tag available (Go update badge)
     pub update_tag: Option<String>,
+    /// Workspace mode: loaded repo names (Go workspaceMode)
+    pub workspace_repos: Option<Vec<String>>,
+    /// Active repo filter in workspace mode (None = all repos)
+    pub active_repo: Option<String>,
     /// cass CLI availability cache
     cass_available: bool,
     cass_cache: std::collections::HashMap<String, usize>,
@@ -329,6 +332,8 @@ impl App {
             dataset_warning: dataset_warning_for(issues.len()),
             session_count: 0,
             update_tag: None,
+            workspace_repos: None,
+            active_repo: None,
             cass_available: cass_installed(),
             cass_cache: std::collections::HashMap::new(),
         };
@@ -337,6 +342,7 @@ impl App {
     }
     pub fn apply_filter(&mut self) {
         let label_filter = self.label_filter.clone();
+        let active_repo = self.active_repo.clone();
         self.filtered_indices = (0..self.rows.len())
             .filter(|&i| {
                 let r = &self.rows[i];
@@ -350,6 +356,12 @@ impl App {
                     && label_filter
                         .as_ref()
                         .is_none_or(|label| r.labels.iter().any(|l| l == label))
+                    && active_repo.as_ref().is_none_or(|repo| {
+                        self.issue_map
+                            .get(&r.id)
+                            .map(|i| &i.source_repo == repo)
+                            .unwrap_or(false)
+                    })
             })
             .collect();
         // Apply sort
@@ -651,8 +663,34 @@ impl App {
                 self.cycle_label_filter();
                 true
             }
+            KeyCode::Char('w') if self.workspace_repos.is_some() => {
+                self.cycle_repo_filter();
+                true
+            }
             _ => false,
         }
+    }
+
+    /// Cycle active repo filter in workspace mode (Go repo picker, simplified).
+    fn cycle_repo_filter(&mut self) {
+        let Some(repos) = &self.workspace_repos else {
+            return;
+        };
+        if repos.is_empty() {
+            return;
+        }
+        self.active_repo = match &self.active_repo {
+            None => Some(repos[0].clone()),
+            Some(current) => match repos.iter().position(|r| r == current) {
+                Some(i) if i + 1 < repos.len() => Some(repos[i + 1].clone()),
+                _ => None,
+            },
+        };
+        self.status_msg = match &self.active_repo {
+            Some(r) => format!("Repos: {r}"),
+            None => "Repos: all".to_string(),
+        };
+        self.apply_filter();
     }
 
     /// Handle a Ctrl-modified key event; returns true if consumed.
@@ -1395,6 +1433,29 @@ fn render_status_bar(f: &mut Frame, app: &App) {
             Style::default()
                 .bg(Color::Green)
                 .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    // Workspace repo filter badge (Go repoFilterSection 🗂)
+    if app.workspace_repos.is_some() {
+        let label = match &app.active_repo {
+            Some(r) => r.clone(),
+            None => {
+                let repos = app.workspace_repos.as_deref().unwrap_or_default();
+                let shown: Vec<&str> = repos.iter().take(3).map(|s| s.as_str()).collect();
+                if repos.len() > 3 {
+                    format!("{},+{}", shown.join(","), repos.len() - 3)
+                } else {
+                    shown.join(",")
+                }
+            }
+        };
+        spans.push(Span::styled(
+            format!(" \u{1f5c2} {label} "),
+            Style::default()
+                .bg(Color::DarkGray)
+                .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ));
     }

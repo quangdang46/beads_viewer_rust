@@ -183,48 +183,79 @@ fn main() -> ExitCode {
 
     // Interactive TUI: no robot flags present.
     let cwd = std::env::current_dir().unwrap_or_default();
+
+    // Workspace mode: .bv/workspace.yaml found → aggregate multi-repo load
+    if let Some(ws_path) = bv_core::workspace::find_workspace_config(&cwd) {
+        let ws_root = ws_path
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap_or(&cwd)
+            .to_path_buf();
+        match bv_core::workspace::load_workspace(&ws_path)
+            .and_then(|cfg| bv_core::workspace::load_all(&cfg, &ws_root))
+        {
+            Ok((issues, results)) => {
+                let repo_names: Vec<String> = results
+                    .iter()
+                    .filter(|r| r.error.is_none())
+                    .map(|r| r.repo_name.clone())
+                    .collect();
+                eprintln!(
+                    "Workspace: loaded {} issues from {} repos — launching TUI",
+                    issues.len(),
+                    repo_names.len()
+                );
+                let mut app = bv_tui::App::new(issues.clone());
+                app.workspace_repos = Some(repo_names);
+                return launch_tui(&mut app, &issues);
+            }
+            Err(e) => {
+                eprintln!("Workspace load failed: {e} — falling back to single-repo mode");
+            }
+        }
+    }
+
     match bv_core::discovery::load_issues_from_repo(&cwd) {
         Ok((issues, _)) => {
             eprintln!("Loaded {} issues — launching TUI", issues.len());
             let mut app = bv_tui::App::new(issues.clone());
-
-            // Compute graph metrics for insights view
-            let g = bv_analysis::build_graph(&issues);
-            let pr = bv_graph_core::pagerank_default(&g);
-            let bw = bv_graph_core::betweenness(&g);
-            let ev = bv_graph_core::eigenvector_default(&g);
-            let hits_result = bv_graph_core::hits_default(&g);
-
-            let to_map = |scores: &[f64]| -> std::collections::BTreeMap<String, f64> {
-                scores
-                    .iter()
-                    .enumerate()
-                    .map(|(i, v)| (g.node_id(i).unwrap_or_default().to_string(), *v))
-                    .collect()
-            };
-
-            eprintln!(
-                "DEBUG: setting graph_metrics with {} pagerank entries",
-                pr.len()
-            );
-            app.graph_metrics = Some(bv_tui::GraphMetrics {
-                pagerank: to_map(&pr),
-                betweenness: to_map(&bw),
-                eigenvector: to_map(&ev),
-                hubs: to_map(&hits_result.hubs),
-                authorities: to_map(&hits_result.authorities),
-            });
-
-            match bv_tui::run_tui(&mut app) {
-                Ok(_) => ExitCode::from(0),
-                Err(e) => {
-                    eprintln!("TUI error: {e}");
-                    ExitCode::from(1)
-                }
-            }
+            launch_tui(&mut app, &issues)
         }
         Err(e) => {
             eprintln!("Error loading beads: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Compute graph metrics and run the TUI event loop.
+fn launch_tui(app: &mut bv_tui::App, issues: &[bv_core::model::Issue]) -> ExitCode {
+    let g = bv_analysis::build_graph(issues);
+    let pr = bv_graph_core::pagerank_default(&g);
+    let bw = bv_graph_core::betweenness(&g);
+    let ev = bv_graph_core::eigenvector_default(&g);
+    let hits_result = bv_graph_core::hits_default(&g);
+
+    let to_map = |scores: &[f64]| -> std::collections::BTreeMap<String, f64> {
+        scores
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (g.node_id(i).unwrap_or_default().to_string(), *v))
+            .collect()
+    };
+
+    app.graph_metrics = Some(bv_tui::GraphMetrics {
+        pagerank: to_map(&pr),
+        betweenness: to_map(&bw),
+        eigenvector: to_map(&ev),
+        hubs: to_map(&hits_result.hubs),
+        authorities: to_map(&hits_result.authorities),
+    });
+
+    match bv_tui::run_tui(app) {
+        Ok(_) => ExitCode::from(0),
+        Err(e) => {
+            eprintln!("TUI error: {e}");
             ExitCode::from(1)
         }
     }
