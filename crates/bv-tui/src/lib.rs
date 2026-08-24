@@ -146,7 +146,7 @@ impl App {
         // Compute proactive alerts (Go computeAlerts): cycles-driven drift
         let g_alerts = bv_analysis::build_graph(&issues);
         let has_cycle = bv_graph_core::algorithms::cycles::has_cycles(&g_alerts);
-        let (a_crit, mut a_warn, a_info) = (0usize, 0usize, 0usize);
+        let (mut a_crit, mut a_warn, a_info) = (0usize, 0usize, 0usize);
         if has_cycle {
             a_crit = 1; // one critical alert for cycles (Go pushes one alert per check)
         }
