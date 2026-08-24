@@ -126,6 +126,19 @@ pub struct App {
     pub alerts_critical: usize,
     pub alerts_warning: usize,
     pub alerts_total: usize,
+    /// When the snapshot was loaded (freshness badge, Go bv-h305)
+    pub loaded_at: std::time::Instant,
+    /// PID of another live instance holding .beads/.bv.lock (Go bv-vrvn)
+    pub instance_pid: Option<u32>,
+    /// Large/huge dataset warning text (Go bv-9thm)
+    pub dataset_warning: Option<String>,
+    /// cass session count for selected bead (Go bv-y836)
+    pub session_count: usize,
+    /// New version tag available (Go update badge)
+    pub update_tag: Option<String>,
+    /// cass CLI availability cache
+    cass_available: bool,
+    cass_cache: std::collections::HashMap<String, usize>,
 }
 
 /// Which view is currently displayed.
@@ -139,6 +152,105 @@ pub enum ViewMode {
     Alerts,
     TimeTravel,
     Tutorial,
+}
+
+/// Large/huge dataset warning (Go largeDatasetWarning, bv-9thm).
+fn dataset_warning_for(total: usize) -> Option<String> {
+    let compact = |n: usize| {
+        if n >= 1_000_000 {
+            format!("{}m", n / 1_000_000)
+        } else if n >= 1_000 {
+            format!("{}k", n / 1_000)
+        } else {
+            format!("{n}")
+        }
+    };
+    if total >= 20_000 {
+        Some(format!("\u{26a0} huge {} issues", compact(total)))
+    } else if total >= 5_000 {
+        Some(format!("\u{26a0} large {} issues", compact(total)))
+    } else {
+        None
+    }
+}
+
+/// Check whether the cass CLI is on PATH (Go cass.Detector).
+fn cass_installed() -> bool {
+    std::env::var("PATH")
+        .map(|paths| {
+            paths
+                .split(':')
+                .any(|dir| std::path::Path::new(dir).join("cass").is_file())
+        })
+        .unwrap_or(false)
+}
+
+/// Acquire the instance lock in .beads/.bv.lock (Go instance.NewLock, bv-vrvn).
+/// Returns PID of another live instance if one holds the lock.
+pub fn acquire_instance_lock(beads_dir: &std::path::Path) -> Option<u32> {
+    let lock_path = beads_dir.join(".bv.lock");
+    let my_pid = std::process::id();
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+    {
+        Ok(mut f) => {
+            use std::io::Write;
+            let _ = writeln!(f, "{{\"pid\":{my_pid}}}");
+            None // we are the first instance
+        }
+        Err(_) => {
+            // Lock exists — read holder PID and check if alive.
+            let holder = std::fs::read_to_string(&lock_path).ok().and_then(|s| {
+                s.trim()
+                    .trim_start_matches('{')
+                    .trim_end_matches('}')
+                    .split(':')
+                    .nth(1)
+                    .and_then(|p| p.trim().parse::<u32>().ok())
+            });
+            let alive = holder
+                .map(|pid| {
+                    std::process::Command::new("kill")
+                        .args(["-0", &pid.to_string()])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .map(|s| s.success())
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if alive {
+                holder
+            } else {
+                // Stale lock — take over.
+                if let Ok(mut f) = std::fs::File::create(&lock_path) {
+                    use std::io::Write;
+                    let _ = writeln!(f, "{{\"pid\":{my_pid}}}");
+                }
+                None
+            }
+        }
+    }
+}
+
+/// Remove the instance lock if we hold it.
+pub fn release_instance_lock(beads_dir: &std::path::Path) {
+    let lock_path = beads_dir.join(".bv.lock");
+    if let Ok(content) = std::fs::read_to_string(&lock_path) {
+        let content = content.trim();
+        let mine = content
+            .trim_start_matches('{')
+            .trim_end_matches('}')
+            .split(':')
+            .nth(1)
+            .and_then(|p| p.trim().parse::<u32>().ok())
+            == Some(std::process::id());
+        if mine {
+            let _ = std::fs::remove_file(&lock_path);
+        }
+    }
 }
 
 impl App {
@@ -212,11 +324,17 @@ impl App {
             label_filter: None,
             detail_scroll: 0,
             graph_metrics: None,
+            loaded_at: std::time::Instant::now(),
+            instance_pid: None,
+            dataset_warning: dataset_warning_for(issues.len()),
+            session_count: 0,
+            update_tag: None,
+            cass_available: cass_installed(),
+            cass_cache: std::collections::HashMap::new(),
         };
         app.apply_filter();
         app
     }
-
     pub fn apply_filter(&mut self) {
         let label_filter = self.label_filter.clone();
         self.filtered_indices = (0..self.rows.len())
@@ -245,6 +363,32 @@ impl App {
         }
         if self.cursor >= self.filtered_indices.len() {
             self.cursor = self.filtered_indices.len().saturating_sub(1);
+        }
+    }
+    /// Update cass session count for the selected bead (Go getCassSessionCount).
+    fn update_session_count(&mut self) {
+        self.session_count = 0;
+        if !self.cass_available {
+            return;
+        }
+        let Some(row) = self.selected() else { return };
+        let id = row.id.clone();
+        if let Some(n) = self.cass_cache.get(&id) {
+            self.session_count = *n;
+            return;
+        }
+        if let Ok(out) = std::process::Command::new("cass")
+            .args(["search", &id, "--robot", "--limit", "10"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+        {
+            let count = serde_json::from_slice::<serde_json::Value>(&out.stdout)
+                .ok()
+                .and_then(|v| v.get("results").and_then(|r| r.as_array()).map(|a| a.len()))
+                .unwrap_or(0);
+            self.cass_cache.insert(id, count);
+            self.session_count = count;
         }
     }
 
@@ -382,6 +526,7 @@ impl App {
                     self.detail_scroll = self.detail_scroll.saturating_add(1);
                 } else if self.cursor + 1 < self.filtered_indices.len() {
                     self.cursor += 1;
+                    self.update_session_count();
                 }
                 true
             }
@@ -390,6 +535,7 @@ impl App {
                     self.detail_scroll = self.detail_scroll.saturating_sub(1);
                 } else {
                     self.cursor = self.cursor.saturating_sub(1);
+                    self.update_session_count();
                 }
                 true
             }
@@ -1173,6 +1319,98 @@ fn render_status_bar(f: &mut Frame, app: &App) {
         ));
     }
 
+    // Freshness badge (Go bv-h305: warn 30s, stale 2min since snapshot)
+    {
+        let elapsed = app.loaded_at.elapsed();
+        let stale_s = std::env::var("BV_FRESHNESS_STALE_S")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(120);
+        let warn_s = std::env::var("BV_FRESHNESS_WARN_S")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30);
+        let secs = elapsed.as_secs();
+        let fmt_age = |s: u64| {
+            if s < 60 {
+                "<1m ago".to_string()
+            } else if s < 3600 {
+                format!("{}m ago", s / 60)
+            } else {
+                format!("{}h ago", s / 3600)
+            }
+        };
+        if secs >= stale_s {
+            spans.push(Span::styled(
+                format!(" \u{26a0} STALE: {} ", fmt_age(secs)),
+                Style::default()
+                    .bg(Color::Red)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else if secs >= warn_s {
+            spans.push(Span::styled(
+                format!(" \u{26a0} {} ", fmt_age(secs)),
+                Style::default().bg(Color::DarkGray).fg(Color::Yellow),
+            ));
+        }
+    }
+
+    // Phase 2 metrics badge (Go bv-tspo: ◌ metrics... until ready)
+    if app.graph_metrics.is_none() {
+        spans.push(Span::styled(
+            " \u{25d0} metrics... ",
+            Style::default().bg(Color::DarkGray).fg(Color::Cyan),
+        ));
+    }
+
+    // Instance warning (Go bv-vrvn: ⚠ PID of other live instance)
+    if let Some(pid) = app.instance_pid {
+        spans.push(Span::styled(
+            format!(" \u{26a0} PID {pid} "),
+            Style::default()
+                .bg(Color::Yellow)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    // Session indicator (Go bv-y836: cass sessions for selected bead)
+    if app.session_count > 0 {
+        let count_str = if app.session_count > 9 {
+            "9+".to_string()
+        } else {
+            app.session_count.to_string()
+        };
+        spans.push(Span::styled(
+            format!(" \u{1f4bc} {count_str} sessions "),
+            Style::default().bg(Color::DarkGray).fg(Color::Cyan),
+        ));
+    }
+
+    // Update badge (Go: Update <tag>)
+    if let Some(tag) = &app.update_tag {
+        spans.push(Span::styled(
+            format!(" \u{2b06} Update {tag} "),
+            Style::default()
+                .bg(Color::Green)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    // Large dataset warning (Go bv-9thm)
+    if let Some(warn) = &app.dataset_warning {
+        let huge = warn.contains("huge");
+        spans.push(Span::styled(
+            format!(" {warn} "),
+            Style::default()
+                .bg(if huge { Color::Red } else { Color::DarkGray })
+                .fg(if huge { Color::White } else { Color::Yellow })
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     // Label hint (Go labelHint: "L:labels * h:detail")
     if app.current_view != ViewMode::Board {
         spans.push(Span::styled(
@@ -1250,6 +1488,40 @@ fn render_status_bar(f: &mut Frame, app: &App) {
 
 /// Run the TUI event loop. Returns when user quits.
 pub fn run_tui(app: &mut App) -> io::Result<()> {
+    // Instance lock (Go bv-vrvn)
+    let beads_dir = std::env::current_dir()
+        .ok()
+        .map(|d| d.join(".beads"))
+        .unwrap_or_default();
+    app.instance_pid = acquire_instance_lock(&beads_dir);
+
+    // Update check (Go updater): background thread, gated by BV_NO_UPDATE_CHECK
+    let (update_tx, update_rx) = std::sync::mpsc::channel::<String>();
+    if std::env::var("BV_NO_UPDATE_CHECK").is_err() {
+        std::thread::spawn(move || {
+            let output = std::process::Command::new("curl")
+                .args([
+                    "-sf",
+                    "-m",
+                    "5",
+                    "-H",
+                    "User-Agent: OpenAI File Downloader, XaiImageApiFetch/1.0",
+                    "https://api.github.com/repos/Dicklesworthstone/beads_viewer/releases/latest",
+                ])
+                .output();
+            if let Ok(out) = output {
+                if let Ok(body) = String::from_utf8(out.stdout) {
+                    if let Some(tag) = serde_json::from_str::<serde_json::Value>(&body)
+                        .ok()
+                        .and_then(|v| v.get("tag_name").and_then(|t| t.as_str().map(String::from)))
+                    {
+                        let _ = update_tx.send(tag);
+                    }
+                }
+            }
+        });
+    }
+
     let mut stdout = io::stdout();
     crossterm::terminal::enable_raw_mode()?;
     crossterm::execute!(
@@ -1258,37 +1530,59 @@ pub fn run_tui(app: &mut App) -> io::Result<()> {
         crossterm::event::EnableMouseCapture
     )?;
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
-    let mut terminal = ratatui::Terminal::new(backend)?;
+    let terminal = ratatui::Terminal::new(backend)?;
 
+    let result = tui_event_loop(terminal, app, &update_rx);
+
+    release_instance_lock(&beads_dir);
+    result
+}
+
+fn tui_event_loop(
+    mut terminal: ratatui::Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    update_rx: &std::sync::mpsc::Receiver<String>,
+) -> io::Result<()> {
     loop {
         terminal.draw(|f| render(f, app))?;
         if app.quit_requested {
             break;
         }
-        match event::read()? {
-            CEvent::Key(key) => {
-                if key.kind == KeyEventKind::Press {
-                    if key
-                        .modifiers
-                        .contains(crossterm::event::KeyModifiers::CONTROL)
-                        && key.code == KeyCode::Char('c')
-                    {
-                        break;
-                    }
-                    if key
-                        .modifiers
-                        .contains(crossterm::event::KeyModifiers::CONTROL)
-                    {
-                        app.handle_ctrl_key(key.code);
-                    } else {
-                        app.handle_key(key.code);
+        // Drain update-check channel (non-blocking)
+        if let Ok(tag) = update_rx.try_recv() {
+            let current = env!("CARGO_PKG_VERSION");
+            let tag_clean = tag.trim_start_matches('v');
+            if tag_clean != current {
+                app.update_tag = Some(tag);
+            }
+        }
+        // Poll events with timeout so freshness badge stays live
+        if event::poll(std::time::Duration::from_millis(500))? {
+            match event::read()? {
+                CEvent::Key(key) => {
+                    if key.kind == KeyEventKind::Press {
+                        if key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL)
+                            && key.code == KeyCode::Char('c')
+                        {
+                            break;
+                        }
+                        if key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL)
+                        {
+                            app.handle_ctrl_key(key.code);
+                        } else {
+                            app.handle_key(key.code);
+                        }
                     }
                 }
+                CEvent::Mouse(mouse) => {
+                    app.handle_mouse(mouse);
+                }
+                _ => {}
             }
-            CEvent::Mouse(mouse) => {
-                app.handle_mouse(mouse);
-            }
-            _ => {}
         }
     }
 
@@ -1382,3 +1676,37 @@ pub mod chrome;
 pub mod detail;
 pub mod views;
 pub mod worker;
+
+#[cfg(test)]
+mod footer_state_tests {
+    use super::*;
+
+    #[test]
+    fn dataset_warning_thresholds_match_go() {
+        assert_eq!(dataset_warning_for(999), None);
+        assert_eq!(dataset_warning_for(4_999), None); // medium tier: no warning
+        assert!(dataset_warning_for(5_000).unwrap().contains("large"));
+        assert!(dataset_warning_for(20_000).unwrap().contains("huge"));
+        assert_eq!(
+            dataset_warning_for(24_000).unwrap(),
+            "\u{26a0} huge 24k issues"
+        );
+    }
+
+    #[test]
+    fn instance_lock_takeover_on_stale() {
+        let dir = std::env::temp_dir().join(format!("bvr_lock_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join(".bv.lock");
+        // Stale holder: PID that (almost certainly) doesn't exist
+        std::fs::write(&lock, "{\"pid\":999999999}").unwrap();
+        let holder = acquire_instance_lock(&dir);
+        assert_eq!(holder, None, "stale lock should be taken over");
+        // Now we hold it — second acquirer sees our PID
+        let second = acquire_instance_lock(&dir);
+        assert_eq!(second, Some(std::process::id()));
+        release_instance_lock(&dir);
+        assert!(!lock.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

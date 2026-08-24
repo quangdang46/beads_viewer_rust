@@ -13,4 +13,5 @@ bv-export = { path = "../bv-export" }
 bv-analysis = { path = "../bv-analysis" }
 crossbeam-channel = { workspace = true }
 jiff = { workspace = true }
+serde_json = { workspace = true }
 bv-graph-core = { path = "../bv-graph-core" }
