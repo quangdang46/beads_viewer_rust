@@ -877,81 +877,57 @@ fn render_status_bar(f: &mut Frame, app: &App) {
         Style::default().fg(Color::DarkGray),
     ));
 
-    // Keyboard hints (context-aware)
-    spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+    // Keyboard hints (context-aware, matching Go footer)
+    spans.push(Span::styled(
+        " \u{2502} ",
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let key_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let sep_style = Style::default().fg(Color::DarkGray);
+    let mut hints: Vec<Span> = Vec::new();
+    let push_hint = |hints: &mut Vec<Span>, key: &str, desc: &str| {
+        if !hints.is_empty() {
+            hints.push(Span::styled(" \u{2502} ", sep_style));
+        }
+        hints.push(Span::styled(key.to_string(), key_style));
+        hints.push(Span::raw(format!(" {desc}")));
+    };
 
     if app.focus_detail {
-        spans.push(Span::styled(
-            "esc",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::raw(" back"));
+        push_hint(&mut hints, "esc", "back");
+        push_hint(&mut hints, "C", "copy");
+        push_hint(&mut hints, "O", "edit");
+        push_hint(&mut hints, "Ctrl+R", "refresh");
+        push_hint(&mut hints, "?", "help");
     } else if app.show_detail {
-        spans.push(Span::styled(
-            "tab",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::raw(" focus"));
-        spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
-        spans.push(Span::styled(
-            "j/k",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::raw(" scroll"));
+        push_hint(&mut hints, "tab", "focus");
+        push_hint(&mut hints, "C", "copy");
+        push_hint(&mut hints, "x", "export");
+        push_hint(&mut hints, "Ctrl+R", "refresh");
+        push_hint(&mut hints, "?", "help");
     } else if app.current_view == ViewMode::Board {
-        spans.push(Span::styled(
-            "h/l",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::raw(" col"));
-        spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
-        spans.push(Span::styled(
-            "b",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::raw(" list"));
+        push_hint(&mut hints, "h/l", "col");
+        push_hint(&mut hints, "j/k", "move");
+        push_hint(&mut hints, "b", "list");
+        push_hint(&mut hints, "?", "help");
     } else {
-        spans.push(Span::styled(
-            "⏎",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::raw(" details"));
-        spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
-        spans.push(Span::styled(
-            "/",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::raw(" search"));
-        spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
-        spans.push(Span::styled(
-            "b/E/i",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::raw(" views"));
+        push_hint(&mut hints, "\u{23ce}", "details");
+        push_hint(&mut hints, "t", "diff");
+        push_hint(&mut hints, "S", "triage");
+        push_hint(&mut hints, "l", "labels");
+        push_hint(&mut hints, "Ctrl+R", "refresh");
+        push_hint(&mut hints, "?", "help");
     }
+    spans.extend(hints);
 
-    // Count badge (right side)
-    let count_text = format!("{} issues", app.filtered_indices.len());
+    // Count badge (right side, padded like Go countBadge)
+    let count_text = format!(" {} issues ", app.filtered_indices.len());
     let count_width = count_text.len() as u16;
-    let filler_width = area.width.saturating_sub(
-        spans.iter().map(|s| s.width() as u16).sum::<u16>() + count_width as u16 + 2,
-    );
+    let used: u16 = spans.iter().map(|s| s.width() as u16).sum::<u16>() + count_width;
+    let filler_width = area.width.saturating_sub(used);
     if filler_width > 0 {
         spans.push(Span::raw(" ".repeat(filler_width as usize)));
     }
