@@ -537,3 +537,95 @@ Anti-conflict rules:
 
 ---
 *Basis: real-code audit, not speculation — every constant cites file:line in the cloned repo `./beads_viewer/`. Detailed scout reports live in session history for deeper lookups.*
+
+## 11. Session status log (2026-09-03)
+
+An audit against `./beads_viewer/` (Go, cloned fresh) found the crate graph
+compiling and passing tests, but several real bugs and a large surface of
+undispatched/stubbed robot commands and TUI views. This log tracks what's
+been fixed vs what remains, so work is resumable across sessions instead of
+silently re-discovered.
+
+### Fixed this session (commits `18becee`, `5d4f3e1`)
+
+- **bv-core**: `discover_repos` produced backslash-separated relative paths
+  on Windows (`packages\web`), breaking multi-repo workspace discovery.
+- **bv-tui**: instance-lock takeover shelled out to `kill -0` unconditionally
+  — nonexistent on Windows, so liveness checks always failed and even our
+  own just-acquired lock was reclaimed as stale. Added a real
+  cross-platform check + short-circuit for our own PID.
+- **bv-correlation**: `combine_confidence` diverged from Go's
+  `CombineConfidence` (per-method clamping + normalized boost vs Go's raw,
+  progressively-updated-headroom formula) — silently wrong correlation
+  ranking for any multi-signal correlation. Rewritten to match exactly.
+- **bv-tui**: Tree and Alerts views were wired to hardcoded empty slices —
+  always rendered blank regardless of real data. Added a real parent-child
+  tree builder (`views::tree::build_tree_nodes`, matches Go
+  `pkg/ui/tree.go` semantics) and a real `App.alerts` vector.
+- **bv CLI**: any `--robot-*` flag registered in the flag registry but not
+  yet dispatched fell through to silently launching the interactive TUI —
+  dangerous for a robot/agent/CI caller. Now fails fast, exit 2, clear
+  message, instead.
+- **bv-analysis** (new `label_health` module): `robot-label-health`,
+  `robot-label-flow`, `robot-label-attention` were dispatched but returned
+  **hardcoded empty JSON** — a fake "no data" success, worse than an error.
+  Ported the real algorithms from `pkg/analysis/label_health.go`: label
+  extraction/stats, velocity/freshness metrics, cross-label blocking-flow
+  with bottleneck detection, composite per-label health, PageRank/
+  betweenness-weighted attention ranking. One documented scope cut: attention
+  scoring sums the already-computed *global* PageRank over a label's issues
+  rather than re-running PageRank on an extracted per-label subgraph (Go's
+  `ComputeLabelSubgraph`/`ComputeLabelPageRank` — not ported, see below).
+
+### Confirmed remaining gaps (not fixed — do not assume otherwise)
+
+**Robot CLI** — ~31 of 47 `--robot-*` primaries in `flags::ROBOT_PRIMARIES`
+have no dispatch handler at all; they now correctly exit 2 via the A4
+fallback above instead of misbehaving, but the underlying commands don't
+exist yet. Roughly in build order of what's cheapest to unblock:
+- No new backing algorithm needed, just wiring: `robot-by-label`,
+  `robot-by-assignee`, `robot-not-ready-labels`, `robot-impact` (note: Go's
+  is "impact of modifying **files**", not `bv_analysis::impact` which scores
+  *issues* — don't wire these together without re-checking
+  `handleRobotImpact` in `cmd/bv/robot_registry.go`), `robot-blocker-chain`
+  (graph traversal), `robot-metrics`/`robot-docs`/`robot-schema`/
+  `robot-capabilities` (introspection — Go's versions embed large generated
+  text; a lower-fidelity but real Rust version is a reasonable first pass).
+- Needs a correlator pipeline that doesn't exist yet (primitives in
+  `bv-correlation` — `explicit.rs`, `temporal.rs`, `orphan.rs`, `scorer.rs`,
+  `feedback.rs` — exist, but nothing assembles them the way Go's
+  `pkg/correlation/correlator.go` does): `robot-explain-correlation`,
+  `robot-correlation-stats`, `robot-file-beads`, `robot-file-hotspots`,
+  `robot-file-relations`, `robot-search` (has `bv-search::hybrid`/`embedder`
+  primitives, same gap). `robot-confirm-correlation`/`robot-reject-correlation`
+  are the exception — `bv-correlation::feedback::FeedbackStore` already has
+  `record`/`load_all`, just needs CLI wiring.
+- Needs whole Go packages not ported at all: `robot-related`,
+  `robot-impact-network`, `robot-causality` (Go `pkg/correlation/cocommit.go`,
+  `causality.go`, `network.go` — no Rust equivalent in any crate).
+  `robot-sprint-list`, `robot-sprint-show`, `robot-forecast`,
+  `robot-capacity`, `robot-burndown` (no sprint/velocity data model exists
+  in `bv-core::model` at all — this needs design work, not just porting).
+- `robot-diff` needs `--diff-since` git-log comparison logic — not audited
+  yet.
+
+**TUI** (`crates/bv-tui`, ~2,940 lines vs Go `pkg/ui`'s ~24,000+): entire
+views missing or placeholder — Graph (`ViewMode::Graph` renders nothing,
+falls through to List), History/time-travel (`ViewMode::TimeTravel` same),
+Flow-Matrix, Attention, Sprint, real Tutorial (currently just re-renders the
+`?` help overlay under a different title), label/recipe/repo pickers,
+semantic search, velocity comparison, update/agent-prompt modals. No
+keybinding customization (`pkg/ui/keybindings.go` has no Rust counterpart —
+low priority).
+
+**Correlation** (`crates/bv-correlation`, 6 files vs Go `pkg/correlation`'s
+24): co-commit correlation, causality graph, network/related-work builder
+have no Rust module at all.
+
+**bv-search** (3 files vs Go `pkg/search`'s 14): vector index, lexical
+boost, presets, query adjustment, metrics cache — only the scoring
+primitives (`hybrid.rs`, `embedder.rs`) exist; no assembled search pipeline.
+
+None of the above should be treated as "safe to assume implemented" —
+verify against this list (or re-grep `flags::ROBOT_PRIMARIES` vs
+`main.rs`'s dispatch chain) before relying on a command's output.
