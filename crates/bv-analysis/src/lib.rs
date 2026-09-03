@@ -5,6 +5,7 @@ pub mod analyzer;
 pub mod cache;
 pub mod drift;
 pub mod impact;
+pub mod label_health;
 pub mod scoring;
 pub mod triage;
 

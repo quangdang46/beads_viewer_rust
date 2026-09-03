@@ -1394,28 +1394,42 @@ fn run_robot_recipes() -> ExitCode {
 }
 
 fn run_robot_label_health() -> ExitCode {
-    let (_, hash, _p1, _status, _g) = match load_and_analyze() {
+    let (issues, hash, _p1, _status, _g) = match load_and_analyze() {
         Ok(x) => x,
         Err(code) => return code,
     };
+    let cfg = bv_analysis::label_health::LabelHealthConfig::default();
+    let results = bv_analysis::label_health::compute_all_label_health(&issues, &cfg, jiff::Timestamp::now());
     let mut payload = envelope_json(&hash);
-    payload["analysis_config"] = serde_json::json!({});
-    payload["results"] = serde_json::json!({"labels": []});
+    payload["analysis_config"] = serde_json::to_value(&cfg).unwrap_or_default();
+    payload["results"] = serde_json::to_value(&results).unwrap_or_default();
+    payload["usage_hints"] = serde_json::json!([
+        "jq '.results.summaries | sort_by(.health) | .[:3]' - Critical labels",
+        "jq '.results.labels[] | select(.health_level == \"critical\")' - Critical details",
+        "jq '.results.attention_needed' - Labels needing attention",
+    ]);
     emit_json(&payload)
 }
 
 fn run_robot_label_flow() -> ExitCode {
-    let (_, hash, _p1, _status, _g) = match load_and_analyze() {
+    let (issues, hash, _p1, _status, _g) = match load_and_analyze() {
         Ok(x) => x,
         Err(code) => return code,
     };
+    let cfg = bv_analysis::label_health::LabelHealthConfig::default();
+    let flow = bv_analysis::label_health::compute_cross_label_flow(&issues, &cfg);
     let mut payload = envelope_json(&hash);
-    payload["flow"] = serde_json::json!({"matrix": {}, "bottleneck_labels": []});
+    payload["flow"] = serde_json::to_value(&flow).unwrap_or_default();
+    payload["analysis_config"] = serde_json::to_value(&cfg).unwrap_or_default();
+    payload["usage_hints"] = serde_json::json!([
+        "jq '.flow.bottleneck_labels' - labels blocking the most others",
+        "jq '.flow.flow_matrix' - raw matrix (row=from, col=to, align with .flow.labels)",
+    ]);
     emit_json(&payload)
 }
 
 fn run_robot_label_attention() -> ExitCode {
-    let (_, hash) = match bv_core::discovery::load_issues_from_repo(
+    let (issues, hash) = match bv_core::discovery::load_issues_from_repo(
         &std::env::current_dir().unwrap_or_default(),
     ) {
         Ok((issues, _)) => {
@@ -1427,8 +1441,13 @@ fn run_robot_label_attention() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    let cfg = bv_analysis::label_health::LabelHealthConfig::default();
+    let result = bv_analysis::label_health::compute_label_attention_scores(&issues, &cfg, jiff::Timestamp::now());
     let mut payload = envelope_json(&hash);
-    payload["labels"] = serde_json::json!([]);
+    payload["labels"] = serde_json::to_value(&result.labels).unwrap_or_default();
+    payload["top_attention"] = serde_json::to_value(&result.top_attention).unwrap_or_default();
+    payload["low_attention"] = serde_json::to_value(&result.low_attention).unwrap_or_default();
+    payload["total_labels"] = serde_json::json!(result.total_labels);
     emit_json(&payload)
 }
 
