@@ -367,6 +367,24 @@ th {{ background: #44475a; }}
         }
     }
 
+    // Any recognized `--robot-*` primary that reached this point is a real
+    // command (per the flag registry / robot-help) whose dispatch handler
+    // hasn't landed yet. Go never falls through to the TUI for a robot
+    // invocation — fail fast with a clear, scriptable error instead of
+    // silently starting the interactive TUI (which a robot/agent caller has
+    // no way to drive and would just hang or block CI).
+    if let Some(unhandled) = flags::ROBOT_PRIMARIES
+        .iter()
+        .find(|f| f.name != "robot-help" && presence.has(f.name))
+    {
+        eprintln!(
+            "Error: --{} is registered but not yet implemented in bvr",
+            unhandled.name
+        );
+        eprintln!("Usage: bvr --robot-help  (see robot-help for currently-dispatched commands)");
+        return ExitCode::from(2);
+    }
+
     // Interactive TUI: no robot flags present.
     let cwd = std::env::current_dir().unwrap_or_default();
 

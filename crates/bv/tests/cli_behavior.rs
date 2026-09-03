@@ -30,6 +30,16 @@ fn modifier_violation_exits_one() {
 }
 
 #[test]
+fn undispatched_robot_command_fails_fast_instead_of_launching_tui() {
+    // --robot-search is a registered primary (flags::ROBOT_PRIMARIES) with no
+    // dispatch handler yet; it must error with exit 2, not fall through to
+    // the interactive TUI (which would hang this test / any CI runner).
+    let (code, _, stderr) = run(&["--robot-search", "--search", "foo"]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("not yet implemented"), "{stderr}");
+}
+
+#[test]
 fn exclusive_primaries_exit_one() {
     let (code, _, stderr) = run(&["--robot-triage", "--robot-next"]);
     assert_eq!(code, 1);

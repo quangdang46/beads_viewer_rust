@@ -126,6 +126,12 @@ pub struct App {
     pub alerts_critical: usize,
     pub alerts_warning: usize,
     pub alerts_total: usize,
+    /// The actual alert messages backing the counts above, for the Alerts view.
+    pub alerts: Vec<bv_analysis::drift::Alert>,
+    /// Collapsed node ids in the Tree view (all nodes start expanded).
+    pub tree_collapsed: std::collections::HashSet<String>,
+    /// Cursor position within the Alerts view list.
+    pub alerts_cursor: usize,
     /// When the snapshot was loaded (freshness badge, Go bv-h305)
     pub loaded_at: std::time::Instant,
     /// PID of another live instance holding .beads/.bv.lock (Go bv-vrvn)
@@ -190,6 +196,40 @@ fn cass_installed() -> bool {
 
 /// Acquire the instance lock in .beads/.bv.lock (Go instance.NewLock, bv-vrvn).
 /// Returns PID of another live instance if one holds the lock.
+/// Best-effort cross-platform liveness check for a PID.
+/// Unix: `kill -0 <pid>` (signal 0 — no-op, only checks permission/existence).
+/// Windows: `kill` doesn't exist as a binary, so shell out to `tasklist` and
+/// check whether the PID shows up in its filtered output.
+#[cfg(unix)]
+fn is_process_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn is_process_alive(pid: u32) -> bool {
+    std::process::Command::new("tasklist")
+        .args(["/NH", "/FO", "CSV", "/FI", &format!("PID eq {pid}")])
+        .output()
+        .map(|out| {
+            out.status.success()
+                && String::from_utf8_lossy(&out.stdout).contains(&format!("\"{pid}\""))
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_process_alive(_pid: u32) -> bool {
+    // Unknown platform: assume dead so stale locks get reclaimed rather than
+    // wedging the TUI forever.
+    false
+}
+
 pub fn acquire_instance_lock(beads_dir: &std::path::Path) -> Option<u32> {
     let lock_path = beads_dir.join(".bv.lock");
     let my_pid = std::process::id();
@@ -213,16 +253,10 @@ pub fn acquire_instance_lock(beads_dir: &std::path::Path) -> Option<u32> {
                     .nth(1)
                     .and_then(|p| p.trim().parse::<u32>().ok())
             });
+            // If we already hold the lock (re-entrant acquire, or a stale write
+            // from a previous run of this same process), it's trivially "alive".
             let alive = holder
-                .map(|pid| {
-                    std::process::Command::new("kill")
-                        .args(["-0", &pid.to_string()])
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status()
-                        .map(|s| s.success())
-                        .unwrap_or(false)
-                })
+                .map(|pid| pid == my_pid || is_process_alive(pid))
                 .unwrap_or(false);
             if alive {
                 holder
@@ -263,9 +297,16 @@ impl App {
         // Compute proactive alerts (Go computeAlerts): cycles-driven drift
         let g_alerts = bv_analysis::build_graph(&issues);
         let has_cycle = bv_graph_core::algorithms::cycles::has_cycles(&g_alerts);
-        let (mut a_crit, mut a_warn, a_info) = (0usize, 0usize, 0usize);
+        let mut alerts: Vec<bv_analysis::drift::Alert> = Vec::new();
         if has_cycle {
-            a_crit = 1; // one critical alert for cycles (Go pushes one alert per check)
+            alerts.push(bv_analysis::drift::Alert {
+                alert_type: bv_analysis::drift::AlertType::NewCycle,
+                severity: bv_analysis::drift::Severity::Critical,
+                message: "Dependency cycle detected in the issue graph".into(),
+                baseline_val: None,
+                current_val: None,
+                delta: None,
+            });
         }
         // Staleness check: open issues untouched for a long time (Go drift engine check)
         let now = jiff::Timestamp::now();
@@ -280,13 +321,31 @@ impl App {
                     if let Ok(t) = updated.parse::<jiff::Timestamp>() {
                         let age = now.since(t).map(|d| d.get_days()).unwrap_or(0);
                         if age > 30 {
-                            a_warn += 1;
+                            alerts.push(bv_analysis::drift::Alert {
+                                alert_type: bv_analysis::drift::AlertType::BlockedIncrease,
+                                severity: bv_analysis::drift::Severity::Warning,
+                                message: format!(
+                                    "{} has been stale for {age} days ({:?})",
+                                    i.id, i.status
+                                ),
+                                baseline_val: None,
+                                current_val: Some(age as f64),
+                                delta: None,
+                            });
                         }
                     }
                 }
             }
         }
-        let alerts_total = a_crit + a_warn + a_info;
+        let a_crit = alerts
+            .iter()
+            .filter(|a| a.severity == bv_analysis::drift::Severity::Critical)
+            .count();
+        let a_warn = alerts
+            .iter()
+            .filter(|a| a.severity == bv_analysis::drift::Severity::Warning)
+            .count();
+        let alerts_total = alerts.len();
         let rows: Vec<ListRow> = issues
             .iter()
             .map(|i| ListRow {
@@ -308,6 +367,9 @@ impl App {
             alerts_critical: a_crit,
             alerts_warning: a_warn,
             alerts_total,
+            alerts,
+            tree_collapsed: std::collections::HashSet::new(),
+            alerts_cursor: 0,
             filtered_indices: Vec::new(),
             cursor: 0,
             filter_mode: FilterMode::All,
@@ -898,7 +960,9 @@ fn age_str(created_at: &Option<String>) -> String {
 pub fn render(f: &mut Frame, app: &App) {
     match app.current_view {
         ViewMode::Tree => {
-            let lines = crate::views::tree::render_tree_lines(&[]);
+            let issues: Vec<bv_core::model::Issue> = app.issue_map.values().cloned().collect();
+            let nodes = crate::views::tree::build_tree_nodes(&issues, &app.tree_collapsed);
+            let lines = crate::views::tree::render_tree_lines(&nodes);
             let block = ratatui::widgets::Block::default()
                 .borders(ratatui::widgets::Borders::ALL)
                 .title(" TREE VIEW ");
@@ -921,7 +985,7 @@ pub fn render(f: &mut Frame, app: &App) {
             return;
         }
         ViewMode::Alerts => {
-            crate::views::alerts::render_alerts(f, &[], 0, f.area());
+            crate::views::alerts::render_alerts(f, &app.alerts, app.alerts_cursor, f.area());
             render_status_bar(f, app);
             return;
         }

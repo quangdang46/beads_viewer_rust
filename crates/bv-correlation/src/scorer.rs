@@ -61,40 +61,28 @@ pub fn clamp_to_method(method: Method, confidence: f64) -> f64 {
     confidence.clamp(min, max)
 }
 
-/// Go: `CombineConfidence` — highest-confidence signal is the base; each
-/// additional independent signal adds headroom × 0.1 × its score, capped 0.99.
+/// Go: `Scorer.CombineConfidence` — sorts raw confidences descending, uses
+/// the highest as the base, then folds in each remaining signal with a
+/// diminishing boost (`headroom * 0.1 * score`, headroom recomputed against
+/// the *running* base after each fold), capped at 0.99. No per-method
+/// clamping happens inside the combiner — `ValidateConfidence`/
+/// `clamp_to_method` is a separate, single-signal check in Go.
 pub fn combine_confidence(signals: &[(Method, f64)]) -> f64 {
     if signals.is_empty() {
         return 0.0;
     }
-    // Base = max by confidence.
-    let mut best_idx = 0;
-    for (i, &(_, c)) in signals.iter().enumerate() {
-        if c > signals[best_idx].1 {
-            best_idx = i;
-        }
+    if signals.len() == 1 {
+        return signals[0].1;
     }
-    let base = clamp_to_method(signals[best_idx].0, signals[best_idx].1);
-    let (_base_min, base_max) = signals[best_idx].0.range();
-    let headroom = base_max - base;
+    let mut scores: Vec<f64> = signals.iter().map(|&(_, c)| c).collect();
+    scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
 
-    let mut combined = base;
-    for (i, &(method, score)) in signals.iter().enumerate() {
-        if i == best_idx {
-            continue;
-        }
-        let clamped = clamp_to_method(method, score);
-        // normalized position within the extra method's own range
-        let (min, max) = method.range();
-        let span = max - min;
-        let pos = if span > 0.0 {
-            (clamped - min) / span
-        } else {
-            0.0
-        };
-        combined += headroom * 0.1 * pos;
+    let mut base = scores[0];
+    for &score in &scores[1..] {
+        let headroom = 1.0 - base;
+        base += headroom * 0.1 * score;
     }
-    combined.min(0.99)
+    base.min(0.99)
 }
 
 /// Signal weights for multi-signal correlation ranking
@@ -116,13 +104,14 @@ mod tests {
     }
 
     #[test]
-    fn combine_single_signal_is_clamped_base() {
+    fn combine_single_signal_passes_through_unclamped() {
+        // Go: `len(signals) == 1` returns the raw confidence, no clamping —
+        // clamping is a separate concern (`ValidateConfidence`).
         let s = vec![(Method::ExplicitId, 0.95)];
         let c = combine_confidence(&s);
         assert!((c - 0.95).abs() < 1e-9);
-        // out-of-range input gets clamped into [0.70, 0.99]
         let s2 = vec![(Method::ExplicitId, 0.50)];
-        assert!((combine_confidence(&s2) - 0.70).abs() < 1e-9);
+        assert!((combine_confidence(&s2) - 0.50).abs() < 1e-9);
     }
 
     #[test]

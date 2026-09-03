@@ -197,7 +197,7 @@ pub fn discover_repos(config: &WorkspaceConfig, root: &Path) -> Vec<RepoConfig> 
             }
             let rel = c
                 .strip_prefix(root)
-                .map(|p| p.to_string_lossy().to_string())
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
                 .unwrap_or_default();
             if rel.is_empty() || found.iter().any(|r| r.path == rel) {
                 continue;
