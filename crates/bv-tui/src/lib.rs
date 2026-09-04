@@ -146,6 +146,8 @@ pub struct App {
     pub graph_data: Option<crate::views::graph::GraphData>,
     /// History/time-travel view state.
     pub history: Option<crate::views::history::HistoryState>,
+    /// Label picker state.
+    pub label_picker: Option<crate::views::pickers::LabelPicker>,
     /// Sprint dashboard state (loaded from .beads/sprints.jsonl).
     pub sprint: Option<crate::views::sprint::SprintState>,
     /// When the snapshot was loaded (freshness badge, Go bv-h305)
@@ -397,6 +399,7 @@ impl App {
             graph_scroll: 0,
             graph_data: None,
             history: None,
+            label_picker: None,
             sprint: None,
             filtered_indices: Vec::new(),
             cursor: 0,
