@@ -150,7 +150,8 @@ fn robot_file_hotspots_runs_without_crashing() {
 
 #[test]
 fn robot_causality_runs_for_real_bead() {
-    let (code, stdout, _) = run_at_repo_root(&["--robot-causality", "beads_viewer_rust-api-freeze-b73"]);
+    let (code, stdout, _) =
+        run_at_repo_root(&["--robot-causality", "beads_viewer_rust-api-freeze-b73"]);
     assert_eq!(code, 0);
     assert!(stdout.contains("\"chain\""));
     assert!(stdout.contains("\"insights\""));
@@ -166,12 +167,16 @@ fn robot_causality_unknown_bead_exits_one() {
 
 #[test]
 fn robot_related_builds_dependency_edges() {
-    let (code, stdout, _) = run_at_repo_root(&["--robot-related", "beads_viewer_rust-api-freeze-b73"]);
+    let (code, stdout, _) =
+        run_at_repo_root(&["--robot-related", "beads_viewer_rust-api-freeze-b73"]);
     assert_eq!(code, 0);
     assert!(stdout.contains("\"related\""));
     let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
     let related = parsed["related"].as_array().expect("array");
-    assert!(!related.is_empty(), "should find at least one dependency edge");
+    assert!(
+        !related.is_empty(),
+        "should find at least one dependency edge"
+    );
     assert_eq!(parsed["bead_id"], "beads_viewer_rust-api-freeze-b73");
 }
 
@@ -219,14 +224,21 @@ fn robot_capacity_runs_without_crashing() {
 
 #[test]
 fn robot_explain_correlation_bad_format_exits_two() {
-    let (code, _, stderr) = run_at_repo_root(&["--robot-explain-correlation", "not-a-valid-format"]);
+    let (code, _, stderr) =
+        run_at_repo_root(&["--robot-explain-correlation", "not-a-valid-format"]);
     assert_eq!(code, 2);
     assert!(stderr.contains("expected format SHA:beadID"), "{stderr}");
 }
 
 #[test]
 fn robot_search_ranks_and_respects_limit() {
-    let (code, stdout, _) = run_at_repo_root(&["--robot-search", "--search", "triage", "--search-limit", "3"]);
+    let (code, stdout, _) = run_at_repo_root(&[
+        "--robot-search",
+        "--search",
+        "triage",
+        "--search-limit",
+        "3",
+    ]);
     assert_eq!(code, 0);
     assert!(stdout.contains("\"results\""));
     let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");

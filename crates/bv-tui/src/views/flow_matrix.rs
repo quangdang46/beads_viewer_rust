@@ -15,18 +15,17 @@ use ratatui::{
 
 /// Render the flow-matrix view: label list on the left with outgoing-dep
 /// bar charts, detail panel on the right for the selected label.
-pub fn render_flow_matrix(
-    f: &mut Frame,
-    flow: &CrossLabelFlow,
-    cursor: usize,
-    area: Rect,
-) {
+pub fn render_flow_matrix(f: &mut Frame, flow: &CrossLabelFlow, cursor: usize, area: Rect) {
     if flow.labels.is_empty() {
         let msg = Paragraph::new(Line::from(Span::styled(
             "No cross-label dependencies found",
             Style::default().fg(Color::DarkGray),
         )))
-        .block(Block::default().borders(Borders::ALL).title(" FLOW MATRIX "));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" FLOW MATRIX "),
+        );
         f.render_widget(msg, area);
         return;
     }
@@ -50,12 +49,18 @@ pub fn render_flow_matrix(
 
     let mut items: Vec<Line> = Vec::new();
     for (i, label) in flow.labels.iter().enumerate() {
-        let out: i64 = flow.flow_matrix.get(i).map(|row| row.iter().sum()).unwrap_or(0);
+        let out: i64 = flow
+            .flow_matrix
+            .get(i)
+            .map(|row| row.iter().sum())
+            .unwrap_or(0);
         let bar_width = ((out as f64 / max_out as f64) * 20.0) as usize;
         let bar: String = "\u{2588}".repeat(bar_width);
         let is_selected = i == cursor;
         let style = if is_selected {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
@@ -88,7 +93,10 @@ pub fn render_flow_matrix(
     detail_lines.push(Line::from(vec![
         Span::raw("Bottleneck: "),
         if is_bottleneck {
-            Span::styled("YES", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+            Span::styled(
+                "YES",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )
         } else {
             Span::styled("no", Style::default().fg(Color::DarkGray))
         },

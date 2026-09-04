@@ -213,9 +213,7 @@ fn render_bead_list(f: &mut Frame, state: &HistoryState, area: Rect) {
         HistoryMode::Git => " COMMITS ",
     };
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(mode_title);
+    let block = Block::default().borders(Borders::ALL).title(mode_title);
 
     let list = List::new(items).block(block);
     let mut list_state = ListState::default();
@@ -246,10 +244,7 @@ fn render_commit_detail(f: &mut Frame, state: &HistoryState, area: Rect) {
             format!(" Status: {}", bead.status),
             Style::default().fg(Color::DarkGray),
         )));
-        lines.push(Line::from(format!(
-            " Commits: {}",
-            bead.commits.len()
-        )));
+        lines.push(Line::from(format!(" Commits: {}", bead.commits.len())));
         lines.push(Line::from(""));
 
         // Commit list
@@ -298,7 +293,13 @@ fn render_commit_detail(f: &mut Frame, state: &HistoryState, area: Rect) {
 
                 // Show file count for selected commit
                 if is_selected && !commit.files.is_empty() {
-                    let files_str = commit.files.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+                    let files_str = commit
+                        .files
+                        .iter()
+                        .take(5)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     let more = if commit.files.len() > 5 {
                         format!(" +{} more", commit.files.len() - 5)
                     } else {
@@ -309,7 +310,11 @@ fn render_commit_detail(f: &mut Frame, state: &HistoryState, area: Rect) {
                         Style::default().fg(Color::DarkGray),
                     )));
                     lines.push(Line::from(Span::styled(
-                        format!("    Author: {} | Confidence: {:.0}%", commit.author, commit.confidence * 100.0),
+                        format!(
+                            "    Author: {} | Confidence: {:.0}%",
+                            commit.author,
+                            commit.confidence * 100.0
+                        ),
                         Style::default().fg(conf_color),
                     )));
                 }
@@ -327,7 +332,12 @@ fn render_commit_detail(f: &mut Frame, state: &HistoryState, area: Rect) {
         let timeline = state.build_timeline();
         for event in &timeline {
             match event {
-                TimelineEvent::Commit { short_sha, message, confidence, .. } => {
+                TimelineEvent::Commit {
+                    short_sha,
+                    message,
+                    confidence,
+                    ..
+                } => {
                     let color = if *confidence >= 0.8 {
                         Color::Green
                     } else if *confidence >= 0.5 {
@@ -336,11 +346,17 @@ fn render_commit_detail(f: &mut Frame, state: &HistoryState, area: Rect) {
                         Color::DarkGray
                     };
                     lines.push(Line::from(Span::styled(
-                        format!("  ● {short_sha} {} ({:.0}%)", truncate_str(message, 40), confidence * 100.0),
+                        format!(
+                            "  ● {short_sha} {} ({:.0}%)",
+                            truncate_str(message, 40),
+                            confidence * 100.0
+                        ),
                         Style::default().fg(color),
                     )));
                 }
-                TimelineEvent::Lifecycle { event_type, detail, .. } => {
+                TimelineEvent::Lifecycle {
+                    event_type, detail, ..
+                } => {
                     lines.push(Line::from(Span::styled(
                         format!("  ◆ {event_type}: {detail}"),
                         Style::default().fg(Color::Cyan),
@@ -359,9 +375,7 @@ fn render_commit_detail(f: &mut Frame, state: &HistoryState, area: Rect) {
         )));
     }
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" HISTORY ");
+    let block = Block::default().borders(Borders::ALL).title(" HISTORY ");
 
     let para = Paragraph::new(lines)
         .block(block)

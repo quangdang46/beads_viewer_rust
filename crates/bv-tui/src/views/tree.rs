@@ -30,7 +30,9 @@ pub fn build_tree_nodes(issues: &[Issue], collapsed: &HashSet<String>) -> Vec<Tr
 
     for issue in issues {
         for dep in &issue.dependencies {
-            if dep.r#type == DependencyType::ParentChild && by_id.contains_key(dep.depends_on_id.as_str()) {
+            if dep.r#type == DependencyType::ParentChild
+                && by_id.contains_key(dep.depends_on_id.as_str())
+            {
                 children_of
                     .entry(dep.depends_on_id.as_str())
                     .or_default()

@@ -25,7 +25,10 @@ pub fn load_sprints(repo_path: &Path) -> Result<Vec<Sprint>, String> {
         match serde_json::from_str::<Sprint>(line) {
             Ok(sprint) => sprints.push(sprint),
             Err(e) => {
-                eprintln!("Warning: skipping malformed sprint at line {}: {e}", line_num + 1);
+                eprintln!(
+                    "Warning: skipping malformed sprint at line {}: {e}",
+                    line_num + 1
+                );
             }
         }
     }
@@ -89,10 +92,7 @@ pub fn calculate_burndown(
     // Ideal line: linear from total to 0 over the sprint duration.
     let sprint_days = (secs_between(end, start) / 86400.0).max(1.0);
     for pt in &mut points {
-        let day_ts = pt
-            .date
-            .parse::<jiff::Timestamp>()
-            .unwrap_or(start);
+        let day_ts = pt.date.parse::<jiff::Timestamp>().unwrap_or(start);
         let day_offset = secs_between(day_ts, start) / 86400.0;
         pt.ideal = Some(total as f64 * (1.0 - day_offset / sprint_days));
     }

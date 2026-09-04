@@ -34,7 +34,13 @@ pub struct LabelPicker {
 impl LabelPicker {
     pub fn new(labels: Vec<LabelOption>) -> Self {
         let filtered: Vec<usize> = (0..labels.len()).collect();
-        LabelPicker { labels, filtered, selected: 0, filter_text: String::new(), visible: false }
+        LabelPicker {
+            labels,
+            filtered,
+            selected: 0,
+            filter_text: String::new(),
+            visible: false,
+        }
     }
 
     pub fn toggle(&mut self) {
@@ -52,7 +58,8 @@ impl LabelPicker {
 
     fn filter(&mut self) {
         let query = self.filter_text.to_lowercase();
-        self.filtered = self.labels
+        self.filtered = self
+            .labels
             .iter()
             .enumerate()
             .filter(|(_, l)| query.is_empty() || l.name.to_lowercase().contains(&query))
@@ -72,7 +79,9 @@ impl LabelPicker {
     }
 
     pub fn selected_label(&self) -> Option<&str> {
-        self.filtered.get(self.selected).map(|&i| self.labels[i].name.as_str())
+        self.filtered
+            .get(self.selected)
+            .map(|&i| self.labels[i].name.as_str())
     }
 
     pub fn render(&self, f: &mut Frame, area: Rect) {
@@ -80,7 +89,12 @@ impl LabelPicker {
         let popup_height = (self.filtered.len() as u16 + 4).min(area.height.saturating_sub(2));
         let x = (area.width.saturating_sub(popup_width)) / 2;
         let y = (area.height.saturating_sub(popup_height)) / 2;
-        let popup = Rect { x, y, width: popup_width, height: popup_height };
+        let popup = Rect {
+            x,
+            y,
+            width: popup_width,
+            height: popup_height,
+        };
 
         f.render_widget(Clear, popup);
 
@@ -99,7 +113,9 @@ impl LabelPicker {
         for &idx in &self.filtered[start..end] {
             let label = &self.labels[idx];
             let style = if idx == self.filtered[self.selected] {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };
@@ -114,7 +130,9 @@ impl LabelPicker {
             .title(" Label Filter ")
             .border_style(Style::default().fg(Color::Cyan));
 
-        let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+        let para = Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false });
         f.render_widget(para, popup);
     }
 }
@@ -136,12 +154,18 @@ pub struct RecipePicker {
 
 impl RecipePicker {
     pub fn new(recipes: Vec<RecipeOption>) -> Self {
-        RecipePicker { recipes, selected: 0, visible: false }
+        RecipePicker {
+            recipes,
+            selected: 0,
+            visible: false,
+        }
     }
 
     pub fn toggle(&mut self) {
         self.visible = !self.visible;
-        if self.visible { self.selected = 0; }
+        if self.visible {
+            self.selected = 0;
+        }
     }
 
     pub fn move_up(&mut self) {
@@ -163,14 +187,21 @@ impl RecipePicker {
         let popup_height = (self.recipes.len() as u16 + 4).min(area.height.saturating_sub(2));
         let x = (area.width.saturating_sub(popup_width)) / 2;
         let y = (area.height.saturating_sub(popup_height)) / 2;
-        let popup = Rect { x, y, width: popup_width, height: popup_height };
+        let popup = Rect {
+            x,
+            y,
+            width: popup_width,
+            height: popup_height,
+        };
 
         f.render_widget(Clear, popup);
 
         let mut lines: Vec<Line> = Vec::new();
         for (i, recipe) in self.recipes.iter().enumerate() {
             let style = if i == self.selected {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };
@@ -185,7 +216,9 @@ impl RecipePicker {
             .title(" Recipe Picker ")
             .border_style(Style::default().fg(Color::Cyan));
 
-        let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+        let para = Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false });
         f.render_widget(para, popup);
     }
 }
@@ -207,12 +240,18 @@ pub struct RepoPicker {
 
 impl RepoPicker {
     pub fn new(repos: Vec<RepoOption>) -> Self {
-        RepoPicker { repos, selected: 0, visible: false }
+        RepoPicker {
+            repos,
+            selected: 0,
+            visible: false,
+        }
     }
 
     pub fn toggle(&mut self) {
         self.visible = !self.visible;
-        if self.visible { self.selected = 0; }
+        if self.visible {
+            self.selected = 0;
+        }
     }
 
     pub fn move_up(&mut self) {
@@ -234,14 +273,21 @@ impl RepoPicker {
         let popup_height = (self.repos.len() as u16 + 4).min(area.height.saturating_sub(2));
         let x = (area.width.saturating_sub(popup_width)) / 2;
         let y = (area.height.saturating_sub(popup_height)) / 2;
-        let popup = Rect { x, y, width: popup_width, height: popup_height };
+        let popup = Rect {
+            x,
+            y,
+            width: popup_width,
+            height: popup_height,
+        };
 
         f.render_widget(Clear, popup);
 
         let mut lines: Vec<Line> = Vec::new();
         for (i, repo) in self.repos.iter().enumerate() {
             let style = if i == self.selected {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };
@@ -256,7 +302,9 @@ impl RepoPicker {
             .title(" Workspace Repo Picker ")
             .border_style(Style::default().fg(Color::Cyan));
 
-        let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+        let para = Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false });
         f.render_widget(para, popup);
     }
 }
@@ -268,9 +316,18 @@ mod tests {
     #[test]
     fn label_picker_navigation() {
         let labels = vec![
-            LabelOption { name: "backend".into(), count: 5 },
-            LabelOption { name: "frontend".into(), count: 3 },
-            LabelOption { name: "urgent".into(), count: 2 },
+            LabelOption {
+                name: "backend".into(),
+                count: 5,
+            },
+            LabelOption {
+                name: "frontend".into(),
+                count: 3,
+            },
+            LabelOption {
+                name: "urgent".into(),
+                count: 2,
+            },
         ];
         let mut picker = LabelPicker::new(labels);
         assert_eq!(picker.selected_label(), Some("backend"));
@@ -283,8 +340,14 @@ mod tests {
     #[test]
     fn label_picker_filter() {
         let labels = vec![
-            LabelOption { name: "backend".into(), count: 5 },
-            LabelOption { name: "frontend".into(), count: 3 },
+            LabelOption {
+                name: "backend".into(),
+                count: 5,
+            },
+            LabelOption {
+                name: "frontend".into(),
+                count: 3,
+            },
         ];
         let mut picker = LabelPicker::new(labels);
         picker.update_filter("front");
@@ -295,8 +358,16 @@ mod tests {
     #[test]
     fn recipe_picker_navigation() {
         let recipes = vec![
-            RecipeOption { name: "R1".into(), description: "desc".into(), labels: vec![] },
-            RecipeOption { name: "R2".into(), description: "desc".into(), labels: vec![] },
+            RecipeOption {
+                name: "R1".into(),
+                description: "desc".into(),
+                labels: vec![],
+            },
+            RecipeOption {
+                name: "R2".into(),
+                description: "desc".into(),
+                labels: vec![],
+            },
         ];
         let mut picker = RecipePicker::new(recipes);
         assert_eq!(picker.selected_recipe().unwrap().name, "R1");

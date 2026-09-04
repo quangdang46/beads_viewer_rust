@@ -15,12 +15,7 @@ use ratatui::{
 
 /// Render the attention view: ranked list of labels by attention score
 /// with visual bars and key details.
-pub fn render_attention(
-    f: &mut Frame,
-    labels: &[LabelAttentionScore],
-    cursor: usize,
-    area: Rect,
-) {
+pub fn render_attention(f: &mut Frame, labels: &[LabelAttentionScore], cursor: usize, area: Rect) {
     if labels.is_empty() {
         let msg = Paragraph::new(Line::from(Span::styled(
             "No label attention data available",
@@ -52,7 +47,9 @@ pub fn render_attention(
         let bar: String = "\u{2588}".repeat(bar_width);
         let is_selected = i == cursor;
         let style = if is_selected {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
         } else if lbl.attention_score > max_score * 0.5 {
             Style::default().fg(Color::Red)
         } else {
@@ -89,17 +86,32 @@ pub fn render_attention(
 
     detail_lines.push(Line::from(format!("Rank: {}/{}", lbl.rank, labels.len())));
     detail_lines.push(Line::from(format!("Score: {:.4}", lbl.attention_score)));
-    detail_lines.push(Line::from(format!("Normalized: {:.2}", lbl.normalized_score)));
+    detail_lines.push(Line::from(format!(
+        "Normalized: {:.2}",
+        lbl.normalized_score
+    )));
     detail_lines.push(Line::from(""));
 
     detail_lines.push(Line::from(Span::styled(
         "Components:",
         Style::default().add_modifier(Modifier::BOLD),
     )));
-    detail_lines.push(Line::from(format!("  PageRank sum: {:.4}", lbl.pagerank_sum)));
-    detail_lines.push(Line::from(format!("  Staleness:    {:.2}", lbl.staleness_factor)));
-    detail_lines.push(Line::from(format!("  Block impact: {:.0}", lbl.block_impact)));
-    detail_lines.push(Line::from(format!("  Velocity:     {:.2}", lbl.velocity_factor)));
+    detail_lines.push(Line::from(format!(
+        "  PageRank sum: {:.4}",
+        lbl.pagerank_sum
+    )));
+    detail_lines.push(Line::from(format!(
+        "  Staleness:    {:.2}",
+        lbl.staleness_factor
+    )));
+    detail_lines.push(Line::from(format!(
+        "  Block impact: {:.0}",
+        lbl.block_impact
+    )));
+    detail_lines.push(Line::from(format!(
+        "  Velocity:     {:.2}",
+        lbl.velocity_factor
+    )));
     detail_lines.push(Line::from(""));
 
     detail_lines.push(Line::from(format!("Open:     {}", lbl.open_count)));

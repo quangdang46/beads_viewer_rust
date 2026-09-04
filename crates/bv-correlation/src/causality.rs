@@ -120,7 +120,12 @@ pub fn build_causality_chain(bead_id: &str, events: &[BeadEvent]) -> Option<Caus
         .timestamp
         .parse::<jiff::Timestamp>()
         .ok()
-        .zip(mine[mine.len() - 1].timestamp.parse::<jiff::Timestamp>().ok())
+        .zip(
+            mine[mine.len() - 1]
+                .timestamp
+                .parse::<jiff::Timestamp>()
+                .ok(),
+        )
         .map(|(a, b)| (b - a).total(jiff::Unit::Second).unwrap_or(0.0).max(0.0))
         .unwrap_or(0.0);
     let is_complete = mine.iter().any(|e| e.event_type == EventType::Closed);
@@ -149,7 +154,11 @@ pub fn build_causality_chain(bead_id: &str, events: &[BeadEvent]) -> Option<Caus
         "{bead_id}: {} events over {:.1}h ({})",
         commit_count,
         total_duration_secs / 3600.0,
-        if is_complete { "complete" } else { "still open" }
+        if is_complete {
+            "complete"
+        } else {
+            "still open"
+        }
     );
 
     let mut recommendations = Vec::new();
@@ -162,7 +171,8 @@ pub fn build_causality_chain(bead_id: &str, events: &[BeadEvent]) -> Option<Caus
         }
     }
     if !is_complete {
-        recommendations.push("Bead is still open — no full-cycle insight available yet.".to_string());
+        recommendations
+            .push("Bead is still open — no full-cycle insight available yet.".to_string());
     }
 
     Some(CausalityResult {
@@ -224,10 +234,19 @@ mod tests {
 
     #[test]
     fn open_bead_is_not_complete_and_flags_it() {
-        let events = vec![event("A-2", EventType::Created, "2026-01-01T00:00:00Z", "sha1")];
+        let events = vec![event(
+            "A-2",
+            EventType::Created,
+            "2026-01-01T00:00:00Z",
+            "sha1",
+        )];
         let result = build_causality_chain("A-2", &events).unwrap();
         assert!(!result.chain.is_complete);
-        assert!(result.insights.recommendations.iter().any(|r| r.contains("still open")));
+        assert!(result
+            .insights
+            .recommendations
+            .iter()
+            .any(|r| r.contains("still open")));
     }
 
     #[test]

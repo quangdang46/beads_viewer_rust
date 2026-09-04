@@ -54,7 +54,10 @@ pub fn walk_commits(repo: &Path, limit: usize) -> Result<Vec<CommitInfo>, String
         .output()
         .map_err(|e| format!("spawning git: {e}"))?;
     if !out.status.success() {
-        return Err(format!("git log failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+        return Err(format!(
+            "git log failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
     }
     let text = String::from_utf8_lossy(&out.stdout).to_string();
     Ok(parse_commits(&text))
@@ -104,7 +107,10 @@ pub struct CorrelatedCommit {
 /// Correlate every commit against every issue. Returns commits grouped by
 /// bead ID, each entry carrying the combined confidence across whichever
 /// signals fired (explicit-ID mention and/or same-author temporal window).
-pub fn correlate(issues: &[Issue], commits: &[CommitInfo]) -> BTreeMap<String, Vec<CorrelatedCommit>> {
+pub fn correlate(
+    issues: &[Issue],
+    commits: &[CommitInfo],
+) -> BTreeMap<String, Vec<CorrelatedCommit>> {
     let patterns = IdPatterns::default();
     let by_id: BTreeMap<&str, &Issue> = issues.iter().map(|i| (i.id.as_str(), i)).collect();
     let mut report: BTreeMap<String, Vec<CorrelatedCommit>> = BTreeMap::new();
@@ -115,33 +121,49 @@ pub fn correlate(issues: &[Issue], commits: &[CommitInfo]) -> BTreeMap<String, V
         let mentioned_ids: std::collections::BTreeSet<&str> =
             mentions.iter().map(|m| m.bead_id.as_str()).collect();
         for bead_id in &mentioned_ids {
-            let Some(issue) = by_id.get(bead_id) else { continue };
-            let kind = mentions.iter().find(|m| m.bead_id == *bead_id).map(|m| m.kind);
+            let Some(issue) = by_id.get(bead_id) else {
+                continue;
+            };
+            let kind = mentions
+                .iter()
+                .find(|m| m.bead_id == *bead_id)
+                .map(|m| m.kind);
             let confidence = calculate_confidence(kind, mentions.len());
-            report.entry(issue.id.clone()).or_default().push(CorrelatedCommit {
-                sha: commit.sha.clone(),
-                bead_id: issue.id.clone(),
-                confidence,
-                methods: vec!["explicit_id"],
-                reason: format!("commit message references {bead_id}"),
-                timestamp: commit.timestamp.clone(),
-                author: commit.author.clone(),
-                files: commit.files.clone(),
-            });
+            report
+                .entry(issue.id.clone())
+                .or_default()
+                .push(CorrelatedCommit {
+                    sha: commit.sha.clone(),
+                    bead_id: issue.id.clone(),
+                    confidence,
+                    methods: vec!["explicit_id"],
+                    reason: format!("commit message references {bead_id}"),
+                    timestamp: commit.timestamp.clone(),
+                    author: commit.author.clone(),
+                    files: commit.files.clone(),
+                });
         }
 
         // 2. Temporal signal: same author committing within the issue's
         // active window (created_at..closed_at, or created_at..now for
         // still-open issues), skipped for issues already matched above.
-        let Ok(commit_ts) = commit.timestamp.parse::<jiff::Timestamp>() else { continue };
+        let Ok(commit_ts) = commit.timestamp.parse::<jiff::Timestamp>() else {
+            continue;
+        };
         for issue in issues {
             if mentioned_ids.contains(issue.id.as_str()) {
                 continue;
             }
-            if issue.assignee.is_empty() || issue.assignee != commit.author && issue.assignee != commit.author_email {
+            if issue.assignee.is_empty()
+                || issue.assignee != commit.author && issue.assignee != commit.author_email
+            {
                 continue;
             }
-            let Some(created) = issue.created_at.as_deref().and_then(|s| s.parse::<jiff::Timestamp>().ok()) else {
+            let Some(created) = issue
+                .created_at
+                .as_deref()
+                .and_then(|s| s.parse::<jiff::Timestamp>().ok())
+            else {
                 continue;
             };
             let end = issue
@@ -152,7 +174,10 @@ pub fn correlate(issues: &[Issue], commits: &[CommitInfo]) -> BTreeMap<String, V
             if commit_ts < created || commit_ts > end {
                 continue;
             }
-            let window_secs = (end - created).total(jiff::Unit::Second).unwrap_or(0.0).max(0.0);
+            let window_secs = (end - created)
+                .total(jiff::Unit::Second)
+                .unwrap_or(0.0)
+                .max(0.0);
             let title_words: Vec<String> = issue
                 .title
                 .split_whitespace()
@@ -168,16 +193,19 @@ pub fn correlate(issues: &[Issue], commits: &[CommitInfo]) -> BTreeMap<String, V
                 window_duration: Duration::from_secs_f64(window_secs),
                 paths_match_hints,
             });
-            report.entry(issue.id.clone()).or_default().push(CorrelatedCommit {
-                sha: commit.sha.clone(),
-                bead_id: issue.id.clone(),
-                confidence,
-                methods: vec!["temporal_author"],
-                reason: format!("same author active during {}'s open window", issue.id),
-                timestamp: commit.timestamp.clone(),
-                author: commit.author.clone(),
-                files: commit.files.clone(),
-            });
+            report
+                .entry(issue.id.clone())
+                .or_default()
+                .push(CorrelatedCommit {
+                    sha: commit.sha.clone(),
+                    bead_id: issue.id.clone(),
+                    confidence,
+                    methods: vec!["temporal_author"],
+                    reason: format!("same author active during {}'s open window", issue.id),
+                    timestamp: commit.timestamp.clone(),
+                    author: commit.author.clone(),
+                    files: commit.files.clone(),
+                });
         }
     }
 
@@ -189,7 +217,11 @@ pub fn correlate(issues: &[Issue], commits: &[CommitInfo]) -> BTreeMap<String, V
     // combine a bead's per-commit confidences into one overall score (used
     // by `robot-explain-correlation`), not needed for per-commit dedup.
     for commits in report.values_mut() {
-        commits.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+        commits.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
     }
 
     report
@@ -209,7 +241,11 @@ mod tests {
             design: String::new(),
             acceptance_criteria: String::new(),
             notes: String::new(),
-            status: if closed.is_some() { Status::Closed } else { Status::Open },
+            status: if closed.is_some() {
+                Status::Closed
+            } else {
+                Status::Open
+            },
             priority: 2,
             issue_type: "task".into(),
             assignee: assignee.to_string(),
@@ -243,8 +279,20 @@ mod tests {
 
     #[test]
     fn explicit_mention_correlates_regardless_of_author() {
-        let issues = vec![issue("PROJ-1", "fix login bug", "", "2026-01-01T00:00:00Z", None)];
-        let commits = vec![commit("sha1", "2026-01-02T00:00:00Z", "anyone", "fixes PROJ-1", &["a.rs"])];
+        let issues = vec![issue(
+            "PROJ-1",
+            "fix login bug",
+            "",
+            "2026-01-01T00:00:00Z",
+            None,
+        )];
+        let commits = vec![commit(
+            "sha1",
+            "2026-01-02T00:00:00Z",
+            "anyone",
+            "fixes PROJ-1",
+            &["a.rs"],
+        )];
         let report = correlate(&issues, &commits);
         let hits = report.get("PROJ-1").expect("correlated");
         assert_eq!(hits.len(), 1);
@@ -254,10 +302,28 @@ mod tests {
 
     #[test]
     fn temporal_signal_requires_assignee_match() {
-        let issues = vec![issue("PROJ-2", "refactor db layer", "alice", "2026-01-01T00:00:00Z", Some("2026-01-03T00:00:00Z"))];
+        let issues = vec![issue(
+            "PROJ-2",
+            "refactor db layer",
+            "alice",
+            "2026-01-01T00:00:00Z",
+            Some("2026-01-03T00:00:00Z"),
+        )];
         let commits = vec![
-            commit("sha2", "2026-01-02T00:00:00Z", "alice", "misc cleanup", &["db.rs"]),
-            commit("sha3", "2026-01-02T00:00:00Z", "bob", "misc cleanup", &["db.rs"]),
+            commit(
+                "sha2",
+                "2026-01-02T00:00:00Z",
+                "alice",
+                "misc cleanup",
+                &["db.rs"],
+            ),
+            commit(
+                "sha3",
+                "2026-01-02T00:00:00Z",
+                "bob",
+                "misc cleanup",
+                &["db.rs"],
+            ),
         ];
         let report = correlate(&issues, &commits);
         let hits = report.get("PROJ-2").expect("correlated");
@@ -267,16 +333,40 @@ mod tests {
 
     #[test]
     fn commit_outside_window_does_not_correlate() {
-        let issues = vec![issue("PROJ-3", "task", "alice", "2026-01-01T00:00:00Z", Some("2026-01-02T00:00:00Z"))];
-        let commits = vec![commit("sha4", "2026-06-01T00:00:00Z", "alice", "unrelated", &["x.rs"])];
+        let issues = vec![issue(
+            "PROJ-3",
+            "task",
+            "alice",
+            "2026-01-01T00:00:00Z",
+            Some("2026-01-02T00:00:00Z"),
+        )];
+        let commits = vec![commit(
+            "sha4",
+            "2026-06-01T00:00:00Z",
+            "alice",
+            "unrelated",
+            &["x.rs"],
+        )];
         let report = correlate(&issues, &commits);
         assert!(!report.contains_key("PROJ-3"));
     }
 
     #[test]
     fn no_signals_yields_no_entry() {
-        let issues = vec![issue("PROJ-4", "task", "alice", "2026-01-01T00:00:00Z", None)];
-        let commits = vec![commit("sha5", "2026-01-02T00:00:00Z", "bob", "unrelated work", &["y.rs"])];
+        let issues = vec![issue(
+            "PROJ-4",
+            "task",
+            "alice",
+            "2026-01-01T00:00:00Z",
+            None,
+        )];
+        let commits = vec![commit(
+            "sha5",
+            "2026-01-02T00:00:00Z",
+            "bob",
+            "unrelated work",
+            &["y.rs"],
+        )];
         let report = correlate(&issues, &commits);
         assert!(!report.contains_key("PROJ-4"));
     }

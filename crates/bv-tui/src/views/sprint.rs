@@ -120,10 +120,7 @@ pub fn render_sprint(
             format!("blocked={} ", blocked),
             Style::default().fg(Color::Red),
         ),
-        Span::styled(
-            format!("open={}", open),
-            Style::default().fg(Color::White),
-        ),
+        Span::styled(format!("open={}", open), Style::default().fg(Color::White)),
     ]));
     lines.push(Line::from(""));
 
@@ -158,7 +155,11 @@ fn render_sprint_header(f: &mut Frame, state: &SprintState, area: Rect) {
         .iter()
         .enumerate()
         .map(|(i, s)| {
-            let marker = if i == state.selected_idx { "▶ " } else { "  " };
+            let marker = if i == state.selected_idx {
+                "▶ "
+            } else {
+                "  "
+            };
             let style = if i == state.selected_idx {
                 Style::default()
                     .fg(Color::Yellow)
@@ -166,16 +167,11 @@ fn render_sprint_header(f: &mut Frame, state: &SprintState, area: Rect) {
             } else {
                 Style::default().fg(Color::White)
             };
-            Line::from(Span::styled(
-                format!("{}{}", marker, s.name),
-                style,
-            ))
+            Line::from(Span::styled(format!("{}{}", marker, s.name), style))
         })
         .collect();
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Sprints ");
+    let block = Block::default().borders(Borders::ALL).title(" Sprints ");
 
     let para = Paragraph::new(items).block(block);
     f.render_widget(para, area);
@@ -231,14 +227,8 @@ fn render_progress_bar(lines: &mut Vec<Line>, total: usize, closed: usize, width
 
     lines.push(Line::from(vec![
         Span::styled("  Progress:  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            "█".repeat(filled),
-            Style::default().fg(Color::Green),
-        ),
-        Span::styled(
-            "░".repeat(empty),
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled("█".repeat(filled), Style::default().fg(Color::Green)),
+        Span::styled("░".repeat(empty), Style::default().fg(Color::DarkGray)),
         Span::raw(format!(" {}/{} ({:.0}%)", closed, total, pct * 100.0)),
     ]));
 }
@@ -295,10 +285,7 @@ fn render_burndown(
             }
             lines.push(Line::raw(line_str));
         }
-        lines.push(Line::raw(format!(
-            "    {}",
-            "─".repeat(chart_width + 1)
-        )));
+        lines.push(Line::raw(format!("    {}", "─".repeat(chart_width + 1))));
         lines.push(Line::from(Span::styled(
             "      · ideal  ● actual",
             Style::default()
@@ -314,16 +301,9 @@ fn render_burndown(
     lines.push(Line::from(""));
 }
 
-fn render_bead_list(
-    lines: &mut Vec<Line>,
-    issues: &[&bv_core::model::Issue],
-    limit: usize,
-) {
+fn render_bead_list(lines: &mut Vec<Line>, issues: &[&bv_core::model::Issue], limit: usize) {
     let label = Style::default().fg(Color::DarkGray);
-    lines.push(Line::from(Span::styled(
-        "  Beads in Sprint:",
-        label,
-    )));
+    lines.push(Line::from(Span::styled("  Beads in Sprint:", label)));
 
     let display_limit = limit.min(issues.len());
     for iss in issues.iter().take(display_limit) {
@@ -352,7 +332,9 @@ fn render_bead_list(
 
 fn short_date(s: &str) -> String {
     // "2026-01-15T00:00:00Z" -> "Jan 15"
-    let months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let months = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
     if s.len() >= 10 {
         if let (Ok(y), Ok(m), Ok(d)) = (
             s[0..4].parse::<i32>(),
@@ -439,7 +421,10 @@ mod tests {
                 updated_at: None,
             },
         ];
-        let mut state = SprintState { sprints, selected_idx: 0 };
+        let mut state = SprintState {
+            sprints,
+            selected_idx: 0,
+        };
         assert_eq!(state.selected().unwrap().id, "s1");
         state.move_down();
         assert_eq!(state.selected().unwrap().id, "s2");

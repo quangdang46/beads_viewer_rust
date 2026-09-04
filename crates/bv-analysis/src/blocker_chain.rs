@@ -51,7 +51,11 @@ pub fn open_blockers(by_id: &HashMap<&str, &Issue>, id: &str) -> Vec<String> {
     set.into_iter().collect()
 }
 
-fn is_transitively_blocked(by_id: &HashMap<&str, &Issue>, id: &str, visiting: &mut HashSet<String>) -> bool {
+fn is_transitively_blocked(
+    by_id: &HashMap<&str, &Issue>,
+    id: &str,
+    visiting: &mut HashSet<String>,
+) -> bool {
     if visiting.contains(id) {
         return false;
     }
@@ -237,14 +241,30 @@ pub fn get_blocker_chain(issues: &[Issue], issue_id: &str) -> Option<BlockerChai
         }
 
         for next_id in &blocker_open {
-            dfs(by_id, next_id, depth + 1, target_id, visited, visiting, result);
+            dfs(
+                by_id,
+                next_id,
+                depth + 1,
+                target_id,
+                visited,
+                visiting,
+                result,
+            );
         }
 
         visiting.remove(id);
         visited.insert(id.to_string());
     }
 
-    dfs(&by_id, issue_id, 0, issue_id, &mut visited, &mut visiting, &mut result);
+    dfs(
+        &by_id,
+        issue_id,
+        0,
+        issue_id,
+        &mut visited,
+        &mut visiting,
+        &mut result,
+    );
 
     result.chain_length = result.chain.len() as i64 - 1;
     result
@@ -336,7 +356,10 @@ mod tests {
         let root = issue("A-1", Status::Closed, "root");
         let issues = vec![root, target];
         let result = get_blocker_chain(&issues, "A-2").unwrap();
-        assert!(!result.is_blocked, "closed blocker must not count as blocking");
+        assert!(
+            !result.is_blocked,
+            "closed blocker must not count as blocking"
+        );
     }
 
     #[test]

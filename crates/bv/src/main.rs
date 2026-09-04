@@ -1485,7 +1485,8 @@ fn run_robot_recipes() -> ExitCode {
     emit_json(&payload)
 }
 
-type CorrelationReport = std::collections::BTreeMap<String, Vec<bv_correlation::correlator::CorrelatedCommit>>;
+type CorrelationReport =
+    std::collections::BTreeMap<String, Vec<bv_correlation::correlator::CorrelatedCommit>>;
 
 /// Go `robotSearch` dispatch block (main.go — computes `searchDispatchContext.SearchOutput`
 /// then calls the `robot-search` handler). `--search QUERY` required
@@ -1557,7 +1558,11 @@ fn run_robot_search(args: &[String]) -> ExitCode {
                 .and_then(|s| s.parse::<jiff::Timestamp>().ok())
                 .map(|t| now.since(t).map(|d| d.get_days()).unwrap_or(0) as f64)
                 .unwrap_or(0.0);
-            let components = bv_search::hybrid::ComponentScores::new(issue.status.as_str(), issue.priority, days_since_update);
+            let components = bv_search::hybrid::ComponentScores::new(
+                issue.status.as_str(),
+                issue.priority,
+                days_since_update,
+            );
             let score = bv_search::hybrid::hybrid_score(text_score, &weights, &components);
             results.push(serde_json::json!({
                 "issue_id": issue.id,
@@ -1568,7 +1573,10 @@ fn run_robot_search(args: &[String]) -> ExitCode {
             }));
         }
         results.sort_by(|a, b| {
-            b["score"].as_f64().partial_cmp(&a["score"].as_f64()).unwrap_or(std::cmp::Ordering::Equal)
+            b["score"]
+                .as_f64()
+                .partial_cmp(&a["score"].as_f64())
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
     } else {
         for issue in &issues {
@@ -1582,7 +1590,10 @@ fn run_robot_search(args: &[String]) -> ExitCode {
             }));
         }
         results.sort_by(|a, b| {
-            b["score"].as_f64().partial_cmp(&a["score"].as_f64()).unwrap_or(std::cmp::Ordering::Equal)
+            b["score"]
+                .as_f64()
+                .partial_cmp(&a["score"].as_f64())
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
     }
     results.truncate(limit);
@@ -1623,7 +1634,13 @@ fn run_robot_causality(args: &[String]) -> ExitCode {
         eprintln!("Bead not found: {bead_id}");
         return ExitCode::from(1);
     }
-    let events = match bv_correlation::extract(&cwd, &bv_correlation::ExtractOptions { limit: 1000, ..Default::default() }) {
+    let events = match bv_correlation::extract(
+        &cwd,
+        &bv_correlation::ExtractOptions {
+            limit: 1000,
+            ..Default::default()
+        },
+    ) {
         Ok(e) => e,
         Err(err) => {
             eprintln!("Error: extraction failed: {err}");
@@ -1811,7 +1828,10 @@ fn run_robot_sprint_show(args: &[String]) -> ExitCode {
             })
         })
         .collect();
-    let open_count = issue_details.iter().filter(|d| d["status"] != "closed" && d["status"] != "tombstone").count();
+    let open_count = issue_details
+        .iter()
+        .filter(|d| d["status"] != "closed" && d["status"] != "tombstone")
+        .count();
     let closed_count = issue_details.len() - open_count;
     let mut payload = envelope_json(&hash);
     payload["sprint"] = serde_json::to_value(sprint).unwrap_or_default();
@@ -1850,7 +1870,14 @@ fn run_robot_burndown(args: &[String]) -> ExitCode {
         sprints.iter().find(|s| s.is_active())
     };
     let Some(sprint) = target else {
-        eprintln!("No {} sprint found", if target_sprint_id.is_some() { "matching" } else { "active" });
+        eprintln!(
+            "No {} sprint found",
+            if target_sprint_id.is_some() {
+                "matching"
+            } else {
+                "active"
+            }
+        );
         return ExitCode::from(1);
     };
     let now = jiff::Timestamp::now();
@@ -1890,7 +1917,14 @@ fn run_robot_forecast(args: &[String]) -> ExitCode {
         sprints.iter().find(|s| s.is_active())
     };
     let Some(sprint) = target else {
-        eprintln!("No {} sprint found", if target_sprint_id.is_some() { "matching" } else { "active" });
+        eprintln!(
+            "No {} sprint found",
+            if target_sprint_id.is_some() {
+                "matching"
+            } else {
+                "active"
+            }
+        );
         return ExitCode::from(1);
     };
     let now = jiff::Timestamp::now();
@@ -1903,7 +1937,8 @@ fn run_robot_forecast(args: &[String]) -> ExitCode {
         }
         None => {
             payload["forecast"] = serde_json::json!(null);
-            payload["message"] = serde_json::json!("all sprint issues are closed — no forecast needed");
+            payload["message"] =
+                serde_json::json!("all sprint issues are closed — no forecast needed");
         }
     }
     emit_json(&payload)
@@ -1925,13 +1960,22 @@ fn run_robot_capacity(args: &[String]) -> ExitCode {
         }
     };
     let filtered: Vec<&bv_core::model::Issue> = if let Some(ref lbl) = label {
-        issues.iter().filter(|i| i.labels.iter().any(|l| l == lbl)).collect()
+        issues
+            .iter()
+            .filter(|i| i.labels.iter().any(|l| l == lbl))
+            .collect()
     } else {
         issues.iter().filter(|i| !i.status.is_closed()).collect()
     };
     let open_count = filtered.len();
-    let blocked_count = filtered.iter().filter(|i| i.status == bv_core::model::Status::Blocked).count();
-    let in_progress = filtered.iter().filter(|i| i.status == bv_core::model::Status::InProgress).count();
+    let blocked_count = filtered
+        .iter()
+        .filter(|i| i.status == bv_core::model::Status::Blocked)
+        .count();
+    let in_progress = filtered
+        .iter()
+        .filter(|i| i.status == bv_core::model::Status::InProgress)
+        .count();
     let avg_priority: f64 = if open_count > 0 {
         filtered.iter().map(|i| i.priority as f64).sum::<f64>() / open_count as f64
     } else {
@@ -1994,7 +2038,10 @@ fn run_robot_explain_correlation(args: &[String]) -> ExitCode {
         eprintln!("Bead not found in correlation report: {bead_id}");
         return ExitCode::from(1);
     };
-    let Some(hit) = commits.iter().find(|c| c.sha.to_lowercase().starts_with(&sha)) else {
+    let Some(hit) = commits
+        .iter()
+        .find(|c| c.sha.to_lowercase().starts_with(&sha))
+    else {
         eprintln!("Commit {sha} not found in bead {bead_id} correlations");
         return ExitCode::from(1);
     };
@@ -2070,8 +2117,10 @@ fn run_robot_file_beads(args: &[String]) -> ExitCode {
     };
     let mut beads: Vec<serde_json::Value> = Vec::new();
     for (bead_id, commits) in &report {
-        let touching: Vec<&bv_correlation::correlator::CorrelatedCommit> =
-            commits.iter().filter(|c| c.files.iter().any(|f| f == &path)).collect();
+        let touching: Vec<&bv_correlation::correlator::CorrelatedCommit> = commits
+            .iter()
+            .filter(|c| c.files.iter().any(|f| f == &path))
+            .collect();
         if !touching.is_empty() {
             let max_conf = touching.iter().map(|c| c.confidence).fold(0.0, f64::max);
             beads.push(serde_json::json!({
@@ -2108,7 +2157,10 @@ fn run_robot_file_hotspots() -> ExitCode {
     for (bead_id, commits) in &report {
         for c in commits {
             for f in &c.files {
-                per_file.entry(f.clone()).or_default().insert(bead_id.clone());
+                per_file
+                    .entry(f.clone())
+                    .or_default()
+                    .insert(bead_id.clone());
             }
         }
     }
@@ -2470,7 +2522,11 @@ fn run_robot_correlation_feedback(args: &[String], flag: &str, feedback_type: &s
 
     let mut payload = envelope_json(&hash);
     payload["feedback"] = serde_json::to_value(&fb).unwrap_or_default();
-    payload["status"] = serde_json::json!(if feedback_type == "confirm" { "confirmed" } else { "rejected" });
+    payload["status"] = serde_json::json!(if feedback_type == "confirm" {
+        "confirmed"
+    } else {
+        "rejected"
+    });
     payload["usage_hints"] = serde_json::json!([
         "This build does not yet cross-check the SHA against the bead's correlation \
          history (correlator pipeline not ported) — original_conf is always 0.0.",
@@ -2484,7 +2540,8 @@ fn run_robot_label_health() -> ExitCode {
         Err(code) => return code,
     };
     let cfg = bv_analysis::label_health::LabelHealthConfig::default();
-    let results = bv_analysis::label_health::compute_all_label_health(&issues, &cfg, jiff::Timestamp::now());
+    let results =
+        bv_analysis::label_health::compute_all_label_health(&issues, &cfg, jiff::Timestamp::now());
     let mut payload = envelope_json(&hash);
     payload["analysis_config"] = serde_json::to_value(&cfg).unwrap_or_default();
     payload["results"] = serde_json::to_value(&results).unwrap_or_default();
@@ -2527,7 +2584,11 @@ fn run_robot_label_attention() -> ExitCode {
         }
     };
     let cfg = bv_analysis::label_health::LabelHealthConfig::default();
-    let result = bv_analysis::label_health::compute_label_attention_scores(&issues, &cfg, jiff::Timestamp::now());
+    let result = bv_analysis::label_health::compute_label_attention_scores(
+        &issues,
+        &cfg,
+        jiff::Timestamp::now(),
+    );
     let mut payload = envelope_json(&hash);
     payload["labels"] = serde_json::to_value(&result.labels).unwrap_or_default();
     payload["top_attention"] = serde_json::to_value(&result.top_attention).unwrap_or_default();
@@ -2570,22 +2631,30 @@ fn run_robot_impact(args: &[String]) -> ExitCode {
     };
 
     // Build file→bead map from correlator report
-    let mut file_to_beads: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    let mut file_to_beads: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
     for (bead_id, commits) in &report {
         for c in commits {
             for f in &c.files {
-                file_to_beads.entry(f.clone()).or_default().push(bead_id.clone());
+                file_to_beads
+                    .entry(f.clone())
+                    .or_default()
+                    .push(bead_id.clone());
             }
         }
     }
 
     let mut affected_beads: Vec<serde_json::Value> = Vec::new();
-    let mut overlap_map: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    let mut overlap_map: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
 
     for file in &files {
         if let Some(beads) = file_to_beads.get(file) {
             for bead_id in beads {
-                overlap_map.entry(bead_id.clone()).or_default().push(file.clone());
+                overlap_map
+                    .entry(bead_id.clone())
+                    .or_default()
+                    .push(file.clone());
             }
         }
     }
@@ -2597,14 +2666,24 @@ fn run_robot_impact(args: &[String]) -> ExitCode {
             "overlap_count": overlap_files.len(),
         }));
     }
-    affected_beads.sort_by(|a, b| b["overlap_count"].as_u64().cmp(&a["overlap_count"].as_u64()));
+    affected_beads.sort_by(|a, b| {
+        b["overlap_count"]
+            .as_u64()
+            .cmp(&a["overlap_count"].as_u64())
+    });
 
     let risk_score = if affected_beads.is_empty() {
         0.0
     } else {
         (affected_beads.len() as f64 / 10.0).min(1.0)
     };
-    let risk_level = if risk_score >= 0.7 { "high" } else if risk_score >= 0.3 { "medium" } else { "low" };
+    let risk_level = if risk_score >= 0.7 {
+        "high"
+    } else if risk_score >= 0.3 {
+        "medium"
+    } else {
+        "low"
+    };
 
     let mut payload = envelope_json(&hash);
     payload["files"] = serde_json::json!(files);
@@ -2675,13 +2754,20 @@ fn run_robot_diff(args: &[String]) -> ExitCode {
             let curr_map: std::collections::HashMap<String, &bv_core::model::Issue> =
                 issues.iter().map(|i| (i.id.clone(), i)).collect();
 
-            let added: Vec<&bv_core::model::Issue> = issues.iter().filter(|i| !prev_map.contains_key(&i.id)).collect();
-            let removed: Vec<&bv_core::model::Issue> = prev.iter().filter(|i| !curr_map.contains_key(&i.id)).collect();
+            let added: Vec<&bv_core::model::Issue> = issues
+                .iter()
+                .filter(|i| !prev_map.contains_key(&i.id))
+                .collect();
+            let removed: Vec<&bv_core::model::Issue> = prev
+                .iter()
+                .filter(|i| !curr_map.contains_key(&i.id))
+                .collect();
             let changed: Vec<serde_json::Value> = issues
                 .iter()
                 .filter_map(|i| {
                     prev_map.get(&i.id).and_then(|pi| {
-                        if i.status != pi.status || i.title != pi.title || i.priority != pi.priority {
+                        if i.status != pi.status || i.title != pi.title || i.priority != pi.priority
+                        {
                             Some(serde_json::json!({
                                 "id": i.id,
                                 "status_change": if i.status != pi.status {
@@ -2700,7 +2786,8 @@ fn run_robot_diff(args: &[String]) -> ExitCode {
             let mut payload = envelope_json(&hash);
             payload["diff_ref"] = serde_json::json!(diff_ref);
             payload["added"] = serde_json::json!(added.iter().map(|i| &i.id).collect::<Vec<_>>());
-            payload["removed"] = serde_json::json!(removed.iter().map(|i| &i.id).collect::<Vec<_>>());
+            payload["removed"] =
+                serde_json::json!(removed.iter().map(|i| &i.id).collect::<Vec<_>>());
             payload["changed"] = serde_json::Value::Array(changed.clone());
             payload["added_count"] = serde_json::json!(added.len());
             payload["removed_count"] = serde_json::json!(removed.len());
@@ -2756,7 +2843,8 @@ fn run_robot_not_ready_labels(args: &[String]) -> ExitCode {
     payload["total_issues"] = serde_json::json!(issues.len());
     payload["excluded_count"] = serde_json::json!(excluded_count);
     payload["remaining_count"] = serde_json::json!(remaining.len());
-    payload["remaining_ids"] = serde_json::json!(remaining.iter().map(|i| &i.id).collect::<Vec<_>>());
+    payload["remaining_ids"] =
+        serde_json::json!(remaining.iter().map(|i| &i.id).collect::<Vec<_>>());
     payload["usage_hints"] = serde_json::json!([
         "This filters issues by label. Go's version integrates deeper into build_triage's claimability logic.",
     ]);

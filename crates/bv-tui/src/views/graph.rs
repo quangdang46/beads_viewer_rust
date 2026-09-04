@@ -31,7 +31,8 @@ pub struct GraphData {
 
 impl GraphData {
     pub fn build(issues: Vec<Issue>, metrics: Option<super::super::GraphMetrics>) -> Self {
-        let issue_map: HashMap<String, Issue> = issues.iter().map(|i| (i.id.clone(), i.clone())).collect();
+        let issue_map: HashMap<String, Issue> =
+            issues.iter().map(|i| (i.id.clone(), i.clone())).collect();
         let mut sorted_ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
         sorted_ids.sort();
 
@@ -41,9 +42,14 @@ impl GraphData {
         for issue in &issues {
             let mut my_blockers = Vec::new();
             for dep in &issue.dependencies {
-                if dep.r#type == DependencyType::Blocks && issue_map.contains_key(&dep.depends_on_id) {
+                if dep.r#type == DependencyType::Blocks
+                    && issue_map.contains_key(&dep.depends_on_id)
+                {
                     my_blockers.push(dep.depends_on_id.clone());
-                    dependents.entry(dep.depends_on_id.clone()).or_default().push(issue.id.clone());
+                    dependents
+                        .entry(dep.depends_on_id.clone())
+                        .or_default()
+                        .push(issue.id.clone());
                 }
             }
             my_blockers.sort();
@@ -53,7 +59,13 @@ impl GraphData {
             deps.sort();
         }
 
-        GraphData { issue_map, sorted_ids, blockers, dependents, metrics }
+        GraphData {
+            issue_map,
+            sorted_ids,
+            blockers,
+            dependents,
+            metrics,
+        }
     }
 }
 
@@ -66,8 +78,8 @@ pub fn render_graph(
     area: Rect,
 ) {
     if graph.sorted_ids.is_empty() {
-        let msg = Paragraph::new("No issues to display")
-            .style(Style::default().fg(Color::DarkGray));
+        let msg =
+            Paragraph::new("No issues to display").style(Style::default().fg(Color::DarkGray));
         f.render_widget(msg, area);
         return;
     }
@@ -160,7 +172,9 @@ fn render_visual_graph(f: &mut Frame, graph: &GraphData, selected_idx: usize, ar
     if !blocker_ids.is_empty() {
         lines.push(Line::from(Span::styled(
             "▲ BLOCKED BY (must complete first) ▲",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )));
         render_node_row(&mut lines, &blocker_ids, graph, area.width, false);
         render_connectors(&mut lines, blocker_ids.len());
@@ -182,11 +196,18 @@ fn render_visual_graph(f: &mut Frame, graph: &GraphData, selected_idx: usize, ar
         let top_border = format!("╔{}╗", "═".repeat(border_width.saturating_sub(2)));
         lines.push(Line::from(Span::styled(
             center_str(&top_border, area.width as usize),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(Span::styled(
-            center_str(&format!("║ {status_icon} {prio_icon} {type_icon} {truncated_id} ║"), area.width as usize),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            center_str(
+                &format!("║ {status_icon} {prio_icon} {type_icon} {truncated_id} ║"),
+                area.width as usize,
+            ),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         )));
         if !truncated_title.is_empty() {
             lines.push(Line::from(Span::styled(
@@ -201,7 +222,9 @@ fn render_visual_graph(f: &mut Frame, graph: &GraphData, selected_idx: usize, ar
         let bot_border = format!("╚{}╝", "═".repeat(border_width.saturating_sub(2)));
         lines.push(Line::from(Span::styled(
             center_str(&bot_border, area.width as usize),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         )));
     } else {
         lines.push(Line::from(Span::styled(
@@ -215,7 +238,9 @@ fn render_visual_graph(f: &mut Frame, graph: &GraphData, selected_idx: usize, ar
         render_connectors(&mut lines, dependent_ids.len());
         lines.push(Line::from(Span::styled(
             "▼ BLOCKS (waiting on this) ▼",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )));
         render_node_row(&mut lines, &dependent_ids, graph, area.width, false);
     }
@@ -230,12 +255,12 @@ fn render_visual_graph(f: &mut Frame, graph: &GraphData, selected_idx: usize, ar
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "j/k: navigate • enter: view details",
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
     )));
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" GRAPH VIEW ");
+    let block = Block::default().borders(Borders::ALL).title(" GRAPH VIEW ");
 
     let para = Paragraph::new(lines)
         .block(block)
@@ -259,7 +284,9 @@ fn render_node_row(
             let remaining = ids.len() - 5;
             lines.push(Line::from(Span::styled(
                 format!("  +{remaining} more"),
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
             )));
             break;
         }
@@ -280,12 +307,21 @@ fn render_node_row(
             Style::default().fg(color),
         )));
         // Content line
-        let content = format!("  │{icon} {display_id:<w$}│", w = box_width.saturating_sub(4));
-        lines.push(Line::from(Span::styled(content, Style::default().fg(color))));
+        let content = format!(
+            "  │{icon} {display_id:<w$}│",
+            w = box_width.saturating_sub(4)
+        );
+        lines.push(Line::from(Span::styled(
+            content,
+            Style::default().fg(color),
+        )));
         // Title
         if !title.is_empty() && box_width > 14 {
             let title_line = format!("  │{title:<w$}│", w = box_width.saturating_sub(4));
-            lines.push(Line::from(Span::styled(title_line, Style::default().fg(color))));
+            lines.push(Line::from(Span::styled(
+                title_line,
+                Style::default().fg(color),
+            )));
         }
         // Box bottom
         let border_bot = format!("└{}┘", "─".repeat(box_width.saturating_sub(2)));
@@ -356,20 +392,12 @@ fn render_metrics_panel(
     render_single_metric(lines, id, "Eigenvector", &metrics.eigenvector);
 }
 
-fn render_single_metric(
-    lines: &mut Vec<Line>,
-    id: &str,
-    name: &str,
-    map: &BTreeMap<String, f64>,
-) {
+fn render_single_metric(lines: &mut Vec<Line>, id: &str, name: &str, map: &BTreeMap<String, f64>) {
     if let Some(&val) = map.get(id) {
         let rank = rank_in_map(map, id);
         let total = map.len();
         let bar = metric_bar(val, 20);
-        let line = format!(
-            "  {:<14} {} {:.4}  rank {}/{}",
-            name, bar, val, rank, total
-        );
+        let line = format!("  {:<14} {} {:.4}  rank {}/{}", name, bar, val, rank, total);
         lines.push(Line::from(Span::styled(
             line,
             Style::default().fg(Color::White),

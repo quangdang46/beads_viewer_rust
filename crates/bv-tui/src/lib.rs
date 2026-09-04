@@ -438,7 +438,8 @@ impl App {
         let now = jiff::Timestamp::now();
         let flow = bv_analysis::label_health::compute_cross_label_flow(&issues, &cfg);
         app.flow = Some(flow);
-        let attention = bv_analysis::label_health::compute_label_attention_scores(&issues, &cfg, now);
+        let attention =
+            bv_analysis::label_health::compute_label_attention_scores(&issues, &cfg, now);
         app.attention_labels = attention.labels;
         // Build graph data for the Graph view (blocker/dependent maps).
         app.graph_data = Some(crate::views::graph::GraphData::build(
@@ -446,7 +447,9 @@ impl App {
             app.graph_metrics.clone(),
         ));
         // Initialize history view (empty for now — populated when user presses t).
-        app.history = Some(crate::views::history::HistoryState::build_from_beads(vec![]));
+        app.history = Some(crate::views::history::HistoryState::build_from_beads(
+            vec![],
+        ));
         app.apply_filter();
         app
     }
@@ -656,7 +659,11 @@ impl App {
                         self.attention_cursor += 1;
                     }
                 } else if self.current_view == ViewMode::Graph {
-                    let max = self.graph_data.as_ref().map(|g| g.sorted_ids.len()).unwrap_or(0);
+                    let max = self
+                        .graph_data
+                        .as_ref()
+                        .map(|g| g.sorted_ids.len())
+                        .unwrap_or(0);
                     if max > 0 && self.graph_cursor + 1 < max {
                         self.graph_cursor += 1;
                         // Auto-scroll the node list panel
@@ -664,10 +671,10 @@ impl App {
                         if self.graph_cursor >= self.graph_scroll + visible {
                             self.graph_scroll = self.graph_cursor.saturating_sub(visible - 1);
                         }
-                } else if self.current_view == ViewMode::TimeTravel {
-                    if let Some(ref mut h) = self.history {
-                        h.move_bead_down();
-                    }
+                    } else if self.current_view == ViewMode::TimeTravel {
+                        if let Some(ref mut h) = self.history {
+                            h.move_bead_down();
+                        }
                     }
                 } else if self.current_view == ViewMode::Alerts {
                     if self.alerts_cursor + 1 < self.alerts.len() {
@@ -794,9 +801,11 @@ impl App {
                 } else {
                     // Build graph data when entering graph view
                     if self.graph_data.is_none() {
-                        let issues: Vec<bv_core::model::Issue> = self.issue_map.values().cloned().collect();
+                        let issues: Vec<bv_core::model::Issue> =
+                            self.issue_map.values().cloned().collect();
                         let metrics = self.graph_metrics.clone();
-                        self.graph_data = Some(crate::views::graph::GraphData::build(issues, metrics));
+                        self.graph_data =
+                            Some(crate::views::graph::GraphData::build(issues, metrics));
                     }
                     ViewMode::Graph
                 };
@@ -1125,7 +1134,12 @@ pub fn render(f: &mut Frame, app: &App) {
             return;
         }
         ViewMode::Attention => {
-            crate::views::attention::render_attention(f, &app.attention_labels, app.attention_cursor, f.area());
+            crate::views::attention::render_attention(
+                f,
+                &app.attention_labels,
+                app.attention_cursor,
+                f.area(),
+            );
             render_status_bar(f, app);
             return;
         }
@@ -1182,8 +1196,15 @@ pub fn render(f: &mut Frame, app: &App) {
             } else {
                 // Build graph data on-the-fly if not cached
                 let issues: Vec<bv_core::model::Issue> = app.issue_map.values().cloned().collect();
-                let graph = crate::views::graph::GraphData::build(issues, app.graph_metrics.clone());
-                crate::views::graph::render_graph(f, &graph, app.graph_cursor, app.graph_scroll, f.area());
+                let graph =
+                    crate::views::graph::GraphData::build(issues, app.graph_metrics.clone());
+                crate::views::graph::render_graph(
+                    f,
+                    &graph,
+                    app.graph_cursor,
+                    app.graph_scroll,
+                    f.area(),
+                );
             }
             render_status_bar(f, app);
             return;

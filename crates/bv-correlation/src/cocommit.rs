@@ -20,7 +20,17 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 
 const EXCLUDED_PREFIXES: &[&str] = &[
-    ".beads/", ".bv/", ".git/", "node_modules/", "vendor/", "__pycache__/", ".venv/", "venv/", "dist/", "build/", ".next/",
+    ".beads/",
+    ".bv/",
+    ".git/",
+    "node_modules/",
+    "vendor/",
+    "__pycache__/",
+    ".venv/",
+    "venv/",
+    "dist/",
+    "build/",
+    ".next/",
 ];
 
 fn is_excluded(path: &str) -> bool {
@@ -29,7 +39,10 @@ fn is_excluded(path: &str) -> bool {
 
 fn is_test_file(path: &str) -> bool {
     let lower = path.to_lowercase();
-    lower.contains("test") || lower.contains("spec") || lower.ends_with("_test.go") || lower.ends_with(".test.ts")
+    lower.contains("test")
+        || lower.contains("spec")
+        || lower.ends_with("_test.go")
+        || lower.ends_with(".test.ts")
 }
 
 fn contains_bead_id(text: &str, bead_id: &str) -> bool {
@@ -54,7 +67,11 @@ fn generate_reason(files: &[String], confidence: f64) -> String {
     if files.is_empty() {
         return "no co-committed files (beads-file-only commit)".to_string();
     }
-    format!("{} file(s) co-committed with bead status change (confidence {:.2})", files.len(), confidence)
+    format!(
+        "{} file(s) co-committed with bead status change (confidence {:.2})",
+        files.len(),
+        confidence
+    )
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -72,22 +89,34 @@ pub struct CoCommitResult {
 /// excluding vendored/build paths) are still returned with an empty
 /// `files` list and a low-information `reason` — matching Go, which
 /// records the event either way.
-pub fn extract_all_cocommits(events: &[BeadEvent], commits: &[CommitInfo]) -> BTreeMap<String, Vec<CoCommitResult>> {
+pub fn extract_all_cocommits(
+    events: &[BeadEvent],
+    commits: &[CommitInfo],
+) -> BTreeMap<String, Vec<CoCommitResult>> {
     let by_sha: BTreeMap<&str, &CommitInfo> = commits.iter().map(|c| (c.sha.as_str(), c)).collect();
     let mut out: BTreeMap<String, Vec<CoCommitResult>> = BTreeMap::new();
 
     for event in events {
-        let Some(commit) = by_sha.get(event.commit_sha.as_str()) else { continue };
-        let files: Vec<String> = commit.files.iter().filter(|f| !is_excluded(f)).cloned().collect();
+        let Some(commit) = by_sha.get(event.commit_sha.as_str()) else {
+            continue;
+        };
+        let files: Vec<String> = commit
+            .files
+            .iter()
+            .filter(|f| !is_excluded(f))
+            .cloned()
+            .collect();
         let confidence = calculate_confidence(event, &files);
         let reason = generate_reason(&files, confidence);
-        out.entry(event.bead_id.clone()).or_default().push(CoCommitResult {
-            sha: event.commit_sha.clone(),
-            bead_id: event.bead_id.clone(),
-            confidence,
-            reason,
-            files,
-        });
+        out.entry(event.bead_id.clone())
+            .or_default()
+            .push(CoCommitResult {
+                sha: event.commit_sha.clone(),
+                bead_id: event.bead_id.clone(),
+                confidence,
+                reason,
+                files,
+            });
     }
     out
 }
@@ -123,7 +152,10 @@ mod tests {
     #[test]
     fn excludes_beads_and_vendored_paths() {
         let events = vec![event("A-1", "sha1", "update A-1")];
-        let commits = vec![commit("sha1", &[".beads/issues.jsonl", "vendor/lib.go", "src/main.rs"])];
+        let commits = vec![commit(
+            "sha1",
+            &[".beads/issues.jsonl", "vendor/lib.go", "src/main.rs"],
+        )];
         let result = extract_all_cocommits(&events, &commits);
         let hits = &result["A-1"];
         assert_eq!(hits[0].files, vec!["src/main.rs".to_string()]);

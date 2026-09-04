@@ -338,7 +338,10 @@ impl Sprint {
         let (Some(start), Some(end)) = (&self.start_date, &self.end_date) else {
             return false;
         };
-        let (Ok(start), Ok(end)) = (start.parse::<jiff::Timestamp>(), end.parse::<jiff::Timestamp>()) else {
+        let (Ok(start), Ok(end)) = (
+            start.parse::<jiff::Timestamp>(),
+            end.parse::<jiff::Timestamp>(),
+        ) else {
             return false;
         };
         let now = jiff::Timestamp::now();

@@ -25,7 +25,8 @@ fn has_label(issue: &Issue, label: &str) -> bool {
 }
 
 fn parse_ts(raw: &Option<String>) -> Option<jiff::Timestamp> {
-    raw.as_deref().and_then(|s| s.parse::<jiff::Timestamp>().ok())
+    raw.as_deref()
+        .and_then(|s| s.parse::<jiff::Timestamp>().ok())
 }
 
 fn clamp_score(v: i64) -> i64 {
@@ -76,7 +77,13 @@ pub fn health_level_from_score(score: i64) -> &'static str {
     }
 }
 
-fn composite_health(velocity: i64, freshness: i64, flow: i64, criticality: i64, cfg: &LabelHealthConfig) -> i64 {
+fn composite_health(
+    velocity: i64,
+    freshness: i64,
+    flow: i64,
+    criticality: i64,
+    cfg: &LabelHealthConfig,
+) -> i64 {
     let weighted = velocity as f64 * cfg.velocity_weight
         + freshness as f64 * cfg.freshness_weight
         + flow as f64 * cfg.flow_weight
@@ -171,7 +178,9 @@ pub fn compute_velocity_metrics(issues: &[Issue], now: jiff::Timestamp) -> Veloc
             current_week += 1;
         }
         if let Some(created_at) = parse_ts(&iss.created_at) {
-            let secs = (closed_at - created_at).total(jiff::Unit::Second).unwrap_or(0.0);
+            let secs = (closed_at - created_at)
+                .total(jiff::Unit::Second)
+                .unwrap_or(0.0);
             total_close_days += secs / day_secs;
             close_samples += 1;
         }
@@ -226,8 +235,16 @@ pub struct FreshnessMetrics {
     pub freshness_score: i64,
 }
 
-pub fn compute_freshness_metrics(issues: &[Issue], now: jiff::Timestamp, stale_days: i64) -> FreshnessMetrics {
-    let stale_days = if stale_days <= 0 { DEFAULT_STALE_THRESHOLD_DAYS } else { stale_days };
+pub fn compute_freshness_metrics(
+    issues: &[Issue],
+    now: jiff::Timestamp,
+    stale_days: i64,
+) -> FreshnessMetrics {
+    let stale_days = if stale_days <= 0 {
+        DEFAULT_STALE_THRESHOLD_DAYS
+    } else {
+        stale_days
+    };
     let mut most_recent: Option<jiff::Timestamp> = None;
     let mut most_recent_raw: Option<String> = None;
     let mut oldest_open: Option<jiff::Timestamp> = None;
@@ -260,7 +277,11 @@ pub fn compute_freshness_metrics(issues: &[Issue], now: jiff::Timestamp, stale_d
         }
     }
 
-    let avg_staleness = if count > 0 { total_staleness / count as f64 } else { 0.0 };
+    let avg_staleness = if count > 0 {
+        total_staleness / count as f64
+    } else {
+        0.0
+    };
     let freshness_score = (100.0 - (avg_staleness / (threshold * 2.0)) * 100.0).max(0.0) as i64;
 
     FreshnessMetrics {
@@ -313,10 +334,15 @@ pub fn compute_cross_label_flow(issues: &[Issue], cfg: &LabelHealthConfig) -> Cr
     let extraction = extract_labels(issues);
     let label_list = extraction.labels;
     let n = label_list.len();
-    let index: BTreeMap<&str, usize> = label_list.iter().enumerate().map(|(i, l)| (l.as_str(), i)).collect();
+    let index: BTreeMap<&str, usize> = label_list
+        .iter()
+        .enumerate()
+        .map(|(i, l)| (l.as_str(), i))
+        .collect();
     let mut matrix = vec![vec![0i64; n]; n];
 
-    let issue_map: std::collections::HashMap<&str, &Issue> = issues.iter().map(|i| (i.id.as_str(), i)).collect();
+    let issue_map: std::collections::HashMap<&str, &Issue> =
+        issues.iter().map(|i| (i.id.as_str(), i)).collect();
 
     let mut dep_map: BTreeMap<(String, String), LabelDependency> = BTreeMap::new();
     let mut total_deps = 0i64;
@@ -340,7 +366,9 @@ pub fn compute_cross_label_flow(issues: &[Issue], cfg: &LabelHealthConfig) -> Cr
                     if from.is_empty() || to.is_empty() || from == to {
                         continue;
                     }
-                    let (Some(&i_from), Some(&i_to)) = (index.get(from.as_str()), index.get(to.as_str())) else {
+                    let (Some(&i_from), Some(&i_to)) =
+                        (index.get(from.as_str()), index.get(to.as_str()))
+                    else {
                         continue;
                     };
                     matrix[i_from][i_to] += 1;
@@ -468,7 +496,11 @@ pub fn compute_graph_stats(issues: &[Issue]) -> GraphStats {
         betweenness.insert(id.clone(), bw.get(i).copied().unwrap_or(0.0));
         critical_path.insert(id, cp.get(i).copied().unwrap_or(0.0));
     }
-    GraphStats { pagerank, betweenness, critical_path }
+    GraphStats {
+        pagerank,
+        betweenness,
+        critical_path,
+    }
 }
 
 fn labels_for_issue<'a>(issues: &'a [Issue], id: &str) -> Vec<&'a str> {
@@ -535,7 +567,8 @@ pub fn compute_label_health_for_label(
     let velocity = compute_velocity_metrics(&labeled_owned, now);
     let freshness = compute_freshness_metrics(&labeled_owned, now, cfg.stale_threshold_days);
 
-    let labeled_set: std::collections::HashSet<&str> = labeled.iter().map(|i| i.id.as_str()).collect();
+    let labeled_set: std::collections::HashSet<&str> =
+        labeled.iter().map(|i| i.id.as_str()).collect();
     let mut seen_in = std::collections::BTreeSet::new();
     let mut seen_out = std::collections::BTreeSet::new();
     let (mut incoming_deps, mut outgoing_deps) = (0i64, 0i64);
@@ -627,7 +660,13 @@ pub fn compute_label_health_for_label(
         criticality_score: clamp_score(crit_score),
     };
 
-    let health = composite_health(velocity.velocity_score, freshness.freshness_score, flow.flow_score, criticality.criticality_score, cfg);
+    let health = composite_health(
+        velocity.velocity_score,
+        freshness.freshness_score,
+        flow.flow_score,
+        criticality.criticality_score,
+        cfg,
+    );
 
     LabelHealth {
         label: label.to_string(),
@@ -671,7 +710,11 @@ pub struct LabelAnalysisResult {
     pub attention_needed: Vec<String>,
 }
 
-pub fn compute_all_label_health(issues: &[Issue], cfg: &LabelHealthConfig, now: jiff::Timestamp) -> LabelAnalysisResult {
+pub fn compute_all_label_health(
+    issues: &[Issue],
+    cfg: &LabelHealthConfig,
+    now: jiff::Timestamp,
+) -> LabelAnalysisResult {
     let extraction = extract_labels(issues);
     let stats = compute_graph_stats(issues);
     let mut result = LabelAnalysisResult {
@@ -711,7 +754,9 @@ pub fn compute_all_label_health(issues: &[Issue], cfg: &LabelHealthConfig, now: 
         result.summaries.push(summary);
     }
 
-    result.summaries.sort_by(|a, b| b.health.cmp(&a.health).then_with(|| a.label.cmp(&b.label)));
+    result
+        .summaries
+        .sort_by(|a, b| b.health.cmp(&a.health).then_with(|| a.label.cmp(&b.label)));
     result
 }
 
@@ -814,7 +859,11 @@ fn compute_label_attention(
     score
 }
 
-pub fn compute_label_attention_scores(issues: &[Issue], cfg: &LabelHealthConfig, now: jiff::Timestamp) -> LabelAttentionResult {
+pub fn compute_label_attention_scores(
+    issues: &[Issue],
+    cfg: &LabelHealthConfig,
+    now: jiff::Timestamp,
+) -> LabelAttentionResult {
     let mut result = LabelAttentionResult {
         generated_at: now.to_string(),
         labels: Vec::new(),
@@ -854,14 +903,20 @@ pub fn compute_label_attention_scores(issues: &[Issue], cfg: &LabelHealthConfig,
     result.min_score = min_score;
     let range = max_score - min_score;
     for s in &mut scores {
-        s.normalized_score = if range > 0.0 { (s.attention_score - min_score) / range } else { 0.5 };
+        s.normalized_score = if range > 0.0 {
+            (s.attention_score - min_score) / range
+        } else {
+            0.5
+        };
     }
 
     scores.sort_by(|a, b| {
         const EPS: f64 = 1e-6;
         let diff = a.attention_score - b.attention_score;
         if diff.abs() > EPS {
-            b.attention_score.partial_cmp(&a.attention_score).unwrap_or(std::cmp::Ordering::Equal)
+            b.attention_score
+                .partial_cmp(&a.attention_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
         } else {
             a.label.cmp(&b.label)
         }
@@ -873,7 +928,10 @@ pub fn compute_label_attention_scores(issues: &[Issue], cfg: &LabelHealthConfig,
     let top_n = scores.len().min(3);
     result.top_attention = scores[..top_n].iter().map(|s| s.label.clone()).collect();
     let low_start = (scores.len().saturating_sub(top_n)).max(top_n);
-    result.low_attention = scores[low_start..].iter().map(|s| s.label.clone()).collect();
+    result.low_attention = scores[low_start..]
+        .iter()
+        .map(|s| s.label.clone())
+        .collect();
 
     result.total_labels = scores.len() as i64;
     result.labels = scores;
@@ -964,14 +1022,23 @@ mod tests {
         blocker.dependencies.clear();
         let issues = vec![blocker, blocked];
         let flow = compute_cross_label_flow(&issues, &LabelHealthConfig::default());
-        assert_eq!(flow.total_cross_label_deps, 0, "same-label deps must not count as cross-label");
+        assert_eq!(
+            flow.total_cross_label_deps, 0,
+            "same-label deps must not count as cross-label"
+        );
     }
 
     #[test]
     fn label_health_empty_label_is_critical_zero() {
         let issues = vec![issue("A-1", Status::Open, &["backend"])];
         let stats = compute_graph_stats(&issues);
-        let h = compute_label_health_for_label("nonexistent", &issues, &LabelHealthConfig::default(), jiff::Timestamp::now(), &stats);
+        let h = compute_label_health_for_label(
+            "nonexistent",
+            &issues,
+            &LabelHealthConfig::default(),
+            jiff::Timestamp::now(),
+            &stats,
+        );
         assert_eq!(h.issue_count, 0);
         assert_eq!(h.health, 0);
         assert_eq!(h.health_level, "critical");
@@ -983,12 +1050,19 @@ mod tests {
             issue("A-1", Status::Open, &["backend"]),
             issue("A-2", Status::Blocked, &["frontend"]),
         ];
-        let result = compute_all_label_health(&issues, &LabelHealthConfig::default(), jiff::Timestamp::now());
+        let result = compute_all_label_health(
+            &issues,
+            &LabelHealthConfig::default(),
+            jiff::Timestamp::now(),
+        );
         assert_eq!(result.total_labels, 2);
         assert_eq!(result.labels.len(), 2);
         assert_eq!(result.summaries.len(), 2);
         // healthy + warning + critical must partition all labels
-        assert_eq!(result.healthy_count + result.warning_count + result.critical_count, 2);
+        assert_eq!(
+            result.healthy_count + result.warning_count + result.critical_count,
+            2
+        );
     }
 
     #[test]
@@ -997,7 +1071,11 @@ mod tests {
             issue("A-1", Status::Open, &["quiet"]),
             issue("A-2", Status::Open, &["busy"]),
         ];
-        let result = compute_label_attention_scores(&issues, &LabelHealthConfig::default(), jiff::Timestamp::now());
+        let result = compute_label_attention_scores(
+            &issues,
+            &LabelHealthConfig::default(),
+            jiff::Timestamp::now(),
+        );
         assert_eq!(result.total_labels, 2);
         assert_eq!(result.labels.len(), 2);
         // ranks are contiguous starting at 1
@@ -1008,7 +1086,11 @@ mod tests {
 
     #[test]
     fn empty_issue_set_yields_empty_attention_result() {
-        let result = compute_label_attention_scores(&[], &LabelHealthConfig::default(), jiff::Timestamp::now());
+        let result = compute_label_attention_scores(
+            &[],
+            &LabelHealthConfig::default(),
+            jiff::Timestamp::now(),
+        );
         assert_eq!(result.total_labels, 0);
         assert!(result.labels.is_empty());
     }
