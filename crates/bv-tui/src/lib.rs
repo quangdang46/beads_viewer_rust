@@ -166,6 +166,14 @@ pub struct App {
     /// cass CLI availability cache
     cass_available: bool,
     cass_cache: std::collections::HashMap<String, usize>,
+    /// Actionable items state.
+    pub actionable: Option<crate::actionable::ActionableState>,
+    /// Tutorial state.
+    pub tutorial: Option<crate::tutorial::TutorialState>,
+    /// Theme for consistent styling.
+    pub theme: crate::theme::Theme,
+    /// Key registry for help display.
+    pub key_registry: crate::keybindings::KeyRegistry,
 }
 
 /// Which view is currently displayed.
@@ -182,6 +190,7 @@ pub enum ViewMode {
     TimeTravel,
     Sprint,
     Tutorial,
+    Actionable,
 }
 
 /// Large/huge dataset warning (Go largeDatasetWarning, bv-9thm).
@@ -429,6 +438,10 @@ impl App {
             active_repo: None,
             cass_available: cass_installed(),
             cass_cache: std::collections::HashMap::new(),
+            actionable: None,
+            tutorial: Some(crate::tutorial::TutorialState::new()),
+            theme: crate::theme::Theme::default(),
+            key_registry: crate::keybindings::build_default_registry(),
         };
         // Pre-compute flow-matrix and attention data for the TUI views
         // (backed by the same data the robot-label-flow / robot-label-attention
@@ -819,6 +832,14 @@ impl App {
                 };
                 true
             }
+            KeyCode::Char('F') => {
+                self.current_view = if self.current_view == ViewMode::Actionable {
+                    ViewMode::List
+                } else {
+                    ViewMode::Actionable
+                };
+                true
+            }
             KeyCode::Char('a') => {
                 self.filter_mode = FilterMode::All;
                 self.apply_filter();
@@ -1172,6 +1193,16 @@ pub fn render(f: &mut Frame, app: &App) {
                     .title(" \u{1f4d6} TUTORIAL — Press ` to close "),
             );
             f.render_widget(para, f.area());
+            return;
+        }
+        ViewMode::Actionable => {
+            if let Some(ref state) = app.actionable {
+                crate::actionable::render_actionable(f, &state.items, state.selected, f.area());
+            } else {
+                let msg = ratatui::widgets::Paragraph::new("No actionable items");
+                f.render_widget(msg, f.area());
+            }
+            render_status_bar(f, app);
             return;
         }
         ViewMode::Board => {

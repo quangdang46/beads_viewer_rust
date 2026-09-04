@@ -11,6 +11,31 @@ use ratatui::{
 
 use bv_core::model::{Issue, Status};
 
+/// Actionable state held by App.
+pub struct ActionableState {
+    pub items: Vec<ActionableItem>,
+    pub selected: usize,
+}
+
+impl ActionableState {
+    pub fn new(issues: &[Issue]) -> Self {
+        ActionableState {
+            items: compute_actionable(issues),
+            selected: 0,
+        }
+    }
+
+    pub fn move_up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    pub fn move_down(&mut self) {
+        if self.selected + 1 < self.items.len() {
+            self.selected += 1;
+        }
+    }
+}
+
 /// An actionable item with reason.
 #[derive(Debug, Clone)]
 pub struct ActionableItem {
