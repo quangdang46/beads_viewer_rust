@@ -152,6 +152,7 @@ dependencies = [
 name = "bv-correlation"
 version = "0.1.0"
 dependencies = [
+ "bv-core",
  "jiff",
  "regex",
  "serde",

@@ -110,6 +110,50 @@ fn robot_docs_unknown_topic_exits_two() {
     assert!(stdout.contains("\"error\""), "{stdout}");
 }
 
+fn run_at_repo_root(args: &[&str]) -> (i32, String, String) {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_bvr"))
+        .args(args)
+        .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+        .output()
+        .expect("binary runs");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+#[test]
+fn robot_blocker_chain_unknown_issue_exits_one() {
+    let (code, _, stderr) = run_at_repo_root(&["--robot-blocker-chain", "nonexistent-id-xyz"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("Issue not found"), "{stderr}");
+}
+
+#[test]
+fn robot_correlation_stats_runs_without_crashing() {
+    // This repo's real .beads + git history exercise the correlator
+    // pipeline end-to-end (git log walk + explicit/temporal scoring).
+    let (code, stdout, _) = run_at_repo_root(&["--robot-correlation-stats"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("\"correlated_beads\""));
+    assert!(stdout.contains("\"by_method\""));
+}
+
+#[test]
+fn robot_file_hotspots_runs_without_crashing() {
+    let (code, stdout, _) = run_at_repo_root(&["--robot-file-hotspots"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("\"hotspots\""));
+}
+
+#[test]
+fn robot_explain_correlation_bad_format_exits_two() {
+    let (code, _, stderr) = run_at_repo_root(&["--robot-explain-correlation", "not-a-valid-format"]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("expected format SHA:beadID"), "{stderr}");
+}
+
 #[test]
 fn robot_metrics_does_not_fabricate_timing_data() {
     let (code, stdout, _) = run(&["--robot-metrics"]);

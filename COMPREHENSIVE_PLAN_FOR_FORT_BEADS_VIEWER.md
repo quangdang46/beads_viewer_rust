@@ -593,10 +593,31 @@ silently re-discovered.
   before recording and captures the correlation's original confidence;
   this records directly (bead-ID-validated only) with `original_conf: 0.0`
   and says so in `usage_hints`. Revisit once the correlator pipeline lands.
+- **bv CLI**: `robot-capabilities`/`robot-schema`/`robot-metrics`/
+  `robot-docs` now real (lower-fidelity — see each function's doc comment):
+  capabilities/schema report actual per-command implementation status
+  cross-checked against an explicit `DISPATCHED_ROBOT_COMMANDS` list
+  (not guessed); metrics honestly reports empty timing/cache (no metrics
+  subsystem exists — never fabricates numbers) plus real dataset size;
+  docs returns a minimal real topic index. None replicate Go's large
+  hand-authored per-command doc/schema text.
+- **bv-correlation** (new `correlator` module) + **bv CLI**: a real,
+  documented-simplified correlator pipeline now backs
+  `robot-explain-correlation`, `robot-correlation-stats`,
+  `robot-file-beads`, `robot-file-hotspots`, `robot-file-relations`.
+  Walks full git log once (sha/author/message/files), scores each
+  commit↔issue pair via existing `explicit.rs` (message ID mentions) and
+  `temporal.rs` (same-author-in-active-window) primitives. Documented
+  scope cuts vs Go's 882-line `correlator.go`: single git-log walk instead
+  of two merged strategies, no incremental/cached-artifact layer, and the
+  temporal signal requires an exact assignee↔git-author match (Go's is
+  looser, weighted by concurrent active-bead count — more false negatives
+  here, fewer false positives). 4 unit tests cover explicit-mention,
+  assignee-gated temporal, out-of-window exclusion, and no-signal cases.
 
 ### Confirmed remaining gaps (not fixed — do not assume otherwise)
 
-**Robot CLI** — ~28 of 47 `--robot-*` primaries in `flags::ROBOT_PRIMARIES`
+**Robot CLI** — ~23 of 47 `--robot-*` primaries in `flags::ROBOT_PRIMARIES`
 still have no dispatch handler at all; they correctly exit 2 via the A4
 fallback instead of misbehaving, but the underlying commands don't exist
 yet. Roughly in build order of what's cheapest to unblock:
@@ -605,19 +626,12 @@ yet. Roughly in build order of what's cheapest to unblock:
   *issues* — don't wire these together without re-checking
   `handleRobotImpact` in `cmd/bv/robot_registry.go`), `robot-not-ready-labels`
   (needs `build_triage`'s claimability logic extended, not a simple filter —
-  see `pkg/analysis/triage.go` `isClaimableRecommendation`/`buildTopPicks`),
-  `robot-metrics`/`robot-docs`/`robot-schema`/`robot-capabilities`
-  (introspection — Go's versions embed large generated text; a
-  lower-fidelity but real Rust version is a reasonable first pass).
-- Needs a correlator pipeline that doesn't exist yet (primitives in
-  `bv-correlation` — `explicit.rs`, `temporal.rs`, `orphan.rs`, `scorer.rs`,
-  `feedback.rs` — exist, but nothing assembles them the way Go's
-  `pkg/correlation/correlator.go` does): `robot-explain-correlation`,
-  `robot-correlation-stats`, `robot-file-beads`, `robot-file-hotspots`,
-  `robot-file-relations`, `robot-search` (has `bv-search::hybrid`/`embedder`
-  primitives, same gap). `robot-confirm-correlation`/`robot-reject-correlation`
-  are the exception — `bv-correlation::feedback::FeedbackStore` already has
-  `record`/`load_all`, just needs CLI wiring.
+  see `pkg/analysis/triage.go` `isClaimableRecommendation`/`buildTopPicks`).
+- Needs the new `bv_correlation::correlator` pipeline wired in (same
+  pattern as the 5 commands already done — see above), just not done yet:
+  `robot-search` (has `bv-search::hybrid`/`embedder` primitives but no
+  assembled pipeline — same class of gap the correlator was for
+  `bv-correlation`; do that first, then wire `robot-search` similarly).
 - Needs whole Go packages not ported at all: `robot-related`,
   `robot-impact-network`, `robot-causality` (Go `pkg/correlation/cocommit.go`,
   `causality.go`, `network.go` — no Rust equivalent in any crate).

@@ -10,4 +10,5 @@ pub mod feedback;
 pub mod scorer;
 pub mod temporal;
 
+pub mod correlator;
 pub mod orphan;

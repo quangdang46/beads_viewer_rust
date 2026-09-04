@@ -255,6 +255,21 @@ fn main() -> ExitCode {
     if presence.has("robot-reject-correlation") {
         return run_robot_correlation_feedback(&args, "reject-correlation", "reject");
     }
+    if presence.has("robot-explain-correlation") {
+        return run_robot_explain_correlation(&args);
+    }
+    if presence.has("robot-correlation-stats") {
+        return run_robot_correlation_stats();
+    }
+    if presence.has("robot-file-beads") {
+        return run_robot_file_beads(&args);
+    }
+    if presence.has("robot-file-hotspots") {
+        return run_robot_file_hotspots();
+    }
+    if presence.has("robot-file-relations") {
+        return run_robot_file_relations(&args);
+    }
 
     // Export pages (static site bundle, Go --export-pages).
     if let Some(idx) = args.iter().position(|a| a == "--export-pages") {
@@ -1434,6 +1449,236 @@ fn run_robot_recipes() -> ExitCode {
     emit_json(&payload)
 }
 
+type CorrelationReport = std::collections::BTreeMap<String, Vec<bv_correlation::correlator::CorrelatedCommit>>;
+
+/// Shared loader for the correlator-backed commands: issues + a full
+/// correlation report (`bv_correlation::correlator::correlate`). Walks up
+/// to 1000 commits — Go's default `--history-limit` is 500; doubled here
+/// since file-hotspots/file-relations benefit from more history and this
+/// pipeline has no caching layer yet (see plan doc §11).
+fn load_correlation_report(
+    cwd: &std::path::Path,
+) -> Result<(Vec<bv_core::model::Issue>, String, CorrelationReport), String> {
+    let (issues, hash) = load_issues_auto(cwd)?;
+    let commits = bv_correlation::correlator::walk_commits(cwd, 1000)?;
+    let report = bv_correlation::correlator::correlate(&issues, &commits);
+    Ok((issues, hash, report))
+}
+
+/// Go `handleRobotExplainCorrelation` — `--robot-explain-correlation SHA:beadID`.
+fn run_robot_explain_correlation(args: &[String]) -> ExitCode {
+    let raw = args
+        .iter()
+        .position(|a| a == "--robot-explain-correlation")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_default();
+    let Some((sha, bead_id)) = raw.split_once(':') else {
+        eprintln!("Error: expected format SHA:beadID, got: {raw:?}");
+        return ExitCode::from(2);
+    };
+    let (sha, bead_id) = (sha.trim().to_lowercase(), bead_id.trim());
+
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let (_issues, hash, report) = match load_correlation_report(&cwd) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let Some(commits) = report.get(bead_id) else {
+        eprintln!("Bead not found in correlation report: {bead_id}");
+        return ExitCode::from(1);
+    };
+    let Some(hit) = commits.iter().find(|c| c.sha.to_lowercase().starts_with(&sha)) else {
+        eprintln!("Commit {sha} not found in bead {bead_id} correlations");
+        return ExitCode::from(1);
+    };
+    let mut payload = envelope_json(&hash);
+    payload["explanation"] = serde_json::to_value(hit).unwrap_or_default();
+    emit_json(&payload)
+}
+
+/// Go `handleRobotCorrelationStats` — `--robot-correlation-stats`.
+fn run_robot_correlation_stats() -> ExitCode {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let (_issues, hash, report) = match load_correlation_report(&cwd) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let total_commits: usize = report.values().map(|v| v.len()).sum();
+    let (mut explicit, mut temporal) = (0usize, 0usize);
+    let mut confidences: Vec<f64> = Vec::new();
+    for commits in report.values() {
+        for c in commits {
+            confidences.push(c.confidence);
+            if c.methods.contains(&"explicit_id") {
+                explicit += 1;
+            }
+            if c.methods.contains(&"temporal_author") {
+                temporal += 1;
+            }
+        }
+    }
+    let avg_confidence = if confidences.is_empty() {
+        0.0
+    } else {
+        confidences.iter().sum::<f64>() / confidences.len() as f64
+    };
+    let beads_dir = cwd.join(".beads");
+    let store = bv_correlation::feedback::FeedbackStore::new(&beads_dir);
+    let (confirmed, rejected, ignored, accuracy) = store.stats();
+
+    let mut payload = envelope_json(&hash);
+    payload["stats"] = serde_json::json!({
+        "correlated_beads": report.len(),
+        "total_correlated_commits": total_commits,
+        "by_method": { "explicit_id": explicit, "temporal_author": temporal },
+        "avg_confidence": avg_confidence,
+        "feedback": {
+            "confirmed": confirmed,
+            "rejected": rejected,
+            "ignored": ignored,
+            "accuracy": accuracy,
+        },
+    });
+    emit_json(&payload)
+}
+
+/// Go `handleRobotFileBeads` — `--robot-file-beads <path>`.
+fn run_robot_file_beads(args: &[String]) -> ExitCode {
+    let path = args
+        .iter()
+        .position(|a| a == "--robot-file-beads")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_default();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let (_issues, hash, report) = match load_correlation_report(&cwd) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut beads: Vec<serde_json::Value> = Vec::new();
+    for (bead_id, commits) in &report {
+        let touching: Vec<&bv_correlation::correlator::CorrelatedCommit> =
+            commits.iter().filter(|c| c.files.iter().any(|f| f == &path)).collect();
+        if !touching.is_empty() {
+            let max_conf = touching.iter().map(|c| c.confidence).fold(0.0, f64::max);
+            beads.push(serde_json::json!({
+                "bead_id": bead_id,
+                "commit_count": touching.len(),
+                "max_confidence": max_conf,
+            }));
+        }
+    }
+    beads.sort_by(|a, b| {
+        b["max_confidence"]
+            .as_f64()
+            .partial_cmp(&a["max_confidence"].as_f64())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut payload = envelope_json(&hash);
+    payload["path"] = serde_json::json!(path);
+    payload["beads"] = serde_json::Value::Array(beads);
+    emit_json(&payload)
+}
+
+/// Go `handleRobotFileHotspots` — `--robot-file-hotspots`.
+fn run_robot_file_hotspots() -> ExitCode {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let (_issues, hash, report) = match load_correlation_report(&cwd) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut per_file: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    for (bead_id, commits) in &report {
+        for c in commits {
+            for f in &c.files {
+                per_file.entry(f.clone()).or_default().insert(bead_id.clone());
+            }
+        }
+    }
+    let mut hotspots: Vec<serde_json::Value> = per_file
+        .iter()
+        .map(|(path, beads)| {
+            serde_json::json!({
+                "path": path,
+                "bead_count": beads.len(),
+                "beads": beads.iter().collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    hotspots.sort_by(|a, b| {
+        b["bead_count"]
+            .as_u64()
+            .cmp(&a["bead_count"].as_u64())
+            .then_with(|| a["path"].as_str().cmp(&b["path"].as_str()))
+    });
+    hotspots.truncate(20);
+    let mut payload = envelope_json(&hash);
+    payload["hotspots"] = serde_json::Value::Array(hotspots);
+    emit_json(&payload)
+}
+
+/// Go `handleRobotFileRelations` — `--robot-file-relations <path>`: files
+/// that co-change with the target across correlated commits.
+fn run_robot_file_relations(args: &[String]) -> ExitCode {
+    let path = args
+        .iter()
+        .position(|a| a == "--robot-file-relations")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_default();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let (_issues, hash, report) = match load_correlation_report(&cwd) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut co_change: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut seen_shas: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for commits in report.values() {
+        for c in commits {
+            if !c.files.iter().any(|f| f == &path) || !seen_shas.insert(c.sha.as_str()) {
+                continue;
+            }
+            for other in &c.files {
+                if other != &path {
+                    *co_change.entry(other.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    let mut related: Vec<serde_json::Value> = co_change
+        .into_iter()
+        .map(|(f, count)| serde_json::json!({ "path": f, "co_change_count": count }))
+        .collect();
+    related.sort_by(|a, b| {
+        b["co_change_count"]
+            .as_u64()
+            .cmp(&a["co_change_count"].as_u64())
+            .then_with(|| a["path"].as_str().cmp(&b["path"].as_str()))
+    });
+    related.truncate(20);
+    let mut payload = envelope_json(&hash);
+    payload["path"] = serde_json::json!(path);
+    payload["related_files"] = serde_json::Value::Array(related);
+    emit_json(&payload)
+}
+
 /// The subset of `flags::ROBOT_PRIMARIES` that actually has a dispatch
 /// handler wired up in this binary today. Kept as an explicit list (rather
 /// than derived from control flow) so `robot-capabilities`/`robot-schema`
@@ -1465,6 +1710,11 @@ const DISPATCHED_ROBOT_COMMANDS: &[&str] = &[
     "robot-blocker-chain",
     "robot-confirm-correlation",
     "robot-reject-correlation",
+    "robot-explain-correlation",
+    "robot-correlation-stats",
+    "robot-file-beads",
+    "robot-file-hotspots",
+    "robot-file-relations",
 ];
 
 /// Go `generateRobotCapabilities` (lower-fidelity first pass — see plan
