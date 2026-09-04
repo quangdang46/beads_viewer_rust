@@ -59,7 +59,7 @@ mod tests {
     #[test]
     fn progress_bar_length() {
         let bar = progress_bar(0.5, 10);
-        assert_eq!(bar.len(), 12); // [ + 10 chars + ]
+        assert_eq!(bar.chars().count(), 12); // [ + 10 chars + ]
     }
 
     #[test]
