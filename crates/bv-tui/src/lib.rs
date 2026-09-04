@@ -2001,7 +2001,12 @@ mod tests {
 }
 
 pub mod chrome;
+pub mod context_help;
 pub mod detail;
+pub mod keybindings;
+pub mod markdown;
+pub mod shortcuts_sidebar;
+pub mod theme;
 pub mod views;
 pub mod worker;
 
