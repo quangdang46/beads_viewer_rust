@@ -23,7 +23,7 @@ fn main() -> ExitCode {
 
     // --version handled before validation (Go parity).
     if args.iter().any(|a| a == "--version") {
-        println!("bvr 0.1.0");
+        println!("bvr 1.0.0");
         return ExitCode::from(0);
     }
 
