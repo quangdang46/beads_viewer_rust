@@ -298,6 +298,15 @@ fn main() -> ExitCode {
         return run_robot_capacity(&args);
     }
 
+    if presence.has("robot-impact") {
+        return run_robot_impact(&args);
+    }
+    if presence.has("robot-diff") {
+        return run_robot_diff(&args);
+    }
+    if presence.has("robot-not-ready-labels") {
+        return run_robot_not_ready_labels(&args);
+    }
     // Export pages (static site bundle, Go --export-pages).
     if let Some(idx) = args.iter().position(|a| a == "--export-pages") {
         let out_dir = args
@@ -2218,6 +2227,9 @@ const DISPATCHED_ROBOT_COMMANDS: &[&str] = &[
     "robot-burndown",
     "robot-forecast",
     "robot-capacity",
+    "robot-impact",
+    "robot-diff",
+    "robot-not-ready-labels",
 ];
 
 /// Go `generateRobotCapabilities` (lower-fidelity first pass — see plan
@@ -2526,6 +2538,229 @@ fn run_robot_label_attention() -> ExitCode {
 
 fn jiff_now() -> String {
     jiff::Timestamp::now().to_string()
+}
+
+/// Go `handleRobotImpact` — `--robot-impact <file1,file2,...>`.
+/// Analyzes which beads would be affected by modifying the given files,
+/// using the correlator pipeline's file→bead mapping.
+fn run_robot_impact(args: &[String]) -> ExitCode {
+    let files_str = args
+        .iter()
+        .position(|a| a == "--robot-impact")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_default();
+    let files: Vec<String> = files_str
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if files.is_empty() {
+        eprintln!("Error: --robot-impact requires comma-separated file paths");
+        return ExitCode::from(2);
+    }
+
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let (_issues, hash, report) = match load_correlation_report(&cwd) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    // Build file→bead map from correlator report
+    let mut file_to_beads: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    for (bead_id, commits) in &report {
+        for c in commits {
+            for f in &c.files {
+                file_to_beads.entry(f.clone()).or_default().push(bead_id.clone());
+            }
+        }
+    }
+
+    let mut affected_beads: Vec<serde_json::Value> = Vec::new();
+    let mut overlap_map: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+
+    for file in &files {
+        if let Some(beads) = file_to_beads.get(file) {
+            for bead_id in beads {
+                overlap_map.entry(bead_id.clone()).or_default().push(file.clone());
+            }
+        }
+    }
+
+    for (bead_id, overlap_files) in &overlap_map {
+        affected_beads.push(serde_json::json!({
+            "bead_id": bead_id,
+            "overlap_files": overlap_files,
+            "overlap_count": overlap_files.len(),
+        }));
+    }
+    affected_beads.sort_by(|a, b| b["overlap_count"].as_u64().cmp(&a["overlap_count"].as_u64()));
+
+    let risk_score = if affected_beads.is_empty() {
+        0.0
+    } else {
+        (affected_beads.len() as f64 / 10.0).min(1.0)
+    };
+    let risk_level = if risk_score >= 0.7 { "high" } else if risk_score >= 0.3 { "medium" } else { "low" };
+
+    let mut payload = envelope_json(&hash);
+    payload["files"] = serde_json::json!(files);
+    payload["risk_level"] = serde_json::json!(risk_level);
+    payload["risk_score"] = serde_json::json!(risk_score);
+    payload["affected_beads"] = serde_json::Value::Array(affected_beads);
+    payload["summary"] = serde_json::json!(format!(
+        "{} beads affected across {} files",
+        overlap_map.len(),
+        files.len()
+    ));
+    payload["usage_hints"] = serde_json::json!([
+        "Risk score is simplified (overlap ratio). Go's version uses recency + status weighting.",
+    ]);
+    emit_json(&payload)
+}
+
+/// Go `handleRobotDiff` — `--robot-diff --diff-since <ref>`.
+/// Compares current issue set against a previous state.
+fn run_robot_diff(args: &[String]) -> ExitCode {
+    let diff_since = args
+        .iter()
+        .position(|a| a == "--diff-since")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    if diff_since.is_none() {
+        eprintln!("Error: --robot-diff requires --diff-since <git-ref>");
+        return ExitCode::from(2);
+    }
+    let diff_ref = diff_since.unwrap();
+
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let (issues, hash) = match load_issues_auto(&cwd) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    // Try to get issues at the previous ref via git show
+    let previous_issues = std::process::Command::new("git")
+        .args(["show", &format!("{diff_ref}:.beads/issues.jsonl")])
+        .current_dir(&cwd)
+        .output()
+        .ok()
+        .and_then(|out| {
+            if out.status.success() {
+                let text = String::from_utf8_lossy(&out.stdout);
+                let mut prev = Vec::new();
+                for line in text.lines() {
+                    if !line.trim().is_empty() {
+                        if let Ok(issue) = serde_json::from_str::<bv_core::model::Issue>(line) {
+                            prev.push(issue);
+                        }
+                    }
+                }
+                Some(prev)
+            } else {
+                None
+            }
+        });
+
+    match previous_issues {
+        Some(prev) => {
+            let prev_map: std::collections::HashMap<String, &bv_core::model::Issue> =
+                prev.iter().map(|i| (i.id.clone(), i)).collect();
+            let curr_map: std::collections::HashMap<String, &bv_core::model::Issue> =
+                issues.iter().map(|i| (i.id.clone(), i)).collect();
+
+            let added: Vec<&bv_core::model::Issue> = issues.iter().filter(|i| !prev_map.contains_key(&i.id)).collect();
+            let removed: Vec<&bv_core::model::Issue> = prev.iter().filter(|i| !curr_map.contains_key(&i.id)).collect();
+            let changed: Vec<serde_json::Value> = issues
+                .iter()
+                .filter_map(|i| {
+                    prev_map.get(&i.id).and_then(|pi| {
+                        if i.status != pi.status || i.title != pi.title || i.priority != pi.priority {
+                            Some(serde_json::json!({
+                                "id": i.id,
+                                "status_change": if i.status != pi.status {
+                                    Some(format!("{} → {}", pi.status.as_str(), i.status.as_str()))
+                                } else { None },
+                                "title_changed": i.title != pi.title,
+                                "priority_changed": i.priority != pi.priority,
+                            }))
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect();
+
+            let mut payload = envelope_json(&hash);
+            payload["diff_ref"] = serde_json::json!(diff_ref);
+            payload["added"] = serde_json::json!(added.iter().map(|i| &i.id).collect::<Vec<_>>());
+            payload["removed"] = serde_json::json!(removed.iter().map(|i| &i.id).collect::<Vec<_>>());
+            payload["changed"] = serde_json::Value::Array(changed.clone());
+            payload["added_count"] = serde_json::json!(added.len());
+            payload["removed_count"] = serde_json::json!(removed.len());
+            payload["changed_count"] = serde_json::json!(changed.len());
+            emit_json(&payload)
+        }
+        None => {
+            eprintln!("Error: could not read issues at ref {diff_ref}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Go `handleRobotNotReadyLabels` — `--robot-not-ready-labels <label1,label2,...>`.
+/// Filters triage results to exclude issues with "not-ready" labels.
+fn run_robot_not_ready_labels(args: &[String]) -> ExitCode {
+    let labels_str = args
+        .iter()
+        .position(|a| a == "--robot-not-ready-labels")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_default();
+    let not_ready_labels: Vec<String> = labels_str
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if not_ready_labels.is_empty() {
+        eprintln!("Error: --robot-not-ready-labels requires comma-separated label names");
+        return ExitCode::from(2);
+    }
+
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let (issues, hash) = match load_issues_auto(&cwd) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let excluded_count = issues
+        .iter()
+        .filter(|i| i.labels.iter().any(|l| not_ready_labels.contains(l)))
+        .count();
+    let remaining: Vec<&bv_core::model::Issue> = issues
+        .iter()
+        .filter(|i| !i.labels.iter().any(|l| not_ready_labels.contains(l)))
+        .collect();
+
+    let mut payload = envelope_json(&hash);
+    payload["not_ready_labels"] = serde_json::json!(not_ready_labels);
+    payload["total_issues"] = serde_json::json!(issues.len());
+    payload["excluded_count"] = serde_json::json!(excluded_count);
+    payload["remaining_count"] = serde_json::json!(remaining.len());
+    payload["remaining_ids"] = serde_json::json!(remaining.iter().map(|i| &i.id).collect::<Vec<_>>());
+    payload["usage_hints"] = serde_json::json!([
+        "This filters issues by label. Go's version integrates deeper into build_triage's claimability logic.",
+    ]);
+    emit_json(&payload)
 }
 
 fn print_robot_help() {

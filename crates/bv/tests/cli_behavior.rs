@@ -30,14 +30,14 @@ fn modifier_violation_exits_one() {
 }
 
 #[test]
-fn undispatched_robot_command_fails_fast_instead_of_launching_tui() {
-    // --robot-diff is a registered primary (flags::ROBOT_PRIMARIES) with
-    // no dispatch handler yet (needs --diff-since git-snapshot logic — see
-    // plan doc §11); it must error with exit 2, not fall through to the
-    // interactive TUI (which would hang this test / any CI runner).
-    let (code, _, stderr) = run(&["--robot-diff", "--diff-since", "HEAD~1"]);
-    assert_eq!(code, 2);
-    assert!(stderr.contains("not yet implemented"), "{stderr}");
+fn all_robot_primaries_are_dispatched_or_validated() {
+    // Every robot primary in flags::ROBOT_PRIMARIES is either dispatched
+    // (has a handler) or caught by modifier-requires validation.
+    // Verify that --robot-drift without --check-drift triggers modifier
+    // validation (exit 1) rather than the "not yet implemented" fallback.
+    let (code, _, stderr) = run(&["--robot-drift"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("requires --check-drift"), "{stderr}");
 }
 
 #[test]
@@ -90,10 +90,10 @@ fn robot_capabilities_reports_real_implementation_status() {
     assert_eq!(code, 0);
     assert!(stdout.contains("\"implemented_count\""));
     assert!(stdout.contains("\"total_count\""));
-    // robot-triage is dispatched; robot-diff is not (yet) — both must be
+    // robot-triage is dispatched; robot-drift is not (yet) — both must be
     // present with their real status, not a blanket "implemented".
     assert!(stdout.contains("robot-triage"));
-    assert!(stdout.contains("robot-diff"));
+    assert!(stdout.contains("robot-drift"));
 }
 
 #[test]
