@@ -2000,9 +2000,13 @@ mod tests {
     }
 }
 
+pub mod actionable;
+pub mod agent_prompt_modal;
 pub mod chrome;
+pub mod context;
 pub mod context_help;
 pub mod detail;
+pub mod helpers;
 pub mod keybindings;
 pub mod markdown;
 pub mod shortcuts_sidebar;
@@ -2010,6 +2014,7 @@ pub mod theme;
 pub mod tutorial;
 pub mod update_modal;
 pub mod views;
+pub mod visuals;
 pub mod worker;
 
 #[cfg(test)]
