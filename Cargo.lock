@@ -129,6 +129,7 @@ name = "bv-analysis"
 version = "0.1.0"
 dependencies = [
  "bv-core",
+ "bv-correlation",
  "bv-graph-core",
  "getrandom",
  "jiff",

@@ -13,3 +13,4 @@ getrandom = "0.4"
 bv-core = { path = "../bv-core" }
 jiff = { workspace = true }
 bv-graph-core = { path = "../bv-graph-core" }
+bv-correlation = { path = "../bv-correlation" }

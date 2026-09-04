@@ -4,7 +4,9 @@
 pub mod analyzer;
 pub mod blocker_chain;
 pub mod cache;
+pub mod diff;
 pub mod drift;
+pub mod file_impact;
 pub mod impact;
 pub mod label_health;
 pub mod scoring;
