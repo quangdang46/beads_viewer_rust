@@ -270,6 +270,9 @@ fn main() -> ExitCode {
     if presence.has("robot-file-relations") {
         return run_robot_file_relations(&args);
     }
+    if presence.has("robot-search") {
+        return run_robot_search(&args);
+    }
 
     // Export pages (static site bundle, Go --export-pages).
     if let Some(idx) = args.iter().position(|a| a == "--export-pages") {
@@ -1451,6 +1454,122 @@ fn run_robot_recipes() -> ExitCode {
 
 type CorrelationReport = std::collections::BTreeMap<String, Vec<bv_correlation::correlator::CorrelatedCommit>>;
 
+/// Go `robotSearch` dispatch block (main.go — computes `searchDispatchContext.SearchOutput`
+/// then calls the `robot-search` handler). `--search QUERY` required
+/// (modifier-requires table), `--search-mode` (`text` default | `hybrid`),
+/// `--search-preset` (hybrid only, default `default`), `--search-limit`/
+/// `--robot-max-results` cap results (default 10).
+///
+/// Scope cut vs Go (see plan doc §11): no persisted vector index /
+/// incremental sync (`index.Sync`, `syncStats`) — embeds every issue's
+/// title+description fresh on each invocation via the existing
+/// `hash_embed` primitive. `index`/`loaded` fields in the envelope are
+/// therefore omitted rather than fabricated.
+fn run_robot_search(args: &[String]) -> ExitCode {
+    let query = args
+        .iter()
+        .position(|a| a == "--search")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_default();
+    if query.trim().is_empty() {
+        eprintln!("Error: --search requires a non-empty query");
+        return ExitCode::from(2);
+    }
+    let mode = args
+        .iter()
+        .position(|a| a == "--search-mode")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| "text".to_string());
+    let preset_name = args
+        .iter()
+        .position(|a| a == "--search-preset")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| "default".to_string());
+    let limit: usize = args
+        .iter()
+        .position(|a| a == "--search-limit" || a == "--robot-max-results")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let (issues, hash) = match load_issues_auto(&cwd) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let dim = bv_search::embedder::DEFAULT_DIM;
+    let query_vec = bv_search::embedder::hash_embed(&query, dim);
+    let now = jiff::Timestamp::now();
+
+    let mut results: Vec<serde_json::Value> = Vec::new();
+    if mode == "hybrid" {
+        let Some(weights) = bv_search::hybrid::get_preset(&preset_name) else {
+            eprintln!("Error: unknown --search-preset {preset_name:?}");
+            return ExitCode::from(2);
+        };
+        for issue in &issues {
+            let text = format!("{} {}", issue.title, issue.description);
+            let issue_vec = bv_search::embedder::hash_embed(&text, dim);
+            let text_score = bv_search::embedder::cosine_similarity(&query_vec, &issue_vec);
+            let days_since_update = issue
+                .updated_at
+                .as_deref()
+                .and_then(|s| s.parse::<jiff::Timestamp>().ok())
+                .map(|t| now.since(t).map(|d| d.get_days()).unwrap_or(0) as f64)
+                .unwrap_or(0.0);
+            let components = bv_search::hybrid::ComponentScores::new(issue.status.as_str(), issue.priority, days_since_update);
+            let score = bv_search::hybrid::hybrid_score(text_score, &weights, &components);
+            results.push(serde_json::json!({
+                "issue_id": issue.id,
+                "score": score,
+                "text_score": text_score,
+                "title": issue.title,
+                "component_scores": components,
+            }));
+        }
+        results.sort_by(|a, b| {
+            b["score"].as_f64().partial_cmp(&a["score"].as_f64()).unwrap_or(std::cmp::Ordering::Equal)
+        });
+    } else {
+        for issue in &issues {
+            let text = format!("{} {}", issue.title, issue.description);
+            let issue_vec = bv_search::embedder::hash_embed(&text, dim);
+            let score = bv_search::embedder::cosine_similarity(&query_vec, &issue_vec);
+            results.push(serde_json::json!({
+                "issue_id": issue.id,
+                "score": score,
+                "title": issue.title,
+            }));
+        }
+        results.sort_by(|a, b| {
+            b["score"].as_f64().partial_cmp(&a["score"].as_f64()).unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+    results.truncate(limit);
+
+    let mut payload = envelope_json(&hash);
+    payload["query"] = serde_json::json!(query);
+    payload["mode"] = serde_json::json!(mode);
+    if mode == "hybrid" {
+        payload["preset"] = serde_json::json!(preset_name);
+    }
+    payload["limit"] = serde_json::json!(limit);
+    payload["results"] = serde_json::Value::Array(results);
+    payload["usage_hints"] = serde_json::json!([
+        "This build embeds fresh on every call — no persisted vector index \
+         yet (see plan doc §11), so there is no 'index' sync-stats field.",
+        "jq '.results[] | {id: .issue_id, score: .score, title: .title}'",
+    ]);
+    emit_json(&payload)
+}
+
 /// Shared loader for the correlator-backed commands: issues + a full
 /// correlation report (`bv_correlation::correlator::correlate`). Walks up
 /// to 1000 commits — Go's default `--history-limit` is 500; doubled here
@@ -1715,6 +1834,7 @@ const DISPATCHED_ROBOT_COMMANDS: &[&str] = &[
     "robot-file-beads",
     "robot-file-hotspots",
     "robot-file-relations",
+    "robot-search",
 ];
 
 /// Go `generateRobotCapabilities` (lower-fidelity first pass — see plan

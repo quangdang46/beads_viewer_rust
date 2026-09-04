@@ -614,10 +614,20 @@ silently re-discovered.
   looser, weighted by concurrent active-bead count — more false negatives
   here, fewer false positives). 4 unit tests cover explicit-mention,
   assignee-gated temporal, out-of-window exclusion, and no-signal cases.
+- **bv-search** (new `cosine_similarity` in `embedder.rs`) + **bv CLI**:
+  `robot-search` now real. `--search-mode text` (Go default) ranks issues
+  by cosine similarity of `hash_embed(title+description)` against the
+  query; `--search-mode hybrid --search-preset NAME` blends that with
+  `bv-search::hybrid`'s status/priority/recency components. Scope cut: no
+  persisted vector index / incremental sync — embeds every issue fresh on
+  each call (Go's `index.Sync`/`syncStats` not ported; `index`/`loaded`
+  envelope fields intentionally omitted rather than faked). 3 new
+  integration tests (limit respected, missing-query rejected by the
+  shared modifier-requires validator, unknown-preset exits 2).
 
 ### Confirmed remaining gaps (not fixed — do not assume otherwise)
 
-**Robot CLI** — ~23 of 47 `--robot-*` primaries in `flags::ROBOT_PRIMARIES`
+**Robot CLI** — ~22 of 47 `--robot-*` primaries in `flags::ROBOT_PRIMARIES`
 still have no dispatch handler at all; they correctly exit 2 via the A4
 fallback instead of misbehaving, but the underlying commands don't exist
 yet. Roughly in build order of what's cheapest to unblock:
@@ -627,11 +637,6 @@ yet. Roughly in build order of what's cheapest to unblock:
   `handleRobotImpact` in `cmd/bv/robot_registry.go`), `robot-not-ready-labels`
   (needs `build_triage`'s claimability logic extended, not a simple filter —
   see `pkg/analysis/triage.go` `isClaimableRecommendation`/`buildTopPicks`).
-- Needs the new `bv_correlation::correlator` pipeline wired in (same
-  pattern as the 5 commands already done — see above), just not done yet:
-  `robot-search` (has `bv-search::hybrid`/`embedder` primitives but no
-  assembled pipeline — same class of gap the correlator was for
-  `bv-correlation`; do that first, then wire `robot-search` similarly).
 - Needs whole Go packages not ported at all: `robot-related`,
   `robot-impact-network`, `robot-causality` (Go `pkg/correlation/cocommit.go`,
   `causality.go`, `network.go` — no Rust equivalent in any crate).
@@ -650,13 +655,19 @@ semantic search, velocity comparison, update/agent-prompt modals. No
 keybinding customization (`pkg/ui/keybindings.go` has no Rust counterpart —
 low priority).
 
-**Correlation** (`crates/bv-correlation`, 6 files vs Go `pkg/correlation`'s
-24): co-commit correlation, causality graph, network/related-work builder
-have no Rust module at all.
+**Correlation** (`crates/bv-correlation`, 7 files vs Go `pkg/correlation`'s
+24): a real (simplified) correlator pipeline exists now (`correlator.rs`,
+backing 5 robot commands + confirm/reject feedback), but co-commit
+correlation, causality graph, and the network/related-work builder still
+have no Rust module at all — these are the pieces `robot-related`,
+`robot-causality`, `robot-impact-network` need.
 
-**bv-search** (3 files vs Go `pkg/search`'s 14): vector index, lexical
-boost, presets, query adjustment, metrics cache — only the scoring
-primitives (`hybrid.rs`, `embedder.rs`) exist; no assembled search pipeline.
+**bv-search** (4 files vs Go `pkg/search`'s 14): `robot-search` works now
+(text + hybrid modes, real cosine-similarity ranking) — but it embeds
+fresh on every call. Vector index persistence/incremental sync, lexical
+boost, and query adjustment (`index_sync.go`, `lexical_boost.go`,
+`query_adjust.go`) are not ported; irrelevant until something needs
+cross-call index caching for performance.
 
 None of the above should be treated as "safe to assume implemented" —
 verify against this list (or re-grep `flags::ROBOT_PRIMARIES` vs

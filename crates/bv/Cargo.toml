@@ -21,3 +21,4 @@ bv-correlation = { path = "../bv-correlation" }
 bv-graph-core = { path = "../bv-graph-core" }
 bv-export = { path = "../bv-export" }
 bv-tui = { path = "../bv-tui" }
+bv-search = { path = "../bv-search" }

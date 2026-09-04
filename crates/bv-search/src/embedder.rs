@@ -38,9 +38,46 @@ pub fn hash_embed(text: &str, dim: usize) -> Vec<f32> {
     vec
 }
 
+/// Cosine similarity between two equal-length vectors (both already
+/// L2-normalized by `hash_embed`, so this reduces to a dot product — kept
+/// as a full cosine calculation so it's correct for non-normalized inputs
+/// too).
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    (dot / (na * nb)) as f64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cosine_similarity_of_identical_vectors_is_one() {
+        let v = hash_embed("login authentication flow", DEFAULT_DIM);
+        assert!((cosine_similarity(&v, &v) - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn cosine_similarity_of_disjoint_vocab_is_zero() {
+        let a = hash_embed("alpha", 8);
+        let b = hash_embed("zzz", 8);
+        // Small dim risks hash collisions landing in the same bucket; just
+        // assert it's not the identical-vector case.
+        assert!(cosine_similarity(&a, &b) < 1.0);
+    }
+
+    #[test]
+    fn cosine_similarity_mismatched_lengths_is_zero() {
+        assert_eq!(cosine_similarity(&[1.0, 0.0], &[1.0, 0.0, 0.0]), 0.0);
+    }
 
     #[test]
     fn embedding_is_normalized() {

@@ -31,10 +31,12 @@ fn modifier_violation_exits_one() {
 
 #[test]
 fn undispatched_robot_command_fails_fast_instead_of_launching_tui() {
-    // --robot-search is a registered primary (flags::ROBOT_PRIMARIES) with no
-    // dispatch handler yet; it must error with exit 2, not fall through to
-    // the interactive TUI (which would hang this test / any CI runner).
-    let (code, _, stderr) = run(&["--robot-search", "--search", "foo"]);
+    // --robot-related is a registered primary (flags::ROBOT_PRIMARIES) with
+    // no dispatch handler yet (needs the co-commit/network correlation
+    // modules — see plan doc §11); it must error with exit 2, not fall
+    // through to the interactive TUI (which would hang this test / any CI
+    // runner).
+    let (code, _, stderr) = run(&["--robot-related", "some-id"]);
     assert_eq!(code, 2);
     assert!(stderr.contains("not yet implemented"), "{stderr}");
 }
@@ -89,10 +91,10 @@ fn robot_capabilities_reports_real_implementation_status() {
     assert_eq!(code, 0);
     assert!(stdout.contains("\"implemented_count\""));
     assert!(stdout.contains("\"total_count\""));
-    // robot-triage is dispatched; robot-search is not (yet) — both must be
+    // robot-triage is dispatched; robot-related is not (yet) — both must be
     // present with their real status, not a blanket "implemented".
     assert!(stdout.contains("robot-triage"));
-    assert!(stdout.contains("robot-search"));
+    assert!(stdout.contains("robot-related"));
 }
 
 #[test]
@@ -152,6 +154,41 @@ fn robot_explain_correlation_bad_format_exits_two() {
     let (code, _, stderr) = run_at_repo_root(&["--robot-explain-correlation", "not-a-valid-format"]);
     assert_eq!(code, 2);
     assert!(stderr.contains("expected format SHA:beadID"), "{stderr}");
+}
+
+#[test]
+fn robot_search_ranks_and_respects_limit() {
+    let (code, stdout, _) = run_at_repo_root(&["--robot-search", "--search", "triage", "--search-limit", "3"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("\"results\""));
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
+    assert_eq!(parsed["query"], "triage");
+    let results = parsed["results"].as_array().expect("results array");
+    assert!(results.len() <= 3, "must respect --search-limit");
+}
+
+#[test]
+fn robot_search_missing_query_caught_by_modifier_requires() {
+    // --robot-search without --search is rejected by the shared
+    // modifier-requires validator before it ever reaches the handler.
+    let (code, _, stderr) = run(&["--robot-search"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("requires --search"), "{stderr}");
+}
+
+#[test]
+fn robot_search_unknown_preset_exits_two() {
+    let (code, _, stderr) = run_at_repo_root(&[
+        "--robot-search",
+        "--search",
+        "x",
+        "--search-mode",
+        "hybrid",
+        "--search-preset",
+        "bogus-preset",
+    ]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("unknown --search-preset"), "{stderr}");
 }
 
 #[test]
