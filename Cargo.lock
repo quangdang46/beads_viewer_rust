@@ -108,7 +108,7 @@ dependencies = [
 
 [[package]]
 name = "bv"
-version = "0.2.0"
+version = "0.1.1"
 dependencies = [
  "bv-analysis",
  "bv-core",
@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "bv-analysis"
-version = "0.2.0"
+version = "0.1.1"
 dependencies = [
  "bv-core",
  "bv-correlation",
@@ -139,7 +139,7 @@ dependencies = [
 
 [[package]]
 name = "bv-core"
-version = "0.2.0"
+version = "0.1.1"
 dependencies = [
  "jiff",
  "rusqlite",
@@ -152,7 +152,7 @@ dependencies = [
 
 [[package]]
 name = "bv-correlation"
-version = "0.2.0"
+version = "0.1.1"
 dependencies = [
  "bv-core",
  "jiff",
@@ -163,7 +163,7 @@ dependencies = [
 
 [[package]]
 name = "bv-export"
-version = "0.2.0"
+version = "0.1.1"
 dependencies = [
  "bv-core",
  "jiff",
@@ -175,7 +175,7 @@ dependencies = [
 
 [[package]]
 name = "bv-graph-core"
-version = "0.2.0"
+version = "0.1.1"
 dependencies = [
  "getrandom",
  "serde",
@@ -183,7 +183,7 @@ dependencies = [
 
 [[package]]
 name = "bv-robot"
-version = "0.2.0"
+version = "0.1.1"
 dependencies = [
  "bv-core",
  "jiff",
@@ -193,14 +193,14 @@ dependencies = [
 
 [[package]]
 name = "bv-search"
-version = "0.2.0"
+version = "0.1.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "bv-tui"
-version = "0.2.0"
+version = "0.1.1"
 dependencies = [
  "bv-analysis",
  "bv-core",

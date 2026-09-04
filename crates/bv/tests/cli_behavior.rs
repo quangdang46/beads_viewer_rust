@@ -19,7 +19,7 @@ fn run(args: &[&str]) -> (i32, String, String) {
 fn version_exits_zero() {
     let (code, stdout, _) = run(&["--version"]);
     assert_eq!(code, 0);
-    assert!(stdout.starts_with("bvr 0.2.0"));
+    assert!(stdout.starts_with("bvr 0.1.1"));
 }
 
 #[test]
