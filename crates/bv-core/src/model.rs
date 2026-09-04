@@ -311,6 +311,62 @@ impl Issue {
     }
 }
 
+/// Sprint — a time-boxed period of work (Go `pkg/model/types.go:Sprint`).
+/// Sprints are loaded from `.beads/sprints.jsonl` (one JSON object per line,
+/// same JSONL format as issues).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Sprint {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub start_date: Option<String>,
+    #[serde(default)]
+    pub end_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bead_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub velocity_target: Option<f64>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+impl Sprint {
+    /// True when today falls within start_date..=end_date.
+    pub fn is_active(&self) -> bool {
+        let (Some(start), Some(end)) = (&self.start_date, &self.end_date) else {
+            return false;
+        };
+        let (Ok(start), Ok(end)) = (start.parse::<jiff::Timestamp>(), end.parse::<jiff::Timestamp>()) else {
+            return false;
+        };
+        let now = jiff::Timestamp::now();
+        now >= start && now <= end
+    }
+}
+
+/// Forecast — an ETA prediction for a bead (Go `pkg/model/types.go:Forecast`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Forecast {
+    pub bead_id: String,
+    pub eta_date: String,
+    pub confidence: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub factors: Vec<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+}
+
+/// A single point on a burndown chart (Go `pkg/model/types.go:BurndownPoint`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BurndownPoint {
+    pub date: String,
+    pub remaining: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ideal: Option<f64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ValidationError {
     #[error("missing required field: {0}")]

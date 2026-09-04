@@ -185,6 +185,39 @@ fn robot_impact_network_all_returns_full_network() {
 }
 
 #[test]
+fn robot_sprint_list_handles_no_sprints_jsonl() {
+    // This repo has no .beads/sprints.jsonl; sprint-list must succeed
+    // with an empty array, not crash.
+    let (code, stdout, _) = run_at_repo_root(&["--robot-sprint-list"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("\"sprint_count\""));
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
+    assert_eq!(parsed["sprints"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn robot_sprint_show_unknown_sprint_exits_one() {
+    let (code, _, stderr) = run_at_repo_root(&["--robot-sprint-show", "nonexistent-sprint"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("Sprint not found"), "{stderr}");
+}
+
+#[test]
+fn robot_burndown_no_active_sprint_exits_one() {
+    let (code, _, stderr) = run_at_repo_root(&["--robot-burndown"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("No active sprint found"), "{stderr}");
+}
+
+#[test]
+fn robot_capacity_runs_without_crashing() {
+    let (code, stdout, _) = run_at_repo_root(&["--robot-capacity"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("\"capacity\""));
+    assert!(stdout.contains("\"open_count\""));
+}
+
+#[test]
 fn robot_explain_correlation_bad_format_exits_two() {
     let (code, _, stderr) = run_at_repo_root(&["--robot-explain-correlation", "not-a-valid-format"]);
     assert_eq!(code, 2);

@@ -282,6 +282,21 @@ fn main() -> ExitCode {
     if presence.has("robot-impact-network") {
         return run_robot_impact_network(&args);
     }
+    if presence.has("robot-sprint-list") {
+        return run_robot_sprint_list();
+    }
+    if presence.has("robot-sprint-show") {
+        return run_robot_sprint_show(&args);
+    }
+    if presence.has("robot-burndown") {
+        return run_robot_burndown(&args);
+    }
+    if presence.has("robot-forecast") {
+        return run_robot_forecast(&args);
+    }
+    if presence.has("robot-capacity") {
+        return run_robot_capacity(&args);
+    }
 
     // Export pages (static site bundle, Go --export-pages).
     if let Some(idx) = args.iter().position(|a| a == "--export-pages") {
@@ -1717,6 +1732,219 @@ fn run_robot_impact_network(args: &[String]) -> ExitCode {
     emit_json(&payload)
 }
 
+/// Go `robot-sprint-list` — loads `.beads/sprints.jsonl` and emits all sprints.
+fn run_robot_sprint_list() -> ExitCode {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let (issues, hash) = match load_issues_auto(&cwd) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let sprints = match bv_core::sprint::load_sprints(&cwd) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let active_id = sprints.iter().find(|s| s.is_active()).map(|s| s.id.clone());
+    let mut payload = envelope_json(&hash);
+    payload["sprint_count"] = serde_json::json!(sprints.len());
+    payload["sprints"] = serde_json::to_value(&sprints).unwrap_or_default();
+    if let Some(id) = &active_id {
+        payload["active_sprint_id"] = serde_json::json!(id);
+    }
+    payload["issue_count"] = serde_json::json!(issues.len());
+    emit_json(&payload)
+}
+
+/// Go `robot-sprint-show` — `--robot-sprint-show <sprint-id>`.
+fn run_robot_sprint_show(args: &[String]) -> ExitCode {
+    let sprint_id = args
+        .iter()
+        .position(|a| a == "--robot-sprint-show")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_default();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let (issues, hash) = match load_issues_auto(&cwd) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let sprints = match bv_core::sprint::load_sprints(&cwd) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let Some(sprint) = sprints.iter().find(|s| s.id == sprint_id) else {
+        eprintln!("Sprint not found: {sprint_id}");
+        return ExitCode::from(1);
+    };
+    let sprint_issues: Vec<&serde_json::Value> = Vec::new(); // populated below
+    let sprint_issue_ids: Vec<&str> = sprint.bead_ids.iter().map(|s| s.as_str()).collect();
+    let issue_details: Vec<serde_json::Value> = sprint_issue_ids
+        .iter()
+        .filter_map(|id| {
+            issues.iter().find(|i| &i.id == id).map(|i| {
+                serde_json::json!({
+                    "id": i.id,
+                    "title": i.title,
+                    "status": i.status.as_str(),
+                    "priority": i.priority,
+                })
+            })
+        })
+        .collect();
+    let open_count = issue_details.iter().filter(|d| d["status"] != "closed" && d["status"] != "tombstone").count();
+    let closed_count = issue_details.len() - open_count;
+    let mut payload = envelope_json(&hash);
+    payload["sprint"] = serde_json::to_value(sprint).unwrap_or_default();
+    payload["issues"] = serde_json::Value::Array(issue_details);
+    payload["open_count"] = serde_json::json!(open_count);
+    payload["closed_count"] = serde_json::json!(closed_count);
+    let _ = sprint_issues; // suppressed unused
+    emit_json(&payload)
+}
+
+/// Go `robot-burndown` — `--robot-burndown [--burndown-sprint <id>]`.
+fn run_robot_burndown(args: &[String]) -> ExitCode {
+    let target_sprint_id = args
+        .iter()
+        .position(|a| a == "--burndown-sprint")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let (issues, hash) = match load_issues_auto(&cwd) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let sprints = match bv_core::sprint::load_sprints(&cwd) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let target = if let Some(id) = &target_sprint_id {
+        sprints.iter().find(|s| &s.id == id)
+    } else {
+        sprints.iter().find(|s| s.is_active())
+    };
+    let Some(sprint) = target else {
+        eprintln!("No {} sprint found", if target_sprint_id.is_some() { "matching" } else { "active" });
+        return ExitCode::from(1);
+    };
+    let now = jiff::Timestamp::now();
+    let (points, total) = bv_core::sprint::calculate_burndown(sprint, &issues, now);
+    let mut payload = envelope_json(&hash);
+    payload["sprint"] = serde_json::to_value(sprint).unwrap_or_default();
+    payload["total_issues"] = serde_json::json!(total);
+    payload["points"] = serde_json::to_value(&points).unwrap_or_default();
+    emit_json(&payload)
+}
+
+/// Go `robot-forecast` — `--robot-forecast [--forecast-sprint <id>]`.
+fn run_robot_forecast(args: &[String]) -> ExitCode {
+    let target_sprint_id = args
+        .iter()
+        .position(|a| a == "--forecast-sprint")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let (issues, hash) = match load_issues_auto(&cwd) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let sprints = match bv_core::sprint::load_sprints(&cwd) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let target = if let Some(id) = &target_sprint_id {
+        sprints.iter().find(|s| &s.id == id)
+    } else {
+        sprints.iter().find(|s| s.is_active())
+    };
+    let Some(sprint) = target else {
+        eprintln!("No {} sprint found", if target_sprint_id.is_some() { "matching" } else { "active" });
+        return ExitCode::from(1);
+    };
+    let now = jiff::Timestamp::now();
+    let forecast = bv_core::sprint::estimate_forecast(sprint, &issues, now);
+    let mut payload = envelope_json(&hash);
+    payload["sprint"] = serde_json::to_value(sprint).unwrap_or_default();
+    match forecast {
+        Some(f) => {
+            payload["forecast"] = serde_json::to_value(&f).unwrap_or_default();
+        }
+        None => {
+            payload["forecast"] = serde_json::json!(null);
+            payload["message"] = serde_json::json!("all sprint issues are closed — no forecast needed");
+        }
+    }
+    emit_json(&payload)
+}
+
+/// Go `robot-capacity` — `--robot-capacity [--capacity-label <label>]`.
+fn run_robot_capacity(args: &[String]) -> ExitCode {
+    let label = args
+        .iter()
+        .position(|a| a == "--capacity-label")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let (issues, hash) = match load_issues_auto(&cwd) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let filtered: Vec<&bv_core::model::Issue> = if let Some(ref lbl) = label {
+        issues.iter().filter(|i| i.labels.iter().any(|l| l == lbl)).collect()
+    } else {
+        issues.iter().filter(|i| !i.status.is_closed()).collect()
+    };
+    let open_count = filtered.len();
+    let blocked_count = filtered.iter().filter(|i| i.status == bv_core::model::Status::Blocked).count();
+    let in_progress = filtered.iter().filter(|i| i.status == bv_core::model::Status::InProgress).count();
+    let avg_priority: f64 = if open_count > 0 {
+        filtered.iter().map(|i| i.priority as f64).sum::<f64>() / open_count as f64
+    } else {
+        0.0
+    };
+    let estimated_minutes: i64 = filtered.iter().filter_map(|i| i.estimated_minutes).sum();
+    let mut payload = envelope_json(&hash);
+    payload["capacity"] = serde_json::json!({
+        "open_count": open_count,
+        "blocked_count": blocked_count,
+        "in_progress_count": in_progress,
+        "avg_priority": avg_priority,
+        "estimated_minutes": estimated_minutes,
+        "label_filter": label,
+    });
+    payload["usage_hints"] = serde_json::json!([
+        "This is a simplified capacity snapshot. Go's robot-capacity uses a more \
+         complex simulation with historical velocity data (see plan doc §11).",
+    ]);
+    emit_json(&payload)
+}
+
 /// Shared loader for the correlator-backed commands: issues + a full
 /// correlation report (`bv_correlation::correlator::correlate`). Walks up
 /// to 1000 commits — Go's default `--history-limit` is 500; doubled here
@@ -1985,6 +2213,11 @@ const DISPATCHED_ROBOT_COMMANDS: &[&str] = &[
     "robot-causality",
     "robot-related",
     "robot-impact-network",
+    "robot-sprint-list",
+    "robot-sprint-show",
+    "robot-burndown",
+    "robot-forecast",
+    "robot-capacity",
 ];
 
 /// Go `generateRobotCapabilities` (lower-fidelity first pass — see plan

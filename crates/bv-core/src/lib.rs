@@ -2,6 +2,7 @@
 //! Contracts here are api-freeze-v1 — see AGENTS.md and plan §3.1.
 
 pub mod model;
+pub mod sprint;
 
 pub use model::{Comment, Dependency, DependencyType, Issue, Status, ValidationError};
 

@@ -637,11 +637,21 @@ silently re-discovered.
     Documented scope cut: cluster detection not ported. 5 unit tests.
 - **bv CLI**: `--robot-causality <bead-id>`, `--robot-related <bead-id>`,
   `--robot-impact-network <bead-id|all>` now real, all backed by the new
-  correlation modules. 22 of 47 robot primaries remain undispatched.
+  correlation modules.
+- **bv-core** (new `sprint` module + `Sprint`/`Forecast`/`BurndownPoint`
+  model types in `model.rs`) + **bv CLI**: `--robot-sprint-list`,
+  `--robot-sprint-show <id>`, `--robot-burndown [--burndown-sprint <id>]`,
+  `--robot-forecast [--forecast-sprint <id>]`,
+  `--robot-capacity [--capacity-label <label>]` now real. Loads from
+  `.beads/sprints.jsonl` (same JSONL format as Go). Documented scope cuts
+  vs Go: burndown simplified (no per-day scope-change tracking), forecast
+  velocity-target-only (Go includes graph-metric factors), capacity basic
+  snapshot (Go simulates agent availability). 4 unit tests + 4 integration
+  tests. 33 of 47 robot primaries now real.
 
 ### Confirmed remaining gaps (not fixed — do not assume otherwise)
 
-**Robot CLI** — ~19 of 47 `--robot-*` primaries in `flags::ROBOT_PRIMARIES`
+**Robot CLI** — ~14 of 47 `--robot-*` primaries in `flags::ROBOT_PRIMARIES`
 still have no dispatch handler at all; they correctly exit 2 via the A4
 fallback instead of misbehaving, but the underlying commands don't exist
 yet. Roughly in build order of what's cheapest to unblock:
@@ -653,10 +663,9 @@ yet. Roughly in build order of what's cheapest to unblock:
   see `pkg/analysis/triage.go` `isClaimableRecommendation`/`buildTopPicks`).
   `robot-diff` needs `--diff-since` git-snapshot comparison logic — not
   audited yet.
-- Needs whole new data models not ported at all: `robot-sprint-list`,
-  `robot-sprint-show`, `robot-forecast`, `robot-capacity`, `robot-burndown`
-  (no sprint/velocity data model exists in `bv-core::model` at all — this
-  needs design work, not just porting — see task #6).
+- The remaining undispatched commands are `robot-docs` full-text help (only
+  a minimal topic index exists — low value), `robot-help` variants, and
+  some edge-case flag combinations.
 
 **TUI** (`crates/bv-tui`, ~2,940 lines vs Go `pkg/ui`'s ~24,000+): entire
 views missing or placeholder — Graph (`ViewMode::Graph` renders nothing,
