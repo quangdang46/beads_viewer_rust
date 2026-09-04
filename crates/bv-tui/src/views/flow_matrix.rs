@@ -109,7 +109,7 @@ pub fn render_flow_matrix(
             incoming.push((other.clone(), count));
         }
     }
-    incoming.sort_by(|a, b| b.1.cmp(&a.1));
+    incoming.sort_by_key(|item| std::cmp::Reverse(item.1));
     if !incoming.is_empty() {
         detail_lines.push(Line::from(Span::styled(
             "Blocked by:",
@@ -135,7 +135,7 @@ pub fn render_flow_matrix(
             outgoing.push((other.clone(), count));
         }
     }
-    outgoing.sort_by(|a, b| b.1.cmp(&a.1));
+    outgoing.sort_by_key(|item| std::cmp::Reverse(item.1));
     if !outgoing.is_empty() {
         detail_lines.push(Line::from(Span::styled(
             "Blocks:",

@@ -138,6 +138,12 @@ pub struct App {
     /// Attention scores for the Attention view.
     pub attention_labels: Vec<bv_analysis::label_health::LabelAttentionScore>,
     pub attention_cursor: usize,
+    /// Graph view: selected issue index (sorted IDs).
+    pub graph_cursor: usize,
+    /// Graph view: scroll offset in the node list panel.
+    pub graph_scroll: usize,
+    /// Precomputed graph data for the Graph view.
+    pub graph_data: Option<crate::views::graph::GraphData>,
     /// When the snapshot was loaded (freshness badge, Go bv-h305)
     pub loaded_at: std::time::Instant,
     /// PID of another live instance holding .beads/.bv.lock (Go bv-vrvn)
@@ -382,6 +388,9 @@ impl App {
             flow_cursor: 0,
             attention_labels: Vec::new(),
             attention_cursor: 0,
+            graph_cursor: 0,
+            graph_scroll: 0,
+            graph_data: None,
             filtered_indices: Vec::new(),
             cursor: 0,
             filter_mode: FilterMode::All,
@@ -421,6 +430,11 @@ impl App {
         app.flow = Some(flow);
         let attention = bv_analysis::label_health::compute_label_attention_scores(&issues, &cfg, now);
         app.attention_labels = attention.labels;
+        // Build graph data for the Graph view (blocker/dependent maps).
+        app.graph_data = Some(crate::views::graph::GraphData::build(
+            app.issue_map.values().cloned().collect(),
+            app.graph_metrics.clone(),
+        ));
         app.apply_filter();
         app
     }
@@ -629,6 +643,16 @@ impl App {
                     if self.attention_cursor + 1 < self.attention_labels.len() {
                         self.attention_cursor += 1;
                     }
+                } else if self.current_view == ViewMode::Graph {
+                    let max = self.graph_data.as_ref().map(|g| g.sorted_ids.len()).unwrap_or(0);
+                    if max > 0 && self.graph_cursor + 1 < max {
+                        self.graph_cursor += 1;
+                        // Auto-scroll the node list panel
+                        let visible = self.height.saturating_sub(4) as usize;
+                        if self.graph_cursor >= self.graph_scroll + visible {
+                            self.graph_scroll = self.graph_cursor.saturating_sub(visible - 1);
+                        }
+                    }
                 } else if self.current_view == ViewMode::Alerts {
                     if self.alerts_cursor + 1 < self.alerts.len() {
                         self.alerts_cursor += 1;
@@ -646,6 +670,12 @@ impl App {
                     self.flow_cursor = self.flow_cursor.saturating_sub(1);
                 } else if self.current_view == ViewMode::Attention {
                     self.attention_cursor = self.attention_cursor.saturating_sub(1);
+                } else if self.current_view == ViewMode::Graph {
+                    self.graph_cursor = self.graph_cursor.saturating_sub(1);
+                    // Auto-scroll up if cursor goes above visible area
+                    if self.graph_cursor < self.graph_scroll {
+                        self.graph_scroll = self.graph_cursor;
+                    }
                 } else if self.current_view == ViewMode::Alerts {
                     self.alerts_cursor = self.alerts_cursor.saturating_sub(1);
                 } else {
@@ -739,6 +769,20 @@ impl App {
                     ViewMode::List
                 } else {
                     ViewMode::Tree
+                };
+                true
+            }
+            KeyCode::Char('G') => {
+                self.current_view = if self.current_view == ViewMode::Graph {
+                    ViewMode::List
+                } else {
+                    // Build graph data when entering graph view
+                    if self.graph_data.is_none() {
+                        let issues: Vec<bv_core::model::Issue> = self.issue_map.values().cloned().collect();
+                        let metrics = self.graph_metrics.clone();
+                        self.graph_data = Some(crate::views::graph::GraphData::build(issues, metrics));
+                    }
+                    ViewMode::Graph
                 };
                 true
             }
@@ -1102,6 +1146,24 @@ pub fn render(f: &mut Frame, app: &App) {
             render_status_bar(f, app);
             return;
         }
+        ViewMode::Graph => {
+            if let Some(ref graph) = app.graph_data {
+                crate::views::graph::render_graph(
+                    f,
+                    graph,
+                    app.graph_cursor,
+                    app.graph_scroll,
+                    f.area(),
+                );
+            } else {
+                // Build graph data on-the-fly if not cached
+                let issues: Vec<bv_core::model::Issue> = app.issue_map.values().cloned().collect();
+                let graph = crate::views::graph::GraphData::build(issues, app.graph_metrics.clone());
+                crate::views::graph::render_graph(f, &graph, app.graph_cursor, app.graph_scroll, f.area());
+            }
+            render_status_bar(f, app);
+            return;
+        }
         _ => {}
     }
 
@@ -1150,6 +1212,9 @@ pub fn render(f: &mut Frame, app: &App) {
             Line::from("  b           Toggle board view"),
             Line::from("  i           Toggle insights view"),
             Line::from("  t           Toggle time-travel view"),
+            Line::from("  G           Toggle graph view"),
+            Line::from("  f           Toggle flow-matrix view"),
+            Line::from("  A           Toggle attention view"),
             Line::from("  E           Toggle tree view"),
             Line::from("  !           Toggle alerts view"),
             Line::from("  `           Toggle tutorial"),
