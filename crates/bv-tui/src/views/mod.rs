@@ -9,3 +9,4 @@ pub mod tree;
 
 pub mod alerts;
 pub mod insights;
+pub mod velocity_comparison;

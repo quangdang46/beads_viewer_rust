@@ -2007,6 +2007,8 @@ pub mod keybindings;
 pub mod markdown;
 pub mod shortcuts_sidebar;
 pub mod theme;
+pub mod tutorial;
+pub mod update_modal;
 pub mod views;
 pub mod worker;
 
