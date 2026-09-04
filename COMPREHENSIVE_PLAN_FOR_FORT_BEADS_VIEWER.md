@@ -624,10 +624,24 @@ silently re-discovered.
   envelope fields intentionally omitted rather than faked). 3 new
   integration tests (limit respected, missing-query rejected by the
   shared modifier-requires validator, unknown-preset exits 2).
+- **bv-correlation** (new modules `cocommit.rs`, `causality.rs`, `network.rs`):
+  - `cocommit`: co-commit extraction + confidence scoring, reusing the
+    correlator's git walk. 4 unit tests cover path-exclusion, bead-ID-
+    mention boost, shotgun-commit penalty, and missing-sha skip.
+  - `causality`: lifecycle causal chain for one bead from its
+    `BeadEvent` list + gap/duration analysis + summary/recommendations.
+    Documented scope cut: blocked-period/critical-path insights not computed
+    (blocked transitions not present in `BeadEvent`). 5 unit tests.
+  - `network`: full impact/relation network (shared-commit + shared-file +
+    dependency edges) with BFS depth-limited sub-network extraction.
+    Documented scope cut: cluster detection not ported. 5 unit tests.
+- **bv CLI**: `--robot-causality <bead-id>`, `--robot-related <bead-id>`,
+  `--robot-impact-network <bead-id|all>` now real, all backed by the new
+  correlation modules. 22 of 47 robot primaries remain undispatched.
 
 ### Confirmed remaining gaps (not fixed — do not assume otherwise)
 
-**Robot CLI** — ~22 of 47 `--robot-*` primaries in `flags::ROBOT_PRIMARIES`
+**Robot CLI** — ~19 of 47 `--robot-*` primaries in `flags::ROBOT_PRIMARIES`
 still have no dispatch handler at all; they correctly exit 2 via the A4
 fallback instead of misbehaving, but the underlying commands don't exist
 yet. Roughly in build order of what's cheapest to unblock:
@@ -637,14 +651,12 @@ yet. Roughly in build order of what's cheapest to unblock:
   `handleRobotImpact` in `cmd/bv/robot_registry.go`), `robot-not-ready-labels`
   (needs `build_triage`'s claimability logic extended, not a simple filter —
   see `pkg/analysis/triage.go` `isClaimableRecommendation`/`buildTopPicks`).
-- Needs whole Go packages not ported at all: `robot-related`,
-  `robot-impact-network`, `robot-causality` (Go `pkg/correlation/cocommit.go`,
-  `causality.go`, `network.go` — no Rust equivalent in any crate).
-  `robot-sprint-list`, `robot-sprint-show`, `robot-forecast`,
-  `robot-capacity`, `robot-burndown` (no sprint/velocity data model exists
-  in `bv-core::model` at all — this needs design work, not just porting).
-- `robot-diff` needs `--diff-since` git-log comparison logic — not audited
-  yet.
+  `robot-diff` needs `--diff-since` git-snapshot comparison logic — not
+  audited yet.
+- Needs whole new data models not ported at all: `robot-sprint-list`,
+  `robot-sprint-show`, `robot-forecast`, `robot-capacity`, `robot-burndown`
+  (no sprint/velocity data model exists in `bv-core::model` at all — this
+  needs design work, not just porting — see task #6).
 
 **TUI** (`crates/bv-tui`, ~2,940 lines vs Go `pkg/ui`'s ~24,000+): entire
 views missing or placeholder — Graph (`ViewMode::Graph` renders nothing,
@@ -655,12 +667,16 @@ semantic search, velocity comparison, update/agent-prompt modals. No
 keybinding customization (`pkg/ui/keybindings.go` has no Rust counterpart —
 low priority).
 
-**Correlation** (`crates/bv-correlation`, 7 files vs Go `pkg/correlation`'s
-24): a real (simplified) correlator pipeline exists now (`correlator.rs`,
-backing 5 robot commands + confirm/reject feedback), but co-commit
-correlation, causality graph, and the network/related-work builder still
-have no Rust module at all — these are the pieces `robot-related`,
-`robot-causality`, `robot-impact-network` need.
+**Correlation** (`crates/bv-correlation`, 10 files vs Go `pkg/correlation`'s
+24): the major algorithms are now all ported — `correlator.rs` (explicit-ID
++ temporal-author signal assembly), `cocommit.rs` (co-commit confidence),
+`causality.rs` (lifecycle causal chain + gap/duration analysis), `network.rs`
+(shared-commit/file/dependency edge graph + depth-limited sub-network) plus
+`extractor.rs`, `explicit.rs`, `temporal.rs`, `scorer.rs`, `feedback.rs`,
+`orphan.rs`. Remaining unported correlation pieces are pure performance
+optimization (`index_sync.go`, `incremental.go`) or the Go-specific
+batched-git-plumbing (`cocommit.go`'s `primeBatch`/`batchLogArgs`) which
+this port sidesteps by reusing a single `git log` walk.
 
 **bv-search** (4 files vs Go `pkg/search`'s 14): `robot-search` works now
 (text + hybrid modes, real cosine-similarity ranking) — but it embeds

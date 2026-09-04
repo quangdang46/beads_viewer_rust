@@ -273,6 +273,15 @@ fn main() -> ExitCode {
     if presence.has("robot-search") {
         return run_robot_search(&args);
     }
+    if presence.has("robot-causality") {
+        return run_robot_causality(&args);
+    }
+    if presence.has("robot-related") {
+        return run_robot_related(&args);
+    }
+    if presence.has("robot-impact-network") {
+        return run_robot_impact_network(&args);
+    }
 
     // Export pages (static site bundle, Go --export-pages).
     if let Some(idx) = args.iter().position(|a| a == "--export-pages") {
@@ -1570,6 +1579,144 @@ fn run_robot_search(args: &[String]) -> ExitCode {
     emit_json(&payload)
 }
 
+/// Go `handleRobotCausality` — `--robot-causality <bead-id>`.
+fn run_robot_causality(args: &[String]) -> ExitCode {
+    let bead_id = args
+        .iter()
+        .position(|a| a == "--robot-causality")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_default();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let (issues, hash) = match load_issues_auto(&cwd) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if !issues.iter().any(|i| i.id == bead_id) {
+        eprintln!("Bead not found: {bead_id}");
+        return ExitCode::from(1);
+    }
+    let events = match bv_correlation::extract(&cwd, &bv_correlation::ExtractOptions { limit: 1000, ..Default::default() }) {
+        Ok(e) => e,
+        Err(err) => {
+            eprintln!("Error: extraction failed: {err}");
+            return ExitCode::from(1);
+        }
+    };
+    match bv_correlation::causality::build_causality_chain(&bead_id, &events) {
+        Some(result) => {
+            let mut payload = envelope_json(&hash);
+            payload["chain"] = serde_json::to_value(&result.chain).unwrap_or_default();
+            payload["insights"] = serde_json::to_value(&result.insights).unwrap_or_default();
+            emit_json(&payload)
+        }
+        None => {
+            eprintln!("No lifecycle events found for bead: {bead_id} (nothing to build a causal chain from)");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Go `handleRobotRelated` — `--robot-related <bead-id>`.
+fn run_robot_related(args: &[String]) -> ExitCode {
+    let bead_id = args
+        .iter()
+        .position(|a| a == "--robot-related")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_default();
+    let max_results: usize = args
+        .iter()
+        .position(|a| a == "--related-max-results")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let (issues, hash, report) = match load_correlation_report(&cwd) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if !issues.iter().any(|i| i.id == bead_id) {
+        eprintln!("Bead not found: {bead_id}");
+        return ExitCode::from(1);
+    }
+    let network = bv_correlation::network::build_network(&issues, &report);
+    let sub = bv_correlation::network::sub_network(&network, &bead_id, 2);
+
+    let mut related: Vec<serde_json::Value> = sub
+        .edges
+        .iter()
+        .filter(|e| e.from == bead_id || e.to == bead_id)
+        .map(|e| {
+            let other = if e.from == bead_id { &e.to } else { &e.from };
+            serde_json::json!({
+                "bead_id": other,
+                "title": sub.nodes.get(other).map(|n| n.title.clone()).unwrap_or_default(),
+                "relation_type": e.edge_type,
+                "weight": e.weight,
+                "shared": e.shared,
+            })
+        })
+        .collect();
+    related.sort_by(|a, b| b["weight"].as_u64().cmp(&a["weight"].as_u64()));
+    related.truncate(max_results);
+
+    let mut payload = envelope_json(&hash);
+    payload["bead_id"] = serde_json::json!(bead_id);
+    payload["related"] = serde_json::Value::Array(related);
+    emit_json(&payload)
+}
+
+/// Go `handleRobotImpactNetwork` — `--robot-impact-network <bead-id|all>`.
+fn run_robot_impact_network(args: &[String]) -> ExitCode {
+    let target = args
+        .iter()
+        .position(|a| a == "--robot-impact-network")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_default();
+    let depth: usize = args
+        .iter()
+        .position(|a| a == "--network-depth")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+        .clamp(1, 3);
+
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let (issues, hash, report) = match load_correlation_report(&cwd) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let network = bv_correlation::network::build_network(&issues, &report);
+
+    let result = if target.is_empty() || target == "all" {
+        network
+    } else {
+        if !network.nodes.contains_key(&target) {
+            eprintln!("Bead not found in network: {target}");
+            return ExitCode::from(1);
+        }
+        bv_correlation::network::sub_network(&network, &target, depth)
+    };
+
+    let mut payload = envelope_json(&hash);
+    payload["network"] = serde_json::to_value(&result).unwrap_or_default();
+    payload["node_count"] = serde_json::json!(result.nodes.len());
+    payload["edge_count"] = serde_json::json!(result.edges.len());
+    emit_json(&payload)
+}
+
 /// Shared loader for the correlator-backed commands: issues + a full
 /// correlation report (`bv_correlation::correlator::correlate`). Walks up
 /// to 1000 commits — Go's default `--history-limit` is 500; doubled here
@@ -1835,6 +1982,9 @@ const DISPATCHED_ROBOT_COMMANDS: &[&str] = &[
     "robot-file-hotspots",
     "robot-file-relations",
     "robot-search",
+    "robot-causality",
+    "robot-related",
+    "robot-impact-network",
 ];
 
 /// Go `generateRobotCapabilities` (lower-fidelity first pass — see plan

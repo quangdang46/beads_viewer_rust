@@ -31,12 +31,11 @@ fn modifier_violation_exits_one() {
 
 #[test]
 fn undispatched_robot_command_fails_fast_instead_of_launching_tui() {
-    // --robot-related is a registered primary (flags::ROBOT_PRIMARIES) with
-    // no dispatch handler yet (needs the co-commit/network correlation
-    // modules — see plan doc §11); it must error with exit 2, not fall
-    // through to the interactive TUI (which would hang this test / any CI
-    // runner).
-    let (code, _, stderr) = run(&["--robot-related", "some-id"]);
+    // --robot-diff is a registered primary (flags::ROBOT_PRIMARIES) with
+    // no dispatch handler yet (needs --diff-since git-snapshot logic — see
+    // plan doc §11); it must error with exit 2, not fall through to the
+    // interactive TUI (which would hang this test / any CI runner).
+    let (code, _, stderr) = run(&["--robot-diff", "--diff-since", "HEAD~1"]);
     assert_eq!(code, 2);
     assert!(stderr.contains("not yet implemented"), "{stderr}");
 }
@@ -91,10 +90,10 @@ fn robot_capabilities_reports_real_implementation_status() {
     assert_eq!(code, 0);
     assert!(stdout.contains("\"implemented_count\""));
     assert!(stdout.contains("\"total_count\""));
-    // robot-triage is dispatched; robot-related is not (yet) — both must be
+    // robot-triage is dispatched; robot-diff is not (yet) — both must be
     // present with their real status, not a blanket "implemented".
     assert!(stdout.contains("robot-triage"));
-    assert!(stdout.contains("robot-related"));
+    assert!(stdout.contains("robot-diff"));
 }
 
 #[test]
@@ -147,6 +146,42 @@ fn robot_file_hotspots_runs_without_crashing() {
     let (code, stdout, _) = run_at_repo_root(&["--robot-file-hotspots"]);
     assert_eq!(code, 0);
     assert!(stdout.contains("\"hotspots\""));
+}
+
+#[test]
+fn robot_causality_runs_for_real_bead() {
+    let (code, stdout, _) = run_at_repo_root(&["--robot-causality", "beads_viewer_rust-api-freeze-b73"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("\"chain\""));
+    assert!(stdout.contains("\"insights\""));
+    assert!(stdout.contains("\"commit_count\""));
+}
+
+#[test]
+fn robot_causality_unknown_bead_exits_one() {
+    let (code, _, stderr) = run_at_repo_root(&["--robot-causality", "nonexistent-xyz"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("Bead not found"), "{stderr}");
+}
+
+#[test]
+fn robot_related_builds_dependency_edges() {
+    let (code, stdout, _) = run_at_repo_root(&["--robot-related", "beads_viewer_rust-api-freeze-b73"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("\"related\""));
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
+    let related = parsed["related"].as_array().expect("array");
+    assert!(!related.is_empty(), "should find at least one dependency edge");
+    assert_eq!(parsed["bead_id"], "beads_viewer_rust-api-freeze-b73");
+}
+
+#[test]
+fn robot_impact_network_all_returns_full_network() {
+    let (code, stdout, _) = run_at_repo_root(&["--robot-impact-network", "all"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("\"network\""));
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
+    assert!(parsed["node_count"].as_u64().unwrap() > 0);
 }
 
 #[test]
