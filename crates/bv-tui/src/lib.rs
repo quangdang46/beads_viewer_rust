@@ -132,6 +132,12 @@ pub struct App {
     pub tree_collapsed: std::collections::HashSet<String>,
     /// Cursor position within the Alerts view list.
     pub alerts_cursor: usize,
+    /// Cross-label flow data for the FlowMatrix view.
+    pub flow: Option<bv_analysis::label_health::CrossLabelFlow>,
+    pub flow_cursor: usize,
+    /// Attention scores for the Attention view.
+    pub attention_labels: Vec<bv_analysis::label_health::LabelAttentionScore>,
+    pub attention_cursor: usize,
     /// When the snapshot was loaded (freshness badge, Go bv-h305)
     pub loaded_at: std::time::Instant,
     /// PID of another live instance holding .beads/.bv.lock (Go bv-vrvn)
@@ -157,6 +163,8 @@ pub enum ViewMode {
     Board,
     Tree,
     Graph,
+    FlowMatrix,
+    Attention,
     Insights,
     Alerts,
     TimeTravel,
@@ -370,6 +378,10 @@ impl App {
             alerts,
             tree_collapsed: std::collections::HashSet::new(),
             alerts_cursor: 0,
+            flow: None,
+            flow_cursor: 0,
+            attention_labels: Vec::new(),
+            attention_cursor: 0,
             filtered_indices: Vec::new(),
             cursor: 0,
             filter_mode: FilterMode::All,
@@ -399,6 +411,16 @@ impl App {
             cass_available: cass_installed(),
             cass_cache: std::collections::HashMap::new(),
         };
+        // Pre-compute flow-matrix and attention data for the TUI views
+        // (backed by the same data the robot-label-flow / robot-label-attention
+        // commands use, so there's no separate code path — just computed once
+        // at startup instead of on demand).
+        let cfg = bv_analysis::label_health::LabelHealthConfig::default();
+        let now = jiff::Timestamp::now();
+        let flow = bv_analysis::label_health::compute_cross_label_flow(&issues, &cfg);
+        app.flow = Some(flow);
+        let attention = bv_analysis::label_health::compute_label_attention_scores(&issues, &cfg, now);
+        app.attention_labels = attention.labels;
         app.apply_filter();
         app
     }
@@ -598,6 +620,19 @@ impl App {
             KeyCode::Char('j') | KeyCode::Down => {
                 if self.focus_detail {
                     self.detail_scroll = self.detail_scroll.saturating_add(1);
+                } else if self.current_view == ViewMode::FlowMatrix {
+                    let max = self.flow.as_ref().map(|f| f.labels.len()).unwrap_or(0);
+                    if self.flow_cursor + 1 < max {
+                        self.flow_cursor += 1;
+                    }
+                } else if self.current_view == ViewMode::Attention {
+                    if self.attention_cursor + 1 < self.attention_labels.len() {
+                        self.attention_cursor += 1;
+                    }
+                } else if self.current_view == ViewMode::Alerts {
+                    if self.alerts_cursor + 1 < self.alerts.len() {
+                        self.alerts_cursor += 1;
+                    }
                 } else if self.cursor + 1 < self.filtered_indices.len() {
                     self.cursor += 1;
                     self.update_session_count();
@@ -607,6 +642,12 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => {
                 if self.focus_detail {
                     self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                } else if self.current_view == ViewMode::FlowMatrix {
+                    self.flow_cursor = self.flow_cursor.saturating_sub(1);
+                } else if self.current_view == ViewMode::Attention {
+                    self.attention_cursor = self.attention_cursor.saturating_sub(1);
+                } else if self.current_view == ViewMode::Alerts {
+                    self.alerts_cursor = self.alerts_cursor.saturating_sub(1);
                 } else {
                     self.cursor = self.cursor.saturating_sub(1);
                     self.update_session_count();
@@ -674,6 +715,22 @@ impl App {
                     ViewMode::List
                 } else {
                     ViewMode::Alerts
+                };
+                true
+            }
+            KeyCode::Char('f') => {
+                self.current_view = if self.current_view == ViewMode::FlowMatrix {
+                    ViewMode::List
+                } else {
+                    ViewMode::FlowMatrix
+                };
+                true
+            }
+            KeyCode::Char('A') => {
+                self.current_view = if self.current_view == ViewMode::Attention {
+                    ViewMode::List
+                } else {
+                    ViewMode::Attention
                 };
                 true
             }
@@ -986,6 +1043,21 @@ pub fn render(f: &mut Frame, app: &App) {
         }
         ViewMode::Alerts => {
             crate::views::alerts::render_alerts(f, &app.alerts, app.alerts_cursor, f.area());
+            render_status_bar(f, app);
+            return;
+        }
+        ViewMode::FlowMatrix => {
+            if let Some(ref flow) = app.flow {
+                crate::views::flow_matrix::render_flow_matrix(f, flow, app.flow_cursor, f.area());
+            } else {
+                let msg = ratatui::widgets::Paragraph::new("No flow data available");
+                f.render_widget(msg, f.area());
+            }
+            render_status_bar(f, app);
+            return;
+        }
+        ViewMode::Attention => {
+            crate::views::attention::render_attention(f, &app.attention_labels, app.attention_cursor, f.area());
             render_status_bar(f, app);
             return;
         }
