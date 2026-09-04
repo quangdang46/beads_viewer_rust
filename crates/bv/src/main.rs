@@ -211,7 +211,7 @@ fn main() -> ExitCode {
         return run_robot_plan();
     }
     if presence.has("robot-priority") {
-        return run_robot_priority();
+        return run_robot_priority(&args);
     }
     if presence.has("robot-suggest") {
         return run_robot_suggest();
@@ -233,6 +233,15 @@ fn main() -> ExitCode {
     }
     if presence.has("robot-label-attention") {
         return run_robot_label_attention();
+    }
+    if presence.has("robot-blocker-chain") {
+        return run_robot_blocker_chain(&args);
+    }
+    if presence.has("robot-confirm-correlation") {
+        return run_robot_correlation_feedback(&args, "confirm-correlation", "confirm");
+    }
+    if presence.has("robot-reject-correlation") {
+        return run_robot_correlation_feedback(&args, "reject-correlation", "reject");
     }
 
     // Export pages (static site bundle, Go --export-pages).
@@ -1121,15 +1130,35 @@ fn run_robot_plan() -> ExitCode {
     emit_json(&payload)
 }
 
-fn run_robot_priority() -> ExitCode {
+/// Go: `--robot-by-label`/`--robot-by-assignee` are modifiers of
+/// `--robot-priority` (main.go:1799-1800) — exact-match filters applied to
+/// the recommendation list, not standalone commands.
+fn run_robot_priority(args: &[String]) -> ExitCode {
+    let by_label = args
+        .iter()
+        .position(|a| a == "--robot-by-label")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    let by_assignee = args
+        .iter()
+        .position(|a| a == "--robot-by-assignee")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (issues, _) = match load_issues_auto(&cwd) {
+    let (mut issues, _) = match load_issues_auto(&cwd) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
             return ExitCode::from(1);
         }
     };
+    if let Some(label) = &by_label {
+        issues.retain(|i| i.labels.iter().any(|l| l == label));
+    }
+    if let Some(assignee) = &by_assignee {
+        issues.retain(|i| &i.assignee == assignee);
+    }
     let hash = bv_core::data_hash::compute_data_hash(&issues);
     let g = bv_analysis::build_graph(&issues);
 
@@ -1390,6 +1419,102 @@ fn run_robot_recipes() -> ExitCode {
         "version": env!("CARGO_PKG_VERSION"),
         "recipes": recipes,
     });
+    emit_json(&payload)
+}
+
+/// Go `Analyzer.GetBlockerChain` — `--robot-blocker-chain <issue-id>`.
+fn run_robot_blocker_chain(args: &[String]) -> ExitCode {
+    let issue_id = args
+        .iter()
+        .position(|a| a == "--robot-blocker-chain")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_default();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let (issues, hash) = match load_issues_auto(&cwd) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    match bv_analysis::blocker_chain::get_blocker_chain(&issues, &issue_id) {
+        Some(result) => {
+            let mut payload = envelope_json(&hash);
+            payload["result"] = serde_json::to_value(&result).unwrap_or_default();
+            emit_json(&payload)
+        }
+        None => {
+            eprintln!("Issue not found: {issue_id}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Go `handleRobotCorrelationFeedback` — `--robot-confirm-correlation SHA:beadID`
+/// / `--robot-reject-correlation SHA:beadID`.
+///
+/// Scope cut: Go cross-checks the SHA against that bead's actual
+/// correlation history (via the correlator pipeline) before recording
+/// feedback, and captures the correlation's original confidence. The
+/// correlator pipeline isn't ported yet (see plan doc §11) — this records
+/// feedback directly against the bead ID (validated to exist) with
+/// `original_conf: 0.0`, deferring the cross-check until that pipeline
+/// lands. Not a silent gap: reported in `usage_hints`.
+fn run_robot_correlation_feedback(args: &[String], flag: &str, feedback_type: &str) -> ExitCode {
+    let flag_name = format!("--robot-{flag}");
+    let raw = args
+        .iter()
+        .position(|a| a == &flag_name)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_default();
+    let Some((sha, bead_id)) = raw.split_once(':') else {
+        eprintln!("Error: expected format SHA:beadID, got: {raw:?}");
+        return ExitCode::from(2);
+    };
+    let (sha, bead_id) = (sha.trim(), bead_id.trim());
+    if sha.is_empty() || bead_id.is_empty() {
+        eprintln!("Error: expected non-empty SHA and bead ID in format SHA:beadID, got: {raw:?}");
+        return ExitCode::from(2);
+    }
+
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let (issues, hash) = match load_issues_auto(&cwd) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if !issues.iter().any(|i| i.id == bead_id) {
+        eprintln!("Bead not found: {bead_id}");
+        return ExitCode::from(1);
+    }
+
+    let beads_dir = cwd.join(".beads");
+    let store = bv_correlation::feedback::FeedbackStore::new(&beads_dir);
+    let fb = bv_correlation::feedback::CorrelationFeedback {
+        commit_sha: sha.to_lowercase(),
+        bead_id: bead_id.to_string(),
+        feedback_at: jiff_now(),
+        feedback_by: "cli".to_string(),
+        feedback_type: feedback_type.to_string(),
+        reason: String::new(),
+        original_conf: 0.0,
+    };
+    if let Err(e) = store.record(&fb) {
+        eprintln!("Error saving feedback: {e}");
+        return ExitCode::from(1);
+    }
+
+    let mut payload = envelope_json(&hash);
+    payload["feedback"] = serde_json::to_value(&fb).unwrap_or_default();
+    payload["status"] = serde_json::json!(if feedback_type == "confirm" { "confirmed" } else { "rejected" });
+    payload["usage_hints"] = serde_json::json!([
+        "This build does not yet cross-check the SHA against the bead's correlation \
+         history (correlator pipeline not ported) — original_conf is always 0.0.",
+    ]);
     emit_json(&payload)
 }
 

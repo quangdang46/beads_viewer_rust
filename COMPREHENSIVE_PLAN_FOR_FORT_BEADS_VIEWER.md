@@ -576,21 +576,39 @@ silently re-discovered.
   scoring sums the already-computed *global* PageRank over a label's issues
   rather than re-running PageRank on an extracted per-label subgraph (Go's
   `ComputeLabelSubgraph`/`ComputeLabelPageRank` — not ported, see below).
+- **bv-analysis** (new `blocker_chain` module) + **bv CLI**:
+  `robot-blocker-chain <issue-id>` now real — ports
+  `Analyzer.GetBlockerChain` (DFS over open blockers, direct + parent-child
+  propagation, cycle detection) from `pkg/analysis/graph.go` +
+  `triage_context.go`'s `OpenBlockers`/`IsActionable`. One approximation:
+  `IsActionable` doesn't model Go's scheduler-deferral concept beyond
+  `Status::Deferred` (no scheduler exists in this Rust port).
+- **bv CLI**: `robot-priority`'s `--robot-by-label`/`--robot-by-assignee`
+  modifiers now filter the issue set before scoring (were previously
+  declared in the flag registry but silently ignored).
+- **bv CLI**: `robot-confirm-correlation`/`robot-reject-correlation` now
+  record real feedback via `bv-correlation::feedback::FeedbackStore`.
+  Documented scope cut: Go cross-checks the SHA against that bead's actual
+  correlation history via the correlator pipeline (not ported — see below)
+  before recording and captures the correlation's original confidence;
+  this records directly (bead-ID-validated only) with `original_conf: 0.0`
+  and says so in `usage_hints`. Revisit once the correlator pipeline lands.
 
 ### Confirmed remaining gaps (not fixed — do not assume otherwise)
 
-**Robot CLI** — ~31 of 47 `--robot-*` primaries in `flags::ROBOT_PRIMARIES`
-have no dispatch handler at all; they now correctly exit 2 via the A4
-fallback above instead of misbehaving, but the underlying commands don't
-exist yet. Roughly in build order of what's cheapest to unblock:
-- No new backing algorithm needed, just wiring: `robot-by-label`,
-  `robot-by-assignee`, `robot-not-ready-labels`, `robot-impact` (note: Go's
+**Robot CLI** — ~28 of 47 `--robot-*` primaries in `flags::ROBOT_PRIMARIES`
+still have no dispatch handler at all; they correctly exit 2 via the A4
+fallback instead of misbehaving, but the underlying commands don't exist
+yet. Roughly in build order of what's cheapest to unblock:
+- No new backing algorithm needed, just wiring: `robot-impact` (note: Go's
   is "impact of modifying **files**", not `bv_analysis::impact` which scores
   *issues* — don't wire these together without re-checking
-  `handleRobotImpact` in `cmd/bv/robot_registry.go`), `robot-blocker-chain`
-  (graph traversal), `robot-metrics`/`robot-docs`/`robot-schema`/
-  `robot-capabilities` (introspection — Go's versions embed large generated
-  text; a lower-fidelity but real Rust version is a reasonable first pass).
+  `handleRobotImpact` in `cmd/bv/robot_registry.go`), `robot-not-ready-labels`
+  (needs `build_triage`'s claimability logic extended, not a simple filter —
+  see `pkg/analysis/triage.go` `isClaimableRecommendation`/`buildTopPicks`),
+  `robot-metrics`/`robot-docs`/`robot-schema`/`robot-capabilities`
+  (introspection — Go's versions embed large generated text; a
+  lower-fidelity but real Rust version is a reasonable first pass).
 - Needs a correlator pipeline that doesn't exist yet (primitives in
   `bv-correlation` — `explicit.rs`, `temporal.rs`, `orphan.rs`, `scorer.rs`,
   `feedback.rs` — exist, but nothing assembles them the way Go's

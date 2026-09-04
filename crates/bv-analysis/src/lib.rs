@@ -2,6 +2,7 @@
 //! Graph algorithms come from bv-graph-core (extracted from upstream wasm crate).
 
 pub mod analyzer;
+pub mod blocker_chain;
 pub mod cache;
 pub mod drift;
 pub mod impact;
