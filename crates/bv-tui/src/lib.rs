@@ -144,6 +144,8 @@ pub struct App {
     pub graph_scroll: usize,
     /// Precomputed graph data for the Graph view.
     pub graph_data: Option<crate::views::graph::GraphData>,
+    /// History/time-travel view state.
+    pub history: Option<crate::views::history::HistoryState>,
     /// Sprint dashboard state (loaded from .beads/sprints.jsonl).
     pub sprint: Option<crate::views::sprint::SprintState>,
     /// When the snapshot was loaded (freshness badge, Go bv-h305)
@@ -394,6 +396,7 @@ impl App {
             graph_cursor: 0,
             graph_scroll: 0,
             graph_data: None,
+            history: None,
             sprint: None,
             filtered_indices: Vec::new(),
             cursor: 0,
@@ -439,6 +442,8 @@ impl App {
             app.issue_map.values().cloned().collect(),
             app.graph_metrics.clone(),
         ));
+        // Initialize history view (empty for now — populated when user presses t).
+        app.history = Some(crate::views::history::HistoryState::build_from_beads(vec![]));
         app.apply_filter();
         app
     }
@@ -656,6 +661,10 @@ impl App {
                         if self.graph_cursor >= self.graph_scroll + visible {
                             self.graph_scroll = self.graph_cursor.saturating_sub(visible - 1);
                         }
+                } else if self.current_view == ViewMode::TimeTravel {
+                    if let Some(ref mut h) = self.history {
+                        h.move_bead_down();
+                    }
                     }
                 } else if self.current_view == ViewMode::Alerts {
                     if self.alerts_cursor + 1 < self.alerts.len() {
@@ -1182,6 +1191,16 @@ pub fn render(f: &mut Frame, app: &App) {
                 crate::views::sprint::render_sprint(f, sprint_state, &issues, f.area());
             } else {
                 let msg = ratatui::widgets::Paragraph::new("No sprint data available");
+                f.render_widget(msg, f.area());
+            }
+            render_status_bar(f, app);
+            return;
+        }
+        ViewMode::TimeTravel => {
+            if let Some(ref history) = app.history {
+                crate::views::history::render_history(f, history, f.area());
+            } else {
+                let msg = ratatui::widgets::Paragraph::new("No history data available");
                 f.render_widget(msg, f.area());
             }
             render_status_bar(f, app);
