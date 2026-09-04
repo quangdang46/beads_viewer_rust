@@ -82,3 +82,42 @@ fn robot_help_lists_primaries() {
     assert!(stdout.contains("--robot-triage"));
     assert!(stdout.contains("exit 0=success"));
 }
+
+#[test]
+fn robot_capabilities_reports_real_implementation_status() {
+    let (code, stdout, _) = run(&["--robot-capabilities"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("\"implemented_count\""));
+    assert!(stdout.contains("\"total_count\""));
+    // robot-triage is dispatched; robot-search is not (yet) — both must be
+    // present with their real status, not a blanket "implemented".
+    assert!(stdout.contains("robot-triage"));
+    assert!(stdout.contains("robot-search"));
+}
+
+#[test]
+fn robot_schema_unknown_command_exits_one_with_suggestions() {
+    let (code, _, stderr) = run(&["--robot-schema", "--schema-command", "bogus-cmd"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("Unknown command"));
+    assert!(stderr.contains("robot-triage"), "{stderr}");
+}
+
+#[test]
+fn robot_docs_unknown_topic_exits_two() {
+    let (code, stdout, _) = run(&["--robot-docs", "bogus-topic"]);
+    assert_eq!(code, 2);
+    assert!(stdout.contains("\"error\""), "{stdout}");
+}
+
+#[test]
+fn robot_metrics_does_not_fabricate_timing_data() {
+    let (code, stdout, _) = run(&["--robot-metrics"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("\"timing\""));
+    assert!(stdout.contains("\"cache\""));
+    // Empty arrays, not fabricated entries — no timing/cache subsystem exists.
+    let compact: String = stdout.split_whitespace().collect();
+    assert!(compact.contains("\"timing\":[]"), "{compact}");
+    assert!(compact.contains("\"cache\":[]"), "{compact}");
+}

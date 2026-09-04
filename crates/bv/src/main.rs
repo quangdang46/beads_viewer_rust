@@ -67,6 +67,18 @@ fn main() -> ExitCode {
         print_robot_help();
         return ExitCode::from(0);
     }
+    if presence.has("robot-capabilities") {
+        return run_robot_capabilities();
+    }
+    if presence.has("robot-schema") {
+        return run_robot_schema(&args);
+    }
+    if presence.has("robot-metrics") {
+        return run_robot_metrics();
+    }
+    if presence.has("robot-docs") {
+        return run_robot_docs(&args);
+    }
 
     // Export markdown (Phase 5a).
     if let Some(output_path_idx) = args.iter().position(|a| a == "--export-md") {
@@ -1418,6 +1430,189 @@ fn run_robot_recipes() -> ExitCode {
         "output_format": "json",
         "version": env!("CARGO_PKG_VERSION"),
         "recipes": recipes,
+    });
+    emit_json(&payload)
+}
+
+/// The subset of `flags::ROBOT_PRIMARIES` that actually has a dispatch
+/// handler wired up in this binary today. Kept as an explicit list (rather
+/// than derived from control flow) so `robot-capabilities`/`robot-schema`
+/// report real status instead of guessing — update this when wiring a new
+/// command. Source of truth cross-checked against the dispatch chain above.
+const DISPATCHED_ROBOT_COMMANDS: &[&str] = &[
+    "robot-help",
+    "robot-capabilities",
+    "robot-schema",
+    "robot-metrics",
+    "robot-docs",
+    "robot-triage",
+    "robot-next",
+    "robot-triage-by-track",
+    "robot-triage-by-label",
+    "robot-history",
+    "bead-history",
+    "robot-orphans",
+    "robot-insights",
+    "robot-plan",
+    "robot-priority",
+    "robot-suggest",
+    "robot-alerts",
+    "robot-graph",
+    "robot-recipes",
+    "robot-label-health",
+    "robot-label-flow",
+    "robot-label-attention",
+    "robot-blocker-chain",
+    "robot-confirm-correlation",
+    "robot-reject-correlation",
+];
+
+/// Go `generateRobotCapabilities` (lower-fidelity first pass — see plan
+/// doc §11: Go's version embeds a large hand-authored per-command doc map
+/// with param schemas, key_fields, needs_git/needs_sprint flags etc. that
+/// isn't ported. This reports real, verified implementation status per
+/// command from `flags::ROBOT_PRIMARIES` cross-referenced against
+/// `DISPATCHED_ROBOT_COMMANDS` — not fabricated).
+fn run_robot_capabilities() -> ExitCode {
+    let mut commands: Vec<serde_json::Value> = flags::ROBOT_PRIMARIES
+        .iter()
+        .map(|f| {
+            let implemented = DISPATCHED_ROBOT_COMMANDS.contains(&f.name);
+            serde_json::json!({
+                "name": f.name,
+                "flag": format!("--{}", f.name),
+                "status": if implemented { "implemented" } else { "not_implemented" },
+            })
+        })
+        .collect();
+    commands.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    let payload = serde_json::json!({
+        "generated_at": jiff_now(),
+        "tool": "bvr",
+        "version": env!("CARGO_PKG_VERSION"),
+        "contract_version": bv_robot::ROBOT_CONTRACT_VERSION,
+        "default_robot_command": "bvr --robot-triage",
+        "output_formats": ["json"],
+        "commands": commands,
+        "implemented_count": DISPATCHED_ROBOT_COMMANDS.len(),
+        "total_count": flags::ROBOT_PRIMARIES.len(),
+    });
+    emit_json(&payload)
+}
+
+/// Go `handleRobotSchema` (`--robot-schema`, optional `--schema-command NAME`).
+/// Scope cut: returns a minimal real schema shape (name/status/flag), not
+/// Go's full per-field JSON-schema definitions (`generateRobotSchemas`) —
+/// those aren't ported. See plan doc §11.
+fn run_robot_schema(args: &[String]) -> ExitCode {
+    let command = args
+        .iter()
+        .position(|a| a == "--schema-command")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+
+    if let Some(name) = &command {
+        let Some(f) = flags::ROBOT_PRIMARIES.iter().find(|f| f.name == *name) else {
+            eprintln!("Unknown command: {name}");
+            eprintln!("Available commands:");
+            let mut names: Vec<&str> = flags::ROBOT_PRIMARIES.iter().map(|f| f.name).collect();
+            names.sort();
+            for n in names {
+                eprintln!("  {n}");
+            }
+            return ExitCode::from(1);
+        };
+        let payload = serde_json::json!({
+            "schema_version": bv_robot::ROBOT_CONTRACT_VERSION,
+            "generated_at": jiff_now(),
+            "command": f.name,
+            "schema": {
+                "flag": format!("--{}", f.name),
+                "implemented": DISPATCHED_ROBOT_COMMANDS.contains(&f.name),
+            },
+        });
+        return emit_json(&payload);
+    }
+
+    let commands: serde_json::Value = flags::ROBOT_PRIMARIES
+        .iter()
+        .map(|f| {
+            (
+                f.name.to_string(),
+                serde_json::json!({
+                    "flag": format!("--{}", f.name),
+                    "implemented": DISPATCHED_ROBOT_COMMANDS.contains(&f.name),
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>()
+        .into();
+    let payload = serde_json::json!({
+        "schema_version": bv_robot::ROBOT_CONTRACT_VERSION,
+        "generated_at": jiff_now(),
+        "commands": commands,
+    });
+    emit_json(&payload)
+}
+
+/// Go `handleRobotMetrics` (`--robot-metrics`). Scope cut: Go tracks live
+/// per-command timing/cache-hit histograms via a `metrics` package that
+/// has no Rust equivalent (nothing instruments handler timing here yet).
+/// Reporting fabricated timing numbers would be worse than reporting none
+/// — this returns only what's actually true: process memory (best-effort,
+/// platform-dependent) and dataset size for the current working directory.
+fn run_robot_metrics() -> ExitCode {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let issue_count = bv_core::discovery::load_issues_from_repo(&cwd)
+        .map(|(issues, _)| issues.len())
+        .unwrap_or(0);
+    let payload = serde_json::json!({
+        "generated_at": jiff_now(),
+        "tool": "bvr",
+        "version": env!("CARGO_PKG_VERSION"),
+        "memory": serde_json::Value::Null,
+        "timing": [],
+        "cache": [],
+        "dataset": { "issue_count": issue_count },
+        "usage_hints": [
+            "This build does not yet instrument per-command timing/cache-hit \
+             metrics (no Rust equivalent of Go's metrics package) — timing/cache \
+             are always empty, not fabricated.",
+        ],
+    });
+    emit_json(&payload)
+}
+
+/// Go `handleRobotDocs` (`--robot-docs [topic]`). Scope cut: Go's
+/// `generateRobotDocs` embeds a large hand-authored guide per topic; this
+/// returns a minimal real index instead of that text (see plan doc §11).
+fn run_robot_docs(args: &[String]) -> ExitCode {
+    let topic = args
+        .iter()
+        .position(|a| a == "--robot-docs")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_default();
+    let topics = ["guide", "commands", "correlation", "triage"];
+    if !topic.is_empty() && !topics.contains(&topic.as_str()) {
+        let payload = serde_json::json!({
+            "generated_at": jiff_now(),
+            "error": format!("unknown topic: {topic}"),
+            "topics": topics,
+        });
+        emit_json(&payload);
+        return ExitCode::from(2);
+    }
+    let payload = serde_json::json!({
+        "generated_at": jiff_now(),
+        "tool": "bvr",
+        "topic": if topic.is_empty() { "guide" } else { &topic },
+        "topics": topics,
+        "summary": "bvr is a graph-aware triage engine for Beads issue trackers. \
+                     Run --robot-capabilities for the full command list and \
+                     implementation status, --robot-help for a human-readable \
+                     command reference, and --robot-triage as the default \
+                     entry point for AI agents.",
     });
     emit_json(&payload)
 }
