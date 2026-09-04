@@ -4,7 +4,7 @@
 pub mod model;
 pub mod sprint;
 
-pub use model::{Comment, Dependency, DependencyType, Issue, Status, ValidationError};
+pub use model::{Comment, Dependency, DependencyType, Issue, Sprint, Status, ValidationError};
 
 pub mod data_hash;
 pub mod discovery;

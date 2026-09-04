@@ -144,6 +144,8 @@ pub struct App {
     pub graph_scroll: usize,
     /// Precomputed graph data for the Graph view.
     pub graph_data: Option<crate::views::graph::GraphData>,
+    /// Sprint dashboard state (loaded from .beads/sprints.jsonl).
+    pub sprint: Option<crate::views::sprint::SprintState>,
     /// When the snapshot was loaded (freshness badge, Go bv-h305)
     pub loaded_at: std::time::Instant,
     /// PID of another live instance holding .beads/.bv.lock (Go bv-vrvn)
@@ -174,6 +176,7 @@ pub enum ViewMode {
     Insights,
     Alerts,
     TimeTravel,
+    Sprint,
     Tutorial,
 }
 
@@ -391,6 +394,7 @@ impl App {
             graph_cursor: 0,
             graph_scroll: 0,
             graph_data: None,
+            sprint: None,
             filtered_indices: Vec::new(),
             cursor: 0,
             filter_mode: FilterMode::All,
@@ -786,6 +790,14 @@ impl App {
                 };
                 true
             }
+            KeyCode::Char('P') => {
+                self.current_view = if self.current_view == ViewMode::Sprint {
+                    ViewMode::List
+                } else {
+                    ViewMode::Sprint
+                };
+                true
+            }
             KeyCode::Char('a') => {
                 self.filter_mode = FilterMode::All;
                 self.apply_filter();
@@ -1160,6 +1172,17 @@ pub fn render(f: &mut Frame, app: &App) {
                 let issues: Vec<bv_core::model::Issue> = app.issue_map.values().cloned().collect();
                 let graph = crate::views::graph::GraphData::build(issues, app.graph_metrics.clone());
                 crate::views::graph::render_graph(f, &graph, app.graph_cursor, app.graph_scroll, f.area());
+            }
+            render_status_bar(f, app);
+            return;
+        }
+        ViewMode::Sprint => {
+            if let Some(ref sprint_state) = app.sprint {
+                let issues: Vec<bv_core::model::Issue> = app.issue_map.values().cloned().collect();
+                crate::views::sprint::render_sprint(f, sprint_state, &issues, f.area());
+            } else {
+                let msg = ratatui::widgets::Paragraph::new("No sprint data available");
+                f.render_widget(msg, f.area());
             }
             render_status_bar(f, app);
             return;
