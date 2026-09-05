@@ -231,25 +231,35 @@ fn parse_ts_secs(s: &str) -> Option<f64> {
 /// Emit StaleIssue alerts for open/in_progress issues whose last update is
 /// beyond the configured staleness thresholds.  Mirrors Go
 /// `Calculator.checkStaleness`.
-fn check_staleness(result: &mut DriftResult, cfg: &DriftConfig, issues: &[Issue]) {
+fn check_staleness(
+    result: &mut DriftResult,
+    cfg: &DriftConfig,
+    issues: &[Issue],
+    now: jiff::Timestamp,
+) {
     if cfg.is_alert_disabled("stale_issue") || issues.is_empty() {
         return;
     }
-    let now_secs = jiff::Timestamp::now().as_millisecond() as f64 / 1000.0;
+    let now_secs = now.as_millisecond() as f64 / 1000.0;
+    let now_str = now.to_string();
 
     for issue in issues {
-        // Skip closed and deferred statuses.
-        if issue.status.is_closed() || issue.status == bv_core::model::Status::Deferred {
+        // Go skips only Closed and Tombstone.
+        if matches!(
+            issue.status,
+            bv_core::model::Status::Closed | bv_core::model::Status::Tombstone
+        ) {
             continue;
         }
 
-        // Last activity = max(updated_at, created_at).
-        let last_active_secs = issue
+        // Last activity = UpdatedAt (fallback CreatedAt when zero).
+        let (last_active_raw, last_active_secs) = issue
             .updated_at
             .as_deref()
-            .or(issue.created_at.as_deref())
-            .and_then(parse_ts_secs)
-            .unwrap_or(0.0);
+            .map(|s| (s, parse_ts_secs(s)))
+            .or_else(|| issue.created_at.as_deref().map(|s| (s, parse_ts_secs(s))))
+            .map(|(s, t)| (s, t.unwrap_or(0.0)))
+            .unwrap_or(("", 0.0));
         if last_active_secs == 0.0 {
             continue;
         }
@@ -292,15 +302,16 @@ fn check_staleness(result: &mut DriftResult, cfg: &DriftConfig, issues: &[Issue]
             severity,
             message: format!("Issue {} inactive for {:.0} days", issue.id, inactive_days),
             baseline_val: None,
-            current_val: Some(inactive_days),
+            // Go leaves BaselineVal/CurrentVal unset (omitempty → absent).
+            current_val: None,
             delta: None,
             details: vec![
                 format!("status={status_str}"),
-                format!("last_update={}", issue.updated_at.as_deref().unwrap_or("")),
+                format!("last_update={last_active_raw}"),
             ],
             issue_id: issue.id.clone(),
             label: String::new(),
-            detected_at: None,
+            detected_at: Some(now_str.clone()),
             unblocks_count: None,
             downstream_priority_sum: None,
         });
@@ -428,6 +439,7 @@ pub fn calculate(
     cfg: &DriftConfig,
     new_cycles: &[Vec<String>],
     issues: &[Issue],
+    now: jiff::Timestamp,
 ) -> DriftResult {
     let mut r = DriftResult::default();
 
@@ -572,7 +584,7 @@ pub fn calculate(
     }
 
     // Staleness: check open/in_progress issues against per-label thresholds.
-    check_staleness(&mut r, cfg, issues);
+    check_staleness(&mut r, cfg, issues, now);
 
     // Blocking cascade: BFS downstream through blocked issues.
     check_blocking_cascade(&mut r, cfg, issues);

@@ -646,7 +646,7 @@ fn run_robot_next() -> ExitCode {
     }
 
     let g = std::sync::Arc::new(bv_analysis::analyzer::build_graph(&issues));
-    let out = bv_analysis::triage::build_triage(&issues, &g, jiff::Timestamp::now());
+    let out = bv_analysis::triage::build_triage(&issues, &g, robot_now());
     payload["phase2_ready"] = serde_json::json!(true);
     payload["status"] = out.metric_status.to_json_map();
 
@@ -796,7 +796,7 @@ fn run_robot_triage() -> ExitCode {
     }
     let data_hash = bv_core::data_hash::compute_data_hash(&issues);
     let g = std::sync::Arc::new(bv_analysis::analyzer::build_graph(&issues));
-    let out = bv_analysis::triage::build_triage(&issues, &g, jiff::Timestamp::now());
+    let out = bv_analysis::triage::build_triage(&issues, &g, robot_now());
 
     // Build top_picks from top recommendations (Go parity).
     let top_picks: Vec<serde_json::Value> = out
@@ -1138,6 +1138,7 @@ fn run_check_drift() -> ExitCode {
         &bv_analysis::drift::DriftConfig::default(),
         &fresh_cycles,
         &issues,
+        robot_now(),
     );
     println!(
         "{}",
@@ -1226,6 +1227,7 @@ fn run_robot_drift() -> ExitCode {
         &bv_analysis::drift::DriftConfig::default(),
         &fresh_cycles,
         &issues,
+        robot_now(),
     );
 
     // Go parity: exact JSON structure from cmd/bv/main.go:3511-3541.
@@ -1527,10 +1529,12 @@ fn run_robot_insights() -> ExitCode {
     let slacks = bv_graph_core::slack(&g);
     let slack_obj = to_id_map(&g, &slacks);
     let art_pts = bv_graph_core::algorithms::articulation::articulation_points(&g);
-    let art_ids: Vec<String> = art_pts
+    let mut art_ids: Vec<String> = art_pts
         .iter()
         .map(|&i| g.node_id(i).unwrap_or_default().to_string())
         .collect();
+    // Go ArticulationPoints() sorts with sort.Strings (lexicographic).
+    art_ids.sort();
 
     let n = g.len() as f64;
     let density = if n <= 1.0 {
@@ -1562,9 +1566,7 @@ fn run_robot_insights() -> ExitCode {
     payload["ClusterDensity"] = serde_json::json!(density);
 
     // Velocity snapshot (Go parity: VelocitySnapshot in insights).
-    if let Some(vel) =
-        bv_analysis::triage::compute_project_velocity(&issues, jiff::Timestamp::now())
-    {
+    if let Some(vel) = bv_analysis::triage::compute_project_velocity(&issues, robot_now()) {
         payload["Velocity"] = vel;
     }
 
@@ -2006,7 +2008,7 @@ fn run_robot_priority(args: &[String]) -> ExitCode {
         .map(|(i, v)| (g.node_id(i).unwrap_or_default().to_string(), *v))
         .collect();
 
-    let now = jiff::Timestamp::now();
+    let now = robot_now();
     let inputs = bv_analysis::impact::ImpactInputs {
         issues: &issues,
         pagerank: &pr_map,
@@ -2177,6 +2179,7 @@ fn run_robot_alerts() -> ExitCode {
         &bv_analysis::drift::DriftConfig::default(),
         &[],
         &issues,
+        robot_now(),
     );
 
     // Go robot-alerts embeds the full RobotEnvelope (output_format+version)
@@ -2390,7 +2393,7 @@ fn run_robot_search(args: &[String]) -> ExitCode {
 
     let dim = bv_search::embedder::DEFAULT_DIM;
     let query_vec = bv_search::embedder::hash_embed(&query, dim);
-    let now = jiff::Timestamp::now();
+    let now = robot_now();
 
     let mut results: Vec<serde_json::Value> = Vec::new();
     if mode == "hybrid" {
@@ -2730,7 +2733,7 @@ fn run_robot_burndown(args: &[String]) -> ExitCode {
         );
         return ExitCode::from(1);
     };
-    let now = jiff::Timestamp::now();
+    let now = robot_now();
     let (points, total) = bv_core::sprint::calculate_burndown(sprint, &issues, now);
     let mut payload = envelope_json(&hash);
     payload["sprint"] = serde_json::to_value(sprint).unwrap_or_default();
@@ -2777,7 +2780,7 @@ fn run_robot_forecast(args: &[String]) -> ExitCode {
         );
         return ExitCode::from(1);
     };
-    let now = jiff::Timestamp::now();
+    let now = robot_now();
     let forecast = bv_core::sprint::estimate_forecast(sprint, &issues, now);
     let mut payload = envelope_json(&hash);
     payload["sprint"] = serde_json::to_value(sprint).unwrap_or_default();
@@ -3393,8 +3396,7 @@ fn run_robot_label_health() -> ExitCode {
         Err(code) => return code,
     };
     let cfg = bv_analysis::label_health::LabelHealthConfig::default();
-    let results =
-        bv_analysis::label_health::compute_all_label_health(&issues, &cfg, jiff::Timestamp::now());
+    let results = bv_analysis::label_health::compute_all_label_health(&issues, &cfg, robot_now());
     let mut payload = envelope_json(&hash);
     payload["analysis_config"] = serde_json::to_value(&cfg).unwrap_or_default();
     payload["results"] = serde_json::to_value(&results).unwrap_or_default();
@@ -3437,11 +3439,8 @@ fn run_robot_label_attention() -> ExitCode {
         }
     };
     let cfg = bv_analysis::label_health::LabelHealthConfig::default();
-    let result = bv_analysis::label_health::compute_label_attention_scores(
-        &issues,
-        &cfg,
-        jiff::Timestamp::now(),
-    );
+    let result =
+        bv_analysis::label_health::compute_label_attention_scores(&issues, &cfg, robot_now());
     let mut payload = envelope_json(&hash);
     payload["labels"] = serde_json::to_value(&result.labels).unwrap_or_default();
     payload["top_attention"] = serde_json::to_value(&result.top_attention).unwrap_or_default();
@@ -3583,9 +3582,22 @@ fn run_robot_not_ready_labels(args: &[String]) -> ExitCode {
     emit_json(&payload)
 }
 
+/// Go `robotNow` parity: `SOURCE_DATE_EPOCH` (unix seconds) pins the clock
+/// for deterministic output (reproducible builds / differential testing).
+fn robot_now() -> jiff::Timestamp {
+    if let Ok(v) = std::env::var("SOURCE_DATE_EPOCH") {
+        if let Ok(secs) = v.trim().parse::<i64>() {
+            if let Ok(ts) = jiff::Timestamp::from_second(secs) {
+                return ts;
+            }
+        }
+    }
+    robot_now()
+}
+
 fn jiff_now() -> String {
     // Go parity: truncate to second precision (no microseconds).
-    let ts = jiff::Timestamp::now();
+    let ts = robot_now();
     let s = ts.to_string();
     // Strip sub-second portion: "2026-08-22T14:07:01.790741Z" → "2026-08-22T14:07:01Z"
     if let Some(pos) = s.find('.') {

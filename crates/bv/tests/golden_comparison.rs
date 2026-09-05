@@ -65,6 +65,11 @@ fn run_bvr(cwd: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new(env!("CARGO_BIN_EXE_bvr"))
         .args(args)
         .current_dir(cwd)
+        // Pin the clock to the golden capture instant (golden/METADATA.txt
+        // captured_at 2026-08-22T14:06:52Z) so time-dependent outputs
+        // (stale-day counts, velocity weekly buckets) are deterministic.
+        // Go `robotNow` honors SOURCE_DATE_EPOCH; Rust parity matches.
+        .env("SOURCE_DATE_EPOCH", "1787407612")
         .env("BV_ROBOT", "1")
         .env("BV_NO_CACHE", "1")
         .output()
@@ -84,7 +89,7 @@ fn normalize(v: &Value) -> Value {
             for (k, val) in map {
                 match k.as_str() {
                     "ms" | "compute_time_ms" => {}
-                    "generated_at" | "timestamp" => {
+                    "generated_at" | "timestamp" | "detected_at" => {
                         out.insert(k.clone(), Value::String("<TIMESTAMP>".into()));
                     }
                     _ => {
