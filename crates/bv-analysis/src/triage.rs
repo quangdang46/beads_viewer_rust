@@ -129,8 +129,100 @@ pub struct TriageOutput {
     pub velocity: Option<serde_json::Value>,
 }
 
+/// Parse YYYY-MM-DDTHH:MM:SS from an RFC3339 timestamp string.
+fn parse_ymd(s: &str) -> Option<(i32, u32, u32)> {
+    let y: i32 = s[0..4].parse().ok()?;
+    let m: u32 = s[5..7].parse().ok()?;
+    let d: u32 = s[8..10].parse().ok()?;
+    Some((y, m, d))
+}
+
+/// Convert year/month/day to ISO year + ISO week number (Monday-start).
+fn ymd_to_iso_week(y: i32, m: u32, d: u32) -> (i32, u32) {
+    // Zeller-like formula for ISO week.
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    let days_since_epoch = {
+        // Days from 1970-01-01 using a simplified civil date diff.
+        let y = y as i64;
+        let m = m as i64;
+        let d = d as i64;
+        let a = (14 - m) / 12;
+        let yy = y + 4800 - a;
+        let mm = m + 12 * a - 3;
+        d + (153 * mm + 2) / 5 + 365 * yy + yy / 4 - yy / 100 + yy / 400 - 32045
+    };
+    // Day of week (0=Monday, 6=Sunday) for the ISO formula.
+    let dow = ((days_since_epoch % 7 + 7) % 7) as i64; // 0=Mon
+    // ISO week: week containing Jan 4.
+    let ordinal = days_since_epoch - (days_since_epoch - 3).div_euclid(365) * 365
+        + (days_since_epoch - 3).div_euclid(365) / 100
+        - (days_since_epoch - 3).div_euclid(365) / 400;
+    // Simpler: just use the day-of-year approach.
+    let jan1_dow = {
+        let a = (14 - 1) / 12;
+        let yy = y + 4800 - a;
+        let mm = 1 + 12 * a - 3;
+        let jd = 1 + (153 * mm + 2) / 5 + 365 * yy + yy / 4 - yy / 100 + yy / 400 - 32045;
+        ((jd % 7 + 7) % 7) as i64
+    };
+    let day_of_year = {
+        let a = (14 - m as i64) / 12;
+        let yy = y as i64 + 4800 - a;
+        let mm = m as i64 + 12 * a - 3;
+        let jd = d as i64 + (153 * mm + 2) / 5 + 365 * yy + yy / 4 - yy / 100 + yy / 400 - 32045;
+        let jan1 = {
+            let a2 = (14 - 1) / 12;
+            let yy2 = y as i64 + 4800 - a2;
+            let mm2 = 1 + 12 * a2 - 3;
+            1 + (153 * mm2 + 2) / 5 + 365 * yy2 + yy2 / 4 - yy2 / 100 + yy2 / 400 - 32045
+        };
+        jd - jan1 + 1
+    };
+    // ISO week number.
+    let week_num = ((day_of_year - dow + 10) / 7) as u32;
+    if week_num == 0 {
+        // Belongs to previous year's last week.
+        let prev_y = y - 1;
+        let prev_dec31_dow = {
+            let a = (14 - 12) / 12;
+            let yy = prev_y + 4800 - a;
+            let mm = 12 + 12 * a - 3;
+            let jd = 31 + (153 * mm + 2) / 5 + 365 * yy + yy / 4 - yy / 100 + yy / 400 - 32045;
+            ((jd % 7 + 7) % 7) as i64
+        };
+        let prev_jan1_dow = {
+            let a = (14 - 1) / 12;
+            let yy = prev_y + 4800 - a;
+            let mm = 1 + 12 * a - 3;
+            let jd = 1 + (153 * mm + 2) / 5 + 365 * yy + yy / 4 - yy / 100 + yy / 400 - 32045;
+            ((jd % 7 + 7) % 7) as i64
+        };
+        let weeks_in_prev_year = {
+            let total_days = 365 + if prev_y % 4 == 0 && (prev_y % 100 != 0 || prev_y % 400 == 0) { 1 } else { 0 };
+            ((total_days - prev_jan1_dow + 6) / 7) as u32
+        };
+        (prev_y, weeks_in_prev_year)
+    } else if week_num > 52 {
+        // Check if it belongs to next year's week 1.
+        let dec31_dow = {
+            let a = (14 - 12) / 12;
+            let yy = y + 4800 - a;
+            let mm = 12 + 12 * a - 3;
+            let jd = 31 + (153 * mm + 2) / 5 + 365 * yy + yy / 4 - yy / 100 + yy / 400 - 32045;
+            ((jd % 7 + 7) % 7) as i64
+        };
+        if dow >= 4 - dec31_dow {
+            (y + 1, 1)
+        } else {
+            (y, week_num)
+        }
+    } else {
+        (y, week_num)
+    }
+}
+
 /// Velocity snapshot — port of Go `ComputeProjectVelocity` (triage.go:215).
-/// Computes closure velocity from issue timestamps.
+/// Computes closure velocity from issue timestamps, including weekly buckets.
 pub fn compute_project_velocity(
     issues: &[Issue],
     now: jiff::Timestamp,
@@ -143,6 +235,11 @@ pub fn compute_project_velocity(
     let mut total_close_secs = 0.0f64;
     let mut close_samples = 0usize;
     let mut estimated = false;
+
+    // Weekly buckets: key = (iso_year, iso_week), value = count.
+    // Go uses 8 weeks, Monday-start ISO weeks.
+    use std::collections::BTreeMap;
+    let mut week_buckets: BTreeMap<(i32, u32), usize> = BTreeMap::new();
 
     for issue in issues {
         if !matches!(issue.status, Status::Closed | Status::Tombstone) {
@@ -168,6 +265,14 @@ pub fn compute_project_velocity(
         if closed_at >= month_ago {
             closed_last_30 += 1;
         }
+        // Bucket by ISO week (year, week_of_year) from timestamp string.
+        if let Some(ts_str) = issue.closed_at.as_deref().or(issue.updated_at.as_deref()) {
+            if let Some((y, m, d)) = parse_ymd(ts_str) {
+                let (iso_year, iso_week) = ymd_to_iso_week(y, m, d);
+                *week_buckets.entry((iso_year, iso_week)).or_insert(0) += 1;
+            }
+        }
+
         // Average time-to-close.
         if let Some(created) = issue
             .created_at
@@ -186,10 +291,34 @@ pub fn compute_project_velocity(
         0.0
     };
 
+    // Build weekly array (newest first, 8 weeks). Go parity: VelocityWeek.
+    // Compute the most recent Monday and iterate backwards.
+    let mut weekly: Vec<serde_json::Value> = Vec::new();
+    let now_str = now.to_string();
+    if let Some((ny, nm, nd)) = parse_ymd(&now_str) {
+        let (cur_y, cur_w) = ymd_to_iso_week(ny, nm, nd);
+        for offset in 0..8i32 {
+            // Subtract offset weeks from current ISO week.
+            let mut wy = cur_y;
+            let mut ww = cur_w as i32 - offset;
+            while ww <= 0 {
+                wy -= 1;
+                let (_, prev_w52) = ymd_to_iso_week(wy + 1, 1, 4);
+                ww += prev_w52 as i32;
+            }
+            let count = week_buckets.get(&(wy, ww as u32)).copied().unwrap_or(0);
+            weekly.push(serde_json::json!({
+                "week_start": format!("{wy}-W{ww:02}"),
+                "closed": count,
+            }));
+        }
+    }
+
     Some(serde_json::json!({
         "closed_last_7_days": closed_last_7,
         "closed_last_30_days": closed_last_30,
         "avg_days_to_close": (avg_days * 100.0).round() / 100.0,
+        "weekly": weekly,
         "estimated": estimated,
     }))
 }

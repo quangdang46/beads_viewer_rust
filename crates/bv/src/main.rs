@@ -1262,15 +1262,45 @@ fn run_robot_insights() -> ExitCode {
             .find(|i| i.id == id)
             .map(|i| i.title.as_str())
             .unwrap_or("");
+
+        // Compute depth_reduction from critical path heights (Go parity).
+        let current_depth = cp_heights
+            .get(entry.node)
+            .copied()
+            .unwrap_or(0.0);
+        const MAX_CRITICAL_PATH_DEPTH: f64 = 10.0;
+        let depth_reduction = (current_depth / MAX_CRITICAL_PATH_DEPTH).min(1.0);
+
+        // Compute blocked_reduction: count of direct unblocks currently blocked.
+        let blocked_reduction = entry.result.unblocked_ids.iter()
+            .filter(|&&idx| closed_set.get(idx).copied().unwrap_or(false)
+                || issues.iter().any(|i| {
+                    g.node_idx(&i.id) == Some(idx)
+                        && matches!(i.status, bv_core::model::Status::Blocked)
+                }))
+            .count();
+
+        // Compute estimated_days_saved from estimated_minutes of unblocked issues.
+        let estimated_days_saved: f64 = entry.result.unblocked_ids.iter()
+            .filter_map(|&idx| {
+                let node_id = g.node_id(idx)?;
+                issues.iter().find(|i| i.id == node_id)
+            })
+            .map(|i| {
+                let minutes = i.estimated_minutes.unwrap_or(60) as f64;
+                minutes / 480.0 // 8-hour workday
+            })
+            .sum();
+
         Some(serde_json::json!({
             "issue_id": id,
             "title": title,
             "delta": {
                 "direct_unblocks": entry.result.direct_unblocks,
                 "transitive_unblocks": entry.result.transitive_unblocks,
-                "blocked_reduction": 0,
-                "depth_reduction": 0.0,
-                "estimated_days_saved": 0.0,
+                "blocked_reduction": blocked_reduction,
+                "depth_reduction": (depth_reduction * 100.0).round() / 100.0,
+                "estimated_days_saved": (estimated_days_saved * 100.0).round() / 100.0,
                 "unblocked_issue_ids": entry.result.unblocked_ids.iter()
                     .filter_map(|&idx| g.node_id(idx).map(|s| s.to_string()))
                     .collect::<Vec<_>>(),
