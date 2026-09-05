@@ -1264,24 +1264,29 @@ fn run_robot_insights() -> ExitCode {
             .unwrap_or("");
 
         // Compute depth_reduction from critical path heights (Go parity).
-        let current_depth = cp_heights
-            .get(entry.node)
-            .copied()
-            .unwrap_or(0.0);
+        let current_depth = cp_heights.get(entry.node).copied().unwrap_or(0.0);
         const MAX_CRITICAL_PATH_DEPTH: f64 = 10.0;
         let depth_reduction = (current_depth / MAX_CRITICAL_PATH_DEPTH).min(1.0);
 
         // Compute blocked_reduction: count of direct unblocks currently blocked.
-        let blocked_reduction = entry.result.unblocked_ids.iter()
-            .filter(|&&idx| closed_set.get(idx).copied().unwrap_or(false)
-                || issues.iter().any(|i| {
-                    g.node_idx(&i.id) == Some(idx)
-                        && matches!(i.status, bv_core::model::Status::Blocked)
-                }))
+        let blocked_reduction = entry
+            .result
+            .unblocked_ids
+            .iter()
+            .filter(|&&idx| {
+                closed_set.get(idx).copied().unwrap_or(false)
+                    || issues.iter().any(|i| {
+                        g.node_idx(&i.id) == Some(idx)
+                            && matches!(i.status, bv_core::model::Status::Blocked)
+                    })
+            })
             .count();
 
         // Compute estimated_days_saved from estimated_minutes of unblocked issues.
-        let estimated_days_saved: f64 = entry.result.unblocked_ids.iter()
+        let estimated_days_saved: f64 = entry
+            .result
+            .unblocked_ids
+            .iter()
             .filter_map(|&idx| {
                 let node_id = g.node_id(idx)?;
                 issues.iter().find(|i| i.id == node_id)
