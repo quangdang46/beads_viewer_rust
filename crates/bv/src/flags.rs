@@ -404,6 +404,8 @@ pub const MODIFIER_FLAGS: &[FlagDef] = &[
     b("no-live-reload"),
     b("watch-export"),
     b("pages"),
+    // Schema
+    s("schema-command"),
     // Debug/render
     s("debug-render"),
     i("debug-width"),
@@ -440,6 +442,16 @@ pub const MODIFIER_REQUIRES: &[(&str, &[&str])] = &[
     ("suggest-confidence", &["robot-suggest"]),
     ("suggest-bead", &["robot-suggest"]),
     ("graph-format", &["robot-graph"]),
+    (
+        "graph-root",
+        &[
+            "robot-graph",
+            "robot-triage",
+            "robot-triage-by-track",
+            "robot-triage-by-label",
+            "robot-next",
+        ],
+    ),
     ("graph-depth", &["robot-graph"]),
     ("severity", &["robot-alerts"]),
     ("alert-type", &["robot-alerts"]),
@@ -486,6 +498,31 @@ pub const MODIFIER_REQUIRES: &[(&str, &[&str])] = &[
     ("watch-export", &["export-pages"]),
     ("debug-width", &["debug-render"]),
     ("debug-height", &["debug-render"]),
+    // Missing rules from Go (main.go:1699-1780)
+    (
+        "robot-not-ready-labels",
+        &[
+            "robot-triage",
+            "robot-triage-by-track",
+            "robot-triage-by-label",
+            "robot-next",
+        ],
+    ),
+    (
+        "correlation-by",
+        &["robot-confirm-correlation", "robot-reject-correlation"],
+    ),
+    (
+        "correlation-reason",
+        &["robot-confirm-correlation", "robot-reject-correlation"],
+    ),
+    ("robot-by-label", &["robot-priority"]),
+    ("robot-by-assignee", &["robot-priority"]),
+    ("pages-include-closed", &["export-pages"]),
+    ("pages-include-history", &["export-pages"]),
+    ("graph-preset", &["export-graph"]),
+    ("graph-title", &["export-graph"]),
+    ("related-include-closed", &["robot-related"]),
 ];
 
 #[cfg(test)]
