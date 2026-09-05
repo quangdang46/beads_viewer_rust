@@ -126,6 +126,72 @@ pub struct TriageOutput {
     pub recommendations: Vec<crate::impact::IssueImpact>,
     pub counts: ProjectCounts,
     pub quick_ref: QuickRef,
+    pub velocity: Option<serde_json::Value>,
+}
+
+/// Velocity snapshot — port of Go `ComputeProjectVelocity` (triage.go:215).
+/// Computes closure velocity from issue timestamps.
+pub fn compute_project_velocity(
+    issues: &[Issue],
+    now: jiff::Timestamp,
+) -> Option<serde_json::Value> {
+    let week_ago = now - jiff::SignedDuration::from_secs(7 * 86400);
+    let month_ago = now - jiff::SignedDuration::from_secs(30 * 86400);
+
+    let mut closed_last_7 = 0usize;
+    let mut closed_last_30 = 0usize;
+    let mut total_close_secs = 0.0f64;
+    let mut close_samples = 0usize;
+    let mut estimated = false;
+
+    for issue in issues {
+        if !matches!(issue.status, Status::Closed | Status::Tombstone) {
+            continue;
+        }
+        // Determine closure time (Go parity: closed_at > updated_at > now).
+        let closed_at = issue
+            .closed_at
+            .as_deref()
+            .and_then(|s| s.parse::<jiff::Timestamp>().ok())
+            .or_else(|| {
+                estimated = true;
+                issue
+                    .updated_at
+                    .as_deref()
+                    .and_then(|s| s.parse::<jiff::Timestamp>().ok())
+            })
+            .unwrap_or(now);
+
+        if closed_at >= week_ago {
+            closed_last_7 += 1;
+        }
+        if closed_at >= month_ago {
+            closed_last_30 += 1;
+        }
+        // Average time-to-close.
+        if let Some(created) = issue
+            .created_at
+            .as_deref()
+            .and_then(|s| s.parse::<jiff::Timestamp>().ok())
+        {
+            let dur = closed_at - created;
+            total_close_secs += dur.total(jiff::Unit::Second).unwrap_or(0.0);
+            close_samples += 1;
+        }
+    }
+
+    let avg_days = if close_samples > 0 {
+        total_close_secs / 86400.0 / close_samples as f64
+    } else {
+        0.0
+    };
+
+    Some(serde_json::json!({
+        "closed_last_7_days": closed_last_7,
+        "closed_last_30_days": closed_last_30,
+        "avg_days_to_close": (avg_days * 100.0).round() / 100.0,
+        "estimated": estimated,
+    }))
 }
 
 pub fn build_triage(issues: &[Issue], g: &DiGraph, now: jiff::Timestamp) -> TriageOutput {
@@ -159,10 +225,12 @@ pub fn build_triage(issues: &[Issue], g: &DiGraph, now: jiff::Timestamp) -> Tria
     let recommendations = compute_impact_scores(&inputs);
     let blocked_set = compute_blocked_set(issues);
     let (counts, quick_ref) = compute_counts(issues, &blocked_set);
+    let velocity = compute_project_velocity(issues, now);
     TriageOutput {
         recommendations,
         counts,
         quick_ref,
+        velocity,
     }
 }
 

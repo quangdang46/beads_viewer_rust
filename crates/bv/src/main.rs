@@ -606,12 +606,12 @@ fn run_robot_triage() -> ExitCode {
         })
         .collect();
 
-    // Build quick_wins: low-effort high-impact (actionable + priority <= 2).
+    // Build quick_wins: low-effort high-impact (Go parity: open, priority<=2, low blocker_ratio).
     let quick_wins: Vec<serde_json::Value> = out
         .recommendations
         .iter()
-        .filter(|r| r.status == "open" && r.priority <= 2 && r.breakdown.staleness < 0.01)
-        .take(3)
+        .filter(|r| r.status == "open" && r.priority <= 2 && r.breakdown.blocker_ratio < 0.1)
+        .take(5)
         .map(|r| {
             serde_json::json!({
                 "id": r.id, "title": r.title, "score": r.score,
@@ -679,6 +679,7 @@ fn run_robot_triage() -> ExitCode {
             "has_cycles": false,
             "phase2_ready": true,
         },
+        "velocity": out.velocity,
     });
 
     // Pre-built br commands (Go parity).
@@ -1167,6 +1168,18 @@ fn run_robot_insights() -> ExitCode {
     payload["Slack"] = serde_json::Value::Array(top_n(&slack_obj, 12));
     payload["Cycles"] = serde_json::Value::Null;
     payload["ClusterDensity"] = serde_json::json!(density);
+
+    // Velocity snapshot (Go parity: VelocitySnapshot in insights).
+    if let Some(issues_data) = load_issues_auto(&std::env::current_dir().unwrap_or_default())
+        .ok()
+        .map(|(issues, _)| issues)
+    {
+        if let Some(vel) =
+            bv_analysis::triage::compute_project_velocity(&issues_data, jiff::Timestamp::now())
+        {
+            payload["Velocity"] = vel;
+        }
+    }
 
     let scc = bv_graph_core::tarjan_scc(&g);
     let cycles_out: Vec<Vec<String>> = scc
@@ -2437,11 +2450,24 @@ fn run_robot_capabilities() -> ExitCode {
         .iter()
         .map(|f| {
             let implemented = DISPATCHED_ROBOT_COMMANDS.contains(&f.name);
-            serde_json::json!({
+            let mut entry = serde_json::json!({
                 "name": f.name,
                 "flag": format!("--{}", f.name),
                 "status": if implemented { "implemented" } else { "not_implemented" },
-            })
+                "preferred_invocation": format!("bvr --{} --json", f.name),
+                "accepted_invocations": [
+                    format!("bvr --{} --format json", f.name),
+                    format!("bvr --{} --json", f.name),
+                ],
+            });
+            // Add needs_* flags matching Go.
+            let obj = entry.as_object_mut().unwrap();
+            obj.insert("needs_issues".into(), serde_json::json!(true));
+            obj.insert("needs_git".into(), serde_json::json!(false));
+            obj.insert("needs_sprint".into(), serde_json::json!(false));
+            obj.insert("needs_baseline".into(), serde_json::json!(false));
+            obj.insert("mutates_state".into(), serde_json::json!(false));
+            entry
         })
         .collect();
     commands.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
@@ -2451,10 +2477,15 @@ fn run_robot_capabilities() -> ExitCode {
         "version": env!("CARGO_PKG_VERSION"),
         "contract_version": bv_robot::ROBOT_CONTRACT_VERSION,
         "default_robot_command": "bvr --robot-triage",
-        "output_formats": ["json"],
+        "output_formats": ["json", "toon"],
         "commands": commands,
         "implemented_count": DISPATCHED_ROBOT_COMMANDS.len(),
         "total_count": flags::ROBOT_PRIMARIES.len(),
+        "schema_command": "bvr --robot-schema",
+        "stream_contract": {
+            "stdout": "Structured robot data only for robot commands.",
+            "stderr": "Diagnostics, warnings, and actionable errors.",
+        },
     });
     emit_json(&payload)
 }
