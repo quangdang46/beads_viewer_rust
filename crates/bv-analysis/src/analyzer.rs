@@ -103,6 +103,9 @@ pub struct AnalysisBudget {
     pub small_threshold: usize,
     pub medium_threshold: usize,
     pub xl_threshold: usize,
+    /// Graph density = edges / (nodes * (nodes - 1)). Used for density-aware
+    /// tier decisions matching Go `ConfigForSize` (pkg/analysis/config.go:86).
+    pub density: f64,
     /// Per-metric override from BV_PHASE2_TIMEOUT_S (seconds).
     pub override_secs: Option<u64>,
     pub skip_phase2: bool,
@@ -114,6 +117,7 @@ impl Default for AnalysisBudget {
             small_threshold: 100,
             medium_threshold: 500,
             xl_threshold: 2000,
+            density: 0.0,
             override_secs: None,
             skip_phase2: false,
         }
@@ -140,6 +144,36 @@ impl AnalysisBudget {
             n if n < self.medium_threshold => 100,
             n if n < self.xl_threshold => 50,
             _ => 10,
+        }
+    }
+
+    /// Whether cycles should be skipped entirely (Go: XL always skips).
+    pub fn skip_cycles(&self, nodes: usize) -> bool {
+        nodes >= self.xl_threshold
+    }
+
+    /// Whether HITS should be skipped for this graph (Go: skip when XL + dense).
+    pub fn skip_hits(&self, nodes: usize) -> bool {
+        // XL (>2000 nodes) AND density >= 0.001 -> skip HITS.
+        nodes >= self.xl_threshold && self.density >= 0.001
+    }
+
+    /// Whether betweenness should use approximate mode (Go: approx when dense).
+    /// Returns `(use_approx, skip)` where skip means don't compute at all.
+    pub fn betweenness_mode(&self, nodes: usize) -> (bool, bool) {
+        if nodes >= self.xl_threshold {
+            // XL: always approximate (Go parity).
+            (true, false)
+        } else if nodes >= self.medium_threshold {
+            // Large (500-2000): approximate if density >= 0.01, skip otherwise.
+            if self.density < 0.01 {
+                (true, false)
+            } else {
+                (false, true)
+            }
+        } else {
+            // Small/Medium: always exact.
+            (false, false)
         }
     }
 }
@@ -290,10 +324,13 @@ pub fn analyze_phase2_blocking(
             Err(()) => status.page_rank = StatusEntry::timeout(0.0),
         }
 
-        // Betweenness: exact below XL threshold; approx w/ sample above.
+        // Betweenness: density-aware mode selection (Go ConfigForSize parity).
         let t0 = Instant::now();
         let sample = recommend_sample_size(n);
-        if n < budget.xl_threshold {
+        let (bw_approx, bw_skip) = budget.betweenness_mode(n);
+        if bw_skip {
+            status.betweenness = StatusEntry::skipped("graph too dense (density > 0.01)");
+        } else if !bw_approx {
             let gc = std::sync::Arc::clone(&g);
             match run_with_timeout(budget.timeout_for(n), move || betweenness(&gc)) {
                 Ok(bw) => {
@@ -332,15 +369,20 @@ pub fn analyze_phase2_blocking(
         }
 
         // HITS (tol 1e-3 — Go network.HITS(g, 1e-3)).
-        let t0 = Instant::now();
-        let gc = std::sync::Arc::clone(&g);
-        match run_with_timeout(budget.timeout_for(n), move || hits_default(&gc)) {
-            Ok(h) => {
-                status.hits = StatusEntry::computed(t0.elapsed().as_secs_f64() * 1000.0);
-                out.hubs = Some(idx_to_score_map(&g, h.hubs));
-                out.authorities = Some(idx_to_score_map(&g, h.authorities));
+        // Skip for XL dense graphs (Go ConfigForSize: density >= 0.001).
+        if budget.skip_hits(n) {
+            status.hits = StatusEntry::skipped("graph too large and dense");
+        } else {
+            let t0 = Instant::now();
+            let gc = std::sync::Arc::clone(&g);
+            match run_with_timeout(budget.timeout_for(n), move || hits_default(&gc)) {
+                Ok(h) => {
+                    status.hits = StatusEntry::computed(t0.elapsed().as_secs_f64() * 1000.0);
+                    out.hubs = Some(idx_to_score_map(&g, h.hubs));
+                    out.authorities = Some(idx_to_score_map(&g, h.authorities));
+                }
+                Err(()) => status.hits = StatusEntry::timeout(0.0),
             }
-            Err(()) => status.hits = StatusEntry::timeout(0.0),
         }
 
         // Critical path heights DP.
@@ -358,31 +400,36 @@ pub fn analyze_phase2_blocking(
             Err(()) => status.critical = StatusEntry::timeout(0.0),
         }
 
-        // Cycles: Tarjan pre-check then enumerate capped by tier.
-        let t0 = Instant::now();
-        let cap = budget.max_cycles(n);
-        let scc = tarjan_scc(&g);
-        if !scc.has_cycles {
-            status.cycles = StatusEntry::computed(t0.elapsed().as_secs_f64() * 1000.0);
-            out.cycles = Some(Vec::new());
+        // Cycles: skip entirely for XL graphs (Go ConfigForSize: >2000 nodes).
+        // Tarjan pre-check then enumerate capped by tier.
+        if budget.skip_cycles(n) {
+            status.cycles = StatusEntry::skipped("graph too large (>2000 nodes)");
         } else {
-            let gc = std::sync::Arc::clone(&g);
-            match run_with_timeout(budget.timeout_for(n), move || enumerate_cycles(&gc, cap)) {
-                Ok(cycles) => {
-                    status.cycles = StatusEntry::computed(t0.elapsed().as_secs_f64() * 1000.0);
-                    let named: Vec<Vec<String>> = cycles
-                        .into_iter()
-                        .map(|c| {
-                            c.into_iter()
-                                .map(|i| g.node_id(i).unwrap_or_default().to_string())
-                                .collect()
-                        })
-                        .collect();
-                    out.cycles = Some(named);
+            let t0 = Instant::now();
+            let cap = budget.max_cycles(n);
+            let scc = tarjan_scc(&g);
+            if !scc.has_cycles {
+                status.cycles = StatusEntry::computed(t0.elapsed().as_secs_f64() * 1000.0);
+                out.cycles = Some(Vec::new());
+            } else {
+                let gc = std::sync::Arc::clone(&g);
+                match run_with_timeout(budget.timeout_for(n), move || enumerate_cycles(&gc, cap)) {
+                    Ok(cycles) => {
+                        status.cycles = StatusEntry::computed(t0.elapsed().as_secs_f64() * 1000.0);
+                        let named: Vec<Vec<String>> = cycles
+                            .into_iter()
+                            .map(|c| {
+                                c.into_iter()
+                                    .map(|i| g.node_id(i).unwrap_or_default().to_string())
+                                    .collect()
+                            })
+                            .collect();
+                        out.cycles = Some(named);
+                    }
+                    Err(()) => status.cycles = StatusEntry::timeout(0.0),
                 }
-                Err(()) => status.cycles = StatusEntry::timeout(0.0),
             }
-        }
+        } // end else !skip_cycles
     }
 
     // k-core / articulation / slack: always-on even under BV_SKIP_PHASE2.

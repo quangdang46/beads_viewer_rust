@@ -75,16 +75,22 @@ pub fn pagerank(graph: &DiGraph, config: &PageRankConfig) -> Vec<f64> {
             }
         }
 
-        // Check convergence
-        let diff: f64 = scores
+        // Check convergence using L2 (Euclidean) norm — matches Go's
+        // `math.Sqrt(diff) < tol` where diff is sum of squared differences.
+        let l2_squared: f64 = scores
             .iter()
             .zip(new_scores.iter())
-            .map(|(a, b)| (a - b).abs())
+            .map(|(a, b)| {
+                let d = a - b;
+                d * d
+            })
             .sum();
 
         std::mem::swap(&mut scores, &mut new_scores);
 
-        if diff < config.tolerance {
+        // Compare l2_squared < tol^2 to avoid sqrt per iteration (equivalent to
+        // math.Sqrt(l2_squared) < tol in Go).
+        if l2_squared < config.tolerance * config.tolerance {
             break;
         }
     }

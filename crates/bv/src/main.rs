@@ -898,7 +898,10 @@ fn load_and_analyze() -> Result<AnalysisTuple, ExitCode> {
     let data_hash = bv_core::data_hash::compute_data_hash(&issues);
     let g = std::sync::Arc::new(bv_analysis::build_graph(&issues));
     let p1 = bv_analysis::analyze_phase1(&g);
-    let budget = bv_analysis::AnalysisBudget::default();
+    let budget = bv_analysis::AnalysisBudget {
+        density: p1.density,
+        ..bv_analysis::AnalysisBudget::default()
+    };
 
     // Phase 2 — run blocking since we're in a CLI context.
     // For parity with Go's async behavior we'd need the thread-per-metric approach;
@@ -952,7 +955,10 @@ fn load_full() -> Result<AnalysisResultFull, ExitCode> {
     let data_hash = bv_core::data_hash::compute_data_hash(&issues);
     let g = std::sync::Arc::new(bv_analysis::build_graph(&issues));
     let p1 = bv_analysis::analyze_phase1(&g);
-    let budget = bv_analysis::AnalysisBudget::default();
+    let budget = bv_analysis::AnalysisBudget {
+        density: p1.density,
+        ..bv_analysis::AnalysisBudget::default()
+    };
     let gc = std::sync::Arc::clone(&g);
     let (status, phase2) = bv_analysis::analyze_phase2_blocking(gc, &budget);
     Ok((issues, data_hash, p1, status, g, phase2))

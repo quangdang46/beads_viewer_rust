@@ -92,22 +92,26 @@ pub fn hits(graph: &DiGraph, config: &HITSConfig) -> HITSResult {
         normalize_l2(&mut new_auth);
         normalize_l2(&mut new_hubs);
 
-        // Check convergence
-        let auth_diff: f64 = auth
-            .iter()
-            .zip(new_auth.iter())
-            .map(|(a, b)| (a - b).abs())
-            .sum();
-        let hub_diff: f64 = hubs
-            .iter()
-            .zip(new_hubs.iter())
-            .map(|(a, b)| (a - b).abs())
-            .sum();
+        // Check convergence using per-element max (absolute) — matches
+        // gonum's HITS which uses max change across all elements < tolerance.
+        let mut max_diff = 0.0_f64;
+        for (a, b) in auth.iter().zip(new_auth.iter()) {
+            let d = (a - b).abs();
+            if d > max_diff {
+                max_diff = d;
+            }
+        }
+        for (h, nh) in hubs.iter().zip(new_hubs.iter()) {
+            let d = (h - nh).abs();
+            if d > max_diff {
+                max_diff = d;
+            }
+        }
 
         auth = new_auth;
         hubs = new_hubs;
 
-        if auth_diff + hub_diff < config.tolerance {
+        if max_diff < config.tolerance {
             break;
         }
     }

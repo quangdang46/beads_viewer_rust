@@ -11,6 +11,8 @@ pub const URGENCY_LABELS: [&str; 5] = ["urgent", "critical", "blocker", "hotfix"
 pub const MAX_CRITICAL_PATH_DEPTH: f64 = 10.0;
 /// Half-life for urgency decay.
 pub const URGENCY_DECAY_DAYS: f64 = 7.0;
+/// Default estimated minutes when no issues have estimates (Go parity).
+pub const DEFAULT_ESTIMATED_MINUTES: i64 = 60;
 
 fn normalize(v: f64, max: f64) -> f64 {
     if max == 0.0 {
@@ -164,6 +166,29 @@ pub struct Breakdown {
     pub risk: f64,
 }
 
+/// Compute the median estimated_minutes across all issues that have estimates.
+/// Returns `DEFAULT_ESTIMATED_MINUTES` if no issues have estimates (Go parity:
+/// `computeMedianEstimatedMinutes` in pkg/analysis/priority.go:304).
+fn compute_median_estimated_minutes(issues: &[bv_core::model::Issue]) -> i64 {
+    let mut estimates: Vec<i64> = issues
+        .iter()
+        .filter_map(|i| i.estimated_minutes)
+        .filter(|&m| m > 0)
+        .collect();
+
+    if estimates.is_empty() {
+        return DEFAULT_ESTIMATED_MINUTES;
+    }
+
+    estimates.sort_unstable();
+    let mid = estimates.len() / 2;
+    if estimates.len().is_multiple_of(2) {
+        (estimates[mid - 1] + estimates[mid]) / 2
+    } else {
+        estimates[mid]
+    }
+}
+
 /// Inputs gathered from Phase-1/2 stats for one scoring pass.
 pub struct ImpactInputs<'a> {
     pub issues: &'a [Issue],
@@ -177,6 +202,9 @@ pub struct ImpactInputs<'a> {
 
 /// Score all open issues, ranked by score desc then ID asc (Go tie-break).
 pub fn compute_impact_scores(inputs: &ImpactInputs) -> Vec<IssueImpact> {
+    // Compute median estimated_minutes once (Go parity: computeMedianEstimatedMinutes).
+    let median_minutes = compute_median_estimated_minutes(inputs.issues);
+
     // Max values for normalization
     let max_pr = inputs.pagerank.values().copied().fold(0.0, f64::max);
     let max_bw = inputs.betweenness.values().copied().fold(0.0, f64::max);
@@ -210,7 +238,7 @@ pub fn compute_impact_scores(inputs: &ImpactInputs) -> Vec<IssueImpact> {
         let staleness_norm = compute_staleness(issue.updated_at.as_deref(), &inputs.now);
         let prio_norm = compute_priority_boost(issue.priority);
         let depth = inputs.critical_path.get(&issue.id).copied().unwrap_or(0.0);
-        let tti_norm = compute_time_to_impact(depth, issue.estimated_minutes, 60);
+        let tti_norm = compute_time_to_impact(depth, issue.estimated_minutes, median_minutes);
         let urgency_norm = compute_urgency(&issue.labels, issue.created_at.as_deref(), &inputs.now);
         let risk = compute_risk_signals(issue, inputs.g, idx);
 
