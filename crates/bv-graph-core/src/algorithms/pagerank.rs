@@ -46,9 +46,13 @@ pub fn pagerank(graph: &DiGraph, config: &PageRankConfig) -> Vec<f64> {
     let mut scores = vec![1.0 / n as f64; n];
     let mut new_scores = vec![0.0; n];
 
-    // Pre-compute successors sorted by node index (Go sorts g.From(u) by
-    // node ID = insertion order) — the accumulation order must match Go's
-    // push-style loop for byte-exact floating-point results.
+    // Go sorts the node list by gonum node ID and iterates sources in that
+    // order; gonum IDs are int64 insertion indices, so the iteration order is
+    // by insertion index. Successor lists are sorted by ID too. The push
+    // order must match Go's for byte-exact floating-point accumulation.
+    let mut node_order: Vec<usize> = (0..n).collect();
+    node_order.sort_by(|&a, &b| a.cmp(&b));
+
     let mut successors: Vec<Vec<usize>> = (0..n)
         .map(|i| {
             let mut succ = graph.successors_slice(i).to_vec();
@@ -65,7 +69,7 @@ pub fn pagerank(graph: &DiGraph, config: &PageRankConfig) -> Vec<f64> {
         // each successor; dangling mass accumulated separately and added
         // AFTER the contributions (Go's exact operation order).
         let mut dangling = 0.0f64;
-        for j in 0..n {
+        for &j in &node_order {
             let out = successors[j].len();
             if out == 0 {
                 dangling += scores[j];

@@ -2975,7 +2975,7 @@ fn run_robot_graph(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let _g = bv_analysis::build_graph(&issues);
+    let g = bv_analysis::build_graph(&issues);
 
     let fmt = args
         .iter()
@@ -3018,37 +3018,74 @@ fn run_robot_graph(args: &[String]) -> ExitCode {
         return ExitCode::from(0);
     }
 
-    let nodes: Vec<serde_json::Value> = issues
+    // Go generateAdjacency: nodes sorted by ID with labels+pagerank; edges
+    // follow sorted issues with deps sorted by DependsOnID; type normalized
+    // ("blocks" when empty). Counts at top level (Go GraphExportResult).
+    let pagerank = bv_graph_core::pagerank_default(&g);
+    let pr_by_id: std::collections::BTreeMap<String, f64> = pagerank
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (g.node_id(i).unwrap_or_default().to_string(), *v))
+        .collect();
+
+    let mut sorted_issues: Vec<&bv_core::model::Issue> = issues.iter().collect();
+    sorted_issues.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let adj_nodes: Vec<serde_json::Value> = sorted_issues
         .iter()
         .map(|i| {
-            serde_json::json!({
-                "id": i.id, "title": i.title,
-                "status": i.status.as_str(), "priority": i.priority,
-            })
+            let mut node = serde_json::json!({
+                "id": i.id,
+                "title": i.title,
+                "status": i.status.as_str(),
+                "priority": i.priority,
+            });
+            if !i.labels.is_empty() {
+                node["labels"] = serde_json::json!(i.labels);
+            }
+            if let Some(pr) = pr_by_id.get(&i.id) {
+                if *pr != 0.0 {
+                    node["pagerank"] = serde_json::json!(pr);
+                }
+            }
+            node
         })
         .collect();
 
-    let mut edges = Vec::new();
-    for i in &issues {
-        for dep in &i.dependencies {
-            if dep.r#type.is_blocking() {
-                edges.push(serde_json::json!({
-                    "from": i.id,
-                    "to": dep.effective_depends_on(),
-                    "type": "blocks",
-                }));
+    let issue_ids: std::collections::HashSet<&str> = issues.iter().map(|i| i.id.as_str()).collect();
+    let mut adj_edges: Vec<serde_json::Value> = Vec::new();
+    for i in &sorted_issues {
+        let mut deps: Vec<&bv_core::model::Dependency> = i.dependencies.iter().collect();
+        deps.sort_by(|a, b| a.effective_depends_on().cmp(b.effective_depends_on()));
+        for dep in deps {
+            if !issue_ids.contains(dep.effective_depends_on()) {
+                continue;
             }
+            let edge_type = dep.r#type.as_str();
+            adj_edges.push(serde_json::json!({
+                "from": i.id,
+                "to": dep.effective_depends_on(),
+                "type": edge_type,
+            }));
         }
     }
+    let edge_count = issues
+        .iter()
+        .filter(|i| issue_ids.contains(i.id.as_str()))
+        .flat_map(|i| i.dependencies.iter())
+        .filter(|dep| issue_ids.contains(dep.effective_depends_on()))
+        .count();
 
     let payload = serde_json::json!({
-        "format": "json", "nodes": nodes, "edges": edges,
+        "format": "json",
+        "nodes": sorted_issues.len(),
+        "edges": edge_count,
         "explanation": {
-            "what": "Dependency graph showing blocking relationships",
-            "when_to_use": "Use for understanding project structure and critical paths",
+            "what": "Dependency graph as JSON adjacency list",
+            "when_to_use": "When you need programmatic access to the graph structure",
         },
         "data_hash": hash,
-        "adjacency": {"nodes": nodes.len(), "edges": edges.len()},
+        "adjacency": {"nodes": adj_nodes, "edges": adj_edges},
     });
     emit_json(&payload)
 }

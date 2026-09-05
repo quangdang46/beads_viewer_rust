@@ -230,9 +230,9 @@ pub fn build_graph(issues: &[bv_core::model::Issue]) -> DiGraph {
             }
             let target = dep.effective_depends_on().to_string();
             if let Some(to) = g.node_idx(&target) {
-                if to != from {
-                    g.add_edge(from, to);
-                }
+                // Go keeps self-loops (gonum SetEdge accepts them); they
+                // participate in out-degree and cycle detection there.
+                g.add_edge(from, to);
             }
         }
     }
