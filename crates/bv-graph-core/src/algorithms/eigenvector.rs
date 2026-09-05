@@ -109,8 +109,10 @@ mod tests {
     #[test]
     fn test_eigenvector_chain() {
         // a -> b -> c (DAG - no cycles)
-        // In a DAG without cycles, eigenvector centrality converges to uniform
-        // because there's no feedback loop to establish dominance
+        // Go parity: power iteration converges mass at the sink (node with no
+        // incoming predecessors that receive mass).  With edges a->b->c the
+        // sink is c (receives mass from b, which receives from a).  After
+        // enough iterations the vector converges to [0, 0, 1].
         let mut graph = DiGraph::new();
         let a = graph.add_node("a");
         let b = graph.add_node("b");
@@ -119,11 +121,10 @@ mod tests {
         graph.add_edge(b, c);
 
         let scores = eigenvector(&graph, &EigenvectorConfig::default());
-        // In a DAG, scores converge to uniform distribution
-        let diff = (scores[a] - scores[b]).abs() + (scores[b] - scores[c]).abs();
+        // Sink node c should have the highest centrality.
         assert!(
-            diff < 0.01,
-            "DAG chain should converge to near-uniform: {:?}",
+            scores[c] > scores[b],
+            "Sink (c) should outrank intermediate (b): {:?}",
             scores
         );
     }

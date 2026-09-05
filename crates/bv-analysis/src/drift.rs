@@ -619,7 +619,14 @@ mod tests {
     #[test]
     fn no_drift_on_identical_snapshots() {
         let s = snap(100, 120, 0.05, 3, 40);
-        let r = calculate(&s, &s, &DriftConfig::default(), &[], &[]);
+        let r = calculate(
+            &s,
+            &s,
+            &DriftConfig::default(),
+            &[],
+            &[],
+            jiff::Timestamp::now(),
+        );
         assert!(!r.has_drift);
         assert_eq!(r.exit_code(), 0);
     }
@@ -633,6 +640,7 @@ mod tests {
             &DriftConfig::default(),
             &[vec!["A".into(), "B".into(), "A".into()]],
             &[],
+            jiff::Timestamp::now(),
         );
         assert!(r.has_drift);
         assert_eq!(r.critical_count, 1);
@@ -643,7 +651,14 @@ mod tests {
     fn density_growth_warning_at_fifty_pct() {
         let base = snap(100, 120, 0.04, 0, 40);
         let cur = snap(100, 130, 0.064, 0, 40); // +60%
-        let r = calculate(&base, &cur, &DriftConfig::default(), &[], &[]);
+        let r = calculate(
+            &base,
+            &cur,
+            &DriftConfig::default(),
+            &[],
+            &[],
+            jiff::Timestamp::now(),
+        );
         assert!(r
             .alerts
             .iter()
@@ -655,7 +670,14 @@ mod tests {
     fn density_growth_info_at_twenty_pct() {
         let base = snap(100, 120, 0.05, 0, 40);
         let cur = snap(100, 125, 0.0625, 0, 40); // +25% -> info band
-        let r = calculate(&base, &cur, &DriftConfig::default(), &[], &[]);
+        let r = calculate(
+            &base,
+            &cur,
+            &DriftConfig::default(),
+            &[],
+            &[],
+            jiff::Timestamp::now(),
+        );
         assert!(r
             .alerts
             .iter()
@@ -667,7 +689,14 @@ mod tests {
     fn blocked_increase_warning_at_plus_five() {
         let base = snap(100, 120, 0.05, 2, 40);
         let cur = snap(100, 120, 0.05, 8, 34); // +6 blocked; actionable -15% (<30 no warn)
-        let r = calculate(&base, &cur, &DriftConfig::default(), &[], &[]);
+        let r = calculate(
+            &base,
+            &cur,
+            &DriftConfig::default(),
+            &[],
+            &[],
+            jiff::Timestamp::now(),
+        );
         assert!(r
             .alerts
             .iter()
@@ -679,7 +708,14 @@ mod tests {
     fn actionable_drop_warning_at_minus_thirty_pct() {
         let base = snap(100, 120, 0.05, 0, 40);
         let cur = snap(100, 120, 0.05, 0, 25); // -37.5%
-        let r = calculate(&base, &cur, &DriftConfig::default(), &[], &[]);
+        let r = calculate(
+            &base,
+            &cur,
+            &DriftConfig::default(),
+            &[],
+            &[],
+            jiff::Timestamp::now(),
+        );
         assert!(r.alerts.iter().any(
             |a| a.alert_type == AlertType::ActionableChange && a.severity == Severity::Warning
         ));
@@ -691,7 +727,14 @@ mod tests {
         base.pagerank.insert("X-1".into(), 0.10);
         let mut cur = snap(10, 10, 0.1, 0, 5);
         cur.pagerank.insert("X-1".into(), 0.20); // +100%
-        let r = calculate(&base, &cur, &DriftConfig::default(), &[], &[]);
+        let r = calculate(
+            &base,
+            &cur,
+            &DriftConfig::default(),
+            &[],
+            &[],
+            jiff::Timestamp::now(),
+        );
         assert!(r
             .alerts
             .iter()
@@ -735,7 +778,14 @@ mod tests {
         let s = snap(10, 10, 0.1, 0, 5);
         // 20 days ago: exceeds 14-day warning but not 30-day critical.
         let issue = stale_issue("X-1", bv_core::model::Status::Open, "2026-08-16T00:00:00Z");
-        let r = calculate(&s, &s, &DriftConfig::default(), &[], &[issue]);
+        let r = calculate(
+            &s,
+            &s,
+            &DriftConfig::default(),
+            &[],
+            &[issue],
+            jiff::Timestamp::now(),
+        );
         assert!(
             r.alerts
                 .iter()
@@ -749,7 +799,14 @@ mod tests {
         let s = snap(10, 10, 0.1, 0, 5);
         // 40 days ago: exceeds 30-day critical.
         let issue = stale_issue("X-2", bv_core::model::Status::Open, "2026-07-27T00:00:00Z");
-        let r = calculate(&s, &s, &DriftConfig::default(), &[], &[issue]);
+        let r = calculate(
+            &s,
+            &s,
+            &DriftConfig::default(),
+            &[],
+            &[issue],
+            jiff::Timestamp::now(),
+        );
         assert!(
             r.alerts
                 .iter()
@@ -768,7 +825,14 @@ mod tests {
             bv_core::model::Status::InProgress,
             "2026-08-28T00:00:00Z",
         );
-        let r = calculate(&s, &s, &DriftConfig::default(), &[], &[issue]);
+        let r = calculate(
+            &s,
+            &s,
+            &DriftConfig::default(),
+            &[],
+            &[issue],
+            jiff::Timestamp::now(),
+        );
         assert!(
             r.alerts
                 .iter()
@@ -785,7 +849,7 @@ mod tests {
             ..Default::default()
         };
         let issue = stale_issue("X-4", bv_core::model::Status::Open, "2026-07-01T00:00:00Z");
-        let r = calculate(&s, &s, &cfg, &[], &[issue]);
+        let r = calculate(&s, &s, &cfg, &[], &[issue], jiff::Timestamp::now());
         assert!(
             !r.alerts
                 .iter()
@@ -802,7 +866,14 @@ mod tests {
             bv_core::model::Status::Closed,
             "2026-07-01T00:00:00Z",
         );
-        let r = calculate(&s, &s, &DriftConfig::default(), &[], &[issue]);
+        let r = calculate(
+            &s,
+            &s,
+            &DriftConfig::default(),
+            &[],
+            &[issue],
+            jiff::Timestamp::now(),
+        );
         assert!(
             !r.alerts
                 .iter()
@@ -868,7 +939,14 @@ mod tests {
         let blocker = casc_issue("X-1", bv_core::model::Status::Open, 1);
         let issues = vec![blocker, dependent2, dependent3, dependent4];
 
-        let r = calculate(&s, &s, &DriftConfig::default(), &[], &issues);
+        let r = calculate(
+            &s,
+            &s,
+            &DriftConfig::default(),
+            &[],
+            &issues,
+            jiff::Timestamp::now(),
+        );
         let cascade_alerts: Vec<_> = r
             .alerts
             .iter()
@@ -894,7 +972,14 @@ mod tests {
             dep.dependencies.push(casc_dep(&format!("X-{i}"), "X-1"));
             issues.push(dep);
         }
-        let r = calculate(&s, &s, &DriftConfig::default(), &[], &issues);
+        let r = calculate(
+            &s,
+            &s,
+            &DriftConfig::default(),
+            &[],
+            &issues,
+            jiff::Timestamp::now(),
+        );
         let cascade = r
             .alerts
             .iter()
@@ -920,7 +1005,7 @@ mod tests {
         dep3.dependencies.push(casc_dep("X-4", "X-1"));
         let issues = vec![blocker, dep, dep2, dep3];
 
-        let r = calculate(&s, &s, &cfg, &[], &issues);
+        let r = calculate(&s, &s, &cfg, &[], &issues, jiff::Timestamp::now());
         assert!(
             !r.alerts
                 .iter()
@@ -939,7 +1024,14 @@ mod tests {
         dep_closed.dependencies.push(casc_dep("X-3", "X-1"));
         let issues = vec![blocker, dep_open, dep_closed];
 
-        let r = calculate(&s, &s, &DriftConfig::default(), &[], &issues);
+        let r = calculate(
+            &s,
+            &s,
+            &DriftConfig::default(),
+            &[],
+            &issues,
+            jiff::Timestamp::now(),
+        );
         // Only X-2 is open, so unblocks = 1, below info threshold (3).
         assert!(
             !r.alerts
@@ -960,7 +1052,14 @@ mod tests {
         dep.dependencies.push(casc_dep("X-2", "X-BOTH"));
         let issues = vec![blocker1, blocker2, dep];
 
-        let r = calculate(&s, &s, &DriftConfig::default(), &[], &issues);
+        let r = calculate(
+            &s,
+            &s,
+            &DriftConfig::default(),
+            &[],
+            &issues,
+            jiff::Timestamp::now(),
+        );
         // Completing X-1 still leaves X-2 blocked by X-BOTH, so unblocks = 0.
         assert!(
             !r.alerts
