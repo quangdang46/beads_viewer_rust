@@ -58,8 +58,15 @@ impl RobotEnvelope {
                 None
             }
         });
+        // Go parity: truncate to second precision (no microseconds).
+        let ts = jiff::Timestamp::now().to_string();
+        let generated_at = if let Some(pos) = ts.find('.') {
+            format!("{}Z", &ts[..pos])
+        } else {
+            ts
+        };
         RobotEnvelope {
-            generated_at: jiff::Timestamp::now().to_string(),
+            generated_at,
             data_hash: data_hash.into(),
             output_format: output_format.as_str().to_string(),
             version: version.into(),

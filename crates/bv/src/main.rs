@@ -695,12 +695,13 @@ fn run_robot_triage() -> ExitCode {
         "refresh_triage": "bvr --robot-triage".to_string(),
     });
 
-    let env = bv_robot::RobotEnvelope::new(
+    let mut env = bv_robot::RobotEnvelope::new(
         data_hash,
         env!("CARGO_PKG_VERSION"),
         None,
         bv_robot::OutputFormat::Json,
     );
+    env.generated_at = jiff_now(); // Truncate to seconds (Go parity).
     let payload = serde_json::json!({
         "generated_at": env.generated_at,
         "data_hash": env.data_hash,
