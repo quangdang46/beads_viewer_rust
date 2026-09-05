@@ -115,11 +115,11 @@ impl DiGraph {
         self.node_index.get(id).copied()
     }
 
-    pub(crate) fn successors_slice(&self, node: usize) -> &[usize] {
+    pub fn successors_slice(&self, node: usize) -> &[usize] {
         &self.adj[node]
     }
 
-    pub(crate) fn predecessors_slice(&self, node: usize) -> &[usize] {
+    pub fn predecessors_slice(&self, node: usize) -> &[usize] {
         &self.rev_adj[node]
     }
 }

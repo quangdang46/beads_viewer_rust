@@ -1414,15 +1414,113 @@ fn full_envelope_json(data_hash: &str) -> serde_json::Value {
 }
 
 fn emit_json(v: &serde_json::Value) -> ExitCode {
-    match serde_json::to_string(v) {
-        Ok(s) => {
-            println!("{s}");
-            ExitCode::from(0)
+    println!("{}", go_json_string(v));
+    ExitCode::from(0)
+}
+
+/// Go `encoding/json`-compatible compact serializer. The one behavioral
+/// difference vs serde_json: float formatting. Go emits `1` for 1.0 and
+/// `30` for 30.0 (shortest round-trip, no trailing ".0"); serde_json/ryu
+/// emits "1.0". Drop-in byte parity with Go goldens requires Go semantics.
+fn go_json_string(v: &serde_json::Value) -> String {
+    let mut out = String::new();
+    write_go_json(v, &mut out);
+    out
+}
+
+fn write_go_json(v: &serde_json::Value, out: &mut String) {
+    use serde_json::Value;
+    match v {
+        Value::Null => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Number(n) => {
+            if let Some(f) = n.as_f64() {
+                if n.as_i64().is_none() && n.as_u64().is_none() {
+                    out.push_str(&go_format_f64(f));
+                    return;
+                }
+            }
+            out.push_str(&n.to_string());
         }
-        Err(e) => {
-            eprintln!("Error: serialization failed: {e}");
-            ExitCode::from(1)
+        Value::String(s) => out.push_str(&serde_json::to_string(s).unwrap_or_default()),
+        Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_go_json(item, out);
+            }
+            out.push(']');
         }
+        Value::Object(map) => {
+            out.push('{');
+            for (i, (k, val)) in map.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&serde_json::to_string(k).unwrap_or_default());
+                out.push(':');
+                write_go_json(val, out);
+            }
+            out.push('}');
+        }
+    }
+}
+
+/// Go `strconv.AppendFloat(f, 'f'/'e', -1, 64)` semantics: shortest
+/// decimal that round-trips. 'f' (no exponent) normally; 'e' when
+/// abs < 1e-6 or abs >= 1e21, with Go's e-09 → e-9 exponent cleanup.
+fn go_format_f64(f: f64) -> String {
+    if f.is_nan() || f.is_infinite() {
+        // Go json errors on these; our data never produces them.
+        return "null".into();
+    }
+    let abs = f.abs();
+    if abs != 0.0 && (abs < 1e-6 || abs >= 1e21) {
+        // Rust {:e} → "1.5e21"; Go → "1.5e+21". Reconstruct Go style.
+        let s = format!("{:e}", f); // e.g. "1.5e21", "1e-7", "-2.5e-8"
+        if let Some(pos) = s.find('e') {
+            let (mantissa, exp) = s.split_at(pos);
+            let exp = &exp[1..]; // strip 'e'
+            let (sign, digits) = if let Some(stripped) = exp.strip_prefix('-') {
+                ("-", stripped)
+            } else {
+                ("+", exp)
+            };
+            let digits = if digits.len() == 2 && digits.starts_with('0') {
+                &digits[1..] // "09" → "9" (Go cleanup e-09 → e-9)
+            } else {
+                digits
+            };
+            return format!("{mantissa}e{sign}{digits}");
+        }
+        return s;
+    }
+    // 'f' shortest: Rust Display matches Go 'f' -1 (no trailing .0).
+    format!("{f}")
+}
+
+#[cfg(test)]
+mod go_json_tests {
+    use super::*;
+
+    #[test]
+    fn go_float_format_matches_go_json() {
+        assert_eq!(go_format_f64(1.0), "1");
+        assert_eq!(go_format_f64(30.0), "30");
+        assert_eq!(go_format_f64(0.5), "0.5");
+        assert_eq!(go_format_f64(0.7415134907189797), "0.7415134907189797");
+        assert_eq!(go_format_f64(1e-7), "1e-7");
+        assert_eq!(go_format_f64(1e21), "1e+21");
+        assert_eq!(go_format_f64(233.5454), "233.5454");
+        assert_eq!(go_format_f64(0.0), "0");
+    }
+
+    #[test]
+    fn go_json_string_whole_floats_have_no_dot() {
+        let v = serde_json::json!({"a": 1.0, "b": 30.0, "c": 0.125});
+        assert_eq!(go_json_string(&v), r#"{"a":1,"b":30,"c":0.125}"#);
     }
 }
 
@@ -1482,13 +1580,20 @@ fn to_id_map(
     g: &bv_graph_core::DiGraph,
     scores: &[f64],
 ) -> serde_json::Map<String, serde_json::Value> {
-    let mut m = serde_json::Map::new();
+    // Insert in lexicographic ID order — Go json.Marshal sorts map keys,
+    // so serialized key order must be lexicographic (index order is
+    // issue-load order, which differs for IDs like FIX-10 vs FIX-2).
+    let mut sorted: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
     for (i, v) in scores.iter().enumerate() {
         let id = g.node_id(i).unwrap_or_default();
+        sorted.insert(id, *v);
+    }
+    let mut m = serde_json::Map::new();
+    for (id, v) in sorted {
         if v.fract() == 0.0 && v.abs() < 1e15 {
-            m.insert(id, serde_json::json!(v.round() as i64));
+            m.insert(id.to_string(), serde_json::json!(v.round() as i64));
         } else {
-            m.insert(id, serde_json::json!(v));
+            m.insert(id.to_string(), serde_json::json!(v));
         }
     }
     m
@@ -1507,16 +1612,122 @@ fn top_n(map: &serde_json::Map<String, serde_json::Value>, n: usize) -> Vec<serd
         .collect()
 }
 
+/// Go `ConfigForSize` JSON shape (ns timeouts) — golden-verified per tier.
+fn insights_analysis_config(nodes: usize) -> serde_json::Value {
+    let (
+        timeout_ns,
+        mode,
+        sample,
+        pr_ns,
+        hits_ns,
+        cycles_ns,
+        max_cycles,
+        compute_cycles,
+        cycles_skip,
+    ) = match nodes {
+        n if n < 100 => (
+            2_000_000_000i64,
+            "exact",
+            0,
+            2_000_000_000i64,
+            2_000_000_000i64,
+            2_000_000_000i64,
+            1000,
+            true,
+            "",
+        ),
+        n if n < 500 => (
+            500_000_000i64,
+            "exact",
+            0,
+            500_000_000i64,
+            500_000_000i64,
+            500_000_000i64,
+            100,
+            true,
+            "",
+        ),
+        n if n < 2000 => (
+            500_000_000i64,
+            "approximate",
+            100,
+            300_000_000i64,
+            300_000_000i64,
+            300_000_000i64,
+            50,
+            true,
+            "",
+        ),
+        _ => (
+            500_000_000i64,
+            "approximate",
+            200,
+            200_000_000i64,
+            200_000_000i64,
+            0i64,
+            10,
+            false,
+            "graph too large (>2000 nodes)",
+        ),
+    };
+    serde_json::json!({
+        "ComputeBetweenness": true,
+        "BetweennessTimeout": timeout_ns,
+        "BetweennessSkipReason": "",
+        "BetweennessMode": mode,
+        "BetweennessSampleSize": sample,
+        "BetweennessIsApproximate": false,
+        "ComputePageRank": true,
+        "PageRankTimeout": pr_ns,
+        "PageRankSkipReason": "",
+        "ComputeHITS": true,
+        "HITSTimeout": hits_ns,
+        "HITSSkipReason": "",
+        "ComputeCycles": compute_cycles,
+        "CyclesTimeout": cycles_ns,
+        "MaxCyclesToStore": max_cycles,
+        "CyclesSkipReason": cycles_skip,
+        "ComputeEigenvector": true,
+        "ComputeCriticalPath": true,
+        "ComputeKCore": true,
+        "ComputeArticulation": true,
+        "ComputeSlack": true,
+    })
+}
+
+/// Go `getTopItems`: sort by value desc, ID asc tiebreak, cap at limit.
+fn top_items_go(
+    map: &serde_json::Map<String, serde_json::Value>,
+    limit: usize,
+) -> Vec<serde_json::Value> {
+    let mut items: Vec<(&String, f64)> = map
+        .iter()
+        .filter_map(|(k, v)| v.as_f64().map(|f| (k, f)))
+        .collect();
+    items.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(b.0))
+    });
+    items
+        .into_iter()
+        .take(limit)
+        .map(|(id, v)| serde_json::json!({"ID": id, "Value": v}))
+        .collect()
+}
+
 fn run_robot_insights() -> ExitCode {
     let all = match load_full() {
         Ok(x) => x,
         Err(code) => return code,
     };
-    let (issues, hash, p1, _status, g, _phase2) = all;
+    let (issues, hash, p1, status, g, phase2) = all;
 
     let pr_obj = to_id_map(&g, &bv_graph_core::pagerank_default(&g));
     let bw_raw = bv_graph_core::betweenness(&g);
-    let bw_obj = to_id_map(&g, &bw_raw);
+    let mut bw_obj = to_id_map(&g, &bw_raw);
+    // gonum Betweenness omits zero-score nodes (endpoints of a DAG chain).
+    bw_obj.retain(|_, v| v.as_f64().map_or(true, |f| f != 0.0));
     let ev_raw = bv_graph_core::eigenvector_default(&g);
     let ev_obj = to_id_map(&g, &ev_raw);
     let hits_result = bv_graph_core::hits_default(&g);
@@ -1544,183 +1755,58 @@ fn run_robot_insights() -> ExitCode {
     };
 
     let mut payload = envelope_json(&hash);
-    payload["analysis_config"] = serde_json::json!({
-        "ComputeBetweenness": true, "BetweennessTimeout": 500,
-        "BetweennessMode": "exact", "ComputePageRank": true, "PageRankTimeout": 500,
-        "ComputeHITS": true, "HITSTimeout": 500, "ComputeCycles": true,
-        "CyclesTimeout": 500, "MaxCyclesToStore": 1000,
-        "ComputeEigenvector": true, "ComputeCriticalPath": true,
-        "ComputeKCore": true, "ComputeArticulation": true, "ComputeSlack": true,
-    });
-    payload["status"] = bv_analysis::analyzer::MetricStatus::default().to_json_map();
+    payload["analysis_config"] = insights_analysis_config(g.len());
+    payload["status"] = status.to_json_map();
 
-    payload["Bottlenecks"] = serde_json::Value::Array(top_n(&bw_obj, 10));
-    payload["Keystones"] = serde_json::Value::Array(top_n(&cp_obj, 12));
-    payload["Influencers"] = serde_json::Value::Array(top_n(&ev_obj, 12));
-    payload["Hubs"] = serde_json::Value::Array(top_n(&hub_obj, 12));
-    payload["Authorities"] = serde_json::Value::Array(top_n(&auth_obj, 12));
-    payload["Cores"] = serde_json::Value::Array(top_n(&core_obj, 12));
+    // Go GenerateInsights(limit=50): value desc, ID asc tiebreak.
+    const INSIGHTS_LIMIT: usize = 50;
+    payload["Bottlenecks"] = serde_json::Value::Array(top_items_go(&bw_obj, INSIGHTS_LIMIT));
+    payload["Keystones"] = serde_json::Value::Array(top_items_go(&cp_obj, INSIGHTS_LIMIT));
+    payload["Influencers"] = serde_json::Value::Array(top_items_go(&ev_obj, INSIGHTS_LIMIT));
+    payload["Hubs"] = serde_json::Value::Array(top_items_go(&hub_obj, INSIGHTS_LIMIT));
+    payload["Authorities"] = serde_json::Value::Array(top_items_go(&auth_obj, INSIGHTS_LIMIT));
+    payload["Cores"] = serde_json::Value::Array(top_items_go(&core_obj, INSIGHTS_LIMIT));
     payload["Articulation"] = serde_json::json!(art_ids);
-    payload["Slack"] = serde_json::Value::Array(top_n(&slack_obj, 12));
-    payload["Cycles"] = serde_json::Value::Null;
-    payload["ClusterDensity"] = serde_json::json!(density);
+    payload["Slack"] = serde_json::Value::Array(top_items_go(&slack_obj, INSIGHTS_LIMIT));
 
-    // Velocity snapshot (Go parity: VelocitySnapshot in insights).
-    if let Some(vel) = bv_analysis::triage::compute_project_velocity(&issues, robot_now()) {
-        payload["Velocity"] = vel;
-    }
-
-    // top_what_ifs — port of Go TopWhatIfDeltas (whatif.go:226).
-    let closed_set: Vec<bool> = issues
-        .iter()
-        .map(|i| {
-            matches!(
-                i.status,
-                bv_core::model::Status::Closed | bv_core::model::Status::Tombstone
-            )
-        })
-        .collect();
-    let whatif_entries: Vec<serde_json::Value> = bv_graph_core::whatif::top_what_if(
-        &g,
-        &closed_set,
-        10,
-    )
-    .into_iter()
-    .filter_map(|entry| {
-        let id = g.node_id(entry.node)?.to_string();
-        let title = issues
-            .iter()
-            .find(|i| i.id == id)
-            .map(|i| i.title.as_str())
-            .unwrap_or("");
-
-        // Compute depth_reduction from critical path heights (Go parity).
-        let current_depth = cp_heights.get(entry.node).copied().unwrap_or(0.0);
-        const MAX_CRITICAL_PATH_DEPTH: f64 = 10.0;
-        let depth_reduction = (current_depth / MAX_CRITICAL_PATH_DEPTH).min(1.0);
-
-        // Compute blocked_reduction: count of direct unblocks currently blocked.
-        let blocked_reduction = entry
-            .result
-            .unblocked_ids
-            .iter()
-            .filter(|&&idx| {
-                closed_set.get(idx).copied().unwrap_or(false)
-                    || issues.iter().any(|i| {
-                        g.node_idx(&i.id) == Some(idx)
-                            && matches!(i.status, bv_core::model::Status::Blocked)
-                    })
-            })
-            .count();
-
-        // Compute estimated_days_saved from estimated_minutes of unblocked issues.
-        let estimated_days_saved: f64 = entry
-            .result
-            .unblocked_ids
-            .iter()
-            .filter_map(|&idx| {
-                let node_id = g.node_id(idx)?;
-                issues.iter().find(|i| i.id == node_id)
-            })
-            .map(|i| {
-                let minutes = i.estimated_minutes.unwrap_or(60) as f64;
-                minutes / 480.0 // 8-hour workday
-            })
-            .sum();
-
-        Some(serde_json::json!({
-            "issue_id": id,
-            "title": title,
-            "delta": {
-                "direct_unblocks": entry.result.direct_unblocks,
-                "transitive_unblocks": entry.result.transitive_unblocks,
-                "blocked_reduction": blocked_reduction,
-                "depth_reduction": (depth_reduction * 100.0).round() / 100.0,
-                "estimated_days_saved": (estimated_days_saved * 100.0).round() / 100.0,
-                "unblocked_issue_ids": entry.result.unblocked_ids.iter()
-                    .filter_map(|&idx| g.node_id(idx).map(|s| s.to_string()))
-                    .collect::<Vec<_>>(),
-                "parallelization_gain": entry.result.parallel_gain,
-                "explanation": format!(
-                    "Completing this would directly unblock {} and transitively unblock {} issues",
-                    entry.result.direct_unblocks, entry.result.transitive_unblocks
-                ),
-            },
-        }))
-    })
-    .collect();
-    if !whatif_entries.is_empty() {
-        payload["top_what_ifs"] = serde_json::Value::Array(whatif_entries);
-    }
-
-    // advanced_insights — port of Go AdvancedInsights (advanced_insights.go).
-    let topk = bv_graph_core::algorithms::topk_set::topk_set_default(&g, &closed_set);
-    let coverage = bv_graph_core::algorithms::coverage::coverage_set_default(&g);
-    let parallel = bv_graph_core::algorithms::parallel_cut::parallel_cut_default(&g, &closed_set);
-    let kpaths = bv_graph_core::algorithms::k_paths::k_critical_paths_default(&g);
-
-    let topk_items: Vec<serde_json::Value> = topk
-        .items
-        .iter()
-        .map(|item| {
-            serde_json::json!({
-                "node": g.node_id(item.node).unwrap_or_default(),
-                "marginal_gain": item.marginal_gain,
-                "unblocked_count": item.unblocked_ids.len(),
-            })
-        })
-        .collect();
-    let coverage_items: Vec<serde_json::Value> = coverage
-        .items
-        .iter()
-        .map(|item| {
-            serde_json::json!({
-                "node": g.node_id(item.node).unwrap_or_default(),
-                "edges_added": item.edges_added,
-            })
-        })
-        .collect();
-    let parallel_items: Vec<serde_json::Value> = parallel
-        .items
-        .iter()
-        .map(|item| {
-            serde_json::json!({
-                "node": g.node_id(item.node).unwrap_or_default(),
-                "parallel_gain": item.parallel_gain,
-                "new_actionable": item.new_actionable,
-            })
-        })
-        .collect();
-
-    payload["advanced_insights"] = serde_json::json!({
-        "topk_set": { "items": topk_items, "total_gain": topk.total_gain, "open_nodes": topk.open_nodes },
-        "coverage_set": { "items": coverage_items, "edges_covered": coverage.edges_covered, "total_edges": coverage.total_edges, "coverage_ratio": coverage.coverage_ratio },
-        "parallel_cut": { "items": parallel_items, "open_nodes": parallel.open_nodes, "current_actionable": parallel.current_actionable },
-        "k_paths": { "path_count": kpaths.paths.len(), "total_nodes": kpaths.total_nodes, "max_length": kpaths.max_length },
-        "config": {},
-    });
-
-    let scc = bv_graph_core::tarjan_scc(&g);
-    let cycles_out: Vec<Vec<String>> = scc
-        .components
-        .iter()
-        .filter(|c| c.len() > 1)
-        .map(|c| {
-            c.iter()
-                .map(|&i| g.node_id(i).unwrap_or_default().to_string())
-                .collect()
-        })
-        .collect();
-    payload["Cycles"] = serde_json::json!(cycles_out);
-
-    // Orphans: leaf nodes (zero out-degree).
+    // Orphans: zero out-degree (nothing depends on them), sorted (Go findOrphans).
     let orphans: Vec<String> = (0..g.len())
         .filter(|&i| g.out_degree(i) == 0)
         .map(|i| g.node_id(i).unwrap_or_default().to_string())
         .collect();
     payload["Orphans"] = serde_json::json!(orphans);
 
-    // Stats sub-object (Go parity).
+    // Cycles: Go emits null when none detected.
+    let cycles_from_phase2 = phase2.cycles.clone().unwrap_or_default();
+    if cycles_from_phase2.is_empty() {
+        payload["Cycles"] = serde_json::Value::Null;
+    } else {
+        payload["Cycles"] = serde_json::json!(cycles_from_phase2);
+    }
+    payload["ClusterDensity"] = serde_json::json!(density);
+
+    // Velocity snapshot — Go VelocitySnapshot: weekly as plain ints (newest
+    // first), estimated omitted when false, no week_start objects.
+    if let Some(vel) = bv_analysis::triage::compute_project_velocity(&issues, robot_now()) {
+        let weekly_ints: Vec<i64> = vel["weekly"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|w| w["closed"].as_i64().unwrap_or(0))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let snapshot = serde_json::json!({
+            "closed_last_7_days": vel["closed_last_7_days"],
+            "closed_last_30_days": vel["closed_last_30_days"],
+            "avg_days_to_close": vel["avg_days_to_close"],
+            "weekly": weekly_ints,
+        });
+        payload["Velocity"] = snapshot;
+    }
+
+    // Stats sub-object (Go GraphStats JSON shape) — comes before
+    // full_stats/top_what_ifs/advanced_insights in Go's output struct order.
     payload["Stats"] = serde_json::json!({
         "OutDegree": p1.out_degree,
         "InDegree": p1.in_degree,
@@ -1728,10 +1814,10 @@ fn run_robot_insights() -> ExitCode {
         "Density": p1.density,
         "NodeCount": p1.node_count,
         "EdgeCount": p1.edge_count,
-        "Config": {},
+        "Config": insights_analysis_config(g.len()),
     });
 
-    // full_stats — raw per-node metric maps.
+    // full_stats — exactly Go's 9 fields (mapLimit=200 default).
     let mut fs = serde_json::Map::new();
     fs.insert("pagerank".into(), serde_json::Value::Object(pr_obj));
     fs.insert("betweenness".into(), serde_json::Value::Object(bw_obj));
@@ -1744,19 +1830,699 @@ fn run_robot_insights() -> ExitCode {
     );
     fs.insert("core_number".into(), serde_json::Value::Object(core_obj));
     fs.insert("slack".into(), serde_json::Value::Object(slack_obj));
-    fs.insert("OutDegree".into(), serde_json::json!(p1.out_degree));
-    fs.insert("InDegree".into(), serde_json::json!(p1.in_degree));
-    fs.insert(
-        "TopologicalOrder".into(),
-        serde_json::json!(p1.topological_order),
-    );
-    fs.insert("Density".into(), serde_json::json!(p1.density));
-    fs.insert("NodeCount".into(), serde_json::json!(p1.node_count));
-    fs.insert("EdgeCount".into(), serde_json::json!(p1.edge_count));
     fs.insert("articulation_points".into(), serde_json::json!(art_ids));
     payload["full_stats"] = serde_json::Value::Object(fs);
 
+    // top_what_ifs — Go TopWhatIfDeltas (bv-83): exact delta semantics.
+    let whatif_entries = compute_top_what_if_deltas(&issues, &g, &cp_heights);
+    if !whatif_entries.is_empty() {
+        payload["top_what_ifs"] = serde_json::Value::Array(whatif_entries);
+    }
+
+    // advanced_insights — Go GenerateAdvancedInsights parity (bv-145/152/153/154).
+    payload["advanced_insights"] = generate_advanced_insights(&issues, &cycles_from_phase2);
+
+    payload["usage_hints"] = serde_json::json!([
+        "jq '.Bottlenecks[:5] | map(.ID)' - Top 5 bottleneck IDs",
+        "jq '.CriticalPath[:3]' - Top 3 critical path items",
+        "jq '.top_what_ifs[] | select(.delta.direct_unblocks > 2)' - High-impact items",
+        "jq '.full_stats.pagerank | to_entries | sort_by(-.value)[:5]' - Top PageRank",
+        "jq '.full_stats.core_number | to_entries | sort_by(-.value)[:5]' - Strongly embedded nodes (k-core)",
+        "jq '.full_stats.articulation_points' - Structural cut points",
+        "jq '.Slack[:5]' - Nodes with slack (good parallel work candidates)",
+        "jq '.Cycles | length' - Count of detected cycles",
+        "jq '.advanced_insights.cycle_break' - Cycle break suggestions (bv-181)",
+        "BV_INSIGHTS_MAP_LIMIT=50 bv --robot-insights - Reduce map sizes",
+    ]);
+
     emit_json(&payload)
+}
+
+/// Go `TopWhatIfDeltas` (priority.go bv-83) — per-issue what-if deltas with
+/// exact Go semantics: direct unblocks (newly-actionable dependents),
+/// BFS-simulated transitive unblocks, depth reduction (cpValue/10 capped
+/// at 1), days saved (Σ estimates / 480), parallel gain = direct − 1.
+fn compute_top_what_if_deltas(
+    issues: &[bv_core::model::Issue],
+    g: &bv_graph_core::DiGraph,
+    cp_heights: &[f64],
+) -> Vec<serde_json::Value> {
+    use bv_core::model::Status;
+    const MAX_CRITICAL_PATH_DEPTH: f64 = 10.0;
+    const MAX_UNBLOCKED_IDS_SHOWN: usize = 10;
+
+    let is_closed = |id: &str| -> bool {
+        issues
+            .iter()
+            .find(|i| i.id == id)
+            .map(|i| matches!(i.status, Status::Closed | Status::Tombstone))
+            .unwrap_or(true)
+    };
+
+    // Go computeUnblocks: dependents that are open and have no OTHER open blocker.
+    let compute_unblocks = |issue_id: &str| -> Vec<String> {
+        let mut unblocks = Vec::new();
+        let Some(node) = g.node_idx(issue_id) else {
+            return unblocks;
+        };
+        for &dep_node in g.predecessors_slice(node) {
+            let dep_id = g.node_id(dep_node).unwrap_or_default();
+            if is_closed(&dep_id) {
+                continue;
+            }
+            let mut still_blocked = false;
+            for &other in g.successors_slice(dep_node) {
+                let other_id = g.node_id(other).unwrap_or_default();
+                if other_id == issue_id {
+                    continue;
+                }
+                if !is_closed(&other_id) {
+                    still_blocked = true;
+                    break;
+                }
+            }
+            if !still_blocked {
+                unblocks.push(dep_id.to_string());
+            }
+        }
+        unblocks.sort();
+        unblocks
+    };
+
+    // Go countTransitiveUnblocks: BFS with simulated-closed set.
+    let count_transitive = |issue_id: &str| -> usize {
+        let mut simulated: std::collections::HashSet<String> = std::collections::HashSet::new();
+        simulated.insert(issue_id.to_string());
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(issue_id.to_string());
+        let mut count = 0usize;
+        while let Some(curr) = queue.pop_front() {
+            let Some(node) = g.node_idx(curr.as_str()) else {
+                continue;
+            };
+            for &dep_node in g.predecessors_slice(node) {
+                let dep_id = g.node_id(dep_node).unwrap_or_default().to_string();
+                if simulated.contains(&dep_id) || is_closed(&dep_id) {
+                    continue;
+                }
+                // Unblocked if ALL blockers are (real or simulated) closed.
+                let mut blocked = false;
+                for &blocker_node in g.successors_slice(dep_node) {
+                    let blocker_id = g.node_id(blocker_node).unwrap_or_default().to_string();
+                    let blocker_closed = simulated.contains(&blocker_id) || is_closed(&blocker_id);
+                    if !blocker_closed {
+                        blocked = true;
+                        break;
+                    }
+                }
+                if !blocked {
+                    simulated.insert(dep_id.clone());
+                    queue.push_back(dep_id);
+                    count += 1;
+                }
+            }
+        }
+        count
+    };
+
+    let mut results: Vec<serde_json::Value> = Vec::new();
+    for issue in issues {
+        if matches!(issue.status, Status::Closed | Status::Tombstone) {
+            continue;
+        }
+        let direct_list = compute_unblocks(&issue.id);
+        let direct = direct_list.len() as i64;
+        let transitive = count_transitive(&issue.id) as i64;
+        if direct == 0 && transitive == 0 {
+            continue;
+        }
+        let blocked_reduction = direct_list
+            .iter()
+            .filter(|id| {
+                issues
+                    .iter()
+                    .any(|i| i.id == **id && i.status == Status::Blocked)
+            })
+            .count() as i64;
+        let cp_node = g.node_idx(issue.id.as_str()).unwrap_or(usize::MAX);
+        let current_depth = cp_heights.get(cp_node).copied().unwrap_or(0.0);
+        let mut depth_reduction = 0.0f64;
+        if current_depth > 0.0 {
+            depth_reduction = (current_depth / MAX_CRITICAL_PATH_DEPTH).min(1.0);
+        }
+        let estimated_days_saved: f64 = direct_list
+            .iter()
+            .map(|id| {
+                issues
+                    .iter()
+                    .find(|i| i.id == *id)
+                    .map(|i| i.estimated_minutes.unwrap_or(60) as f64)
+                    .unwrap_or(60.0)
+            })
+            .sum::<f64>()
+            / 480.0;
+        let unblocked_ids: Vec<String> = direct_list
+            .iter()
+            .take(MAX_UNBLOCKED_IDS_SHOWN)
+            .cloned()
+            .collect();
+        let parallel_gain = direct - 1;
+
+        // Go generateWhatIfExplanation.
+        let explanation = if direct == 0 {
+            "No immediate downstream impact".to_string()
+        } else {
+            let mut e = format!("Completing this directly unblocks {direct} item");
+            if direct != 1 {
+                e.push('s');
+            }
+            if transitive > direct {
+                e.push_str(&format!(" ({transitive} total including cascades)"));
+            }
+            if blocked_reduction > 0 {
+                e.push_str(&format!(", clears {blocked_reduction} blocked"));
+            }
+            if estimated_days_saved >= 0.5 {
+                e.push_str(&format!(
+                    ", enabling ~{estimated_days_saved:.1} days of work"
+                ));
+            }
+            e
+        };
+
+        results.push(serde_json::json!({
+            "issue_id": issue.id,
+            "title": issue.title,
+            "delta": {
+                "direct_unblocks": direct,
+                "transitive_unblocks": transitive,
+                "blocked_reduction": blocked_reduction,
+                "depth_reduction": depth_reduction,
+                "estimated_days_saved": estimated_days_saved,
+                "unblocked_issue_ids": unblocked_ids,
+                "parallelization_gain": parallel_gain,
+                "explanation": explanation,
+            },
+        }));
+    }
+
+    // Sort: transitive desc, direct desc, ID asc; cap at 10.
+    results.sort_by(|a, b| {
+        let at = a["delta"]["transitive_unblocks"].as_i64().unwrap_or(0);
+        let bt = b["delta"]["transitive_unblocks"].as_i64().unwrap_or(0);
+        let ad = a["delta"]["direct_unblocks"].as_i64().unwrap_or(0);
+        let bd = b["delta"]["direct_unblocks"].as_i64().unwrap_or(0);
+        bt.cmp(&at)
+            .then_with(|| bd.cmp(&ad))
+            .then_with(|| a["issue_id"].as_str().cmp(&b["issue_id"].as_str()))
+    });
+    results.truncate(10);
+    results
+}
+
+/// Go `FeatureStatus` JSON with omitempty semantics:
+/// state always; reason/capped/count/limited omitted when zero-valued.
+fn feature_status(
+    state: &str,
+    reason: &str,
+    capped: bool,
+    count: i64,
+    limited: i64,
+) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    m.insert("state".into(), serde_json::json!(state));
+    if !reason.is_empty() {
+        m.insert("reason".into(), serde_json::json!(reason));
+    }
+    if capped {
+        m.insert("capped".into(), serde_json::json!(true));
+    }
+    if count != 0 {
+        m.insert("count".into(), serde_json::json!(count));
+    }
+    if limited != 0 {
+        m.insert("limited".into(), serde_json::json!(limited));
+    }
+    serde_json::Value::Object(m)
+}
+
+/// Go `AdvancedInsights` port (advanced_insights.go) — greedy top-k set,
+/// coverage set, k-paths, parallel cut, pending parallel gain, cycle break.
+fn generate_advanced_insights(
+    issues: &[bv_core::model::Issue],
+    cycles: &[Vec<String>],
+) -> serde_json::Value {
+    use bv_core::model::Issue;
+    let is_open = |i: &Issue| {
+        !matches!(
+            i.status,
+            bv_core::model::Status::Closed | bv_core::model::Status::Tombstone
+        )
+    };
+    let title_of = |id: &str| -> String {
+        issues
+            .iter()
+            .find(|i| i.id == id)
+            .map(|i| i.title.clone())
+            .unwrap_or_default()
+    };
+
+    // ---- TopK Set (greedy submodular, k=5) — Go generateTopKSet ----
+    let mut candidates: Vec<String> = issues
+        .iter()
+        .filter(|i| is_open(i))
+        .map(|i| i.id.clone())
+        .collect();
+    candidates.sort();
+    let mut topk_items: Vec<serde_json::Value> = Vec::new();
+    let mut marginal_gains: Vec<i64> = Vec::new();
+    let mut total_gain = 0i64;
+    let mut completed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    {
+        let by_id: std::collections::HashMap<&str, &Issue> =
+            issues.iter().map(|i| (i.id.as_str(), i)).collect();
+        let mut remaining = candidates.clone();
+        let k = 5usize;
+        for _ in 0..k {
+            if remaining.is_empty() {
+                break;
+            }
+            let mut best_id = String::new();
+            let mut best_gain: i64 = -1;
+            let mut best_unblocks: Vec<String> = Vec::new();
+            for cand in &remaining {
+                // Go computeMarginalUnblocks: direct newly-actionable count.
+                let mut unblocks: Vec<String> = Vec::new();
+                for issue in issues {
+                    if !is_open(issue) || completed.contains(&issue.id) || issue.id == *cand {
+                        continue;
+                    }
+                    let mut has_this_blocker = false;
+                    let mut would_be_blocked = false;
+                    for dep in &issue.dependencies {
+                        if !dep.r#type.is_blocking() {
+                            continue;
+                        }
+                        let b = dep.effective_depends_on();
+                        if b == cand.as_str() {
+                            has_this_blocker = true;
+                            continue;
+                        }
+                        let blocker_closed = by_id.get(b).map(|bi| !is_open(bi)).unwrap_or(true);
+                        let blocker_completed = completed.contains(b);
+                        if !blocker_closed && !blocker_completed {
+                            would_be_blocked = true;
+                        }
+                    }
+                    if has_this_blocker && !would_be_blocked {
+                        unblocks.push(issue.id.clone());
+                    }
+                }
+                unblocks.sort();
+                let gain = unblocks.len() as i64;
+                if gain > best_gain
+                    || (gain == best_gain && (best_id.is_empty() || cand < &best_id))
+                {
+                    best_id = cand.clone();
+                    best_gain = gain;
+                    best_unblocks = unblocks;
+                }
+            }
+            if best_id.is_empty() {
+                break;
+            }
+            completed.insert(best_id.clone());
+            remaining.retain(|r| r != &best_id);
+            topk_items.push(serde_json::json!({
+                "id": best_id,
+                "title": title_of(&best_id),
+                "marginal_gain": best_gain,
+                "unblocks": best_unblocks,
+            }));
+            marginal_gains.push(best_gain);
+            total_gain += best_gain;
+        }
+    }
+    let topk_limited = candidates.len() as i64;
+    let topk = serde_json::json!({
+        "status": feature_status(
+            "available",
+            "",
+            topk_items.len() as i64 >= 5 && topk_limited > 5,
+            topk_items.len() as i64,
+            topk_limited,
+        ),
+        "items": topk_items,
+        "total_gain": total_gain,
+        "marginal_gain": marginal_gains,
+        "how_to_use": "Best k issues to complete for max downstream unlock. Work these in order.",
+    });
+
+    // ---- Coverage Set (greedy vertex cover, limit 5) — Go generateCoverageSet ----
+    let mut edges: Vec<(String, String)> = Vec::new();
+    let by_id: std::collections::HashMap<&str, &Issue> =
+        issues.iter().map(|i| (i.id.as_str(), i)).collect();
+    for issue in issues {
+        if !is_open(issue) {
+            continue;
+        }
+        for dep in &issue.dependencies {
+            if !dep.r#type.is_blocking() {
+                continue;
+            }
+            let target = dep.effective_depends_on();
+            if let Some(t) = by_id.get(target) {
+                if is_open(t) {
+                    edges.push((issue.id.clone(), target.to_string()));
+                }
+            }
+        }
+    }
+    let total_edges = edges.len() as i64;
+    let coverage = if total_edges == 0 {
+        serde_json::json!({
+            "status": feature_status("available", "No blocking edges to cover", false, 0, 0),
+            "edges_covered": 0,
+            "total_edges": 0,
+            "coverage_ratio": 1.0,
+            "rationale": "Graph has no blocking dependencies.",
+            "how_to_use": "Small vertex cover touching all dependency edges. Use for breadth coverage.",
+        })
+    } else {
+        let mut uncovered: Vec<(String, String)> = edges.clone();
+        let mut cov_items: Vec<serde_json::Value> = Vec::new();
+        let mut edges_covered = 0i64;
+        let mut selection = 0i64;
+        while !uncovered.is_empty() && cov_items.len() < 5 {
+            let mut deg: std::collections::BTreeMap<String, i64> =
+                std::collections::BTreeMap::new();
+            for (f, t) in &uncovered {
+                *deg.entry(f.clone()).or_insert(0) += 1;
+                *deg.entry(t.clone()).or_insert(0) += 1;
+            }
+            let mut best_id = String::new();
+            let mut best_deg = -1i64;
+            for (id, d) in &deg {
+                if *d > best_deg || (*d == best_deg && (best_id.is_empty() || id < &best_id)) {
+                    best_id = id.clone();
+                    best_deg = *d;
+                }
+            }
+            if best_id.is_empty() {
+                break;
+            }
+            let mut added = 0i64;
+            uncovered.retain(|(f, t)| {
+                if f == &best_id || t == &best_id {
+                    added += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+            edges_covered += added;
+            selection += 1;
+            cov_items.push(serde_json::json!({
+                "id": best_id,
+                "title": title_of(&best_id),
+                "edges_added": added,
+                "total_degree": best_deg,
+                "selection_seq": selection,
+            }));
+        }
+        let capped = !uncovered.is_empty();
+        serde_json::json!({
+            "status": feature_status("available", "", capped, cov_items.len() as i64, total_edges),
+            "items": cov_items,
+            "edges_covered": edges_covered,
+            "total_edges": total_edges,
+            "coverage_ratio": edges_covered as f64 / total_edges as f64,
+            "rationale": "Greedy vertex cover (2-approx): iteratively pick highest uncovered degree until edges are covered or cap is reached.",
+            "how_to_use": "Small vertex cover touching all dependency edges. Use for breadth coverage.",
+        })
+    };
+
+    // ---- K-Paths (k=5, cap=50) — Go generateKPaths (longest-path DP) ----
+    // Nodes: open issues sorted by ID; edges blocker -> blocked among open.
+    let mut nodes: Vec<String> = issues
+        .iter()
+        .filter(|i| is_open(i))
+        .map(|i| i.id.clone())
+        .collect();
+    nodes.sort();
+    let idx: std::collections::HashMap<&str, usize> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (id.as_str(), i))
+        .collect();
+    let n = nodes.len();
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut in_deg = vec![0usize; n];
+    for issue in issues {
+        if !is_open(issue) {
+            continue;
+        }
+        let to = idx[issue.id.as_str()];
+        for dep in &issue.dependencies {
+            if !dep.r#type.is_blocking() {
+                continue;
+            }
+            if let Some(&from) = idx.get(dep.effective_depends_on()) {
+                adj[from].push(to);
+                in_deg[to] += 1;
+            }
+        }
+    }
+    for a in &mut adj {
+        a.sort();
+    }
+    // Kahn topo with min-heap (BTreeSet for determinism).
+    let mut topo: Vec<usize> = Vec::new();
+    let mut pq: std::collections::BTreeSet<usize> = (0..n).filter(|&i| in_deg[i] == 0).collect();
+    let mut temp_deg = in_deg.clone();
+    while let Some(&u) = pq.iter().next() {
+        pq.remove(&u);
+        topo.push(u);
+        for &v in &adj[u] {
+            temp_deg[v] -= 1;
+            if temp_deg[v] == 0 {
+                pq.insert(v);
+            }
+        }
+    }
+    let mut dist = vec![0i64; n];
+    let mut pred = vec![-1i64; n];
+    for &u in &topo {
+        for &v in &adj[u] {
+            if dist[u] + 1 > dist[v] {
+                dist[v] = dist[u] + 1;
+                pred[v] = u as i64;
+            } else if dist[u] + 1 == dist[v] && (pred[v] == -1 || (u as i64) < pred[v]) {
+                pred[v] = u as i64;
+            }
+        }
+    }
+    let mut path_ends: Vec<(usize, i64)> = (0..n).map(|i| (i, dist[i])).collect();
+    path_ends.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| nodes[a.0].cmp(&nodes[b.0])));
+    let mut paths: Vec<serde_json::Value> = Vec::new();
+    let mut used_sources: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut total_paths = 0i64;
+    for &(_, len) in &path_ends {
+        if len > 0 {
+            total_paths += 1;
+        }
+    }
+    for &(i, len) in &path_ends {
+        if paths.len() >= 5 {
+            break;
+        }
+        if len == 0 {
+            continue;
+        }
+        let mut chain = Vec::new();
+        let mut cur = i as i64;
+        while cur != -1 {
+            chain.push(cur as usize);
+            cur = pred[cur as usize];
+        }
+        chain.reverse();
+        let source = chain[0];
+        if !used_sources.insert(source) {
+            continue;
+        }
+        let mut truncated = false;
+        if chain.len() > 50 {
+            chain.truncate(50);
+            truncated = true;
+        }
+        let ids: Vec<String> = chain.iter().map(|&x| nodes[x].clone()).collect();
+        let mut p = serde_json::json!({
+            "rank": paths.len() + 1,
+            "length": ids.len(),
+            "issue_ids": ids,
+        });
+        if truncated {
+            p["truncated"] = serde_json::json!(true);
+        }
+        paths.push(p);
+    }
+    let k_paths = serde_json::json!({
+        "status": feature_status("available", "", paths.len() >= 5 && total_paths > 5, paths.len() as i64, total_paths),
+        "paths": paths,
+        "how_to_use": "K-shortest critical paths. Focus on issues appearing in multiple paths.",
+    });
+
+    // ---- Parallel Cut (limit 5) — Go generateParallelCut ----
+    let open_set: std::collections::HashSet<&str> = issues
+        .iter()
+        .filter(|i| is_open(i))
+        .map(|i| i.id.as_str())
+        .collect();
+    let mut blocker_of: std::collections::BTreeMap<&str, Vec<&str>> =
+        std::collections::BTreeMap::new();
+    let mut blocked_by: std::collections::BTreeMap<&str, Vec<&str>> =
+        std::collections::BTreeMap::new();
+    for issue in issues {
+        if !is_open(issue) {
+            continue;
+        }
+        for dep in &issue.dependencies {
+            if !dep.r#type.is_blocking() {
+                continue;
+            }
+            let b = dep.effective_depends_on();
+            if open_set.contains(b) {
+                blocker_of.entry(b).or_default().push(issue.id.as_str());
+                blocked_by.entry(issue.id.as_str()).or_default().push(b);
+            }
+        }
+    }
+    let current_actionable = open_set
+        .iter()
+        .filter(|id| blocked_by.get(*id).map_or(true, |v| v.is_empty()))
+        .count();
+    let mut pc_candidates: Vec<(String, i64, i64, Vec<String>)> = Vec::new();
+    for id in &open_set {
+        let mut newly: Vec<String> = Vec::new();
+        if let Some(dependents) = blocker_of.get(id) {
+            for &dep_id in dependents {
+                let all_others_resolved = blocked_by
+                    .get(dep_id)
+                    .map(|blockers| blockers.iter().all(|&b| b == *id || !open_set.contains(b)))
+                    .unwrap_or(true);
+                if all_others_resolved {
+                    newly.push(dep_id.to_string());
+                }
+            }
+        }
+        let gain = newly.len() as i64 - 1;
+        if gain > 0 {
+            newly.sort();
+            pc_candidates.push((id.to_string(), gain, newly.len() as i64, newly));
+        }
+    }
+    pc_candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    pc_candidates.truncate(5);
+    let max_parallel = current_actionable as i64 + pc_candidates.first().map_or(0, |c| c.1);
+    let parallel_cut = serde_json::json!({
+        "status": {"state": "available"},
+        "max_parallel": max_parallel,
+        "how_to_use": "Issues that enable parallel work. Complete to maximize team throughput.",
+    });
+
+    // ---- Parallel Gain — Go: pending (bv-129 not implemented upstream) ----
+    let parallel_gain = serde_json::json!({
+        "status": {"state": "pending", "reason": "Awaiting implementation (bv-129)"},
+        "how_to_use": "Parallelization improvement from completing each issue.",
+    });
+
+    // ---- Cycle Break — Go generateCycleBreakSuggestions ----
+    let cycle_break = if cycles.is_empty() {
+        serde_json::json!({
+            "status": feature_status("available", "", false, 0, 0),
+            "cycle_count": 0,
+            "how_to_use": "Structural fix suggestions. Apply BEFORE working on cycle members.",
+            "advisory": "No cycles detected - dependency graph is a proper DAG.",
+        })
+    } else {
+        let mut edge_freq: std::collections::BTreeMap<(String, String), Vec<i64>> =
+            std::collections::BTreeMap::new();
+        for (ci, cycle) in cycles.iter().enumerate() {
+            if cycle.len() < 2 || cycle[0] == "CYCLE_DETECTION_TIMEOUT" || cycle[0] == "..." {
+                continue;
+            }
+            for j in 0..cycle.len() - 1 {
+                edge_freq
+                    .entry((cycle[j].clone(), cycle[j + 1].clone()))
+                    .or_default()
+                    .push(ci as i64);
+            }
+            edge_freq
+                .entry((cycle[cycle.len() - 1].clone(), cycle[0].clone()))
+                .or_default()
+                .push(ci as i64);
+        }
+        let mut ranked: Vec<(&(String, String), &Vec<i64>)> = edge_freq.iter().collect();
+        ranked.sort_by(|a, b| {
+            b.1.len()
+                .cmp(&a.1.len())
+                .then_with(|| a.0 .0.cmp(&b.0 .0))
+                .then_with(|| a.0 .1.cmp(&b.0 .1))
+        });
+        let mut suggestions: Vec<serde_json::Value> = Vec::new();
+        for ((from, to), cycs) in ranked.iter().take(5) {
+            let collateral = issues
+                .iter()
+                .filter(|i| {
+                    i.dependencies
+                        .iter()
+                        .any(|d| d.r#type.is_blocking() && d.effective_depends_on() == to.as_str())
+                })
+                .count();
+            suggestions.push(serde_json::json!({
+                "edge_from": from,
+                "edge_to": to,
+                "impact": cycs.len(),
+                "collateral": collateral,
+                "in_cycles": cycs,
+                "rationale": "Appears in most cycles; removing minimizes structural damage.",
+            }));
+        }
+        let capped = ranked.len() > 5;
+        serde_json::json!({
+            "status": feature_status("available", "", capped, suggestions.len() as i64, ranked.len() as i64),
+            "suggestions": suggestions,
+            "cycle_count": cycles.len(),
+            "how_to_use": "Structural fix suggestions. Apply BEFORE working on cycle members.",
+            "advisory": "",
+        })
+    };
+
+    serde_json::json!({
+        "topk_set": topk,
+        "coverage_set": coverage,
+        "k_paths": k_paths,
+        "parallel_cut": parallel_cut,
+        "parallel_gain": parallel_gain,
+        "cycle_break": cycle_break,
+        "config": {
+            "topk_set_limit": 5,
+            "coverage_set_limit": 5,
+            "k_paths_limit": 5,
+            "path_length_cap": 50,
+            "cycle_break_limit": 5,
+            "parallel_cut_limit": 5,
+        },
+        // Go map keys serialize sorted alphabetically.
+        "usage_hints": {
+            "coverage_set": "Small vertex cover touching all dependency edges. Use for breadth coverage.",
+            "cycle_break": "Structural fix suggestions. Apply BEFORE working on cycle members.",
+            "k_paths": "K-shortest critical paths. Focus on issues appearing in multiple paths.",
+            "parallel_cut": "Issues that enable parallel work. Complete to maximize team throughput.",
+            "parallel_gain": "Parallelization improvement from completing each issue.",
+            "topk_set": "Best k issues to complete for max downstream unlock. Work these in order.",
+        },
+    })
 }
 
 /// Go `AnalysisConfig` JSON shape (exported Go field names, ns timeouts).
@@ -3592,7 +4358,7 @@ fn robot_now() -> jiff::Timestamp {
             }
         }
     }
-    robot_now()
+    jiff::Timestamp::now()
 }
 
 fn jiff_now() -> String {

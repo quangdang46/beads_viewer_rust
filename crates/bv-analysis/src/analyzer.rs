@@ -250,8 +250,10 @@ pub fn analyze_phase1(g: &DiGraph) -> Phase1Stats {
         in_degree.insert(id, g.in_degree(idx));
     }
     let topo = topological_sort(g); // Kahn sorted-frontier; None when cyclic
+                                    // Go reverses gonum's topo.Sort output (dependencies-first canonical order).
+    let mut topo = topo.unwrap_or_else(|| (0..n).collect());
+    topo.reverse();
     let topological_order: Vec<String> = topo
-        .unwrap_or_else(|| (0..n).collect())
         .into_iter()
         .map(|idx| g.node_id(idx).unwrap_or_default().to_string())
         .collect();

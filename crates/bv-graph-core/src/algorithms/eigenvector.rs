@@ -34,8 +34,8 @@ pub fn eigenvector(graph: &DiGraph, config: &EigenvectorConfig) -> Vec<f64> {
         return Vec::new();
     }
 
-    // Initialize with uniform distribution
-    let init_val = 1.0 / (n as f64).sqrt();
+    // Initialize with uniform distribution (Go: vec[i] = 1.0 / float64(n)).
+    let init_val = 1.0 / n as f64;
     let mut vec = vec![init_val; n];
     let mut work = vec![0.0; n];
 
@@ -54,9 +54,9 @@ pub fn eigenvector(graph: &DiGraph, config: &EigenvectorConfig) -> Vec<f64> {
         // Normalize to unit length (L2 norm)
         let norm: f64 = work.iter().map(|x| x * x).sum::<f64>().sqrt();
         if norm < 1e-10 {
-            // Graph has no edges or is disconnected - return uniform
-            let uniform = 1.0 / (n as f64).sqrt();
-            return vec![uniform; n];
+            // Go parity: `if sum == 0 { break }` — keep the last vector
+            // (mass has fully accumulated at sinks; uniform would be wrong).
+            break;
         }
 
         for w in &mut work {

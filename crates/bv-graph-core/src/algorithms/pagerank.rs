@@ -46,37 +46,44 @@ pub fn pagerank(graph: &DiGraph, config: &PageRankConfig) -> Vec<f64> {
     let mut scores = vec![1.0 / n as f64; n];
     let mut new_scores = vec![0.0; n];
 
-    // Pre-compute out-degrees
-    let out_degrees: Vec<usize> = (0..n).map(|i| graph.out_degree(i)).collect();
+    // Pre-compute successors sorted by node index (Go sorts g.From(u) by
+    // node ID = insertion order) — the accumulation order must match Go's
+    // push-style loop for byte-exact floating-point results.
+    let mut successors: Vec<Vec<usize>> = (0..n)
+        .map(|i| {
+            let mut succ = graph.successors_slice(i).to_vec();
+            succ.sort_unstable();
+            succ
+        })
+        .collect();
 
     for _ in 0..config.max_iterations {
         // Reset new scores to base value
         new_scores.fill(base);
 
-        // Handle dangling nodes (no outgoing edges)
-        // Their rank "leaks" and is distributed uniformly
-        let dangling_sum: f64 = (0..n)
-            .filter(|&i| out_degrees[i] == 0)
-            .map(|i| scores[i])
-            .sum();
-        let dangling_contrib = d * dangling_sum / n as f64;
-
-        // Add dangling contribution to all nodes
-        for s in &mut new_scores {
-            *s += dangling_contrib;
+        // Go push-style: iterate sources in node order, pushing share to
+        // each successor; dangling mass accumulated separately and added
+        // AFTER the contributions (Go's exact operation order).
+        let mut dangling = 0.0f64;
+        for j in 0..n {
+            let out = successors[j].len();
+            if out == 0 {
+                dangling += scores[j];
+                continue;
+            }
+            let share = d * scores[j] / out as f64;
+            for &i in &successors[j] {
+                new_scores[i] += share;
+            }
         }
-
-        // Accumulate contributions from predecessors
-        for (v, score) in new_scores.iter_mut().enumerate() {
-            for &u in graph.predecessors_slice(v) {
-                if out_degrees[u] > 0 {
-                    *score += d * scores[u] / out_degrees[u] as f64;
-                }
+        if dangling != 0.0 {
+            let add = d * dangling / n as f64;
+            for s in &mut new_scores {
+                *s += add;
             }
         }
 
-        // Check convergence using L2 (Euclidean) norm — matches Go's
-        // `math.Sqrt(diff) < tol` where diff is sum of squared differences.
+        // Convergence: Go `math.Sqrt(diff) < tol` (sum of squared diffs).
         let l2_squared: f64 = scores
             .iter()
             .zip(new_scores.iter())
@@ -88,9 +95,7 @@ pub fn pagerank(graph: &DiGraph, config: &PageRankConfig) -> Vec<f64> {
 
         std::mem::swap(&mut scores, &mut new_scores);
 
-        // Compare l2_squared < tol^2 to avoid sqrt per iteration (equivalent to
-        // math.Sqrt(l2_squared) < tol in Go).
-        if l2_squared < config.tolerance * config.tolerance {
+        if l2_squared.sqrt() < config.tolerance {
             break;
         }
     }
