@@ -260,7 +260,7 @@ pub fn compute_freshness_metrics(
                 most_recent = Some(updated);
                 most_recent_raw = iss.updated_at.clone();
             }
-            let days = (now - updated).total(jiff::Unit::Second).unwrap_or(0.0) / 86400.0;
+            let hours = (now - updated).total(jiff::Unit::Second).unwrap_or(0.0) / 3600.0; let days = hours / 24.0;
             total_staleness += days;
             count += 1;
             if days >= threshold {

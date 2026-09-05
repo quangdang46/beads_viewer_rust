@@ -2531,7 +2531,13 @@ fn generate_advanced_insights(
 fn plan_analysis_config(nodes: usize) -> serde_json::Value {
     // Go ConfigForSize timeout tiers (ns) — golden-verified per fixture size.
     let (bt_ns, pr_ns, cycles_ns, max_cycles, sample) = match nodes {
-        n if n < 100 => (2_000_000_000i64, 2_000_000_000i64, 2_000_000_000i64, 1000, 0),
+        n if n < 100 => (
+            2_000_000_000i64,
+            2_000_000_000i64,
+            2_000_000_000i64,
+            1000,
+            0,
+        ),
         n if n < 500 => (500_000_000i64, 500_000_000i64, 500_000_000i64, 100, 0),
         n if n < 2000 => (500_000_000i64, 300_000_000i64, 300_000_000i64, 50, 100),
         _ => (500_000_000i64, 200_000_000i64, 0i64, 10, 200),
@@ -4353,11 +4359,41 @@ fn run_robot_label_flow() -> ExitCode {
     let cfg = bv_analysis::label_health::LabelHealthConfig::default();
     let flow = bv_analysis::label_health::compute_cross_label_flow(&issues, &cfg);
     let mut payload = envelope_json(&hash);
-    payload["flow"] = serde_json::to_value(&flow).unwrap_or_default();
+    // Go: nil arrays serialize as null (not []) for empty list fields.
+    let mut flow_obj = serde_json::Map::new();
+    flow_obj.insert("labels".into(), serde_json::json!(flow.labels));
+    flow_obj.insert("flow_matrix".into(), serde_json::json!(flow.flow_matrix));
+    if flow.dependencies.is_empty() {
+        flow_obj.insert("dependencies".into(), serde_json::Value::Null);
+    } else {
+        flow_obj.insert("dependencies".into(), serde_json::json!(flow.dependencies));
+    }
+    if flow.critical_paths.is_empty() {
+        flow_obj.insert("critical_paths".into(), serde_json::Value::Null);
+    } else {
+        flow_obj.insert(
+            "critical_paths".into(),
+            serde_json::json!(flow.critical_paths),
+        );
+    }
+    if flow.bottleneck_labels.is_empty() {
+        flow_obj.insert("bottleneck_labels".into(), serde_json::Value::Null);
+    } else {
+        flow_obj.insert(
+            "bottleneck_labels".into(),
+            serde_json::json!(flow.bottleneck_labels),
+        );
+    }
+    flow_obj.insert(
+        "total_cross_label_deps".into(),
+        serde_json::json!(flow.total_cross_label_deps),
+    );
+    payload["flow"] = serde_json::Value::Object(flow_obj);
     payload["analysis_config"] = serde_json::to_value(&cfg).unwrap_or_default();
     payload["usage_hints"] = serde_json::json!([
         "jq '.flow.bottleneck_labels' - labels blocking the most others",
         "jq '.flow.flow_matrix' - raw matrix (row=from, col=to, align with .flow.labels)",
+        "jq '.flow.dependencies[] | select(.issue_count > 1)' - High-impact cross-label edges",
     ]);
     emit_json(&payload)
 }
@@ -4379,10 +4415,15 @@ fn run_robot_label_attention() -> ExitCode {
     let result =
         bv_analysis::label_health::compute_label_attention_scores(&issues, &cfg, robot_now());
     let mut payload = envelope_json(&hash);
-    payload["labels"] = serde_json::to_value(&result.labels).unwrap_or_default();
-    payload["top_attention"] = serde_json::to_value(&result.top_attention).unwrap_or_default();
-    payload["low_attention"] = serde_json::to_value(&result.low_attention).unwrap_or_default();
+    // Go: limit comes from --attention-limit flag (default 0 = no limit).
+    payload["limit"] = serde_json::json!(0);
     payload["total_labels"] = serde_json::json!(result.total_labels);
+    payload["labels"] = serde_json::to_value(&result.labels).unwrap_or_default();
+    payload["usage_hints"] = serde_json::json!([
+        "jq '.labels[0]' - Top attention item",
+        "jq '.top_attention' - Labels needing most attention",
+        "jq '.low_attention' - Labels with least attention needed",
+    ]);
     emit_json(&payload)
 }
 
