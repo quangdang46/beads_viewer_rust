@@ -112,7 +112,7 @@ fn main() -> ExitCode {
     if let Some(idx) = args.iter().position(|a| a == "--export-graph") {
         let output_path = args.get(idx + 1).cloned().unwrap_or_default();
         let cwd = std::env::current_dir().unwrap_or_default();
-        let (issues, hash) = match load_issues_auto(&cwd) {
+        let (issues, hash, _as_of_commit) = match load_issues_auto(&cwd, None) {
             Ok(x) => x,
             Err(e) => {
                 eprintln!("Error: {e}");
@@ -322,7 +322,7 @@ fn main() -> ExitCode {
             .unwrap_or_else(|| "Beads Dashboard".to_string());
         let include_closed = args.iter().any(|a| a == "--pages-include-closed");
         let cwd = std::env::current_dir().unwrap_or_default();
-        let (issues, hash) = match load_issues_auto(&cwd) {
+        let (issues, hash, _as_of_commit) = match load_issues_auto(&cwd, None) {
             Ok(x) => x,
             Err(e) => {
                 eprintln!("Error: {e}");
@@ -538,8 +538,43 @@ fn launch_tui(app: &mut bv_tui::App, issues: &[bv_core::model::Issue]) -> ExitCo
     }
 }
 
+/// Extract --as-of value from process args (Go parity: global flag).
+fn extract_as_of() -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    for i in 1..args.len() {
+        if args[i] == "--as-of" {
+            return args.get(i + 1).cloned();
+        }
+        if let Some(val) = args[i].strip_prefix("--as-of=") {
+            return Some(val.to_string());
+        }
+    }
+    None
+}
+
 /// Load issues from cwd, honoring workspace config if present (multi-repo).
-fn load_issues_auto(cwd: &std::path::Path) -> Result<(Vec<bv_core::model::Issue>, String), String> {
+fn load_issues_auto(
+    cwd: &std::path::Path,
+    as_of: Option<&str>,
+) -> Result<(Vec<bv_core::model::Issue>, String, Option<String>), String> {
+    // If --as-of is specified, use GitLoader for time-travel (Go parity).
+    if let Some(revision) = as_of {
+        let loader = bv_core::discovery::GitLoader::new(cwd);
+        let resolved = loader
+            .resolve_revision(revision)
+            .map_err(|e| e.to_string())?;
+        let issues = loader
+            .load_at(revision)
+            .map_err(|e| e.to_string())?;
+        eprintln!(
+            "Loaded {} issues from {} ({})",
+            issues.len(),
+            revision,
+            &resolved[..resolved.len().min(7)]
+        );
+        let hash = bv_core::data_hash::compute_data_hash(&issues);
+        return Ok((issues, hash, Some(resolved)));
+    }
     if let Some(ws_path) = bv_core::workspace::find_workspace_config(cwd) {
         let ws_root = ws_path
             .parent()
@@ -551,21 +586,22 @@ fn load_issues_auto(cwd: &std::path::Path) -> Result<(Vec<bv_core::model::Issue>
         {
             Ok((issues, _)) => {
                 let hash = bv_core::data_hash::compute_data_hash(&issues);
-                return Ok((issues, hash));
+                return Ok((issues, hash, None));
             }
             Err(e) => eprintln!("workspace load failed, falling back: {e}"),
         }
     }
     let (issues, _) = bv_core::discovery::load_issues_from_repo(cwd).map_err(|e| e.to_string())?;
     let hash = bv_core::data_hash::compute_data_hash(&issues);
-    Ok((issues, hash))
+    Ok((issues, hash, None))
 }
 
 /// Load issues from discovery chain and emit --robot-triage JSON.
 fn run_robot_triage() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let issues = match load_issues_auto(&cwd) {
-        Ok((issues, _hash)) => issues,
+    let as_of = extract_as_of();
+    let (issues, _hash, as_of_commit) = match load_issues_auto(&cwd, as_of.as_deref()) {
+        Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
             return ExitCode::from(1);
@@ -703,7 +739,7 @@ fn run_robot_triage() -> ExitCode {
         bv_robot::OutputFormat::Json,
     );
     env.generated_at = jiff_now(); // Truncate to seconds (Go parity).
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "generated_at": env.generated_at,
         "data_hash": env.data_hash,
         "triage": {
@@ -730,6 +766,13 @@ fn run_robot_triage() -> ExitCode {
             "commands": commands,
         },
     });
+    // Add as_of/as_of_commit only when --as-of was used (Go omitempty parity).
+    if let Some(ref a) = as_of {
+        payload["triage"]["as_of"] = serde_json::json!(a);
+    }
+    if let Some(ref c) = as_of_commit {
+        payload["triage"]["as_of_commit"] = serde_json::json!(c);
+    }
     match serde_json::to_string(&payload) {
         Ok(s) => {
             println!("{s}");
@@ -746,7 +789,7 @@ fn capture_baseline(
 ) -> Result<(bv_analysis::drift::BaselineStats, Vec<Vec<String>>, String), String> {
     use bv_analysis::algorithms::cycles::tarjan_scc;
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (issues, _hash) = load_issues_auto(&cwd)?;
+    let (issues, _hash, _as_of_commit) = load_issues_auto(&cwd, None)?;
     let hash = bv_core::data_hash::compute_data_hash(&issues);
     let g = bv_analysis::analyzer::build_graph(&issues);
     let p1 = bv_analysis::analyzer::analyze_phase1(&g);
@@ -894,7 +937,7 @@ fn run_check_drift() -> ExitCode {
 
 fn run_robot_history() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (issues, _) = match load_issues_auto(&cwd) {
+    let (issues, _, _as_of_commit) = match load_issues_auto(&cwd, None) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -949,7 +992,7 @@ fn run_robot_history() -> ExitCode {
 
 fn run_robot_orphans() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (issues, _) = match load_issues_auto(&cwd) {
+    let (issues, _, _as_of_commit) = match load_issues_auto(&cwd, None) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -1065,11 +1108,33 @@ type AnalysisResultFull = (
 
 fn load_full() -> Result<AnalysisResultFull, ExitCode> {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (issues, _) = match bv_core::discovery::load_issues_from_repo(&cwd) {
-        Ok(x) => x,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            return Err(ExitCode::from(1));
+    let as_of = extract_as_of();
+    let issues = if let Some(ref revision) = as_of {
+        let loader = bv_core::discovery::GitLoader::new(&cwd);
+        match loader.load_at(revision) {
+            Ok(issues) => {
+                if let Ok(sha) = loader.resolve_revision(revision) {
+                    eprintln!(
+                        "Loaded {} issues from {} ({})",
+                        issues.len(),
+                        revision,
+                        &sha[..sha.len().min(7)]
+                    );
+                }
+                issues
+            }
+            Err(e) => {
+                eprintln!("Error loading issues at {revision}: {e}");
+                return Err(ExitCode::from(1));
+            }
+        }
+    } else {
+        match bv_core::discovery::load_issues_from_repo(&cwd) {
+            Ok((issues, _)) => issues,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return Err(ExitCode::from(1));
+            }
         }
     };
     let data_hash = bv_core::data_hash::compute_data_hash(&issues);
@@ -1272,7 +1337,7 @@ fn run_robot_insights() -> ExitCode {
 
 fn run_robot_plan() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (issues, _) = match load_issues_auto(&cwd) {
+    let (issues, _, _as_of_commit) = match load_issues_auto(&cwd, None) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -1395,7 +1460,7 @@ fn run_robot_priority(args: &[String]) -> ExitCode {
         .cloned();
 
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (mut issues, _) = match load_issues_auto(&cwd) {
+    let (mut issues, _, _as_of_commit) = match load_issues_auto(&cwd, None) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -1503,7 +1568,7 @@ fn run_robot_priority(args: &[String]) -> ExitCode {
 
 fn run_robot_suggest() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (issues, hash) = match load_issues_auto(&cwd) {
+    let (issues, hash, _as_of_commit) = match load_issues_auto(&cwd, None) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -1524,7 +1589,7 @@ fn run_robot_suggest() -> ExitCode {
 }
 fn run_robot_alerts() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (issues, hash) = match load_issues_auto(&cwd) {
+    let (issues, hash, _as_of_commit) = match load_issues_auto(&cwd, None) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -1556,7 +1621,7 @@ fn run_robot_alerts() -> ExitCode {
 
 fn run_robot_graph(args: &[String]) -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (issues, hash) = match load_issues_auto(&cwd) {
+    let (issues, hash, _as_of_commit) = match load_issues_auto(&cwd, None) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -1715,7 +1780,7 @@ fn run_robot_search(args: &[String]) -> ExitCode {
         .unwrap_or(10);
 
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (issues, hash) = match load_issues_auto(&cwd) {
+    let (issues, hash, _as_of_commit) = match load_issues_auto(&cwd, None) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -1808,7 +1873,7 @@ fn run_robot_causality(args: &[String]) -> ExitCode {
         .cloned()
         .unwrap_or_default();
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (issues, hash) = match load_issues_auto(&cwd) {
+    let (issues, hash, _as_of_commit) = match load_issues_auto(&cwd, None) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -1946,7 +2011,7 @@ fn run_robot_impact_network(args: &[String]) -> ExitCode {
 /// Go `robot-sprint-list` — loads `.beads/sprints.jsonl` and emits all sprints.
 fn run_robot_sprint_list() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (issues, hash) = match load_issues_auto(&cwd) {
+    let (issues, hash, _as_of_commit) = match load_issues_auto(&cwd, None) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -1980,7 +2045,7 @@ fn run_robot_sprint_show(args: &[String]) -> ExitCode {
         .cloned()
         .unwrap_or_default();
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (issues, hash) = match load_issues_auto(&cwd) {
+    let (issues, hash, _as_of_commit) = match load_issues_auto(&cwd, None) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -2035,7 +2100,7 @@ fn run_robot_burndown(args: &[String]) -> ExitCode {
         .and_then(|i| args.get(i + 1))
         .cloned();
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (issues, hash) = match load_issues_auto(&cwd) {
+    let (issues, hash, _as_of_commit) = match load_issues_auto(&cwd, None) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -2082,7 +2147,7 @@ fn run_robot_forecast(args: &[String]) -> ExitCode {
         .and_then(|i| args.get(i + 1))
         .cloned();
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (issues, hash) = match load_issues_auto(&cwd) {
+    let (issues, hash, _as_of_commit) = match load_issues_auto(&cwd, None) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -2137,7 +2202,7 @@ fn run_robot_capacity(args: &[String]) -> ExitCode {
         .and_then(|i| args.get(i + 1))
         .cloned();
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (issues, hash) = match load_issues_auto(&cwd) {
+    let (issues, hash, _as_of_commit) = match load_issues_auto(&cwd, None) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -2191,7 +2256,7 @@ fn run_robot_capacity(args: &[String]) -> ExitCode {
 fn load_correlation_report(
     cwd: &std::path::Path,
 ) -> Result<(Vec<bv_core::model::Issue>, String, CorrelationReport), String> {
-    let (issues, hash) = load_issues_auto(cwd)?;
+    let (issues, hash, _as_of_commit) = load_issues_auto(cwd, None)?;
     let commits = bv_correlation::correlator::walk_commits(cwd, 1000)?;
     let report = bv_correlation::correlator::correlate(&issues, &commits);
     Ok((issues, hash, report))
@@ -2646,7 +2711,7 @@ fn run_robot_blocker_chain(args: &[String]) -> ExitCode {
         .cloned()
         .unwrap_or_default();
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (issues, hash) = match load_issues_auto(&cwd) {
+    let (issues, hash, _as_of_commit) = match load_issues_auto(&cwd, None) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -2695,7 +2760,7 @@ fn run_robot_correlation_feedback(args: &[String], flag: &str, feedback_type: &s
     }
 
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (issues, hash) = match load_issues_auto(&cwd) {
+    let (issues, hash, _as_of_commit) = match load_issues_auto(&cwd, None) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -2847,7 +2912,7 @@ fn run_robot_diff(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     };
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (current, hash) = match load_issues_auto(&cwd) {
+    let (current, hash, _as_of_commit) = match load_issues_auto(&cwd, None) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -2908,7 +2973,7 @@ fn run_robot_not_ready_labels(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     }
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (issues, hash) = match load_issues_auto(&cwd) {
+    let (issues, hash, _as_of_commit) = match load_issues_auto(&cwd, None) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
