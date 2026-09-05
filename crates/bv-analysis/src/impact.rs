@@ -151,6 +151,8 @@ pub struct IssueImpact {
     pub labels: Vec<String>,
     pub score: f64,
     pub breakdown: Breakdown,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<String>,
 }
 
 /// Golden field names + order.
@@ -261,6 +263,36 @@ pub fn compute_impact_scores(inputs: &ImpactInputs) -> Vec<IssueImpact> {
             + b.urgency
             + b.risk;
 
+        // Generate human-readable reasons from score breakdown (Go parity).
+        let mut reasons = Vec::new();
+        if b.pagerank > 0.01 {
+            reasons.push(format!("High graph centrality ({:.2})", b.pagerank));
+        }
+        if b.betweenness > 0.01 {
+            reasons.push(format!("Key bottleneck node ({:.2})", b.betweenness));
+        }
+        if b.blocker_ratio > 0.0 {
+            reasons.push(format!(
+                "Blocks {:.0}% of downstream work",
+                b.blocker_ratio * 100.0
+            ));
+        }
+        if b.staleness > 0.05 {
+            reasons.push(format!("Stale for {:.0} days", b.staleness * 100.0));
+        }
+        if b.time_to_impact > 0.02 {
+            reasons.push(format!("High time-to-impact ({:.2})", b.time_to_impact));
+        }
+        if b.urgency > 0.01 {
+            reasons.push(format!("Urgent ({:.2})", b.urgency));
+        }
+        if b.risk > 0.01 {
+            reasons.push(format!("Elevated risk ({:.2})", b.risk));
+        }
+        if reasons.is_empty() {
+            reasons.push("Open and actionable".to_string());
+        }
+
         results.push(IssueImpact {
             id: issue.id.clone(),
             title: issue.title.clone(),
@@ -270,6 +302,7 @@ pub fn compute_impact_scores(inputs: &ImpactInputs) -> Vec<IssueImpact> {
             labels: issue.labels.clone(),
             score,
             breakdown: b,
+            reasons,
         });
     }
     results.sort_by(|a, b| {

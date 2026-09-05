@@ -572,7 +572,6 @@ fn run_robot_triage() -> ExitCode {
         }
     };
     if issues.is_empty() {
-        // Go: zero-issues exit 0 with empty payload
         println!(
             "{{\"generated_at\":\"{}\",\"data_hash\":\"empty\",\"triage\":{{}}}}",
             jiff_now()
@@ -583,18 +582,128 @@ fn run_robot_triage() -> ExitCode {
     let g = std::sync::Arc::new(bv_analysis::analyzer::build_graph(&issues));
     let out = bv_analysis::triage::build_triage(&issues, &g, jiff::Timestamp::now());
 
+    // Build top_picks from top recommendations (Go parity).
+    let top_picks: Vec<serde_json::Value> = out
+        .recommendations
+        .iter()
+        .take(5)
+        .map(|r| {
+            let unblocks: usize = issues
+                .iter()
+                .filter(|o| {
+                    o.dependencies
+                        .iter()
+                        .any(|d| d.r#type.is_blocking() && d.effective_depends_on() == r.id)
+                })
+                .count();
+            serde_json::json!({
+                "id": r.id,
+                "title": r.title,
+                "score": r.score,
+                "reasons": r.reasons,
+                "unblocks": unblocks,
+            })
+        })
+        .collect();
+
+    // Build quick_wins: low-effort high-impact (actionable + priority <= 2).
+    let quick_wins: Vec<serde_json::Value> = out
+        .recommendations
+        .iter()
+        .filter(|r| r.status == "open" && r.priority <= 2 && r.breakdown.staleness < 0.01)
+        .take(3)
+        .map(|r| {
+            serde_json::json!({
+                "id": r.id, "title": r.title, "score": r.score,
+                "reason": format!("High priority (P{}) with minimal staleness", r.priority),
+            })
+        })
+        .collect();
+
+    // Build blockers_to_clear: high betweenness blocking issues.
+    let blockers_to_clear: Vec<serde_json::Value> = out
+        .recommendations
+        .iter()
+        .filter(|r| r.breakdown.blocker_ratio > 0.0 || r.breakdown.betweenness > 0.01)
+        .take(5)
+        .map(|r| {
+            let unblocks_count = issues
+                .iter()
+                .filter(|o| {
+                    o.dependencies
+                        .iter()
+                        .any(|d| d.r#type.is_blocking() && d.effective_depends_on() == r.id)
+                })
+                .count();
+            let unblocks_ids: Vec<String> = issues
+                .iter()
+                .filter(|o| {
+                    o.dependencies
+                        .iter()
+                        .any(|d| d.r#type.is_blocking() && d.effective_depends_on() == r.id)
+                })
+                .map(|o| o.id.clone())
+                .collect();
+            serde_json::json!({
+                "id": r.id, "title": r.title,
+                "unblocks_count": unblocks_count,
+                "unblocks_ids": unblocks_ids,
+                "actionable": r.status == "open",
+            })
+        })
+        .collect();
+
+    // Project health overview.
+    let graph_density = if out.counts.total > 1 {
+        g.edge_count() as f64 / (out.counts.total as f64 * (out.counts.total as f64 - 1.0))
+    } else {
+        0.0
+    };
+    let project_health = serde_json::json!({
+        "counts": {
+            "total": out.counts.total,
+            "open": out.counts.open,
+            "closed": out.counts.closed,
+            "blocked": out.counts.blocked,
+            "actionable": out.counts.actionable,
+            "not_closed": out.counts.not_closed,
+            "dependency_blocked": out.counts.dependency_blocked,
+            "by_status": out.counts.by_status,
+            "by_type": out.counts.by_type,
+            "by_priority": out.counts.by_priority,
+        },
+        "graph": {
+            "node_count": out.counts.total,
+            "edge_count": g.edge_count(),
+            "density": (graph_density * 10000.0).round() / 10000.0,
+            "has_cycles": false,
+            "phase2_ready": true,
+        },
+    });
+
+    // Pre-built br commands (Go parity).
+    let top_id = out
+        .recommendations
+        .first()
+        .map(|r| r.id.as_str())
+        .unwrap_or("");
+    let commands = serde_json::json!({
+        "claim_top": format!("br update {top_id} --status in_progress --assignee agent"),
+        "show_top": format!("br show {top_id}"),
+        "list_ready": "br ready".to_string(),
+        "list_blocked": "br list --status blocked".to_string(),
+        "refresh_triage": "bvr --robot-triage".to_string(),
+    });
+
     let env = bv_robot::RobotEnvelope::new(
         data_hash,
         env!("CARGO_PKG_VERSION"),
         None,
         bv_robot::OutputFormat::Json,
     );
-    // Field order: envelope fields first, then triage payload — matches golden.
     let payload = serde_json::json!({
         "generated_at": env.generated_at,
         "data_hash": env.data_hash,
-        "output_format": env.output_format,
-        "version": env.version,
         "triage": {
             "meta": {
                 "version": bv_robot::ROBOT_CONTRACT_VERSION,
@@ -603,8 +712,20 @@ fn run_robot_triage() -> ExitCode {
                 "issue_count": out.counts.total,
             },
             "status": bv_analysis::analyzer::MetricStatus::default().to_json_map(),
-            "quick_ref": out.quick_ref,
+            "quick_ref": {
+                "open_count": out.quick_ref.open_count,
+                "actionable_count": out.quick_ref.actionable_count,
+                "blocked_count": out.quick_ref.blocked_count,
+                "in_progress_count": out.quick_ref.in_progress_count,
+                "not_closed_count": out.quick_ref.not_closed_count,
+                "not_actionable_count": out.quick_ref.not_actionable_count,
+                "top_picks": top_picks,
+            },
             "recommendations": out.recommendations,
+            "quick_wins": quick_wins,
+            "blockers_to_clear": blockers_to_clear,
+            "project_health": project_health,
+            "commands": commands,
         },
     });
     match serde_json::to_string(&payload) {
@@ -922,7 +1043,7 @@ fn envelope_json(data_hash: &str) -> serde_json::Value {
 }
 
 fn emit_json(v: &serde_json::Value) -> ExitCode {
-    match serde_json::to_string_pretty(v) {
+    match serde_json::to_string(v) {
         Ok(s) => {
             println!("{s}");
             ExitCode::from(0)
@@ -2738,7 +2859,15 @@ fn run_robot_not_ready_labels(args: &[String]) -> ExitCode {
 }
 
 fn jiff_now() -> String {
-    jiff::Timestamp::now().to_string()
+    // Go parity: truncate to second precision (no microseconds).
+    let ts = jiff::Timestamp::now();
+    let s = ts.to_string();
+    // Strip sub-second portion: "2026-08-22T14:07:01.790741Z" → "2026-08-22T14:07:01Z"
+    if let Some(pos) = s.find('.') {
+        format!("{}Z", &s[..pos])
+    } else {
+        s
+    }
 }
 
 /// Go `handleRobotImpact` — `--robot-impact <file1,file2,...>`.
