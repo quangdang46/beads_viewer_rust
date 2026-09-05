@@ -929,8 +929,7 @@ fn run_robot_history() -> ExitCode {
     let payload = serde_json::json!({
         "generated_at": jiff_now(),
         "data_hash": data_hash,
-        "output_format": "json",
-        "version": env!("CARGO_PKG_VERSION"),
+        // output_format/version omitted for JSON (Go omitempty parity).
         "stats": {
             "total_events": events.len(),
             "beads_with_commits": by_bead.len(),
@@ -980,8 +979,7 @@ fn run_robot_orphans() -> ExitCode {
     let payload = serde_json::json!({
         "generated_at": jiff_now(),
         "data_hash": data_hash,
-        "output_format": "json",
-        "version": env!("CARGO_PKG_VERSION"),
+        // output_format/version omitted for JSON (Go omitempty parity).
         "candidates_count": candidates.len(),
         "candidates": candidates,
     });
@@ -1037,8 +1035,7 @@ fn envelope_json(data_hash: &str) -> serde_json::Value {
     serde_json::json!({
         "generated_at": jiff_now(),
         "data_hash": data_hash,
-        "output_format": "json",
-        "version": env!("CARGO_PKG_VERSION"),
+        // output_format/version omitted for JSON (Go omitempty parity).
     })
 }
 
@@ -1183,7 +1180,25 @@ fn run_robot_insights() -> ExitCode {
         .collect();
     payload["Cycles"] = serde_json::json!(cycles_out);
 
-    // full_stats
+    // Orphans: leaf nodes (zero out-degree).
+    let orphans: Vec<String> = (0..g.len())
+        .filter(|&i| g.out_degree(i) == 0)
+        .map(|i| g.node_id(i).unwrap_or_default().to_string())
+        .collect();
+    payload["Orphans"] = serde_json::json!(orphans);
+
+    // Stats sub-object (Go parity).
+    payload["Stats"] = serde_json::json!({
+        "OutDegree": p1.out_degree,
+        "InDegree": p1.in_degree,
+        "TopologicalOrder": p1.topological_order,
+        "Density": p1.density,
+        "NodeCount": p1.node_count,
+        "EdgeCount": p1.edge_count,
+        "Config": {},
+    });
+
+    // full_stats — raw per-node metric maps.
     let mut fs = serde_json::Map::new();
     fs.insert("pagerank".into(), serde_json::Value::Object(pr_obj));
     fs.insert("betweenness".into(), serde_json::Value::Object(bw_obj));
@@ -1301,7 +1316,6 @@ fn run_robot_plan() -> ExitCode {
 
     let payload = serde_json::json!({
         "generated_at": jiff_now(), "data_hash": hash,
-        "output_format": "json", "version": env!("CARGO_PKG_VERSION"),
         "plan": {
             "tracks": tracks,
             "total_actionable": actionable.len(),
@@ -1606,8 +1620,7 @@ fn run_robot_recipes() -> ExitCode {
 
     let payload = serde_json::json!({
         "generated_at": jiff_now(),
-        "output_format": "json",
-        "version": env!("CARGO_PKG_VERSION"),
+        // output_format/version omitted for JSON (Go omitempty parity).
         "recipes": recipes,
     });
     emit_json(&payload)
