@@ -2528,23 +2528,30 @@ fn generate_advanced_insights(
 /// Go `AnalysisConfig` JSON shape (exported Go field names, ns timeouts).
 /// `--robot-plan` variant: KCore/Articulation/Slack only, everything else
 /// skipped with "not computed for --robot-plan".
-fn plan_analysis_config() -> serde_json::Value {
+fn plan_analysis_config(nodes: usize) -> serde_json::Value {
+    // Go ConfigForSize timeout tiers (ns) — golden-verified per fixture size.
+    let (bt_ns, pr_ns, cycles_ns, max_cycles, sample) = match nodes {
+        n if n < 100 => (2_000_000_000i64, 2_000_000_000i64, 2_000_000_000i64, 1000, 0),
+        n if n < 500 => (500_000_000i64, 500_000_000i64, 500_000_000i64, 100, 0),
+        n if n < 2000 => (500_000_000i64, 300_000_000i64, 300_000_000i64, 50, 100),
+        _ => (500_000_000i64, 200_000_000i64, 0i64, 10, 200),
+    };
     serde_json::json!({
         "ComputeBetweenness": false,
-        "BetweennessTimeout": 2_000_000_000i64,
+        "BetweennessTimeout": bt_ns,
         "BetweennessSkipReason": "not computed for --robot-plan",
         "BetweennessMode": "skip",
-        "BetweennessSampleSize": 0,
+        "BetweennessSampleSize": sample,
         "BetweennessIsApproximate": false,
         "ComputePageRank": false,
-        "PageRankTimeout": 2_000_000_000i64,
+        "PageRankTimeout": pr_ns,
         "PageRankSkipReason": "not computed for --robot-plan",
         "ComputeHITS": false,
-        "HITSTimeout": 2_000_000_000i64,
+        "HITSTimeout": pr_ns,
         "HITSSkipReason": "not computed for --robot-plan",
         "ComputeCycles": false,
-        "CyclesTimeout": 2_000_000_000i64,
-        "MaxCyclesToStore": 1000,
+        "CyclesTimeout": cycles_ns,
+        "MaxCyclesToStore": max_cycles,
         "CyclesSkipReason": "not computed for --robot-plan",
         "ComputeEigenvector": false,
         "ComputeCriticalPath": false,
@@ -2555,23 +2562,29 @@ fn plan_analysis_config() -> serde_json::Value {
 }
 
 /// Go `AnalysisConfig` for `--robot-priority`: full Phase-2 config.
-fn priority_analysis_config() -> serde_json::Value {
+fn priority_analysis_config(nodes: usize) -> serde_json::Value {
+    let (bt_ns, pr_ns, cycles_ns, max_cycles) = match nodes {
+        n if n < 100 => (2_000_000_000i64, 2_000_000_000i64, 2_000_000_000i64, 1000),
+        n if n < 500 => (500_000_000i64, 500_000_000i64, 500_000_000i64, 100),
+        n if n < 2000 => (500_000_000i64, 300_000_000i64, 300_000_000i64, 50),
+        _ => (500_000_000i64, 200_000_000i64, 0i64, 10),
+    };
     serde_json::json!({
         "ComputeBetweenness": true,
-        "BetweennessTimeout": 2_000_000_000i64,
+        "BetweennessTimeout": bt_ns,
         "BetweennessSkipReason": "",
         "BetweennessMode": "exact",
         "BetweennessSampleSize": 0,
         "BetweennessIsApproximate": false,
         "ComputePageRank": true,
-        "PageRankTimeout": 2_000_000_000i64,
+        "PageRankTimeout": pr_ns,
         "PageRankSkipReason": "",
         "ComputeHITS": true,
-        "HITSTimeout": 2_000_000_000i64,
+        "HITSTimeout": pr_ns,
         "HITSSkipReason": "",
         "ComputeCycles": true,
-        "CyclesTimeout": 2_000_000_000i64,
-        "MaxCyclesToStore": 1000,
+        "CyclesTimeout": cycles_ns,
+        "MaxCyclesToStore": max_cycles,
         "CyclesSkipReason": "",
         "ComputeEigenvector": true,
         "ComputeCriticalPath": true,
@@ -2610,6 +2623,18 @@ fn plan_priority_status(g: &bv_graph_core::DiGraph) -> serde_json::Value {
     })
 }
 
+/// Go `generateTrackID` — 1-based n to base-26 alphabetic (A, B, ..., Z, AA...).
+fn go_track_id(mut n: usize) -> String {
+    let mut out = Vec::new();
+    while n > 0 {
+        n -= 1;
+        out.push(b'A' + (n % 26) as u8);
+        n /= 26;
+    }
+    out.reverse();
+    String::from_utf8(out).unwrap_or_default()
+}
+
 fn run_robot_plan() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
     let (issues, _, _as_of_commit) = match load_issues_auto(&cwd, None) {
@@ -2627,96 +2652,205 @@ fn run_robot_plan() -> ExitCode {
         .filter(|i| i.status.is_open() && !blocked.contains(&i.id))
         .collect();
 
-    // Union-Find
-    let mut parent: std::collections::HashMap<String, String> = actionable
+    // Go GetExecutionPlan parity: union-find over ALL issues (blocking +
+    // parent-child deps), deterministic merge (smaller root wins), tracks
+    // filtered to actionable members, unblocks = newly-actionable dependents.
+    let by_id: std::collections::HashMap<&str, &bv_core::model::Issue> =
+        issues.iter().map(|i| (i.id.as_str(), i)).collect();
+
+    let mut parent: std::collections::HashMap<String, String> = issues
         .iter()
         .map(|i| (i.id.clone(), i.id.clone()))
         .collect();
-    for i in &actionable {
-        for dep in &i.dependencies {
-            if dep.r#type.is_blocking() {
-                let t = dep.effective_depends_on();
-                if parent.contains_key(t) {
-                    let mut ra = i.id.clone();
-                    while parent[&ra] != ra {
-                        ra = parent[&ra].clone();
-                    }
-                    let mut rb = t.to_string();
-                    while parent[&rb] != rb {
-                        rb = parent[&rb].clone();
-                    }
-                    if ra != rb {
-                        parent.insert(ra, rb);
+    fn find(parent: &std::collections::HashMap<String, String>, x: &str) -> String {
+        let mut root = x.to_string();
+        while parent[&root] != root {
+            root = parent[&root].clone();
+        }
+        root
+    }
+    let mut sorted_ids: Vec<&str> = issues.iter().map(|i| i.id.as_str()).collect();
+    sorted_ids.sort();
+    for id in &sorted_ids {
+        let issue = by_id[*id];
+        for dep in &issue.dependencies {
+            let is_linking = dep.r#type.is_blocking()
+                || matches!(dep.r#type, bv_core::model::DependencyType::ParentChild);
+            if is_linking && by_id.contains_key(dep.effective_depends_on()) {
+                let px = find(&parent, id);
+                let py = find(&parent, dep.effective_depends_on());
+                if px != py {
+                    // Deterministic merge: smaller root wins.
+                    if px < py {
+                        parent.insert(py, px);
+                    } else {
+                        parent.insert(px, py);
                     }
                 }
             }
         }
     }
 
-    let mut track_map: std::collections::BTreeMap<String, Vec<&bv_core::model::Issue>> =
-        Default::default();
-    for i in &actionable {
-        let mut root = i.id.clone();
-        while parent[&root] != root {
-            root = parent[&root].clone();
+    // Go computeUnblocks: dependents that are open and have no OTHER open blocker.
+    let is_closed_like = |id: &str| -> bool {
+        by_id
+            .get(id)
+            .map(|i| {
+                matches!(
+                    i.status,
+                    bv_core::model::Status::Closed | bv_core::model::Status::Tombstone
+                )
+            })
+            .unwrap_or(true)
+    };
+    let compute_unblocks = |issue_id: &str| -> Vec<String> {
+        let mut unblocks = Vec::new();
+        let Some(node) = g.node_idx(issue_id) else {
+            return unblocks;
+        };
+        for &dep_node in g.predecessors_slice(node) {
+            let dep_id = g.node_id(dep_node).unwrap_or_default();
+            if is_closed_like(&dep_id) {
+                continue;
+            }
+            let mut still_blocked = false;
+            for &other in g.successors_slice(dep_node) {
+                let other_id = g.node_id(other).unwrap_or_default();
+                if other_id == issue_id {
+                    continue;
+                }
+                if !is_closed_like(&other_id) {
+                    still_blocked = true;
+                    break;
+                }
+            }
+            if !still_blocked {
+                unblocks.push(dep_id);
+            }
         }
-        track_map.entry(root).or_default().push(i);
+        unblocks.sort();
+        unblocks
+    };
+
+    // Components grouped by root (all issues, sorted iteration).
+    let mut components: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for id in &sorted_ids {
+        let root = find(&parent, id);
+        components.entry(root).or_default().push(id.to_string());
+    }
+    let total_components = components.len();
+
+    // Actionable set: open AND not blocked by open deps (Go actionableSet).
+    let blocked = bv_analysis::triage::compute_blocked_set(&issues);
+    let actionable: Vec<&bv_core::model::Issue> = issues
+        .iter()
+        .filter(|i| i.status.is_open() && !blocked.contains(&i.id))
+        .collect();
+    let actionable_set: std::collections::HashSet<&str> =
+        actionable.iter().map(|i| i.id.as_str()).collect();
+
+    // Build tracks: roots sorted; only components with actionable members.
+    let mut tracks: Vec<serde_json::Value> = Vec::new();
+    let mut track_num = 1usize;
+    for (root, members) in &components {
+        let mut actionable_members: Vec<&bv_core::model::Issue> = members
+            .iter()
+            .filter_map(|id| {
+                actionable_set
+                    .contains(id.as_str())
+                    .then(|| by_id[id.as_str()])
+            })
+            .collect();
+        if actionable_members.is_empty() {
+            continue;
+        }
+        actionable_members
+            .sort_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.id.cmp(&b.id)));
+        let track_items: Vec<serde_json::Value> = actionable_members
+            .iter()
+            .map(|i| {
+                let unblocks = compute_unblocks(&i.id);
+                // Go: nil slice serializes as null (not []).
+                let unblocks_val = if unblocks.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!(unblocks)
+                };
+                serde_json::json!({
+                    "id": i.id, "title": i.title, "priority": i.priority,
+                    "status": i.status.as_str(),
+                    "unblocks": unblocks_val,
+                })
+            })
+            .collect();
+        let reason = if actionable_members.len() == 1 {
+            "Single actionable item"
+        } else if total_components == 1 {
+            "All issues in connected graph"
+        } else {
+            "Independent work stream"
+        };
+        let label = go_track_id(track_num);
+        tracks.push(serde_json::json!({
+            "track_id": format!("track-{label}"),
+            "items": track_items,
+            "reason": reason,
+        }));
+        track_num += 1;
     }
 
-    let labels = ["A", "B", "C", "D", "E", "F", "G", "H"];
-    let tracks: Vec<serde_json::Value> = track_map.values().enumerate().map(|(ti, items)| {
-        let label = labels.get(ti).unwrap_or(&"?");
-        let mut sorted = items.clone();
-        sorted.sort_by_key(|i| (i.priority, i.id.clone()));
-        let track_items: Vec<serde_json::Value> = sorted.iter().map(|i| {
-            let unblocks: Vec<String> = issues.iter().filter(|o|
-                o.dependencies.iter().any(|d| d.r#type.is_blocking() && d.effective_depends_on() == i.id)
-            ).map(|o| o.id.clone()).collect();
-            serde_json::json!({"id": i.id, "title": i.title, "priority": i.priority,
-                               "status": i.status.as_str(), "unblocks": unblocks})
-        }).collect();
-        serde_json::json!({
-            "track_id": format!("track-{label}"), "items": track_items,
-            "reason": if track_map.len() == 1 { "Single actionable item" } else { "Independent work stream" },
-        })
-    }).collect();
+    // Summary: actionable sorted by ID; strictly-greater count wins (Go).
+    let mut highest_id = String::new();
+    let mut highest_count = -1i64;
+    let mut sorted_actionable: Vec<&&bv_core::model::Issue> = actionable.iter().collect();
+    sorted_actionable.sort_by(|a, b| a.id.cmp(&b.id));
+    for issue in &sorted_actionable {
+        let count = compute_unblocks(&issue.id).len() as i64;
+        if count > highest_count {
+            highest_count = count;
+            highest_id = issue.id.clone();
+        }
+    }
+    let impact_reason = if highest_count == 1 {
+        "Unblocks 1 task"
+    } else if highest_count > 1 {
+        "Unblocks multiple tasks"
+    } else {
+        "No downstream dependencies"
+    };
 
-    let highest = actionable
+    // Go: TotalBlocked = totalOpen (non-closed-like) - len(actionable).
+    let total_open = issues
         .iter()
-        .map(|i| {
-            (
-                i.id.clone(),
-                issues
-                    .iter()
-                    .filter(|o| {
-                        o.dependencies
-                            .iter()
-                            .any(|d| d.r#type.is_blocking() && d.effective_depends_on() == i.id)
-                    })
-                    .count(),
+        .filter(|i| {
+            !matches!(
+                i.status,
+                bv_core::model::Status::Closed | bv_core::model::Status::Tombstone
             )
         })
-        .max_by_key(|(_, u)| *u)
-        .unwrap_or(("none".to_string(), 0));
+        .count();
+    let total_blocked_count = total_open - actionable.len();
 
     let payload = serde_json::json!({
         "generated_at": jiff_now(), "data_hash": hash,
-        "analysis_config": plan_analysis_config(),
+        "analysis_config": plan_analysis_config(g.len()),
         "status": plan_priority_status(&g),
         "plan": {
             "tracks": tracks,
             "total_actionable": actionable.len(),
-            "total_blocked": blocked.len(),
+            "total_blocked": total_blocked_count,
             "summary": {
-                "highest_impact": highest.0,
-                "impact_reason": format!("Unblocks {} task{}", highest.1, if highest.1 != 1 {"s"} else {""}),
-                "unblocks_count": highest.1,
+                "highest_impact": highest_id,
+                "impact_reason": impact_reason,
+                "unblocks_count": highest_count,
             },
         },
         "usage_hints": [
             "jq '.plan.tracks | length' - Number of parallel execution tracks",
             "jq '.plan.tracks[0].items | map(.id)' - First track item IDs",
-            "jq '.plan.summary.highest_impact' - Highest impact item ID",
+            "jq '.plan.tracks[].items[] | select(.unblocks | length > 0)' - Items that unblock others",
+            "jq '.plan.summary' - High-level execution summary",
+            "jq '[.plan.tracks[].items[]] | length' - Total items across all tracks",
         ],
     });
     emit_json(&payload)
@@ -2831,7 +2965,7 @@ fn run_robot_priority(args: &[String]) -> ExitCode {
     recommendations.truncate(10);
 
     let mut payload = envelope_json(&hash);
-    payload["analysis_config"] = priority_analysis_config();
+    payload["analysis_config"] = priority_analysis_config(g.len());
     payload["status"] = plan_priority_status(&g);
     payload["recommendations"] = serde_json::Value::Array(recommendations.clone());
     payload["field_descriptions"] = serde_json::json!({
