@@ -1,1 +1,0 @@
-{"generated_at":"2026-08-22T14:06:52Z","data_hash":"a246cf21b60fc41e","limit":0,"total_labels":0,"labels":null,"usage_hints":["jq '.labels[0]' - top attention label details","jq '.labels[] | select(.blocked_count \u003e 0)' - labels with blocked issues","jq '.labels[] | {label:.label,score:.attention_score,reason:.reason}'"]}

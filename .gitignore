@@ -26,3 +26,4 @@ beads_viewer/
 # Fixture-local beads state
 tests/fixtures/*/.beads/*.db*
 handoff.txt
+.claude/worktrees/
