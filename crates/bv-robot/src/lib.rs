@@ -1,6 +1,8 @@
 //! bv-robot: robot command registry, envelope, TOON/JSON encoding.
 
+pub mod docs;
 pub mod envelope;
+pub mod schema;
 
 pub use envelope::{encode_payload, OutputFormat, RobotEnvelope, RobotLoadStats};
 

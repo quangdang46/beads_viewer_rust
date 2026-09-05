@@ -105,10 +105,18 @@ fn robot_schema_unknown_command_exits_one_with_suggestions() {
 }
 
 #[test]
-fn robot_docs_unknown_topic_exits_two() {
+fn robot_docs_unknown_topic_emits_error_json() {
+    // Go parity: unknown topics emit JSON with error+available_topics and exit 0.
+    // `did_you_mean` only appears when the topic is close enough (Levenshtein);
+    // "bogus-topic" is too far from any valid topic.
     let (code, stdout, _) = run(&["--robot-docs", "bogus-topic"]);
-    assert_eq!(code, 2);
+    assert_eq!(code, 0);
     assert!(stdout.contains("\"error\""), "{stdout}");
+    assert!(stdout.contains("\"available_topics\""), "{stdout}");
+    // Close miss should get did_you_mean (Go: suggestClosest ≤3 for len≤10).
+    let (code2, stdout2, _) = run(&["--robot-docs", "guied"]);
+    assert_eq!(code2, 0);
+    assert!(stdout2.contains("\"did_you_mean\""), "{stdout2}");
 }
 
 fn run_at_repo_root(args: &[&str]) -> (i32, String, String) {
@@ -272,13 +280,15 @@ fn robot_search_unknown_preset_exits_two() {
 }
 
 #[test]
-fn robot_metrics_does_not_fabricate_timing_data() {
+fn robot_metrics_emits_timing_and_cache_entries() {
     let (code, stdout, _) = run(&["--robot-metrics"]);
     assert_eq!(code, 0);
-    assert!(stdout.contains("\"timing\""));
-    assert!(stdout.contains("\"cache\""));
-    // Empty arrays, not fabricated entries — no timing/cache subsystem exists.
-    let compact: String = stdout.split_whitespace().collect();
-    assert!(compact.contains("\"timing\":[]"), "{compact}");
-    assert!(compact.contains("\"cache\":[]"), "{compact}");
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
+    assert!(parsed["timing"].is_array(), "timing must be array");
+    assert!(parsed["cache"].is_array(), "cache must be array");
+    assert!(parsed["memory"].is_object(), "memory must be object");
+    // Each timing entry has name, count, avg_ms etc.
+    let timing = parsed["timing"].as_array().unwrap();
+    assert!(!timing.is_empty(), "at least one timing metric");
+    assert_eq!(timing[0]["name"], "cycle_detection");
 }

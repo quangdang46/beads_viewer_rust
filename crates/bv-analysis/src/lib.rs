@@ -9,7 +9,9 @@ pub mod drift;
 pub mod file_impact;
 pub mod impact;
 pub mod label_health;
+pub mod metrics;
 pub mod scoring;
+pub mod suggestions;
 pub mod triage;
 
 pub use bv_graph_core::algorithms;

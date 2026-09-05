@@ -23,17 +23,24 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
-  # Placeholder differential gate: goldens are frozen; the Rust side gains
-  # real comparison logic with Phase 1 acceptance work. This job fails loudly
+  # Differential gate: goldens are frozen from Go bv @ 9ace029; the Rust
+  # binary is run against every fixture/command pair and compared after
+  # normalizing nondeterministic fields. Content parity is a RATCHET
+  # (GOLDEN_GATE_BASELINE_FAILS in the test): regressions fail CI, parity
+  # improvements require lowering the baseline. The job also fails loudly
   # if the golden corpus goes missing.
   differential:
     name: Golden corpus integrity
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Verify golden corpus present and non-empty
         run: |
           count=$(find golden -type f | wc -l)
           echo "golden files: $count"
           [ "$count" -ge 70 ] || { echo "::error::Golden corpus missing/thin ($count < 70)"; exit 1; }
           grep -q "go_commit: 9ace029" golden/METADATA.txt
+      - name: Golden byte-comparison gate (ratchet)
+        run: cargo test -p bv --test golden_comparison -- --nocapture

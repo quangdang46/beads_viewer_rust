@@ -182,6 +182,10 @@ fn main() -> ExitCode {
         }
     }
 
+    // Robot drift (Go: --robot-drift wraps --check-drift with JSON output).
+    if presence.has("robot-drift") {
+        return run_robot_drift();
+    }
     // Export markdown (Phase 5a).
     if presence.has("check-drift") {
         return run_check_drift();
@@ -204,9 +208,12 @@ fn main() -> ExitCode {
     }
 
     // Triage family dispatch (Phase 3c first slice).
+    // robot-next has its own flattened output shape (Go handleRobotNext).
+    if presence.has("robot-next") {
+        return run_robot_next();
+    }
     let triage_family = [
         "robot-triage",
-        "robot-next",
         "robot-triage-by-track",
         "robot-triage-by-label",
     ]
@@ -227,7 +234,7 @@ fn main() -> ExitCode {
         return run_robot_priority(&args);
     }
     if presence.has("robot-suggest") {
-        return run_robot_suggest();
+        return run_robot_suggest(&args);
     }
     if presence.has("robot-alerts") {
         return run_robot_alerts();
@@ -595,6 +602,181 @@ fn load_issues_auto(
 }
 
 /// Load issues from discovery chain and emit --robot-triage JSON.
+/// Go `handleRobotNext`: single top claimable pick with the claimability
+/// filter (open, non-epic, unassigned, no open blockers) and fail-closed
+/// degraded output when no pick is claim-safe.
+fn run_robot_next() -> ExitCode {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let as_of = extract_as_of();
+    let (issues, hash, as_of_commit) = match load_issues_auto(&cwd, as_of.as_deref()) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let mut payload = full_envelope_json(&hash);
+    if let Some(ref a) = as_of {
+        payload["as_of"] = serde_json::json!(a);
+    }
+    if let Some(ref c) = as_of_commit {
+        payload["as_of_commit"] = serde_json::json!(c);
+    }
+
+    let usage_hints = serde_json::json!([
+        "Use scripts/br_retry.sh actionable --json plus the claim gate before mutating Beads state in crowded swarms.",
+        "No claim_command is emitted unless the item is open, unblocked, unassigned, and triage metrics are ready.",
+        "Inspect .status for skipped, timeout, or pending graph phases.",
+    ]);
+
+    if issues.is_empty() {
+        payload["actionable"] = serde_json::json!(false);
+        payload["phase2_ready"] = serde_json::json!(false);
+        payload["status"] = bv_analysis::analyzer::MetricStatus::default().to_json_map();
+        payload["message"] = serde_json::json!("No proven actionable item available");
+        payload["degraded"] = serde_json::json!([{
+            "code": "no_actionable_recommendation",
+            "severity": "info",
+            "message": "No open, unblocked, unassigned non-epic recommendation passed the robot-next claimability filter.",
+            "repair": "Use br ready --json or scripts/br_retry.sh actionable --json for authoritative claim candidates.",
+        }]);
+        payload["usage_hints"] = usage_hints;
+        return emit_json(&payload);
+    }
+
+    let g = std::sync::Arc::new(bv_analysis::analyzer::build_graph(&issues));
+    let out = bv_analysis::triage::build_triage(&issues, &g, jiff::Timestamp::now());
+    payload["phase2_ready"] = serde_json::json!(true);
+    payload["status"] = out.metric_status.to_json_map();
+
+    // Claimability filter (Go robotNextClaimabilityReasons): the pick must
+    // be open, non-epic, unassigned, and free of open blockers.
+    let issue_by_id: std::collections::HashMap<&str, &bv_core::model::Issue> =
+        issues.iter().map(|i| (i.id.as_str(), i)).collect();
+    let claimability_reasons = |pick: &serde_json::Value| -> Vec<String> {
+        let Some(id) = pick["id"].as_str() else {
+            return vec!["pick lacks id".into()];
+        };
+        let Some(issue) = issue_by_id.get(id) else {
+            return vec![format!("{id} is absent from loaded Beads records")];
+        };
+        let mut reasons = Vec::new();
+        if issue.status != bv_core::model::Status::Open {
+            reasons.push(format!("{id} status is {:?}", issue.status));
+        }
+        if issue.issue_type.eq_ignore_ascii_case("epic") {
+            reasons.push(format!("{id} is an epic"));
+        }
+        let assignee = issue.assignee.trim();
+        if !assignee.is_empty() {
+            reasons.push(format!("{id} is already assigned to {assignee}"));
+        }
+        let mut open_blockers: Vec<String> = Vec::new();
+        for dep in &issue.dependencies {
+            if !dep.r#type.is_blocking() {
+                continue;
+            }
+            let blocker_id = dep.effective_depends_on().trim().to_string();
+            if blocker_id.is_empty() {
+                open_blockers.push("<missing blocker id>".into());
+                continue;
+            }
+            match issue_by_id.get(blocker_id.as_str()) {
+                None => open_blockers.push(format!("{blocker_id} (missing)")),
+                Some(b) => {
+                    if !matches!(
+                        b.status,
+                        bv_core::model::Status::Closed | bv_core::model::Status::Tombstone
+                    ) {
+                        open_blockers.push(blocker_id);
+                    }
+                }
+            }
+        }
+        if !open_blockers.is_empty() {
+            open_blockers.sort();
+            reasons.push(format!("{id} is blocked by {}", open_blockers.join(", ")));
+        }
+        reasons
+    };
+
+    // Build top picks exactly as run_robot_triage does (top 5 recommendations
+    // with direct unblock counts).
+    let picks: Vec<serde_json::Value> = out
+        .recommendations
+        .iter()
+        .take(5)
+        .map(|r| {
+            let unblocks: usize = issues
+                .iter()
+                .filter(|o| {
+                    o.dependencies
+                        .iter()
+                        .any(|d| d.r#type.is_blocking() && d.effective_depends_on() == r.id)
+                })
+                .count();
+            serde_json::json!({
+                "id": r.id,
+                "title": r.title,
+                "score": r.score,
+                "reasons": r.reasons,
+                "unblocks": unblocks,
+            })
+        })
+        .collect();
+    let mut chosen: Option<&serde_json::Value> = None;
+    let mut first_unsafe: Option<Vec<String>> = None;
+    for pick in &picks {
+        let reasons = claimability_reasons(pick);
+        if reasons.is_empty() {
+            chosen = Some(pick);
+            break;
+        }
+        if first_unsafe.is_none() {
+            first_unsafe = Some(reasons);
+        }
+    }
+
+    match chosen {
+        Some(top) => {
+            payload["actionable"] = serde_json::json!(true);
+            payload["id"] = top["id"].clone();
+            payload["title"] = top["title"].clone();
+            payload["score"] = top["score"].clone();
+            payload["reasons"] = top["reasons"].clone();
+            payload["unblocks"] = top["unblocks"].clone();
+            let id = top["id"].as_str().unwrap_or_default();
+            payload["claim_command"] =
+                serde_json::json!(format!("br update {id} --status=in_progress"));
+            payload["show_command"] = serde_json::json!(format!("br show {id}"));
+        }
+        None => {
+            payload["actionable"] = serde_json::json!(false);
+            payload["message"] = serde_json::json!(
+                "No claim command emitted because the top recommendation was not claim-safe"
+            );
+            if let Some(first_pick) = picks.first() {
+                payload["diagnostic_top_pick"] = serde_json::json!({
+                    "id": first_pick["id"],
+                    "title": first_pick["title"],
+                    "score": first_pick["score"],
+                    "reasons": first_pick["reasons"],
+                    "unblocks": first_pick["unblocks"],
+                });
+            }
+            payload["degraded"] = serde_json::json!([{
+                "code": "robot_next_claim_unsafe",
+                "severity": "warning",
+                "message": first_unsafe.unwrap_or_default().join("; "),
+                "repair": "Use the authoritative Beads actionable queue plus claim gate before claiming work.",
+            }]);
+        }
+    }
+    payload["usage_hints"] = usage_hints;
+    emit_json(&payload)
+}
+
 fn run_robot_triage() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
     let as_of = extract_as_of();
@@ -737,17 +919,29 @@ fn run_robot_triage() -> ExitCode {
         bv_robot::OutputFormat::Json,
     );
     env.generated_at = jiff_now(); // Truncate to seconds (Go parity).
+                                   // Go emits history_status ("ok") only when the history prologue ran —
+                                   // i.e. the workspace is a valid git repo; otherwise the key is omitted.
+    let history_status = if cwd.join(".git").exists() {
+        Some("ok")
+    } else {
+        None
+    };
+    let mut meta = serde_json::json!({
+        "version": bv_robot::ROBOT_CONTRACT_VERSION,
+        "generated_at": env.generated_at,
+        "phase2_ready": true,
+        "issue_count": out.counts.total,
+        "compute_time_ms": 0,
+    });
+    if let Some(hs) = history_status {
+        meta["history_status"] = serde_json::json!(hs);
+    }
     let mut payload = serde_json::json!({
         "generated_at": env.generated_at,
         "data_hash": env.data_hash,
         "triage": {
-            "meta": {
-                "version": bv_robot::ROBOT_CONTRACT_VERSION,
-                "generated_at": env.generated_at,
-                "phase2_ready": true,
-                "issue_count": out.counts.total,
-            },
-            "status": bv_analysis::analyzer::MetricStatus::default().to_json_map(),
+            "meta": meta,
+            "status": out.metric_status.to_json_map(),
             "quick_ref": {
                 "open_count": out.quick_ref.open_count,
                 "actionable_count": out.quick_ref.actionable_count,
@@ -771,6 +965,22 @@ fn run_robot_triage() -> ExitCode {
     if let Some(ref c) = as_of_commit {
         payload["triage"]["as_of_commit"] = serde_json::json!(c);
     }
+    payload["usage_hints"] = serde_json::json!([
+        "jq '.triage.quick_ref.top_picks[:3]' - Top 3 picks for immediate work",
+        "jq '.triage.recommendations[3:10] | map({id,title,score})' - Next candidates after top picks",
+        "jq '.triage.blockers_to_clear | map(.id)' - High-impact blockers to clear",
+        "jq '.triage.recommendations[] | select(.type == \"bug\")' - Bug-focused recommendations",
+        "jq '.triage.quick_ref.top_picks[] | select(.unblocks > 2)' - High-impact picks",
+        "jq '.triage.quick_wins' - Low-effort, high-impact items",
+        "--robot-next - Get only the single top recommendation",
+        "--brief - Compact output: only id/title/status/assignee/blockers/unblocks (#183)",
+        "--robot-triage-by-track - Group by execution track for multi-agent coordination",
+        "--robot-triage-by-label - Group by label for area-focused agents",
+        "jq '.triage.recommendations_by_track[].top_pick' - Top pick per track",
+        "jq '.triage.recommendations_by_label[].claim_command' - Claim commands per label",
+        "jq '.feedback.weight_adjustments' - View feedback-adjusted weights (bv-90)",
+        "--graph-root <id> - Scope triage to subgraph rooted at a specific epic (bv-140)",
+    ]);
     match serde_json::to_string(&payload) {
         Ok(s) => {
             println!("{s}");
@@ -839,6 +1049,11 @@ fn capture_baseline(
 
 const BASELINE_PATH: &str = ".bv/baseline.json";
 
+/// Application version Go bv reports in robot envelopes (`pkg/version`
+/// fallback, pinned at parity commit 9ace029). Byte-parity with frozen
+/// goldens requires emitting Go's version string, not the Rust crate's.
+const GO_APP_VERSION: &str = "v0.20.0";
+
 fn run_save_baseline(desc: &str) -> ExitCode {
     match capture_baseline() {
         Err(e) => {
@@ -895,6 +1110,11 @@ fn run_check_drift() -> ExitCode {
         }
     };
 
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let issues = load_issues_auto(&cwd, None)
+        .map(|(i, _, _)| i)
+        .unwrap_or_default();
+
     let norm: std::collections::HashSet<String> = old_cycles
         .iter()
         .map(|c| {
@@ -917,6 +1137,7 @@ fn run_check_drift() -> ExitCode {
         &current,
         &bv_analysis::drift::DriftConfig::default(),
         &fresh_cycles,
+        &issues,
     );
     println!(
         "{}",
@@ -930,6 +1151,100 @@ fn run_check_drift() -> ExitCode {
             "alerts": result.alerts,
         })
     );
+    ExitCode::from(result.exit_code())
+}
+
+/// Go `robot-drift` — wraps `--check-drift` with structured JSON output.
+/// JSON schema matches Go output struct at cmd/bv/main.go:3509-3541.
+fn run_robot_drift() -> ExitCode {
+    let baseline_doc = match std::fs::read_to_string(BASELINE_PATH) {
+        Ok(raw) => raw,
+        Err(_) => {
+            let payload = serde_json::json!({
+                "generated_at": jiff_now(),
+                "error": format!("No baseline found at {BASELINE_PATH}. Save one with --save-baseline."),
+            });
+            emit_json(&payload);
+            return ExitCode::from(1);
+        }
+    };
+    let base: serde_json::Value = serde_json::from_str(&baseline_doc).expect("baseline parses");
+    let base_stats: bv_analysis::drift::BaselineStats =
+        serde_json::from_value(base["stats"].clone()).expect("baseline stats shape");
+    let old_cycles: Vec<Vec<String>> = base
+        .get("cycles")
+        .and_then(|c| serde_json::from_value(c.clone()).ok())
+        .unwrap_or_default();
+    let baseline_created_at = base
+        .get("created_at")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let baseline_commit_sha = base
+        .get("commit_sha")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let (current, new_cycles, _hash) = match capture_baseline() {
+        Ok(x) => x,
+        Err(e) => {
+            let payload = serde_json::json!({
+                "generated_at": jiff_now(),
+                "error": format!("Error capturing baseline: {e}"),
+            });
+            emit_json(&payload);
+            return ExitCode::from(1);
+        }
+    };
+
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let issues = load_issues_auto(&cwd, None)
+        .map(|(i, _, _)| i)
+        .unwrap_or_default();
+
+    let norm: std::collections::HashSet<String> = old_cycles
+        .iter()
+        .map(|c| {
+            let mut v = c.clone();
+            v.sort();
+            v.join("|")
+        })
+        .collect();
+    let fresh_cycles: Vec<Vec<String>> = new_cycles
+        .into_iter()
+        .filter(|c| {
+            let mut v = c.clone();
+            v.sort();
+            !norm.contains(&v.join("|"))
+        })
+        .collect();
+
+    let result = bv_analysis::drift::calculate(
+        &base_stats,
+        &current,
+        &bv_analysis::drift::DriftConfig::default(),
+        &fresh_cycles,
+        &issues,
+    );
+
+    // Go parity: exact JSON structure from cmd/bv/main.go:3511-3541.
+    let payload = serde_json::json!({
+        "generated_at": jiff_now(),
+        "has_drift": result.has_drift,
+        "exit_code": result.exit_code(),
+        "summary": {
+            "critical": result.critical_count,
+            "warning": result.warning_count,
+            "info": result.info_count,
+        },
+        "alerts": result.alerts,
+        "baseline": {
+            "created_at": baseline_created_at,
+            "commit_sha": baseline_commit_sha,
+        },
+    });
+    emit_json(&payload);
     ExitCode::from(result.exit_code())
 }
 
@@ -1078,7 +1393,21 @@ fn envelope_json(data_hash: &str) -> serde_json::Value {
     serde_json::json!({
         "generated_at": jiff_now(),
         "data_hash": data_hash,
-        // output_format/version omitted for JSON (Go omitempty parity).
+        // output_format/version omitted: Go handlers with hand-rolled inline
+        // output structs (triage, plan, insights, priority, label-*, suggest)
+        // don't embed RobotEnvelope, so those keys are absent there too.
+    })
+}
+
+/// Go `NewRobotEnvelope` parity: for handlers whose Go output embeds the
+/// full `RobotEnvelope` struct (alerts, next, history, …) the envelope also
+/// carries `output_format` and `version` — golden-verified.
+fn full_envelope_json(data_hash: &str) -> serde_json::Value {
+    serde_json::json!({
+        "generated_at": jiff_now(),
+        "data_hash": data_hash,
+        "output_format": "json",
+        "version": GO_APP_VERSION,
     })
 }
 
@@ -1428,6 +1757,91 @@ fn run_robot_insights() -> ExitCode {
     emit_json(&payload)
 }
 
+/// Go `AnalysisConfig` JSON shape (exported Go field names, ns timeouts).
+/// `--robot-plan` variant: KCore/Articulation/Slack only, everything else
+/// skipped with "not computed for --robot-plan".
+fn plan_analysis_config() -> serde_json::Value {
+    serde_json::json!({
+        "ComputeBetweenness": false,
+        "BetweennessTimeout": 2_000_000_000i64,
+        "BetweennessSkipReason": "not computed for --robot-plan",
+        "BetweennessMode": "skip",
+        "BetweennessSampleSize": 0,
+        "BetweennessIsApproximate": false,
+        "ComputePageRank": false,
+        "PageRankTimeout": 2_000_000_000i64,
+        "PageRankSkipReason": "not computed for --robot-plan",
+        "ComputeHITS": false,
+        "HITSTimeout": 2_000_000_000i64,
+        "HITSSkipReason": "not computed for --robot-plan",
+        "ComputeCycles": false,
+        "CyclesTimeout": 2_000_000_000i64,
+        "MaxCyclesToStore": 1000,
+        "CyclesSkipReason": "not computed for --robot-plan",
+        "ComputeEigenvector": false,
+        "ComputeCriticalPath": false,
+        "ComputeKCore": true,
+        "ComputeArticulation": true,
+        "ComputeSlack": true,
+    })
+}
+
+/// Go `AnalysisConfig` for `--robot-priority`: full Phase-2 config.
+fn priority_analysis_config() -> serde_json::Value {
+    serde_json::json!({
+        "ComputeBetweenness": true,
+        "BetweennessTimeout": 2_000_000_000i64,
+        "BetweennessSkipReason": "",
+        "BetweennessMode": "exact",
+        "BetweennessSampleSize": 0,
+        "BetweennessIsApproximate": false,
+        "ComputePageRank": true,
+        "PageRankTimeout": 2_000_000_000i64,
+        "PageRankSkipReason": "",
+        "ComputeHITS": true,
+        "HITSTimeout": 2_000_000_000i64,
+        "HITSSkipReason": "",
+        "ComputeCycles": true,
+        "CyclesTimeout": 2_000_000_000i64,
+        "MaxCyclesToStore": 1000,
+        "CyclesSkipReason": "",
+        "ComputeEigenvector": true,
+        "ComputeCriticalPath": true,
+        "ComputeKCore": true,
+        "ComputeArticulation": true,
+        "ComputeSlack": true,
+    })
+}
+
+/// Status map for plan/priority (golden-verified): only KCore, Articulation
+/// and Slack run; the rest are skipped with the plan-specific reason.
+/// Priority's Go handler reports the identical status shape.
+fn plan_priority_status(g: &bv_graph_core::DiGraph) -> serde_json::Value {
+    let t0 = std::time::Instant::now();
+    let kcore = bv_analysis::algorithms::kcore::kcore(g);
+    let kcore_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let t1 = std::time::Instant::now();
+    let articulation = bv_analysis::algorithms::articulation::articulation_points(g);
+    let art_ms = t1.elapsed().as_secs_f64() * 1000.0;
+    let t2 = std::time::Instant::now();
+    let slack = bv_analysis::algorithms::slack::slack(g);
+    let slack_ms = t2.elapsed().as_secs_f64() * 1000.0;
+    let _ = (kcore, articulation, slack);
+
+    let plan_skip = |reason: &str| bv_analysis::analyzer::StatusEntry::skipped(reason);
+    serde_json::json!({
+        "PageRank": plan_skip(""),
+        "Betweenness": plan_skip("not computed for --robot-plan"),
+        "Eigenvector": plan_skip(""),
+        "HITS": plan_skip("not computed for --robot-plan"),
+        "Critical": plan_skip(""),
+        "Cycles": plan_skip("not computed for --robot-plan"),
+        "KCore": bv_analysis::analyzer::StatusEntry::computed(kcore_ms),
+        "Articulation": bv_analysis::analyzer::StatusEntry::computed(art_ms),
+        "Slack": bv_analysis::analyzer::StatusEntry::computed(slack_ms),
+    })
+}
+
 fn run_robot_plan() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
     let (issues, _, _as_of_commit) = match load_issues_auto(&cwd, None) {
@@ -1438,6 +1852,7 @@ fn run_robot_plan() -> ExitCode {
         }
     };
     let hash = bv_core::data_hash::compute_data_hash(&issues);
+    let g = bv_analysis::analyzer::build_graph(&issues);
     let blocked = bv_analysis::triage::compute_blocked_set(&issues);
     let actionable: Vec<&bv_core::model::Issue> = issues
         .iter()
@@ -1518,6 +1933,8 @@ fn run_robot_plan() -> ExitCode {
 
     let payload = serde_json::json!({
         "generated_at": jiff_now(), "data_hash": hash,
+        "analysis_config": plan_analysis_config(),
+        "status": plan_priority_status(&g),
         "plan": {
             "tracks": tracks,
             "total_actionable": actionable.len(),
@@ -1646,8 +2063,19 @@ fn run_robot_priority(args: &[String]) -> ExitCode {
     recommendations.truncate(10);
 
     let mut payload = envelope_json(&hash);
+    payload["analysis_config"] = priority_analysis_config();
+    payload["status"] = plan_priority_status(&g);
     payload["recommendations"] = serde_json::Value::Array(recommendations.clone());
-    payload["field_descriptions"] = serde_json::json!({});
+    payload["field_descriptions"] = serde_json::json!({
+        "status.capped": "Whether results were truncated to prevent overload",
+        "status.phase2": "Whether expensive graph metrics (PageRank, betweenness) are included",
+        "top_reasons": "Top 3 factors contributing to priority score, ordered by weight",
+        "what_if.cascade": "Total issues transitively unblocked (including indirect)",
+        "what_if.days_saved": "Estimated days saved based on issue estimates",
+        "what_if.depth": "Critical path depth reduction if completed",
+        "what_if.parallelization_gain": "Net change in parallel work capacity (direct_unblocks - 1); positive = more parallel work possible",
+        "what_if.unblocks": "Number of issues directly waiting on this one",
+    });
     payload["filters"] = serde_json::json!({"max_results": 10});
     payload["summary"] = serde_json::json!({
         "total_issues": issues.len(),
@@ -1656,10 +2084,32 @@ fn run_robot_priority(args: &[String]) -> ExitCode {
             .filter(|r| r["impact_score"].as_f64().unwrap_or(0.0) > 0.5)
             .count(),
     });
+    payload["usage_hints"] = serde_json::json!([
+        "jq '.recommendations[] | select(.confidence > 0.7)' - Filter high confidence",
+        "jq '.recommendations[] | {id: .issue_id, score: .impact_score, prio: .suggested_priority}' - Extract essentials",
+        "jq '.summary' - Overview counts",
+    ]);
     emit_json(&payload)
 }
 
-fn run_robot_suggest() -> ExitCode {
+fn run_robot_suggest(args: &[String]) -> ExitCode {
+    // Parse --suggest-type, --suggest-confidence, --suggest-bead (Go parity).
+    let suggest_type = args
+        .iter()
+        .position(|a| a == "--suggest-type")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    let suggest_confidence = args
+        .iter()
+        .position(|a| a == "--suggest-confidence")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse::<f64>().ok());
+    let suggest_bead = args
+        .iter()
+        .position(|a| a == "--suggest-bead")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+
     let cwd = std::env::current_dir().unwrap_or_default();
     let (issues, hash, _as_of_commit) = match load_issues_auto(&cwd, None) {
         Ok(x) => x,
@@ -1668,17 +2118,45 @@ fn run_robot_suggest() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let _ = issues;
-    let mut payload = envelope_json(&hash);
-    payload["filters"] = serde_json::json!({});
-    payload["suggestions"] = serde_json::json!({
-        "suggestions": [],
-        "generated_at": jiff_now(),
-        "data_hash": hash,
-        "stats": {"total": 0},
-    });
-    payload["usage_hints"] = serde_json::json!([]);
-    emit_json(&payload)
+
+    let mut config = bv_analysis::suggestions::SuggestAllConfig::default();
+
+    if let Some(conf) = suggest_confidence {
+        config.min_confidence = conf;
+    }
+    if let Some(ref bead) = suggest_bead {
+        config.filter_bead = bead.clone();
+    }
+
+    // Map suggest-type strings (Go parity).
+    match suggest_type.as_deref() {
+        None | Some("") => {}
+        Some("duplicate") | Some("duplicates") => {
+            config.filter_type = Some("potential_duplicate".to_string());
+        }
+        Some("dependency") | Some("dependencies") => {
+            config.filter_type = Some("missing_dependency".to_string());
+        }
+        Some("label") | Some("labels") => {
+            config.filter_type = Some("label_suggestion".to_string());
+        }
+        Some("cycle") | Some("cycles") => {
+            config.filter_type = Some("cycle_warning".to_string());
+        }
+        Some(other) => {
+            eprintln!("Invalid suggest-type: {other} (use: duplicate, dependency, label, cycle)");
+            return ExitCode::from(1);
+        }
+    }
+
+    let output = bv_analysis::suggestions::generate_robot_suggest_output(&issues, &config, &hash);
+    match serde_json::to_value(&output) {
+        Ok(v) => emit_json(&v),
+        Err(e) => {
+            eprintln!("Error: serialization failed: {e}");
+            ExitCode::from(1)
+        }
+    }
 }
 fn run_robot_alerts() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
@@ -1698,9 +2176,12 @@ fn run_robot_alerts() -> ExitCode {
         &stats,
         &bv_analysis::drift::DriftConfig::default(),
         &[],
+        &issues,
     );
 
-    let mut payload = envelope_json(&hash);
+    // Go robot-alerts embeds the full RobotEnvelope (output_format+version)
+    // and provides non-empty usage hints.
+    let mut payload = full_envelope_json(&hash);
     payload["alerts"] = serde_json::to_value(&result.alerts).unwrap_or_default();
     payload["summary"] = serde_json::json!({
         "total": result.alerts.len(),
@@ -1708,7 +2189,11 @@ fn run_robot_alerts() -> ExitCode {
         "warning": result.warning_count,
         "info": result.info_count,
     });
-    payload["usage_hints"] = serde_json::json!([]);
+    payload["usage_hints"] = serde_json::json!([
+        "--severity=warning --alert-type=stale_issue   # stale warnings only",
+        "--alert-type=blocking_cascade                 # high-unblock opportunities",
+        "jq '.alerts | map(.issue_id)'                # list impacted issues",
+    ]);
     emit_json(&payload)
 }
 
@@ -1800,7 +2285,7 @@ fn run_robot_graph(args: &[String]) -> ExitCode {
 }
 
 fn run_robot_recipes() -> ExitCode {
-    let recipes: Vec<serde_json::Value> = [
+    let mut recipes: Vec<(String, &'static str)> = [
         (
             "default",
             "Default view showing all open issues sorted by priority",
@@ -1817,12 +2302,19 @@ fn run_robot_recipes() -> ExitCode {
         ("bottlenecks", "High betweenness nodes"),
     ]
     .iter()
-    .map(|(name, desc)| serde_json::json!({"name": name, "description": desc, "source": "builtin"}))
+    .map(|(name, desc)| (name.to_string(), *desc))
     .collect();
+    // Go `ListSummaries` sorts recipe summaries alphabetically by name.
+    recipes.sort_by(|a, b| a.0.cmp(&b.0));
+    let recipes: Vec<serde_json::Value> = recipes
+        .into_iter()
+        .map(|(name, desc)| serde_json::json!({"name": name, "description": desc, "source": "builtin"}))
+        .collect();
 
     let payload = serde_json::json!({
         "generated_at": jiff_now(),
-        // output_format/version omitted for JSON (Go omitempty parity).
+        "output_format": "json",
+        "version": GO_APP_VERSION,
         "recipes": recipes,
     });
     emit_json(&payload)
@@ -2600,6 +3092,7 @@ const DISPATCHED_ROBOT_COMMANDS: &[&str] = &[
     "robot-priority",
     "robot-suggest",
     "robot-alerts",
+    "robot-drift",
     "robot-graph",
     "robot-recipes",
     "robot-label-health",
@@ -2683,52 +3176,36 @@ fn run_robot_capabilities() -> ExitCode {
 /// Go's full per-field JSON-schema definitions (`generateRobotSchemas`) —
 /// those aren't ported. See plan doc §11.
 fn run_robot_schema(args: &[String]) -> ExitCode {
+    // Go: --schema-command filters to a single command's schema.
     let command = args
         .iter()
         .position(|a| a == "--schema-command")
         .and_then(|i| args.get(i + 1))
         .cloned();
 
-    if let Some(name) = &command {
-        let Some(f) = flags::ROBOT_PRIMARIES.iter().find(|f| f.name == *name) else {
-            eprintln!("Unknown command: {name}");
-            eprintln!("Available commands:");
-            let mut names: Vec<&str> = flags::ROBOT_PRIMARIES.iter().map(|f| f.name).collect();
-            names.sort();
-            for n in names {
-                eprintln!("  {n}");
-            }
-            return ExitCode::from(1);
-        };
-        let payload = serde_json::json!({
-            "schema_version": bv_robot::ROBOT_CONTRACT_VERSION,
-            "generated_at": jiff_now(),
-            "command": f.name,
-            "schema": {
-                "flag": format!("--{}", f.name),
-                "implemented": DISPATCHED_ROBOT_COMMANDS.contains(&f.name),
-            },
-        });
-        return emit_json(&payload);
-    }
+    let full = bv_robot::schema::generate_robot_schemas(&jiff_now());
+    let Some(name) = &command else {
+        return emit_json(&full);
+    };
 
-    let commands: serde_json::Value = flags::ROBOT_PRIMARIES
-        .iter()
-        .map(|f| {
-            (
-                f.name.to_string(),
-                serde_json::json!({
-                    "flag": format!("--{}", f.name),
-                    "implemented": DISPATCHED_ROBOT_COMMANDS.contains(&f.name),
-                }),
-            )
-        })
-        .collect::<serde_json::Map<_, _>>()
-        .into();
+    let Some(schema) = full["commands"].get(name) else {
+        eprintln!("Unknown command: {name}");
+        eprintln!("Available commands:");
+        let mut names: Vec<&str> = full["commands"]
+            .as_object()
+            .map(|o| o.keys().map(|k| k.as_str()).collect())
+            .unwrap_or_default();
+        names.sort();
+        for n in names {
+            eprintln!("  {n}");
+        }
+        return ExitCode::from(1);
+    };
     let payload = serde_json::json!({
-        "schema_version": bv_robot::ROBOT_CONTRACT_VERSION,
-        "generated_at": jiff_now(),
-        "commands": commands,
+        "schema_version": full["schema_version"],
+        "generated_at": full["generated_at"],
+        "command": name,
+        "schema": schema,
     });
     emit_json(&payload)
 }
@@ -2741,23 +3218,26 @@ fn run_robot_schema(args: &[String]) -> ExitCode {
 /// platform-dependent) and dataset size for the current working directory.
 fn run_robot_metrics() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
+    let t_load = bv_analysis::metrics::time(&bv_analysis::metrics::TIMING_GRAPH_LOAD);
     let issue_count = bv_core::discovery::load_issues_from_repo(&cwd)
         .map(|(issues, _)| issues.len())
         .unwrap_or(0);
-    let payload = serde_json::json!({
+    drop(t_load);
+    let mut payload = serde_json::json!({
         "generated_at": jiff_now(),
         "tool": "bvr",
         "version": env!("CARGO_PKG_VERSION"),
-        "memory": serde_json::Value::Null,
-        "timing": [],
-        "cache": [],
         "dataset": { "issue_count": issue_count },
-        "usage_hints": [
-            "This build does not yet instrument per-command timing/cache-hit \
-             metrics (no Rust equivalent of Go's metrics package) — timing/cache \
-             are always empty, not fabricated.",
-        ],
     });
+    let m = bv_analysis::metrics::get_all_metrics();
+    payload["timing"] = m["timing"].clone();
+    payload["cache"] = m["cache"].clone();
+    payload["memory"] = m["memory"].clone();
+    payload["usage_hints"] = serde_json::json!([
+        "Set BV_METRICS=0 to disable collection entirely",
+        "jq '.timing[] | select(.count > 0)' - Only measured operations",
+        "jq '.cache[] | select(.total > 0) | {name, hit_rate}' - Cache efficiency",
+    ]);
     emit_json(&payload)
 }
 
@@ -2765,33 +3245,14 @@ fn run_robot_metrics() -> ExitCode {
 /// `generateRobotDocs` embeds a large hand-authored guide per topic; this
 /// returns a minimal real index instead of that text (see plan doc §11).
 fn run_robot_docs(args: &[String]) -> ExitCode {
+    // Go: `--robot-docs` with no topic defaults to "guide" (cobra flag value).
     let topic = args
         .iter()
         .position(|a| a == "--robot-docs")
         .and_then(|i| args.get(i + 1))
         .cloned()
-        .unwrap_or_default();
-    let topics = ["guide", "commands", "correlation", "triage"];
-    if !topic.is_empty() && !topics.contains(&topic.as_str()) {
-        let payload = serde_json::json!({
-            "generated_at": jiff_now(),
-            "error": format!("unknown topic: {topic}"),
-            "topics": topics,
-        });
-        emit_json(&payload);
-        return ExitCode::from(2);
-    }
-    let payload = serde_json::json!({
-        "generated_at": jiff_now(),
-        "tool": "bvr",
-        "topic": if topic.is_empty() { "guide" } else { &topic },
-        "topics": topics,
-        "summary": "bvr is a graph-aware triage engine for Beads issue trackers. \
-                     Run --robot-capabilities for the full command list and \
-                     implementation status, --robot-help for a human-readable \
-                     command reference, and --robot-triage as the default \
-                     entry point for AI agents.",
-    });
+        .unwrap_or_else(|| "guide".to_string());
+    let payload = bv_robot::docs::generate_robot_docs(&topic, GO_APP_VERSION, &jiff_now());
     emit_json(&payload)
 }
 
@@ -2827,13 +3288,11 @@ fn run_robot_blocker_chain(args: &[String]) -> ExitCode {
 /// Go `handleRobotCorrelationFeedback` — `--robot-confirm-correlation SHA:beadID`
 /// / `--robot-reject-correlation SHA:beadID`.
 ///
-/// Scope cut: Go cross-checks the SHA against that bead's actual
-/// correlation history (via the correlator pipeline) before recording
-/// feedback, and captures the correlation's original confidence. The
-/// correlator pipeline isn't ported yet (see plan doc §11) — this records
-/// feedback directly against the bead ID (validated to exist) with
-/// `original_conf: 0.0`, deferring the cross-check until that pipeline
-/// lands. Not a silent gap: reported in `usage_hints`.
+/// Runs the correlator pipeline to generate a fresh report, validates that
+/// the given SHA exists in the bead's correlation history (exact match,
+/// short SHA, or unambiguous prefix), and records feedback with the
+/// commit's `original_conf` from the report. Returns exit code 1 if the
+/// SHA is not found or ambiguous, matching Go behavior.
 fn run_robot_correlation_feedback(args: &[String], flag: &str, feedback_type: &str) -> ExitCode {
     let flag_name = format!("--robot-{flag}");
     let raw = args
@@ -2853,28 +3312,48 @@ fn run_robot_correlation_feedback(args: &[String], flag: &str, feedback_type: &s
     }
 
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (issues, hash, _as_of_commit) = match load_issues_auto(&cwd, None) {
+
+    // Generate correlation report via the correlator pipeline.
+    let (_issues, hash, report) = match load_correlation_report(&cwd) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
             return ExitCode::from(1);
         }
     };
-    if !issues.iter().any(|i| i.id == bead_id) {
+
+    // Look up bead's correlation history.
+    let Some(commits) = report.get(bead_id) else {
         eprintln!("Bead not found: {bead_id}");
         return ExitCode::from(1);
-    }
+    };
+
+    // Resolve SHA against the bead's correlated commits.
+    let target = match bv_correlation::correlator::resolve_correlated_commit(commits, sha) {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            eprintln!("Commit SHA not found in bead {bead_id} correlations");
+            return ExitCode::from(1);
+        }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let resolved_sha = target.sha.clone();
+    let original_conf = target.confidence;
 
     let beads_dir = cwd.join(".beads");
     let store = bv_correlation::feedback::FeedbackStore::new(&beads_dir);
     let fb = bv_correlation::feedback::CorrelationFeedback {
-        commit_sha: sha.to_lowercase(),
+        commit_sha: resolved_sha.to_lowercase(),
         bead_id: bead_id.to_string(),
         feedback_at: jiff_now(),
         feedback_by: "cli".to_string(),
         feedback_type: feedback_type.to_string(),
         reason: String::new(),
-        original_conf: 0.0,
+        original_conf,
     };
     if let Err(e) = store.record(&fb) {
         eprintln!("Error saving feedback: {e}");
@@ -2882,16 +3361,14 @@ fn run_robot_correlation_feedback(args: &[String], flag: &str, feedback_type: &s
     }
 
     let mut payload = envelope_json(&hash);
-    payload["feedback"] = serde_json::to_value(&fb).unwrap_or_default();
+    payload["commit"] = serde_json::json!(resolved_sha);
+    payload["bead"] = serde_json::json!(bead_id);
     payload["status"] = serde_json::json!(if feedback_type == "confirm" {
         "confirmed"
     } else {
         "rejected"
     });
-    payload["usage_hints"] = serde_json::json!([
-        "This build does not yet cross-check the SHA against the bead's correlation \
-         history (correlator pipeline not ported) — original_conf is always 0.0.",
-    ]);
+    payload["orig_conf"] = serde_json::json!(original_conf);
     emit_json(&payload)
 }
 

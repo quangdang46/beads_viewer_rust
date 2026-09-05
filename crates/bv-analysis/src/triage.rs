@@ -127,6 +127,10 @@ pub struct TriageOutput {
     pub counts: ProjectCounts,
     pub quick_ref: QuickRef,
     pub velocity: Option<serde_json::Value>,
+    /// Go TriageConfig parity: PageRank computed, Betweenness computed with
+    /// reason "approximate" (sample recorded only when the approximator
+    /// actually sampled), every other Phase-2 metric skipped.
+    pub metric_status: crate::analyzer::MetricStatus,
 }
 
 /// Parse YYYY-MM-DDTHH:MM:SS from an RFC3339 timestamp string.
@@ -275,8 +279,34 @@ pub fn compute_project_velocity(
 }
 
 pub fn build_triage(issues: &[Issue], g: &DiGraph, now: jiff::Timestamp) -> TriageOutput {
+    // Go TriageConfig (fast config) parity: PageRank exact, Betweenness
+    // approximate with sample 50 (falling back to exact inside the
+    // approximator when sample >= n), all other Phase-2 metrics skipped.
+    const TRIAGE_BETWEENNESS_SAMPLE: usize = 50;
+
+    let n = g.len();
+    let t0 = std::time::Instant::now();
     let pagerank = crate::algorithms::pagerank::pagerank_default(g);
-    let betweenness = crate::algorithms::betweenness::betweenness(g);
+    let pr_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    let t1 = std::time::Instant::now();
+    let (betweenness, actual_sample) = if TRIAGE_BETWEENNESS_SAMPLE >= n {
+        // Go ApproxBetweenness falls back to exact when sample >= n; the
+        // config-mode reason stays "approximate" but no sample is reported.
+        (crate::algorithms::betweenness::betweenness(g), 0)
+    } else {
+        (
+            crate::algorithms::betweenness::betweenness_approx(
+                g,
+                TRIAGE_BETWEENNESS_SAMPLE,
+                Some(1),
+            ),
+            TRIAGE_BETWEENNESS_SAMPLE,
+        )
+    };
+    let bw_ms = t1.elapsed().as_secs_f64() * 1000.0;
+
+    // Critical path heights are needed for the time-to-impact component.
     let heights = crate::algorithms::critical_path::critical_path_heights(g);
     let pr: BTreeMap<String, f64> = pagerank
         .into_iter()
@@ -293,6 +323,24 @@ pub fn build_triage(issues: &[Issue], g: &DiGraph, now: jiff::Timestamp) -> Tria
         .enumerate()
         .map(|(i, v)| (g.node_id(i).unwrap_or_default().to_string(), v))
         .collect();
+
+    let skipped = crate::analyzer::StatusEntry::skipped("disabled by triage fast config");
+    let metric_status = crate::analyzer::MetricStatus {
+        page_rank: crate::analyzer::StatusEntry::computed(pr_ms),
+        betweenness: {
+            let mut e = crate::analyzer::StatusEntry::computed(bw_ms);
+            e.reason = "approximate".into();
+            e.sample = actual_sample;
+            e
+        },
+        eigenvector: skipped.clone(),
+        hits: skipped.clone(),
+        critical: skipped.clone(),
+        cycles: skipped.clone(),
+        kcore: skipped.clone(),
+        articulation: skipped.clone(),
+        slack: skipped.clone(),
+    };
 
     let inputs = ImpactInputs {
         issues,
@@ -311,6 +359,7 @@ pub fn build_triage(issues: &[Issue], g: &DiGraph, now: jiff::Timestamp) -> Tria
         counts,
         quick_ref,
         velocity,
+        metric_status,
     }
 }
 

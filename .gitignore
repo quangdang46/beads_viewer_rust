@@ -27,3 +27,4 @@ beads_viewer/
 tests/fixtures/*/.beads/*.db*
 handoff.txt
 .claude/worktrees/
+tests/fixtures/small_chain/.beads/.bv.lock

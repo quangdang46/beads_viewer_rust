@@ -85,9 +85,13 @@ impl AnalysisCache {
         match self.entries.get_mut(&key) {
             Some(entry) => {
                 entry.last_access = Instant::now();
+                crate::metrics::record_cache_hit(&crate::metrics::CACHE_GRAPH);
                 Some(entry.payload.as_slice())
             }
-            None => None,
+            None => {
+                crate::metrics::record_cache_miss(&crate::metrics::CACHE_GRAPH);
+                None
+            }
         }
     }
 

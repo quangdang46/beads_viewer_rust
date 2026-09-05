@@ -227,6 +227,64 @@ pub fn correlate(
     report
 }
 
+/// Resolve a user-supplied SHA string against a bead's correlated commits.
+///
+/// Matching order (mirrors Go `resolveCorrelatedCommit`):
+/// 1. Exact full-SHA match (case-insensitive) -- immediate return.
+/// 2. Short-SHA match (7-char prefix of full SHA) or prefix match against
+///    full SHA -- accumulated.
+/// 3. One match: return it; zero: return `Ok(None)` (caller decides error);
+///    more than one: return `Err` with the ambiguous SHAs listed.
+pub fn resolve_correlated_commit<'a>(
+    commits: &'a [CorrelatedCommit],
+    sha: &str,
+) -> Result<Option<&'a CorrelatedCommit>, String> {
+    let sha_lower = sha.trim().to_lowercase();
+    if sha_lower.is_empty() {
+        return Err("commit SHA is required".into());
+    }
+
+    // Pass 1: exact full-SHA match.
+    for c in commits {
+        if c.sha.to_lowercase() == sha_lower {
+            return Ok(Some(c));
+        }
+    }
+
+    // Pass 2: short-SHA or prefix match.
+    let mut matches: Vec<&CorrelatedCommit> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for c in commits {
+        let full_lower = c.sha.to_lowercase();
+        if seen.contains(&full_lower) {
+            continue;
+        }
+        let short = if full_lower.len() >= 7 {
+            &full_lower[..7]
+        } else {
+            &full_lower
+        };
+        if short == sha_lower || full_lower.starts_with(&sha_lower) {
+            seen.insert(full_lower);
+            matches.push(c);
+        }
+    }
+
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(Some(matches[0])),
+        _ => {
+            let mut shas: Vec<&str> = matches.iter().map(|c| c.sha.as_str()).collect();
+            shas.sort();
+            Err(format!(
+                "ambiguous commit SHA prefix \"{sha_lower}\" matches {} commits: {}",
+                shas.len(),
+                shas.join(", ")
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

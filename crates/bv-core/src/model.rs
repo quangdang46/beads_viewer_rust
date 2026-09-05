@@ -382,6 +382,11 @@ pub enum ValidationError {
     InvertedTimestamps,
 }
 
+/// Parse a timestamp string to `jiff::Timestamp`, returning `None` on failure.
+pub fn parse_ts(s: &Option<String>) -> Option<jiff::Timestamp> {
+    s.as_deref()?.parse::<jiff::Timestamp>().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

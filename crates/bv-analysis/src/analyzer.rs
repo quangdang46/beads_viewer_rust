@@ -316,7 +316,10 @@ pub fn analyze_phase2_blocking(
         // PageRank
         let t0 = Instant::now();
         let gc = std::sync::Arc::clone(&g);
-        match run_with_timeout(budget.timeout_for(n), move || pagerank_default(&gc)) {
+        match run_with_timeout(budget.timeout_for(n), move || {
+            let _t = crate::metrics::time(&crate::metrics::TIMING_PAGERANK_COMPUTE);
+            pagerank_default(&gc)
+        }) {
             Ok(pr) => {
                 status.page_rank = StatusEntry::computed(t0.elapsed().as_secs_f64() * 1000.0);
                 out.page_rank = Some(idx_to_score_map(&g, pr));
@@ -332,7 +335,10 @@ pub fn analyze_phase2_blocking(
             status.betweenness = StatusEntry::skipped("graph too dense (density > 0.01)");
         } else if !bw_approx {
             let gc = std::sync::Arc::clone(&g);
-            match run_with_timeout(budget.timeout_for(n), move || betweenness(&gc)) {
+            match run_with_timeout(budget.timeout_for(n), move || {
+                let _t = crate::metrics::time(&crate::metrics::TIMING_BETWEENNESS_COMPUTE);
+                betweenness(&gc)
+            }) {
                 Ok(bw) => {
                     status.betweenness = StatusEntry::computed(t0.elapsed().as_secs_f64() * 1000.0);
                     out.betweenness = Some(idx_to_score_map(&g, bw));
@@ -342,11 +348,14 @@ pub fn analyze_phase2_blocking(
         } else {
             let gc = std::sync::Arc::clone(&g);
             match run_with_timeout(budget.timeout_for(n), move || {
+                let _t = crate::metrics::time(&crate::metrics::TIMING_BETWEENNESS_COMPUTE);
                 betweenness_approx(&gc, sample, Some(1))
             }) {
                 Ok(bw) => {
+                    // Go: state stays "computed" with reason "approximate"
+                    // (betweennessReason) plus the sample size.
                     let mut e = StatusEntry::computed(t0.elapsed().as_secs_f64() * 1000.0);
-                    e.state = "approx".into();
+                    e.reason = "approximate".into();
                     e.sample = sample;
                     status.betweenness = e;
                     out.betweenness = Some(idx_to_score_map(&g, bw));
@@ -375,7 +384,10 @@ pub fn analyze_phase2_blocking(
         } else {
             let t0 = Instant::now();
             let gc = std::sync::Arc::clone(&g);
-            match run_with_timeout(budget.timeout_for(n), move || hits_default(&gc)) {
+            match run_with_timeout(budget.timeout_for(n), move || {
+                let _t = crate::metrics::time(&crate::metrics::TIMING_HITS_COMPUTE);
+                hits_default(&gc)
+            }) {
                 Ok(h) => {
                     status.hits = StatusEntry::computed(t0.elapsed().as_secs_f64() * 1000.0);
                     out.hubs = Some(idx_to_score_map(&g, h.hubs));

@@ -336,6 +336,7 @@ impl App {
                 baseline_val: None,
                 current_val: None,
                 delta: None,
+                ..Default::default()
             });
         }
         // Staleness check: open issues untouched for a long time (Go drift engine check)
@@ -361,6 +362,7 @@ impl App {
                                 baseline_val: None,
                                 current_val: Some(age as f64),
                                 delta: None,
+                                ..Default::default()
                             });
                         }
                     }
