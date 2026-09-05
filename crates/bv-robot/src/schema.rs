@@ -64,18 +64,32 @@ fn alert_schema() -> Value {
         "type": "object",
         "properties": {
             "type": s("string"),
-            "severity": s("string"),
+            "severity": json!({"type": "string", "enum": ["critical", "warning", "info"]}),
             "message": s("string"),
-            "baseline_val": s("number"),
-            "current_val": s("number"),
+            "baseline_value": s("number"),
+            "current_value": s("number"),
             "delta": s("number"),
             "details": string_array(),
             "issue_id": s("string"),
             "label": s("string"),
+            "detected_at": {"type": "string", "format": "date-time"},
             "unblocks_count": s("integer"),
             "downstream_priority_sum": s("integer"),
         },
         "required": ["type", "severity", "message"],
+    })
+}
+
+fn alert_summary_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "total": s("integer"),
+            "critical": s("integer"),
+            "warning": s("integer"),
+            "info": s("integer"),
+        },
+        "required": ["total", "critical", "warning", "info"],
     })
 }
 
@@ -291,6 +305,35 @@ fn title_case_robot_command(name: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn blocker_chain_schema() -> Value {
+    json!({
+        "$schema": DRAFT,
+        "title": "Robot Blocker Chain Output",
+        "description": "Full blocker chain analysis for an issue",
+        "type": "object",
+        "properties": {
+            "generated_at": {"type": "string", "format": "date-time"},
+            "data_hash": s("string"),
+            "output_format": format_enum(),
+            "version": s("string"),
+            "result": {
+                "type": "object",
+                "properties": {
+                    "target_id": s("string"),
+                    "target_title": s("string"),
+                    "is_blocked": s("boolean"),
+                    "chain_length": s("integer"),
+                    "root_blockers": array_of(s("object")),
+                    "chain": array_of(s("object")),
+                    "has_cycle": s("boolean"),
+                    "cycle_ids": {"type": ["array", "null"], "items": s("string")},
+                },
+            },
+        },
+        "required": ["generated_at", "data_hash", "output_format", "version", "result"],
+    })
 }
 
 /// Go `genericRobotCommandSchema` — envelope + description fallback.
@@ -561,15 +604,7 @@ fn alerts_schema() -> Value {
             "output_format": format_enum(),
             "version": s("string"),
             "alerts": array_of(alert_schema()),
-            "summary": {
-                "type": "object",
-                "properties": {
-                    "total": s("integer"),
-                    "critical": s("integer"),
-                    "warning": s("integer"),
-                    "info": s("integer"),
-                },
-            },
+            "summary": alert_summary_schema(),
             "usage_hints": string_array(),
         },
         "required": ["generated_at", "data_hash", "output_format", "version", "alerts", "summary", "usage_hints"],
@@ -838,6 +873,24 @@ fn forecast_schema() -> Value {
     })
 }
 
+/// Recursively sort all Map keys in a Value tree for deterministic JSON output
+/// matching Go's `json.Marshal` which sorts map keys alphabetically.
+fn sort_keys(v: Value) -> Value {
+    match v {
+        Value::Object(map) => {
+            let mut keys: Vec<String> = map.keys().cloned().collect();
+            keys.sort();
+            let mut sorted = Map::new();
+            for k in keys {
+                sorted.insert(k.clone(), sort_keys(map[&k].clone()));
+            }
+            Value::Object(sorted)
+        }
+        Value::Array(arr) => Value::Array(arr.into_iter().map(sort_keys).collect()),
+        other => other,
+    }
+}
+
 /// Go `generateRobotSchemas` — full payload with per-command schemas.
 /// Detailed schemas for primary commands; generic fallback for the rest.
 pub fn generate_robot_schemas(now: &str) -> Value {
@@ -862,6 +915,7 @@ pub fn generate_robot_schemas(now: &str) -> Value {
         ("robot-capacity", capacity_schema()),
         ("robot-burndown", burndown_schema()),
         ("robot-forecast", forecast_schema()),
+        ("robot-blocker-chain", blocker_chain_schema()),
     ];
     for (name, schema) in detailed {
         commands.insert(name.to_string(), schema.clone());
@@ -885,12 +939,18 @@ pub fn generate_robot_schemas(now: &str) -> Value {
         sorted.insert(k.clone(), commands[k].clone());
     }
 
-    json!({
-        "schema_version": SCHEMA_VERSION,
-        "generated_at": now,
-        "envelope": envelope_schema(),
-        "commands": Value::Object(sorted),
-    })
+    // Go's RobotSchemas struct field order: SchemaVersion, GeneratedAt, Envelope, Commands.
+    // Go's json.Marshal sorts map keys alphabetically at each nesting level.
+    let envelope = sort_keys(envelope_schema());
+    let sorted_cmds: Map<String, Value> =
+        sorted.into_iter().map(|(k, v)| (k, sort_keys(v))).collect();
+    // Build output with correct Go struct field order (not json! macro insertion order).
+    let mut result = Map::new();
+    result.insert("schema_version".into(), json!(SCHEMA_VERSION));
+    result.insert("generated_at".into(), json!(now));
+    result.insert("envelope".into(), envelope);
+    result.insert("commands".into(), Value::Object(sorted_cmds));
+    Value::Object(result)
 }
 
 #[cfg(test)]

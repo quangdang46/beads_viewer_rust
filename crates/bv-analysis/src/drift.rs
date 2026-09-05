@@ -36,8 +36,10 @@ pub struct Alert {
     pub severity: Severity,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "baseline_value")]
     pub baseline_val: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "current_value")]
     pub current_val: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delta: Option<f64>,
@@ -47,6 +49,8 @@ pub struct Alert {
     pub issue_id: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detected_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unblocks_count: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -296,6 +300,7 @@ fn check_staleness(result: &mut DriftResult, cfg: &DriftConfig, issues: &[Issue]
             ],
             issue_id: issue.id.clone(),
             label: String::new(),
+            detected_at: None,
             unblocks_count: None,
             downstream_priority_sum: None,
         });
@@ -406,6 +411,7 @@ fn check_blocking_cascade(result: &mut DriftResult, cfg: &DriftConfig, issues: &
             details: unblocked,
             issue_id: issue.id.clone(),
             label: String::new(),
+            detected_at: None,
             unblocks_count: Some(count),
             downstream_priority_sum: Some(priority_sum),
         });

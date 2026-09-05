@@ -186,7 +186,7 @@ fn rust_output_matches_frozen_go_goldens() {
     eprintln!(
         "Golden gate: PASS={pass} DIFF_FAILS={diff_fails} INFRA_FAILS={infra_fails} SKIP={skip}"
     );
-    for m in diff_msgs.iter().take(20) {
+    for m in &diff_msgs {
         eprintln!("  {m}");
     }
     for m in &infra_msgs {

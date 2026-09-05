@@ -2293,13 +2293,28 @@ fn run_robot_recipes() -> ExitCode {
         ("actionable", "Issues ready to work on (no open blockers)"),
         ("recent", "Issues updated in the last 7 days"),
         ("blocked", "Issues waiting on dependencies"),
-        ("high-impact", "Top PageRank scores"),
-        ("stale", "Open but untouched for 30+ days"),
-        ("triage", "Sorted by computed triage score"),
+        (
+            "high-impact",
+            "Issues with highest blocking impact (PageRank)",
+        ),
+        ("stale", "Open issues not updated in 30+ days"),
+        (
+            "triage",
+            "Issues sorted by computed triage score (high impact + unblocking potential)",
+        ),
         ("closed", "Recently closed issues"),
-        ("release-cut", "Closed in last 14 days"),
-        ("quick-wins", "Easy P2/P3 items with no blockers"),
-        ("bottlenecks", "High betweenness nodes"),
+        (
+            "release-cut",
+            "Recently closed items for changelog generation",
+        ),
+        (
+            "quick-wins",
+            "Easy items with no blockers - good for quick progress",
+        ),
+        (
+            "bottlenecks",
+            "High betweenness nodes - potential project bottlenecks",
+        ),
     ]
     .iter()
     .map(|(name, desc)| (name.to_string(), *desc))
