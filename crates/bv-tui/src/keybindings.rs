@@ -77,6 +77,10 @@ pub fn build_default_registry() -> KeyRegistry {
     for (key, desc) in [
         ("j/↓", "Move down"),
         ("k/↑", "Move up"),
+        ("gg", "Go to top"),
+        ("G", "Go to bottom"),
+        ("ctrl+d", "Page down (half-screen)"),
+        ("ctrl+u", "Page up (half-screen)"),
         ("enter", "Toggle detail pane"),
         ("tab", "Focus detail pane"),
         ("/", "Search"),
@@ -101,13 +105,15 @@ pub fn build_default_registry() -> KeyRegistry {
     for (key, desc) in [
         ("b", "Toggle board view"),
         ("E", "Toggle tree view"),
-        ("G", "Toggle graph view"),
+        ("g", "Toggle graph view"),
+        ("h", "Toggle history view"),
         ("i", "Toggle insights view"),
         ("f", "Toggle flow-matrix view"),
         ("A", "Toggle attention view"),
         ("!", "Toggle alerts view"),
-        ("t", "Toggle time-travel/history view"),
-        ("P", "Toggle sprint view"),
+        ("p", "Toggle priority hints"),
+        ("t", "Time travel forward"),
+        ("T", "Time travel back"),
         ("`", "Toggle tutorial"),
         (";", "Toggle sidebar"),
     ] {
@@ -142,6 +148,8 @@ pub fn build_default_registry() -> KeyRegistry {
         ("k/↑", "Scroll up"),
         ("tab", "Return to list"),
         ("esc", "Return to list"),
+        ("C", "Copy full issue"),
+        ("O", "Open in $EDITOR"),
     ] {
         reg.register(KeyBinding {
             focus: Focus::Detail,
@@ -167,9 +175,11 @@ pub fn build_default_registry() -> KeyRegistry {
 
     // Graph view bindings
     for (key, desc) in [
-        ("j/↓", "Next issue"),
-        ("k/↑", "Previous issue"),
-        ("G", "Close graph view"),
+        ("hjkl", "Navigate graph"),
+        ("H", "Scroll left"),
+        ("L", "Scroll right"),
+        ("PgUp", "Scroll up"),
+        ("PgDn", "Scroll down"),
     ] {
         reg.register(KeyBinding {
             focus: Focus::Graph,
@@ -183,7 +193,12 @@ pub fn build_default_registry() -> KeyRegistry {
     for (key, desc) in [
         ("j/↓", "Next bead"),
         ("k/↑", "Previous bead"),
-        ("t", "Toggle bead/git mode"),
+        ("v", "Toggle git/bead mode"),
+        ("tab", "Toggle focus"),
+        ("J", "Detail scroll down"),
+        ("K", "Detail scroll up"),
+        ("o", "Open in browser"),
+        ("c", "Cycle confidence threshold"),
     ] {
         reg.register(KeyBinding {
             focus: Focus::History,
