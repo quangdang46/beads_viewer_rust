@@ -563,9 +563,7 @@ fn load_issues_auto(
         let resolved = loader
             .resolve_revision(revision)
             .map_err(|e| e.to_string())?;
-        let issues = loader
-            .load_at(revision)
-            .map_err(|e| e.to_string())?;
+        let issues = loader.load_at(revision).map_err(|e| e.to_string())?;
         eprintln!(
             "Loaded {} issues from {} ({})",
             issues.len(),
@@ -1244,37 +1242,97 @@ fn run_robot_insights() -> ExitCode {
     // top_what_ifs — port of Go TopWhatIfDeltas (whatif.go:226).
     let closed_set: Vec<bool> = issues
         .iter()
-        .map(|i| matches!(i.status, bv_core::model::Status::Closed | bv_core::model::Status::Tombstone))
-        .collect();
-    let whatif_entries: Vec<serde_json::Value> = bv_graph_core::whatif::top_what_if(&g, &closed_set, 10)
-        .into_iter()
-        .filter_map(|entry| {
-            let id = g.node_id(entry.node)?.to_string();
-            let title = issues.iter().find(|i| i.id == id).map(|i| i.title.as_str()).unwrap_or("");
-            Some(serde_json::json!({
-                "issue_id": id,
-                "title": title,
-                "delta": {
-                    "direct_unblocks": entry.result.direct_unblocks,
-                    "transitive_unblocks": entry.result.transitive_unblocks,
-                    "blocked_reduction": 0,
-                    "depth_reduction": 0.0,
-                    "estimated_days_saved": 0.0,
-                    "unblocked_issue_ids": entry.result.unblocked_ids.iter()
-                        .filter_map(|&idx| g.node_id(idx).map(|s| s.to_string()))
-                        .collect::<Vec<_>>(),
-                    "parallelization_gain": entry.result.parallel_gain,
-                    "explanation": format!(
-                        "Completing this would directly unblock {} and transitively unblock {} issues",
-                        entry.result.direct_unblocks, entry.result.transitive_unblocks
-                    ),
-                },
-            }))
+        .map(|i| {
+            matches!(
+                i.status,
+                bv_core::model::Status::Closed | bv_core::model::Status::Tombstone
+            )
         })
         .collect();
+    let whatif_entries: Vec<serde_json::Value> = bv_graph_core::whatif::top_what_if(
+        &g,
+        &closed_set,
+        10,
+    )
+    .into_iter()
+    .filter_map(|entry| {
+        let id = g.node_id(entry.node)?.to_string();
+        let title = issues
+            .iter()
+            .find(|i| i.id == id)
+            .map(|i| i.title.as_str())
+            .unwrap_or("");
+        Some(serde_json::json!({
+            "issue_id": id,
+            "title": title,
+            "delta": {
+                "direct_unblocks": entry.result.direct_unblocks,
+                "transitive_unblocks": entry.result.transitive_unblocks,
+                "blocked_reduction": 0,
+                "depth_reduction": 0.0,
+                "estimated_days_saved": 0.0,
+                "unblocked_issue_ids": entry.result.unblocked_ids.iter()
+                    .filter_map(|&idx| g.node_id(idx).map(|s| s.to_string()))
+                    .collect::<Vec<_>>(),
+                "parallelization_gain": entry.result.parallel_gain,
+                "explanation": format!(
+                    "Completing this would directly unblock {} and transitively unblock {} issues",
+                    entry.result.direct_unblocks, entry.result.transitive_unblocks
+                ),
+            },
+        }))
+    })
+    .collect();
     if !whatif_entries.is_empty() {
         payload["top_what_ifs"] = serde_json::Value::Array(whatif_entries);
     }
+
+    // advanced_insights — port of Go AdvancedInsights (advanced_insights.go).
+    let topk = bv_graph_core::algorithms::topk_set::topk_set_default(&g, &closed_set);
+    let coverage = bv_graph_core::algorithms::coverage::coverage_set_default(&g);
+    let parallel = bv_graph_core::algorithms::parallel_cut::parallel_cut_default(&g, &closed_set);
+    let kpaths = bv_graph_core::algorithms::k_paths::k_critical_paths_default(&g);
+
+    let topk_items: Vec<serde_json::Value> = topk
+        .items
+        .iter()
+        .map(|item| {
+            serde_json::json!({
+                "node": g.node_id(item.node).unwrap_or_default(),
+                "marginal_gain": item.marginal_gain,
+                "unblocked_count": item.unblocked_ids.len(),
+            })
+        })
+        .collect();
+    let coverage_items: Vec<serde_json::Value> = coverage
+        .items
+        .iter()
+        .map(|item| {
+            serde_json::json!({
+                "node": g.node_id(item.node).unwrap_or_default(),
+                "edges_added": item.edges_added,
+            })
+        })
+        .collect();
+    let parallel_items: Vec<serde_json::Value> = parallel
+        .items
+        .iter()
+        .map(|item| {
+            serde_json::json!({
+                "node": g.node_id(item.node).unwrap_or_default(),
+                "parallel_gain": item.parallel_gain,
+                "new_actionable": item.new_actionable,
+            })
+        })
+        .collect();
+
+    payload["advanced_insights"] = serde_json::json!({
+        "topk_set": { "items": topk_items, "total_gain": topk.total_gain, "open_nodes": topk.open_nodes },
+        "coverage_set": { "items": coverage_items, "edges_covered": coverage.edges_covered, "total_edges": coverage.total_edges, "coverage_ratio": coverage.coverage_ratio },
+        "parallel_cut": { "items": parallel_items, "open_nodes": parallel.open_nodes, "current_actionable": parallel.current_actionable },
+        "k_paths": { "path_count": kpaths.paths.len(), "total_nodes": kpaths.total_nodes, "max_length": kpaths.max_length },
+        "config": {},
+    });
 
     let scc = bv_graph_core::tarjan_scc(&g);
     let cycles_out: Vec<Vec<String>> = scc
