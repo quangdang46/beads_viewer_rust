@@ -1118,7 +1118,7 @@ fn run_robot_insights() -> ExitCode {
         Ok(x) => x,
         Err(code) => return code,
     };
-    let (_, hash, p1, _status, g, _phase2) = all;
+    let (issues, hash, p1, _status, g, _phase2) = all;
 
     let pr_obj = to_id_map(&g, &bv_graph_core::pagerank_default(&g));
     let bw_raw = bv_graph_core::betweenness(&g);
@@ -1170,15 +1170,45 @@ fn run_robot_insights() -> ExitCode {
     payload["ClusterDensity"] = serde_json::json!(density);
 
     // Velocity snapshot (Go parity: VelocitySnapshot in insights).
-    if let Some(issues_data) = load_issues_auto(&std::env::current_dir().unwrap_or_default())
-        .ok()
-        .map(|(issues, _)| issues)
+    if let Some(vel) =
+        bv_analysis::triage::compute_project_velocity(&issues, jiff::Timestamp::now())
     {
-        if let Some(vel) =
-            bv_analysis::triage::compute_project_velocity(&issues_data, jiff::Timestamp::now())
-        {
-            payload["Velocity"] = vel;
-        }
+        payload["Velocity"] = vel;
+    }
+
+    // top_what_ifs — port of Go TopWhatIfDeltas (whatif.go:226).
+    let closed_set: Vec<bool> = issues
+        .iter()
+        .map(|i| matches!(i.status, bv_core::model::Status::Closed | bv_core::model::Status::Tombstone))
+        .collect();
+    let whatif_entries: Vec<serde_json::Value> = bv_graph_core::whatif::top_what_if(&g, &closed_set, 10)
+        .into_iter()
+        .filter_map(|entry| {
+            let id = g.node_id(entry.node)?.to_string();
+            let title = issues.iter().find(|i| i.id == id).map(|i| i.title.as_str()).unwrap_or("");
+            Some(serde_json::json!({
+                "issue_id": id,
+                "title": title,
+                "delta": {
+                    "direct_unblocks": entry.result.direct_unblocks,
+                    "transitive_unblocks": entry.result.transitive_unblocks,
+                    "blocked_reduction": 0,
+                    "depth_reduction": 0.0,
+                    "estimated_days_saved": 0.0,
+                    "unblocked_issue_ids": entry.result.unblocked_ids.iter()
+                        .filter_map(|&idx| g.node_id(idx).map(|s| s.to_string()))
+                        .collect::<Vec<_>>(),
+                    "parallelization_gain": entry.result.parallel_gain,
+                    "explanation": format!(
+                        "Completing this would directly unblock {} and transitively unblock {} issues",
+                        entry.result.direct_unblocks, entry.result.transitive_unblocks
+                    ),
+                },
+            }))
+        })
+        .collect();
+    if !whatif_entries.is_empty() {
+        payload["top_what_ifs"] = serde_json::Value::Array(whatif_entries);
     }
 
     let scc = bv_graph_core::tarjan_scc(&g);
