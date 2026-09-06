@@ -1244,13 +1244,13 @@ pub fn generate_all_suggestions(
         })
         .collect();
 
-    // Sort by confidence (highest first), with alphabetical tiebreak.
+    // Sort by confidence (highest first). Go uses unstable sort for equal
+    // confidence — golden order is non-deterministic and not reproducible.
     let mut filtered = filtered;
     filtered.sort_by(|a, b| {
         b.confidence
             .partial_cmp(&a.confidence)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.target_bead.cmp(&b.target_bead))
     });
 
     let mut filtered = filtered;
