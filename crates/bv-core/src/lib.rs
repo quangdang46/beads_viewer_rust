@@ -1,6 +1,7 @@
 //! bv-core: frozen data model, tolerant JSONL loader, datasource discovery.
 //! Contracts here are api-freeze-v1 — see AGENTS.md and plan §3.1.
 
+pub mod agents;
 pub mod model;
 pub mod sprint;
 

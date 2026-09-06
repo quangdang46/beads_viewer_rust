@@ -68,6 +68,13 @@ fn main() -> ExitCode {
         print_robot_help();
         return ExitCode::from(0);
     }
+    if presence.has("agents-add")
+        || presence.has("agents-remove")
+        || presence.has("agents-update")
+        || presence.has("agents-check")
+    {
+        return run_agents_commands(&presence, &args);
+    }
     if presence.has("robot-capabilities") {
         return run_robot_capabilities();
     }
@@ -1125,6 +1132,284 @@ fn run_save_baseline(desc: &str) -> ExitCode {
             }
         }
     }
+}
+
+/// Go agent management commands (--agents-add/remove/update/check).
+fn run_agents_commands(presence: &validation::Presence, _args: &[String]) -> ExitCode {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let detection = bv_core::agents::detect::detect_agent_file_in_parents(&cwd, 3);
+    let is_robot = presence.has("robot-robot") || std::env::var("BV_ROBOT").as_deref() == Ok("1");
+    let dry_run = presence.has("agents-dry-run");
+    let force = presence.has("agents-force");
+
+    if is_robot {
+        // JSON output for AI agents.
+        let result = serde_json::json!({
+            "found": detection.found(),
+            "file_path": detection.file_path,
+            "file_type": detection.file_type,
+            "has_blurb": detection.has_blurb,
+            "has_legacy_blurb": detection.has_legacy_blurb,
+            "blurb_version": detection.blurb_version,
+            "current_version": bv_core::agents::BLURB_VERSION,
+            "needs_blurb": detection.found() && detection.needs_blurb(),
+            "needs_upgrade": detection.needs_upgrade(),
+        });
+        return emit_json(&result);
+    }
+
+    let is_check = !presence.has("agents-add")
+        && !presence.has("agents-remove")
+        && !presence.has("agents-update");
+
+    if is_check || presence.has("agents-check") {
+        if !detection.found() {
+            println!(
+                "No agent file found (searched up to 3 parent directories from {})",
+                cwd.display()
+            );
+            println!("Run 'bvr --agents-add' to create AGENTS.md with beads workflow instructions.");
+            return ExitCode::from(0);
+        }
+        if detection.has_legacy_blurb {
+            println!(
+                "Found {} at {} (legacy blurb — needs upgrade)",
+                detection.file_type, detection.file_path
+            );
+            println!("Run 'bvr --agents-update' to upgrade to the current format.");
+            return ExitCode::from(0);
+        }
+        if detection.has_blurb
+            && detection.blurb_version < bv_core::agents::BLURB_VERSION
+        {
+            println!(
+                "Found {} at {} (blurb v{}, current v{} — needs update)",
+                detection.file_type,
+                detection.file_path,
+                detection.blurb_version,
+                bv_core::agents::BLURB_VERSION
+            );
+            println!("Run 'bvr --agents-update' to update to the latest version.");
+            return ExitCode::from(0);
+        }
+        if detection.has_blurb {
+            println!(
+                "Found {} at {} (blurb v{} — up to date)",
+                detection.file_type, detection.file_path, detection.blurb_version
+            );
+            return ExitCode::from(0);
+        }
+        println!(
+            "Found {} at {} (no beads workflow instructions)",
+            detection.file_type, detection.file_path
+        );
+        println!("Run 'bvr --agents-add' to add beads workflow instructions.");
+        return ExitCode::from(0);
+    }
+
+    if presence.has("agents-add") {
+        if detection.found()
+            && detection.has_blurb
+            && detection.blurb_version >= bv_core::agents::BLURB_VERSION
+        {
+            println!(
+                "{} already has current blurb (v{}) — no action needed.",
+                detection.file_path, detection.blurb_version
+            );
+            return ExitCode::from(0);
+        }
+        if detection.found() && (detection.has_legacy_blurb
+            || (detection.has_blurb && detection.blurb_version < bv_core::agents::BLURB_VERSION))
+        {
+            println!("Existing blurb found but outdated. Use --agents-update instead.");
+            return ExitCode::from(1);
+        }
+
+        let target_path = if detection.found() {
+            detection.file_path.clone()
+        } else {
+            bv_core::agents::get_preferred_agent_file_path(&cwd)
+                .to_string_lossy()
+                .to_string()
+        };
+        let creating = !detection.found();
+
+        if dry_run {
+            if creating {
+                println!("[dry-run] Would create {target_path} with beads workflow instructions.");
+            } else {
+                println!("[dry-run] Would append beads workflow instructions to {target_path}.");
+            }
+            return ExitCode::from(0);
+        }
+
+        if !force {
+            let action = if creating {
+                "Create"
+            } else {
+                "Append blurb to"
+            };
+            print!("{action} {target_path}? [Y/n]: ");
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+            let mut buf = String::new();
+            std::io::stdin().read_line(&mut buf).ok();
+            let resp = buf.trim().to_lowercase();
+            if !resp.is_empty() && resp != "y" && resp != "yes" {
+                println!("Cancelled.");
+                return ExitCode::from(0);
+            }
+        }
+
+        let result = if creating {
+            bv_core::agents::file::create_agent_file(
+                std::path::Path::new(&target_path),
+            )
+        } else {
+            bv_core::agents::file::append_blurb_to_file(
+                std::path::Path::new(&target_path),
+            )
+        };
+
+        if let Err(e) = result {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+
+        let msg = if creating {
+            format!("Created {target_path} with beads workflow instructions.")
+        } else {
+            format!("Appended beads workflow instructions to {target_path}.")
+        };
+        println!("{msg}");
+
+        let verified = bv_core::agents::file::verify_blurb_present(
+            std::path::Path::new(&target_path),
+        )
+        .unwrap_or(false);
+        if !verified {
+            eprintln!("Warning: verification failed — blurb may not have been written correctly.");
+            return ExitCode::from(1);
+        }
+        return ExitCode::from(0);
+    }
+
+    if presence.has("agents-update") {
+        if !detection.found() {
+            println!("No agent file found. Use --agents-add to create one.");
+            return ExitCode::from(1);
+        }
+        if !detection.has_blurb && !detection.has_legacy_blurb {
+            println!(
+                "{} has no blurb to update. Use --agents-add to add one.",
+                detection.file_path
+            );
+            return ExitCode::from(1);
+        }
+        if detection.has_blurb
+            && detection.blurb_version >= bv_core::agents::BLURB_VERSION
+        {
+            println!(
+                "{} already has current blurb (v{}) — no update needed.",
+                detection.file_path, detection.blurb_version
+            );
+            return ExitCode::from(0);
+        }
+
+        if dry_run {
+            if detection.has_legacy_blurb {
+                println!(
+                    "[dry-run] Would upgrade legacy blurb to v{} in {}.",
+                    bv_core::agents::BLURB_VERSION, detection.file_path
+                );
+            } else {
+                println!(
+                    "[dry-run] Would update blurb from v{} to v{} in {}.",
+                    detection.blurb_version, bv_core::agents::BLURB_VERSION, detection.file_path
+                );
+            }
+            return ExitCode::from(0);
+        }
+
+        if !force {
+            print!("Update blurb in {}? [Y/n]: ", detection.file_path);
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+            let mut buf = String::new();
+            std::io::stdin().read_line(&mut buf).ok();
+            let resp = buf.trim().to_lowercase();
+            if !resp.is_empty() && resp != "y" && resp != "yes" {
+                println!("Cancelled.");
+                return ExitCode::from(0);
+            }
+        }
+
+        if let Err(e) =
+            bv_core::agents::file::update_blurb_in_file(std::path::Path::new(&detection.file_path))
+        {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+        println!(
+            "Updated blurb to v{} in {}.",
+            bv_core::agents::BLURB_VERSION, detection.file_path
+        );
+
+        let verified = bv_core::agents::file::verify_blurb_present(
+            std::path::Path::new(&detection.file_path),
+        )
+        .unwrap_or(false);
+        if !verified {
+            eprintln!("Warning: verification failed — blurb may not have been written correctly.");
+            return ExitCode::from(1);
+        }
+        return ExitCode::from(0);
+    }
+
+    if presence.has("agents-remove") {
+        if !detection.found() {
+            println!("No agent file found — nothing to remove.");
+            return ExitCode::from(0);
+        }
+        if !detection.has_blurb && !detection.has_legacy_blurb {
+            println!("{} has no blurb — nothing to remove.", detection.file_path);
+            return ExitCode::from(0);
+        }
+
+        if dry_run {
+            println!(
+                "[dry-run] Would remove blurb from {}.",
+                detection.file_path
+            );
+            return ExitCode::from(0);
+        }
+
+        if !force {
+            print!("Remove blurb from {}? [Y/n]: ", detection.file_path);
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+            let mut buf = String::new();
+            std::io::stdin().read_line(&mut buf).ok();
+            let resp = buf.trim().to_lowercase();
+            if !resp.is_empty() && resp != "y" && resp != "yes" {
+                println!("Cancelled.");
+                return ExitCode::from(0);
+            }
+        }
+
+        if let Err(e) = bv_core::agents::file::remove_blurb_from_file(
+            std::path::Path::new(&detection.file_path),
+        ) {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+        println!("Removed beads workflow instructions from {}.", detection.file_path);
+        return ExitCode::from(0);
+    }
+
+    // Default: should not reach here
+    eprintln!("No agents action specified. Use --agents-add, --agents-remove, --agents-update, or --agents-check.");
+    ExitCode::from(1)
 }
 
 fn run_check_drift() -> ExitCode {
