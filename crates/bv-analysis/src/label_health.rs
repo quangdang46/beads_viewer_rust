@@ -619,11 +619,19 @@ pub fn compute_label_health_for_label(
         outgoing_deps,
         incoming_labels: {
             let v: Vec<String> = seen_in.into_iter().collect();
-            if v.is_empty() { None } else { Some(v) }
+            if v.is_empty() {
+                None
+            } else {
+                Some(v)
+            }
         },
         outgoing_labels: {
             let v: Vec<String> = seen_out.into_iter().collect();
-            if v.is_empty() { None } else { Some(v) }
+            if v.is_empty() {
+                None
+            } else {
+                Some(v)
+            }
         },
         blocked_by_external,
         blocking_external,

@@ -331,9 +331,7 @@ pub fn compute_impact_scores(inputs: &ImpactInputs) -> Vec<IssueImpact> {
         let days_stale = if let Some(raw) = issue.updated_at.as_deref() {
             match raw.parse::<jiff::Timestamp>() {
                 Ok(t) => {
-                    let secs = (inputs.now - t)
-                        .total(jiff::Unit::Second)
-                        .unwrap_or(0.0);
+                    let secs = (inputs.now - t).total(jiff::Unit::Second).unwrap_or(0.0);
                     (secs / 86400.0) as i64
                 }
                 Err(_) => 0,

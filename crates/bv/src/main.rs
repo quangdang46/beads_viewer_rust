@@ -745,14 +745,30 @@ fn run_robot_next() -> ExitCode {
     // Clear skipped reasons for Go omitempty parity (only "approximate" kept).
     let cleared_status = {
         let mut s = out.metric_status.clone();
-        if s.page_rank.state == "skipped" { s.page_rank.reason.clear(); }
-        if s.eigenvector.state == "skipped" { s.eigenvector.reason.clear(); }
-        if s.hits.state == "skipped" { s.hits.reason.clear(); }
-        if s.critical.state == "skipped" { s.critical.reason.clear(); }
-        if s.cycles.state == "skipped" { s.cycles.reason.clear(); }
-        if s.kcore.state == "skipped" { s.kcore.reason.clear(); }
-        if s.articulation.state == "skipped" { s.articulation.reason.clear(); }
-        if s.slack.state == "skipped" { s.slack.reason.clear(); }
+        if s.page_rank.state == "skipped" {
+            s.page_rank.reason.clear();
+        }
+        if s.eigenvector.state == "skipped" {
+            s.eigenvector.reason.clear();
+        }
+        if s.hits.state == "skipped" {
+            s.hits.reason.clear();
+        }
+        if s.critical.state == "skipped" {
+            s.critical.reason.clear();
+        }
+        if s.cycles.state == "skipped" {
+            s.cycles.reason.clear();
+        }
+        if s.kcore.state == "skipped" {
+            s.kcore.reason.clear();
+        }
+        if s.articulation.state == "skipped" {
+            s.articulation.reason.clear();
+        }
+        if s.slack.state == "skipped" {
+            s.slack.reason.clear();
+        }
         s.to_json_map()
     };
     match chosen {
@@ -901,8 +917,7 @@ fn run_robot_triage() -> ExitCode {
                     })
                     .map(|o| o.id.clone())
                     .collect();
-                let unblock_impact =
-                    ((unblocks_count as f64) + 1.0).log2();
+                let unblock_impact = ((unblocks_count as f64) + 1.0).log2();
                 let simplicity = if r.breakdown.blocker_ratio < 0.2 {
                     1.0
                 } else if r.breakdown.blocker_ratio < 0.4 {
@@ -911,8 +926,7 @@ fn run_robot_triage() -> ExitCode {
                     0.0
                 };
                 let priority_bonus = if r.priority <= 1 { 0.5 } else { 0.0 };
-                let qw_score =
-                    unblock_impact * 0.4 + simplicity * 0.4 + priority_bonus * 0.2;
+                let qw_score = unblock_impact * 0.4 + simplicity * 0.4 + priority_bonus * 0.2;
                 // Build reason (Go parity: buildQuickWins reason logic).
                 let mut reason = "Low complexity".to_string();
                 if unblocks_count > 0 {
@@ -1885,7 +1899,7 @@ fn go_format_f64(f: f64) -> String {
         return "null".into();
     }
     let abs = f.abs();
-    if abs != 0.0 && (abs < 1e-6 || abs >= 1e21) {
+    if abs != 0.0 && !(1e-6..1e21).contains(&abs) {
         // Rust {:e} → "1.5e21"; Go → "1.5e+21". Reconstruct Go style.
         let s = format!("{:e}", f); // e.g. "1.5e21", "1e-7", "-2.5e-8"
         if let Some(pos) = s.find('e') {
@@ -2135,7 +2149,7 @@ fn run_robot_insights() -> ExitCode {
     let bw_raw = bv_graph_core::betweenness(&g);
     let mut bw_obj = to_id_map(&g, &bw_raw);
     // gonum Betweenness omits zero-score nodes (endpoints of a DAG chain).
-    bw_obj.retain(|_, v| v.as_f64().map_or(true, |f| f != 0.0));
+    bw_obj.retain(|_, v| v.as_f64() != Some(0.0));
     let ev_raw = bv_graph_core::eigenvector_default(&g);
     let ev_obj = to_id_map(&g, &ev_raw);
     let hits_result = bv_graph_core::hits_default(&g);
@@ -2835,7 +2849,7 @@ fn generate_advanced_insights(
     }
     let current_actionable = open_set
         .iter()
-        .filter(|id| blocked_by.get(*id).map_or(true, |v| v.is_empty()))
+        .filter(|id| blocked_by.get(*id).is_none_or(|v| v.is_empty()))
         .count();
     let mut pc_candidates: Vec<(String, i64, i64, Vec<String>)> = Vec::new();
     for id in &open_set {
@@ -3089,7 +3103,7 @@ fn run_robot_plan() -> ExitCode {
     let hash = bv_core::data_hash::compute_data_hash(&issues);
     let g = bv_analysis::analyzer::build_graph(&issues);
     let blocked = bv_analysis::triage::compute_blocked_set(&issues);
-    let actionable: Vec<&bv_core::model::Issue> = issues
+    let _actionable: Vec<&bv_core::model::Issue> = issues
         .iter()
         .filter(|i| i.status.is_open() && !blocked.contains(&i.id))
         .collect();
@@ -3194,14 +3208,11 @@ fn run_robot_plan() -> ExitCode {
     // Build tracks: roots sorted; only components with actionable members.
     let mut tracks: Vec<serde_json::Value> = Vec::new();
     let mut track_num = 1usize;
-    for (root, members) in &components {
+    for (_root, members) in &components {
         let mut actionable_members: Vec<&bv_core::model::Issue> = members
             .iter()
-            .filter_map(|id| {
-                actionable_set
-                    .contains(id.as_str())
-                    .then(|| by_id[id.as_str()])
-            })
+            .filter(|&id| actionable_set
+                    .contains(id.as_str())).map(|id| by_id[id.as_str()])
             .collect();
         if actionable_members.is_empty() {
             continue;
@@ -3313,7 +3324,7 @@ fn run_robot_priority(args: &[String]) -> ExitCode {
         .and_then(|i| args.get(i + 1))
         .cloned();
 
-    let (mut issues, hash, _p1, status, g) = match load_and_analyze() {
+    let (mut issues, _hash, _p1, status, _g) = match load_and_analyze() {
         Ok(x) => x,
         Err(code) => return code,
     };
