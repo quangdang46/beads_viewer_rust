@@ -196,8 +196,8 @@ pub struct ImpactInputs<'a> {
     pub issues: &'a [Issue],
     pub pagerank: &'a BTreeMap<String, f64>,
     pub betweenness: &'a BTreeMap<String, f64>,
-    /// critical path heights keyed by id.
-    pub critical_path: &'a BTreeMap<String, f64>,
+    /// critical path heights keyed by id (None = not computed, skip time-to-impact).
+    pub critical_path: Option<&'a BTreeMap<String, f64>>,
     pub g: &'a DiGraph,
     pub now: jiff::Timestamp,
 }
@@ -239,7 +239,7 @@ pub fn compute_impact_scores(inputs: &ImpactInputs) -> Vec<IssueImpact> {
         let blocker_norm = normalize(blockers as f64, max_blockers as f64);
         let staleness_norm = compute_staleness(issue.updated_at.as_deref(), &inputs.now);
         let prio_norm = compute_priority_boost(issue.priority);
-        let depth = inputs.critical_path.get(&issue.id).copied().unwrap_or(0.0);
+        let depth = inputs.critical_path.and_then(|cp| cp.get(&issue.id)).copied().unwrap_or(0.0);
         let tti_norm = compute_time_to_impact(depth, issue.estimated_minutes, median_minutes);
         let urgency_norm = compute_urgency(&issue.labels, issue.created_at.as_deref(), &inputs.now);
         let risk = compute_risk_signals(issue, inputs.g, idx);

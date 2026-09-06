@@ -306,19 +306,13 @@ pub fn build_triage(issues: &[Issue], g: &DiGraph, now: jiff::Timestamp) -> Tria
     };
     let bw_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
-    // Critical path heights are needed for the time-to-impact component.
-    let heights = crate::algorithms::critical_path::critical_path_heights(g);
+    // Go TriageConfig skips ComputeCriticalPath: no time-to-impact component.
     let pr: BTreeMap<String, f64> = pagerank
         .into_iter()
         .enumerate()
         .map(|(i, v)| (g.node_id(i).unwrap_or_default().to_string(), v))
         .collect();
     let bw: BTreeMap<String, f64> = betweenness
-        .into_iter()
-        .enumerate()
-        .map(|(i, v)| (g.node_id(i).unwrap_or_default().to_string(), v))
-        .collect();
-    let cp: BTreeMap<String, f64> = heights
         .into_iter()
         .enumerate()
         .map(|(i, v)| (g.node_id(i).unwrap_or_default().to_string(), v))
@@ -346,7 +340,7 @@ pub fn build_triage(issues: &[Issue], g: &DiGraph, now: jiff::Timestamp) -> Tria
         issues,
         pagerank: &pr,
         betweenness: &bw,
-        critical_path: &cp,
+        critical_path: None, // Go TriageConfig skips ComputeCriticalPath
         g,
         now,
     };

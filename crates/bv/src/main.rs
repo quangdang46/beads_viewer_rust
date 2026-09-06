@@ -936,12 +936,22 @@ fn run_robot_triage() -> ExitCode {
     if let Some(hs) = history_status {
         meta["history_status"] = serde_json::json!(hs);
     }
+    // Go parity: clear reason on all skipped entries except betweenness.
+    let mut triage_status = out.metric_status.clone();
+    if triage_status.page_rank.state == "skipped" { triage_status.page_rank.reason.clear(); }
+    if triage_status.eigenvector.state == "skipped" { triage_status.eigenvector.reason.clear(); }
+    if triage_status.hits.state == "skipped" { triage_status.hits.reason.clear(); }
+    if triage_status.critical.state == "skipped" { triage_status.critical.reason.clear(); }
+    if triage_status.cycles.state == "skipped" { triage_status.cycles.reason.clear(); }
+    if triage_status.kcore.state == "skipped" { triage_status.kcore.reason.clear(); }
+    if triage_status.articulation.state == "skipped" { triage_status.articulation.reason.clear(); }
+    if triage_status.slack.state == "skipped" { triage_status.slack.reason.clear(); }
     let mut payload = serde_json::json!({
         "generated_at": env.generated_at,
         "data_hash": env.data_hash,
         "triage": {
             "meta": meta,
-            "status": out.metric_status.to_json_map(),
+            "status": triage_status.to_json_map(),
             "quick_ref": {
                 "open_count": out.quick_ref.open_count,
                 "actionable_count": out.quick_ref.actionable_count,
@@ -1756,7 +1766,35 @@ fn run_robot_insights() -> ExitCode {
 
     let mut payload = envelope_json(&hash);
     payload["analysis_config"] = insights_analysis_config(g.len());
-    payload["status"] = status.to_json_map();
+    // Go parity: only "approximate" reason is non-empty for skipped entries.
+    // All other skipped metrics emit {"state":"skipped"} without reason field.
+    let mut fixed_status = status.clone();
+    if fixed_status.page_rank.state == "skipped" {
+        fixed_status.page_rank.reason.clear();
+    }
+    if fixed_status.betweenness.state != "computed" { /* keep reason for approx */ }
+    if fixed_status.eigenvector.state == "skipped" {
+        fixed_status.eigenvector.reason.clear();
+    }
+    if fixed_status.hits.state == "skipped" {
+        fixed_status.hits.reason.clear();
+    }
+    if fixed_status.critical.state == "skipped" {
+        fixed_status.critical.reason.clear();
+    }
+    if fixed_status.cycles.state == "skipped" {
+        fixed_status.cycles.reason.clear();
+    }
+    if fixed_status.kcore.state == "skipped" {
+        fixed_status.kcore.reason.clear();
+    }
+    if fixed_status.articulation.state == "skipped" {
+        fixed_status.articulation.reason.clear();
+    }
+    if fixed_status.slack.state == "skipped" {
+        fixed_status.slack.reason.clear();
+    }
+    payload["status"] = fixed_status.to_json_map();
 
     // Go GenerateInsights(limit=50): value desc, ID asc tiebreak.
     const INSIGHTS_LIMIT: usize = 50;
@@ -2919,7 +2957,7 @@ fn run_robot_priority(args: &[String]) -> ExitCode {
         issues: &issues,
         pagerank: &pr_map,
         betweenness: &bw_map,
-        critical_path: &cp_map,
+        critical_path: Some(&cp_map),
         g: &g,
         now,
     };
