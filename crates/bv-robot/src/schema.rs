@@ -233,7 +233,7 @@ fn capacity_bottleneck_schema() -> Value {
             "blocks_count": s("integer"),
             "blocks": string_array(),
         },
-        "required": ["id", "blocks_count"],
+        "required": ["id", "title", "blocks_count"],
     })
 }
 
@@ -891,6 +891,53 @@ fn forecast_schema() -> Value {
     })
 }
 
+/// Go `robotCapabilitiesSchema` — machine-readable command manifest.
+fn capabilities_schema() -> Value {
+    json!({
+        "$schema": DRAFT,
+        "title": "Robot Capabilities Output",
+        "description": "Machine-readable command manifest for agent command discovery.",
+        "type": "object",
+        "properties": {
+            "agent_intent_aliases": {"type": "array"},
+            "commands": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "properties": {
+                        "accepted_invocations": {"type": "array", "items": {"type": "string"}},
+                        "description": s("string"),
+                        "flag": s("string"),
+                        "key_fields": {"type": "array", "items": {"type": "string"}},
+                        "mutates_state": {"type": "boolean"},
+                        "name": s("string"),
+                        "needs_baseline": {"type": "boolean"},
+                        "needs_git": {"type": "boolean"},
+                        "needs_issues": {"type": "boolean"},
+                        "needs_sprint": {"type": "boolean"},
+                        "params": {"type": "array", "items": {"type": "string"}},
+                        "preferred_invocation": s("string"),
+                    },
+                    "required": ["name", "flag", "description", "preferred_invocation", "accepted_invocations", "needs_issues", "needs_git", "needs_sprint", "needs_baseline", "mutates_state"],
+                },
+            },
+            "contract_version": s("string"),
+            "default_robot_command": s("string"),
+            "docs_topics": {"type": "array", "items": {"type": "string"}},
+            "environment_variables": {"type": "object", "additionalProperties": {"type": "string"}},
+            "exit_codes": {"type": "object", "additionalProperties": {"type": "string"}},
+            "generated_at": {"type": "string", "format": "date-time"},
+            "output_formats": {"type": "array", "items": {"type": "string"}},
+            "schema_command": s("string"),
+            "stream_contract": {"type": "object", "additionalProperties": {"type": "string"}},
+            "tool": s("string"),
+            "version": s("string"),
+        },
+        "required": ["generated_at", "tool", "version", "contract_version", "commands", "environment_variables", "exit_codes"],
+    })
+}
+
 /// Recursively sort all Map keys in a Value tree for deterministic JSON output
 /// matching Go's `json.Marshal` which sorts map keys alphabetically.
 fn sort_keys(v: Value) -> Value {
@@ -931,6 +978,7 @@ pub fn generate_robot_schemas(now: &str) -> Value {
         ("robot-sprint-list", sprint_list_schema()),
         ("robot-sprint-show", sprint_show_schema()),
         ("robot-capacity", capacity_schema()),
+        ("robot-capabilities", capabilities_schema()),
         ("robot-burndown", burndown_schema()),
         ("robot-forecast", forecast_schema()),
         ("robot-blocker-chain", blocker_chain_schema()),
