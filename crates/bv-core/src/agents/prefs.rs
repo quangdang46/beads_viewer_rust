@@ -36,8 +36,7 @@ pub fn get_prefs_dir() -> Result<std::path::PathBuf, String> {
 /// Generate a project hash from work directory (SHA256 truncated to 16 hex).
 pub fn project_hash(work_dir: &std::path::Path) -> Result<String, String> {
     use sha2::{Digest, Sha256};
-    let abs = std::fs::canonicalize(work_dir)
-        .map_err(|e| format!("cannot resolve path: {e}"))?;
+    let abs = std::fs::canonicalize(work_dir).map_err(|e| format!("cannot resolve path: {e}"))?;
     let mut hasher = Sha256::new();
     hasher.update(abs.to_string_lossy().as_bytes());
     let hash = hasher.finalize();

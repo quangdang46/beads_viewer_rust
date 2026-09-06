@@ -3,7 +3,7 @@
 //! Detects AGENTS.md/CLAUDE.md in the current directory or parent directories,
 //! and checks for existing blurb content.
 
-use super::{SUPPORTED_AGENT_FILES, contains_any_blurb, contains_legacy_blurb, get_blurb_version};
+use super::{contains_any_blurb, contains_legacy_blurb, get_blurb_version, SUPPORTED_AGENT_FILES};
 
 /// Detection result for an agent configuration file.
 #[derive(Debug, Default)]
@@ -55,7 +55,10 @@ pub fn detect_agent_file(work_dir: &std::path::Path) -> AgentFileDetection {
 }
 
 /// Detect agent file walking up parent directories (max 3 levels).
-pub fn detect_agent_file_in_parents(work_dir: &std::path::Path, max_levels: usize) -> AgentFileDetection {
+pub fn detect_agent_file_in_parents(
+    work_dir: &std::path::Path,
+    max_levels: usize,
+) -> AgentFileDetection {
     let mut current_dir = work_dir.to_path_buf();
     for _ in 0..=max_levels {
         let detection = detect_agent_file(&current_dir);
@@ -115,7 +118,7 @@ mod tests {
         let tmp = std::env::temp_dir().join("bvr_test_agents_blurb");
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
-        let content = format!("# Project\n\n{}\nsome content\n{}", super::BLURB_START_MARKER, super::BLURB_END_MARKER);
+        let content = "# Project\n\n<!-- bv-agent-instructions-v3 -->\nsome content\n<!-- end-bv-agent-instructions -->";
         fs::write(tmp.join("AGENTS.md"), content).unwrap();
         let detection = detect_agent_file(&tmp);
         assert!(detection.found());

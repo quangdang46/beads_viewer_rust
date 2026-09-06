@@ -13,12 +13,7 @@ pub const BLURB_VERSION: i32 = 3;
 pub const BLURB_START_MARKER: &str = "<!-- bv-agent-instructions-v3 -->";
 pub const BLURB_END_MARKER: &str = "<!-- end-bv-agent-instructions -->";
 
-pub const SUPPORTED_AGENT_FILES: &[&str] = &[
-    "AGENTS.md",
-    "CLAUDE.md",
-    "agents.md",
-    "claude.md",
-];
+pub const SUPPORTED_AGENT_FILES: &[&str] = &["AGENTS.md", "CLAUDE.md", "agents.md", "claude.md"];
 
 /// The full v3 agent blurb content.
 pub const AGENT_BLURB: &str = r#"<!-- bv-agent-instructions-v3 -->
@@ -144,9 +139,11 @@ pub fn update_blurb(content: &str) -> String {
             cleaned = if after.is_empty() {
                 before
             } else {
-                format!("{before}
+                format!(
+                    "{before}
 
-{after}")
+{after}"
+                )
             };
         }
     }
@@ -173,9 +170,11 @@ pub fn update_blurb(content: &str) -> String {
         cleaned = if after.is_empty() {
             before
         } else {
-            format!("{before}
+            format!(
+                "{before}
 
-{after}")
+{after}"
+            )
         };
     }
 
@@ -183,53 +182,52 @@ pub fn update_blurb(content: &str) -> String {
 }
 
 /// Remove blurb from content (both legacy and current markers).
-/// Order: remove legacy first, then marker-wrapped content.
+/// Order: remove marker-wrapped content first, then any legacy remnant.
 pub fn remove_blurb(content: &str) -> String {
-    let mut result = content.to_string();
+    // Step 1: Remove marker-wrapped content.
+    if let Some(start) = content.find(BLURB_START_MARKER) {
+        if let Some(end) = content[start..].find(BLURB_END_MARKER) {
+            let end_pos = start + end + BLURB_END_MARKER.len();
+            let before = content[..start].trim_end().to_string();
+            let after = if end_pos < content.len() {
+                content[end_pos..].trim_start().to_string()
+            } else {
+                String::new()
+            };
+            let mut result = before;
+            if !after.is_empty() {
+                result.push_str("\n\n");
+                result.push_str(&after);
+            }
+            return result;
+        }
+    }
 
-    // 1. Remove legacy blurb (section between "## Beads Workflow Integration"
-    //    and next ## heading, OR content containing robot- patterns).
-    if let Some(legacy_start) = result.find("## Beads Workflow Integration") {
-        let mut legacy_end = result.len();
+    // Step 2: Remove legacy blurb that's NOT between markers.
+    if let Some(legacy_start) = content.find("## Beads Workflow Integration") {
+        let mut legacy_end = content.len();
         let search_from = legacy_start + 25;
-        for line in result[search_from..].lines() {
+        for line in content[search_from..].lines() {
             if line.starts_with("## ") && !line.starts_with("### ") {
-                if let Some(pos) = result[search_from..].find(line) {
+                if let Some(pos) = content[search_from..].find(line) {
                     legacy_end = search_from + pos;
                 }
                 break;
             }
         }
-        let before = result[..legacy_start].trim_end().to_string();
-        let after = if legacy_end < result.len() {
-            result[legacy_end..].trim_start().to_string()
+        let before = content[..legacy_start].trim_end().to_string();
+        let after = if legacy_end < content.len() {
+            content[legacy_end..].trim_start().to_string()
         } else {
             String::new()
         };
-        result = if after.is_empty() {
-            before
-        } else {
-            format!("{before}\n\n{after}")
-        };
-    }
-
-    // 2. Remove marker-wrapped content.
-    if let Some(start) = result.find(BLURB_START_MARKER) {
-        if let Some(end) = result[start..].find(BLURB_END_MARKER) {
-            let end_pos = start + end + BLURB_END_MARKER.len();
-            let mut cleaned = result[..start].trim_end().to_string();
-            if end_pos < result.len() {
-                let rest = result[end_pos..].trim_start();
-                if !rest.is_empty() {
-                    cleaned.push_str("\n\n");
-                    cleaned.push_str(rest);
-                }
-            }
-            return cleaned;
+        if after.is_empty() {
+            return before;
         }
+        return format!("{before}\n\n{after}");
     }
 
-    result
+    content.to_string()
 }
 
 /// Append blurb to content.

@@ -51,9 +51,9 @@ pub fn pagerank(graph: &DiGraph, config: &PageRankConfig) -> Vec<f64> {
     // by insertion index. Successor lists are sorted by ID too. The push
     // order must match Go's for byte-exact floating-point accumulation.
     let mut node_order: Vec<usize> = (0..n).collect();
-    node_order.sort_by(|&a, &b| a.cmp(&b));
+    node_order.sort();
 
-    let mut successors: Vec<Vec<usize>> = (0..n)
+    let successors: Vec<Vec<usize>> = (0..n)
         .map(|i| {
             let mut succ = graph.successors_slice(i).to_vec();
             succ.sort_unstable();

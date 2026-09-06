@@ -239,7 +239,11 @@ pub fn compute_impact_scores(inputs: &ImpactInputs) -> Vec<IssueImpact> {
         let blocker_norm = normalize(blockers as f64, max_blockers as f64);
         let staleness_norm = compute_staleness(issue.updated_at.as_deref(), &inputs.now);
         let prio_norm = compute_priority_boost(issue.priority);
-        let depth = inputs.critical_path.and_then(|cp| cp.get(&issue.id)).copied().unwrap_or(0.0);
+        let depth = inputs
+            .critical_path
+            .and_then(|cp| cp.get(&issue.id))
+            .copied()
+            .unwrap_or(0.0);
         let tti_norm = compute_time_to_impact(depth, issue.estimated_minutes, median_minutes);
         let urgency_norm = compute_urgency(&issue.labels, issue.created_at.as_deref(), &inputs.now);
         let risk = compute_risk_signals(issue, inputs.g, idx);

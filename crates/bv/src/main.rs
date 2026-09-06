@@ -829,7 +829,8 @@ fn run_robot_triage() -> ExitCode {
                             .map(|b| {
                                 !matches!(
                                     b.status,
-                                    bv_core::model::Status::Closed | bv_core::model::Status::Tombstone
+                                    bv_core::model::Status::Closed
+                                        | bv_core::model::Status::Tombstone
                                 )
                             })
                             .unwrap_or(false)
@@ -976,14 +977,30 @@ fn run_robot_triage() -> ExitCode {
     }
     // Go parity: clear reason on all skipped entries except betweenness.
     let mut triage_status = out.metric_status.clone();
-    if triage_status.page_rank.state == "skipped" { triage_status.page_rank.reason.clear(); }
-    if triage_status.eigenvector.state == "skipped" { triage_status.eigenvector.reason.clear(); }
-    if triage_status.hits.state == "skipped" { triage_status.hits.reason.clear(); }
-    if triage_status.critical.state == "skipped" { triage_status.critical.reason.clear(); }
-    if triage_status.cycles.state == "skipped" { triage_status.cycles.reason.clear(); }
-    if triage_status.kcore.state == "skipped" { triage_status.kcore.reason.clear(); }
-    if triage_status.articulation.state == "skipped" { triage_status.articulation.reason.clear(); }
-    if triage_status.slack.state == "skipped" { triage_status.slack.reason.clear(); }
+    if triage_status.page_rank.state == "skipped" {
+        triage_status.page_rank.reason.clear();
+    }
+    if triage_status.eigenvector.state == "skipped" {
+        triage_status.eigenvector.reason.clear();
+    }
+    if triage_status.hits.state == "skipped" {
+        triage_status.hits.reason.clear();
+    }
+    if triage_status.critical.state == "skipped" {
+        triage_status.critical.reason.clear();
+    }
+    if triage_status.cycles.state == "skipped" {
+        triage_status.cycles.reason.clear();
+    }
+    if triage_status.kcore.state == "skipped" {
+        triage_status.kcore.reason.clear();
+    }
+    if triage_status.articulation.state == "skipped" {
+        triage_status.articulation.reason.clear();
+    }
+    if triage_status.slack.state == "skipped" {
+        triage_status.slack.reason.clear();
+    }
     let mut payload = serde_json::json!({
         "generated_at": env.generated_at,
         "data_hash": env.data_hash,
@@ -1168,7 +1185,9 @@ fn run_agents_commands(presence: &validation::Presence, _args: &[String]) -> Exi
                 "No agent file found (searched up to 3 parent directories from {})",
                 cwd.display()
             );
-            println!("Run 'bvr --agents-add' to create AGENTS.md with beads workflow instructions.");
+            println!(
+                "Run 'bvr --agents-add' to create AGENTS.md with beads workflow instructions."
+            );
             return ExitCode::from(0);
         }
         if detection.has_legacy_blurb {
@@ -1179,9 +1198,7 @@ fn run_agents_commands(presence: &validation::Presence, _args: &[String]) -> Exi
             println!("Run 'bvr --agents-update' to upgrade to the current format.");
             return ExitCode::from(0);
         }
-        if detection.has_blurb
-            && detection.blurb_version < bv_core::agents::BLURB_VERSION
-        {
+        if detection.has_blurb && detection.blurb_version < bv_core::agents::BLURB_VERSION {
             println!(
                 "Found {} at {} (blurb v{}, current v{} — needs update)",
                 detection.file_type,
@@ -1218,8 +1235,10 @@ fn run_agents_commands(presence: &validation::Presence, _args: &[String]) -> Exi
             );
             return ExitCode::from(0);
         }
-        if detection.found() && (detection.has_legacy_blurb
-            || (detection.has_blurb && detection.blurb_version < bv_core::agents::BLURB_VERSION))
+        if detection.found()
+            && (detection.has_legacy_blurb
+                || (detection.has_blurb
+                    && detection.blurb_version < bv_core::agents::BLURB_VERSION))
         {
             println!("Existing blurb found but outdated. Use --agents-update instead.");
             return ExitCode::from(1);
@@ -1262,13 +1281,9 @@ fn run_agents_commands(presence: &validation::Presence, _args: &[String]) -> Exi
         }
 
         let result = if creating {
-            bv_core::agents::file::create_agent_file(
-                std::path::Path::new(&target_path),
-            )
+            bv_core::agents::file::create_agent_file(std::path::Path::new(&target_path))
         } else {
-            bv_core::agents::file::append_blurb_to_file(
-                std::path::Path::new(&target_path),
-            )
+            bv_core::agents::file::append_blurb_to_file(std::path::Path::new(&target_path))
         };
 
         if let Err(e) = result {
@@ -1283,10 +1298,9 @@ fn run_agents_commands(presence: &validation::Presence, _args: &[String]) -> Exi
         };
         println!("{msg}");
 
-        let verified = bv_core::agents::file::verify_blurb_present(
-            std::path::Path::new(&target_path),
-        )
-        .unwrap_or(false);
+        let verified =
+            bv_core::agents::file::verify_blurb_present(std::path::Path::new(&target_path))
+                .unwrap_or(false);
         if !verified {
             eprintln!("Warning: verification failed — blurb may not have been written correctly.");
             return ExitCode::from(1);
@@ -1306,9 +1320,7 @@ fn run_agents_commands(presence: &validation::Presence, _args: &[String]) -> Exi
             );
             return ExitCode::from(1);
         }
-        if detection.has_blurb
-            && detection.blurb_version >= bv_core::agents::BLURB_VERSION
-        {
+        if detection.has_blurb && detection.blurb_version >= bv_core::agents::BLURB_VERSION {
             println!(
                 "{} already has current blurb (v{}) — no update needed.",
                 detection.file_path, detection.blurb_version
@@ -1320,12 +1332,15 @@ fn run_agents_commands(presence: &validation::Presence, _args: &[String]) -> Exi
             if detection.has_legacy_blurb {
                 println!(
                     "[dry-run] Would upgrade legacy blurb to v{} in {}.",
-                    bv_core::agents::BLURB_VERSION, detection.file_path
+                    bv_core::agents::BLURB_VERSION,
+                    detection.file_path
                 );
             } else {
                 println!(
                     "[dry-run] Would update blurb from v{} to v{} in {}.",
-                    detection.blurb_version, bv_core::agents::BLURB_VERSION, detection.file_path
+                    detection.blurb_version,
+                    bv_core::agents::BLURB_VERSION,
+                    detection.file_path
                 );
             }
             return ExitCode::from(0);
@@ -1352,13 +1367,13 @@ fn run_agents_commands(presence: &validation::Presence, _args: &[String]) -> Exi
         }
         println!(
             "Updated blurb to v{} in {}.",
-            bv_core::agents::BLURB_VERSION, detection.file_path
+            bv_core::agents::BLURB_VERSION,
+            detection.file_path
         );
 
-        let verified = bv_core::agents::file::verify_blurb_present(
-            std::path::Path::new(&detection.file_path),
-        )
-        .unwrap_or(false);
+        let verified =
+            bv_core::agents::file::verify_blurb_present(std::path::Path::new(&detection.file_path))
+                .unwrap_or(false);
         if !verified {
             eprintln!("Warning: verification failed — blurb may not have been written correctly.");
             return ExitCode::from(1);
@@ -1377,10 +1392,7 @@ fn run_agents_commands(presence: &validation::Presence, _args: &[String]) -> Exi
         }
 
         if dry_run {
-            println!(
-                "[dry-run] Would remove blurb from {}.",
-                detection.file_path
-            );
+            println!("[dry-run] Would remove blurb from {}.", detection.file_path);
             return ExitCode::from(0);
         }
 
@@ -1397,13 +1409,16 @@ fn run_agents_commands(presence: &validation::Presence, _args: &[String]) -> Exi
             }
         }
 
-        if let Err(e) = bv_core::agents::file::remove_blurb_from_file(
-            std::path::Path::new(&detection.file_path),
-        ) {
+        if let Err(e) = bv_core::agents::file::remove_blurb_from_file(std::path::Path::new(
+            &detection.file_path,
+        )) {
             eprintln!("Error: {e}");
             return ExitCode::from(1);
         }
-        println!("Removed beads workflow instructions from {}.", detection.file_path);
+        println!(
+            "Removed beads workflow instructions from {}.",
+            detection.file_path
+        );
         return ExitCode::from(0);
     }
 
@@ -3325,14 +3340,30 @@ fn run_robot_priority(args: &[String]) -> ExitCode {
     // Real status from phase2 analysis (Go priority uses full config).
     let priority_status = {
         let mut s = status.clone();
-        if s.page_rank.state == "skipped" { s.page_rank.reason.clear(); }
-        if s.eigenvector.state == "skipped" { s.eigenvector.reason.clear(); }
-        if s.hits.state == "skipped" { s.hits.reason.clear(); }
-        if s.critical.state == "skipped" { s.critical.reason.clear(); }
-        if s.cycles.state == "skipped" { s.cycles.reason.clear(); }
-        if s.kcore.state == "skipped" { s.kcore.reason.clear(); }
-        if s.articulation.state == "skipped" { s.articulation.reason.clear(); }
-        if s.slack.state == "skipped" { s.slack.reason.clear(); }
+        if s.page_rank.state == "skipped" {
+            s.page_rank.reason.clear();
+        }
+        if s.eigenvector.state == "skipped" {
+            s.eigenvector.reason.clear();
+        }
+        if s.hits.state == "skipped" {
+            s.hits.reason.clear();
+        }
+        if s.critical.state == "skipped" {
+            s.critical.reason.clear();
+        }
+        if s.cycles.state == "skipped" {
+            s.cycles.reason.clear();
+        }
+        if s.kcore.state == "skipped" {
+            s.kcore.reason.clear();
+        }
+        if s.articulation.state == "skipped" {
+            s.articulation.reason.clear();
+        }
+        if s.slack.state == "skipped" {
+            s.slack.reason.clear();
+        }
         s.to_json_map()
     };
     payload["status"] = priority_status;
