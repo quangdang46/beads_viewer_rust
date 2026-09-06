@@ -267,32 +267,102 @@ pub fn compute_impact_scores(inputs: &ImpactInputs) -> Vec<IssueImpact> {
             + b.urgency
             + b.risk;
 
-        // Generate human-readable reasons from score breakdown (Go parity).
+        // Generate human-readable reasons with emoji prefixes (Go parity:
+        // GenerateTriageReasons in triage.go).  The emoji + phrasing must
+        // match Go byte-for-byte so golden diffs converge.
         let mut reasons = Vec::new();
-        if b.pagerank > 0.01 {
-            reasons.push(format!("High graph centrality ({:.2})", b.pagerank));
-        }
-        if b.betweenness > 0.01 {
-            reasons.push(format!("Key bottleneck node ({:.2})", b.betweenness));
-        }
-        if b.blocker_ratio > 0.0 {
+
+        // 1. Unblock cascade (highest priority — most actionable).
+        //    Edge direction: u -> v means u depends on v (v blocks u).
+        //    So in_degree(v) = how many issues are blocked by v = unblocks count.
+        let unblocks = if idx == usize::MAX {
+            0usize
+        } else {
+            inputs.g.in_degree(idx)
+        };
+        // Collect IDs of issues that this one unblocks (for the list suffix).
+        // predecessors_slice returns nodes that have edges TO this node,
+        // i.e., issues whose blocking dependency is this one.
+        let unblocked_ids: Vec<String> = if idx != usize::MAX {
+            inputs
+                .g
+                .predecessors_slice(idx)
+                .iter()
+                .filter_map(|&n| inputs.g.node_id(n).map(|s| s.to_string()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if unblocks >= 3 {
+            let list = if unblocked_ids.len() <= 3 {
+                unblocked_ids.join(", ")
+            } else {
+                format!(
+                    "{}, {}, +{} more",
+                    unblocked_ids[0],
+                    unblocked_ids[1],
+                    unblocked_ids.len() - 2
+                )
+            };
             reasons.push(format!(
-                "Blocks {:.0}% of downstream work",
-                b.blocker_ratio * 100.0
+                "🎯 Completing this unblocks {unblocks} downstream issues ({list})"
+            ));
+        } else if unblocks > 0 {
+            let list = unblocked_ids.join(", ");
+            reasons.push(format!("🔓 Unblocks {unblocks} item(s): {list}"));
+        }
+
+        // 2. Graph metrics (bottleneck / centrality).
+        if bw_norm > 0.5 {
+            reasons.push(format!(
+                "🔀 Critical path bottleneck (betweenness: {:.0}%)",
+                bw_norm * 100.0
             ));
         }
-        if b.staleness > 0.05 {
-            reasons.push(format!("Stale for {:.0} days", b.staleness * 100.0));
+        if pr_norm > 0.3 {
+            reasons.push(format!(
+                "📊 High centrality in dependency graph (PageRank: {:.0}%)",
+                pr_norm * 100.0
+            ));
         }
-        if b.time_to_impact > 0.02 {
-            reasons.push(format!("High time-to-impact ({:.2})", b.time_to_impact));
+
+        // 3. Staleness alert — compute actual days from updated_at (Go parity).
+        //    Use seconds to avoid jiff Unit::Day quirks, then divide.
+        let days_stale = if let Some(raw) = issue.updated_at.as_deref() {
+            match raw.parse::<jiff::Timestamp>() {
+                Ok(t) => {
+                    let secs = (inputs.now - t)
+                        .total(jiff::Unit::Second)
+                        .unwrap_or(0.0);
+                    (secs / 86400.0) as i64
+                }
+                Err(_) => 0,
+            }
+        } else {
+            0
+        };
+        if days_stale > 14 {
+            reasons.push(format!(
+                "🕐 No activity in {days_stale} days - may need review"
+            ));
+        } else if days_stale > 7 {
+            reasons.push(format!("📅 Last updated {days_stale} days ago"));
         }
-        if b.urgency > 0.01 {
-            reasons.push(format!("Urgent ({:.2})", b.urgency));
+
+        // 4. Quick-win identification (unblock impact + not heavily blocked).
+        //    Go parity: QuickWinBoost > 0.05 in triage factors.
+        //    Simplified: unblocks > 0 and priority is high enough.
+        if unblocks > 0 && prio_norm >= 0.5 {
+            reasons.push("⚡ Low effort, high impact - good starting point".to_string());
         }
-        if b.risk > 0.01 {
-            reasons.push(format!("Elevated risk ({:.2})", b.risk));
+
+        // 5. Claim status — open and unassigned (Go parity: isOpenStatus guard).
+        //    Go shows "Currently unclaimed" for all open unassigned items
+        //    in the robot-next actionable set.
+        if issue.status.is_open() && issue.assignee.is_empty() {
+            reasons.push("✅ Currently unclaimed - available for work".to_string());
         }
+
         if reasons.is_empty() {
             reasons.push("Open and actionable".to_string());
         }

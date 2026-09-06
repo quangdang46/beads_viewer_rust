@@ -875,19 +875,72 @@ fn run_robot_triage() -> ExitCode {
         })
         .collect();
 
-    // Build quick_wins: low-effort high-impact (Go parity: open, priority<=2, low blocker_ratio).
-    let quick_wins: Vec<serde_json::Value> = out
-        .recommendations
-        .iter()
-        .filter(|r| r.status == "open" && r.priority <= 2 && r.breakdown.blocker_ratio < 0.1)
-        .take(5)
-        .map(|r| {
-            serde_json::json!({
-                "id": r.id, "title": r.title, "score": r.score,
-                "reason": format!("High priority (P{}) with minimal staleness", r.priority),
+    // Build quick_wins: low-effort high-impact (Go parity: buildQuickWins).
+    // Go formula: (log2(unblocks+1)*0.4 + simplicity*0.4 + priorityBonus*0.2)
+    // Sorted by quickWinScore desc, then ID asc.
+    let quick_wins: Vec<serde_json::Value> = {
+        let mut candidates: Vec<_> = out
+            .recommendations
+            .iter()
+            .filter(|r| r.status == "open")
+            .map(|r| {
+                let unblocks_count = issues
+                    .iter()
+                    .filter(|o| {
+                        o.dependencies
+                            .iter()
+                            .any(|d| d.r#type.is_blocking() && d.effective_depends_on() == r.id)
+                    })
+                    .count();
+                let unblocks_ids: Vec<String> = issues
+                    .iter()
+                    .filter(|o| {
+                        o.dependencies
+                            .iter()
+                            .any(|d| d.r#type.is_blocking() && d.effective_depends_on() == r.id)
+                    })
+                    .map(|o| o.id.clone())
+                    .collect();
+                let unblock_impact =
+                    ((unblocks_count as f64) + 1.0).log2();
+                let simplicity = if r.breakdown.blocker_ratio < 0.2 {
+                    1.0
+                } else if r.breakdown.blocker_ratio < 0.4 {
+                    0.5
+                } else {
+                    0.0
+                };
+                let priority_bonus = if r.priority <= 1 { 0.5 } else { 0.0 };
+                let qw_score =
+                    unblock_impact * 0.4 + simplicity * 0.4 + priority_bonus * 0.2;
+                // Build reason (Go parity: buildQuickWins reason logic).
+                let mut reason = "Low complexity".to_string();
+                if unblocks_count > 0 {
+                    reason = format!("Unblocks {unblocks_count} items");
+                }
+                if r.priority <= 1 {
+                    reason.push_str(", high priority");
+                }
+                (qw_score, r, unblocks_ids, reason)
             })
-        })
-        .collect();
+            .collect();
+        candidates.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.1.id.cmp(&b.1.id))
+        });
+        candidates
+            .into_iter()
+            .take(5)
+            .map(|(_, r, unblocks_ids, reason)| {
+                serde_json::json!({
+                    "id": r.id, "title": r.title, "score": r.score,
+                    "reason": reason,
+                    "unblocks_ids": unblocks_ids,
+                })
+            })
+            .collect()
+    };
 
     // Build blockers_to_clear: high betweenness blocking issues.
     let blockers_to_clear: Vec<serde_json::Value> = out
