@@ -2946,13 +2946,9 @@ fn run_robot_priority(args: &[String]) -> ExitCode {
         .and_then(|i| args.get(i + 1))
         .cloned();
 
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let (mut issues, _, _as_of_commit) = match load_issues_auto(&cwd, None) {
+    let (mut issues, hash, _p1, status, g) = match load_and_analyze() {
         Ok(x) => x,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            return ExitCode::from(1);
-        }
+        Err(code) => return code,
     };
     if let Some(label) = &by_label {
         issues.retain(|i| i.labels.iter().any(|l| l == label));
@@ -3041,7 +3037,20 @@ fn run_robot_priority(args: &[String]) -> ExitCode {
 
     let mut payload = envelope_json(&hash);
     payload["analysis_config"] = priority_analysis_config(g.len());
-    payload["status"] = plan_priority_status(&g);
+    // Real status from phase2 analysis (Go priority uses full config).
+    let priority_status = {
+        let mut s = status.clone();
+        if s.page_rank.state == "skipped" { s.page_rank.reason.clear(); }
+        if s.eigenvector.state == "skipped" { s.eigenvector.reason.clear(); }
+        if s.hits.state == "skipped" { s.hits.reason.clear(); }
+        if s.critical.state == "skipped" { s.critical.reason.clear(); }
+        if s.cycles.state == "skipped" { s.cycles.reason.clear(); }
+        if s.kcore.state == "skipped" { s.kcore.reason.clear(); }
+        if s.articulation.state == "skipped" { s.articulation.reason.clear(); }
+        if s.slack.state == "skipped" { s.slack.reason.clear(); }
+        s.to_json_map()
+    };
+    payload["status"] = priority_status;
     payload["recommendations"] = serde_json::Value::Array(recommendations.clone());
     payload["field_descriptions"] = serde_json::json!({
         "status.capped": "Whether results were truncated to prevent overload",
