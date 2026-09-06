@@ -579,13 +579,19 @@ impl App {
         use crossterm::event::{MouseButton, MouseEventKind};
         match mouse.kind {
             MouseEventKind::ScrollDown => {
-                if self.cursor + 1 < self.filtered_indices.len() {
+                if self.focus_detail {
+                    self.detail_scroll = self.detail_scroll.saturating_add(1);
+                } else if self.cursor + 1 < self.filtered_indices.len() {
                     self.cursor += 1;
                 }
                 true
             }
             MouseEventKind::ScrollUp => {
-                self.cursor = self.cursor.saturating_sub(1);
+                if self.focus_detail {
+                    self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                } else {
+                    self.cursor = self.cursor.saturating_sub(1);
+                }
                 true
             }
             MouseEventKind::Down(MouseButton::Left) => {
@@ -854,6 +860,11 @@ impl App {
             }
             KeyCode::Enter => {
                 self.show_detail = !self.show_detail;
+                // When opening detail panel, auto-focus it so j/k scroll
+                // the detail content immediately (UX parity with Go bv).
+                if self.show_detail {
+                    self.focus_detail = true;
+                }
                 true
             }
             KeyCode::Char('x') => {
