@@ -356,11 +356,56 @@ pub fn compute_impact_scores(inputs: &ImpactInputs) -> Vec<IssueImpact> {
             reasons.push("⚡ Low effort, high impact - good starting point".to_string());
         }
 
-        // 5. Claim status — open and unassigned (Go parity: isOpenStatus guard).
+        // 5b. Blocked-by reason (Go parity: BlockedByIDs in triage reasons).
+        //     Only for issues that have open blockers (status != open or
+        //     has blocking dependencies).
+        if blockers > 0 && !issue.status.is_open() {
+            // Collect open blocker IDs from the issue's dependencies.
+            let blocker_ids: Vec<String> = issue
+                .dependencies
+                .iter()
+                .filter(|d| d.r#type.is_blocking())
+                .filter_map(|d| {
+                    let bid = d.effective_depends_on();
+                    if bid.is_empty() {
+                        return None;
+                    }
+                    // Check if blocker is still open (not closed/tombstone).
+                    inputs.issues.iter().find(|i| i.id == bid).and_then(|bi| {
+                        if matches!(bi.status, Status::Closed | Status::Tombstone) {
+                            None
+                        } else {
+                            Some(bid.to_string())
+                        }
+                    })
+                })
+                .collect();
+            if blocker_ids.len() == 1 {
+                reasons.push(format!(
+                    "⏳ Blocked by {} - complete that first",
+                    blocker_ids[0]
+                ));
+            } else if blocker_ids.len() > 1 {
+                reasons.push(format!(
+                    "⏳ Blocked by {} items - need to clear dependencies",
+                    blocker_ids.len()
+                ));
+            }
+        }
+
+        // 5. Claim status — Go parity: isOpenStatus guard.
         //    Go shows "Currently unclaimed" for all open unassigned items
         //    in the robot-next actionable set.
         if issue.status.is_open() && issue.assignee.is_empty() {
             reasons.push("✅ Currently unclaimed - available for work".to_string());
+        }
+
+        // 6. Urgency label signal — Go parity: Priority <= 1 (P0/P1 only).
+        if issue.priority <= 1 {
+            let prio_label = format!("P{}", issue.priority);
+            reasons.push(format!(
+                "🚨 High priority ({prio_label}) - prioritize this work"
+            ));
         }
 
         if reasons.is_empty() {
