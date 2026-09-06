@@ -798,10 +798,41 @@ fn run_robot_triage() -> ExitCode {
     let g = std::sync::Arc::new(bv_analysis::analyzer::build_graph(&issues));
     let out = bv_analysis::triage::build_triage(&issues, &g, robot_now());
 
-    // Build top_picks from top recommendations (Go parity).
+    // Build top_picks: Go `buildTopPicks` — only claimable recommendations
+    // (open, not epic, unassigned, no open blockers, not a parent with open
+    // children). Use original issue data for assignee/blocker checks.
+    let issue_by_id: std::collections::HashMap<&str, &bv_core::model::Issue> =
+        issues.iter().map(|i| (i.id.as_str(), i)).collect();
     let top_picks: Vec<serde_json::Value> = out
         .recommendations
         .iter()
+        .filter(|r| {
+            if r.status != "open" || r.issue_type == "epic" {
+                return false;
+            }
+            if let Some(issue) = issue_by_id.get(r.id.as_str()) {
+                if !issue.assignee.trim().is_empty() {
+                    return false;
+                }
+                // Check for open blockers
+                let has_open_blockers = issue.dependencies.iter().any(|dep| {
+                    dep.r#type.is_blocking()
+                        && issue_by_id
+                            .get(dep.effective_depends_on())
+                            .map(|b| {
+                                !matches!(
+                                    b.status,
+                                    bv_core::model::Status::Closed | bv_core::model::Status::Tombstone
+                                )
+                            })
+                            .unwrap_or(false)
+                });
+                if has_open_blockers {
+                    return false;
+                }
+            }
+            true
+        })
         .take(5)
         .map(|r| {
             let unblocks: usize = issues
