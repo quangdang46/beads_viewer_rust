@@ -654,8 +654,6 @@ fn run_robot_next() -> ExitCode {
 
     let g = std::sync::Arc::new(bv_analysis::analyzer::build_graph(&issues));
     let out = bv_analysis::triage::build_triage(&issues, &g, robot_now());
-    payload["phase2_ready"] = serde_json::json!(true);
-    payload["status"] = out.metric_status.to_json_map();
 
     // Claimability filter (Go robotNextClaimabilityReasons): the pick must
     // be open, non-epic, unassigned, and free of open blockers.
@@ -713,7 +711,6 @@ fn run_robot_next() -> ExitCode {
     let picks: Vec<serde_json::Value> = out
         .recommendations
         .iter()
-        .take(5)
         .map(|r| {
             let unblocks: usize = issues
                 .iter()
@@ -745,9 +742,24 @@ fn run_robot_next() -> ExitCode {
         }
     }
 
+    // Clear skipped reasons for Go omitempty parity (only "approximate" kept).
+    let cleared_status = {
+        let mut s = out.metric_status.clone();
+        if s.page_rank.state == "skipped" { s.page_rank.reason.clear(); }
+        if s.eigenvector.state == "skipped" { s.eigenvector.reason.clear(); }
+        if s.hits.state == "skipped" { s.hits.reason.clear(); }
+        if s.critical.state == "skipped" { s.critical.reason.clear(); }
+        if s.cycles.state == "skipped" { s.cycles.reason.clear(); }
+        if s.kcore.state == "skipped" { s.kcore.reason.clear(); }
+        if s.articulation.state == "skipped" { s.articulation.reason.clear(); }
+        if s.slack.state == "skipped" { s.slack.reason.clear(); }
+        s.to_json_map()
+    };
     match chosen {
         Some(top) => {
             payload["actionable"] = serde_json::json!(true);
+            payload["phase2_ready"] = serde_json::json!(true);
+            payload["status"] = cleared_status.clone();
             payload["id"] = top["id"].clone();
             payload["title"] = top["title"].clone();
             payload["score"] = top["score"].clone();
@@ -760,6 +772,8 @@ fn run_robot_next() -> ExitCode {
         }
         None => {
             payload["actionable"] = serde_json::json!(false);
+            payload["phase2_ready"] = serde_json::json!(true);
+            payload["status"] = cleared_status;
             payload["message"] = serde_json::json!(
                 "No claim command emitted because the top recommendation was not claim-safe"
             );
