@@ -4437,7 +4437,10 @@ fn run_robot_label_attention() -> ExitCode {
         bv_analysis::label_health::compute_label_attention_scores(&issues, &cfg, robot_now());
     let mut payload = envelope_json(&hash);
     // Go: limit comes from --attention-limit flag (default 0 = no limit).
-    payload["limit"] = serde_json::json!(0);
+    // Go: if limit flag is 0 (default), limit = len(scores). JSON shows
+    // the EFFECTIVE limit, not the raw flag value.
+    let effective_limit = result.labels.len();
+    payload["limit"] = serde_json::json!(effective_limit);
     payload["total_labels"] = serde_json::json!(result.total_labels);
     // Go builds labels from a separate struct with specific field order:
     // rank, label, attention_score, normalized_score, reason, open_count,

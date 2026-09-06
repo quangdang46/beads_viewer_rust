@@ -109,11 +109,11 @@ fn canonical(v: &Value) -> String {
 }
 
 /// Ratchet baseline: number of content divergences at gate introduction
-/// (2026-09-05: 65 of 65 comparable cases diverge; 10 goldens are empty
-/// captures and skipped). Lower as parity lands; the test fails if
-/// divergences exceed this count, locking in progress and preventing
-/// regressions.
-const GOLDEN_GATE_BASELINE_FAILS: usize = 65;
+/// (2026-09-06: 47 remaining; 13 selfrepo stale data_hash, 20 schema
+/// incomplete, 14 triage/next/priority/suggest algorithmic, 4 insights
+/// approx, 4 freshness timing, 4 attention precision, 1 alert timing).
+/// Lower as parity lands; the test fails if divergences exceed this count.
+const GOLDEN_GATE_BASELINE_FAILS: usize = 47;
 
 #[test]
 fn rust_output_matches_frozen_go_goldens() {
