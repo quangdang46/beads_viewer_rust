@@ -104,8 +104,24 @@ fn normalize(v: &Value) -> Value {
     }
 }
 
+fn sort_keys_recursive(v: &Value) -> Value {
+    match v {
+        Value::Object(map) => {
+            let mut sorted = serde_json::Map::new();
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            for k in keys {
+                sorted.insert(k.clone(), sort_keys_recursive(&map[k]));
+            }
+            Value::Object(sorted)
+        }
+        Value::Array(arr) => Value::Array(arr.iter().map(sort_keys_recursive).collect()),
+        other => other.clone(),
+    }
+}
+
 fn canonical(v: &Value) -> String {
-    serde_json::to_string(&normalize(v)).expect("json serialize")
+    serde_json::to_string(&sort_keys_recursive(&normalize(v))).expect("json serialize")
 }
 
 /// Ratchet baseline: number of content divergences at gate introduction
