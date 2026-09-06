@@ -3211,8 +3211,8 @@ fn run_robot_plan() -> ExitCode {
     for (_root, members) in &components {
         let mut actionable_members: Vec<&bv_core::model::Issue> = members
             .iter()
-            .filter(|&id| actionable_set
-                    .contains(id.as_str())).map(|id| by_id[id.as_str()])
+            .filter(|&id| actionable_set.contains(id.as_str()))
+            .map(|id| by_id[id.as_str()])
             .collect();
         if actionable_members.is_empty() {
             continue;

@@ -7,6 +7,18 @@ use bv_graph_core::DiGraph;
 use serde::Serialize;
 use std::collections::BTreeMap;
 
+// === Triage scoring weights (Go triage.go:1203-1208) — DO NOT ALTER ===
+/// Base score weight applied to the impact score.
+pub const TRIAGE_BASE_WEIGHT: f64 = 0.70;
+/// Maximum boost for unblock count.
+pub const TRIAGE_UNBLOCK_BOOST: f64 = 0.15;
+/// Maximum boost for quick-win potential.
+pub const TRIAGE_QUICKWIN_BOOST: f64 = 0.15;
+/// Minimum unblocks required for full unblock boost (normalization floor).
+pub const TRIAGE_UNBLOCK_THRESHOLD: usize = 5;
+/// Maximum blocker depth eligible for quick-win boost.
+pub const TRIAGE_QUICKWIN_MAX_DEPTH: usize = 2;
+
 /// Strict count semantics from #165.
 #[derive(Debug, Default, Serialize)]
 pub struct QuickRef {
@@ -344,7 +356,88 @@ pub fn build_triage(issues: &[Issue], g: &DiGraph, now: jiff::Timestamp) -> Tria
         g,
         now,
     };
-    let recommendations = compute_impact_scores(&inputs);
+    let mut recommendations = compute_impact_scores(&inputs);
+
+    // === Go triage scoring (triage.go:1267-1311) ===
+    // triageScore = baseScore * 0.70 + unblockBoost + quickwinBoost
+    // This transforms raw impact scores into triage-prioritized scores.
+
+    // 1. Compute unblock counts: how many open issues each issue unblocks.
+    let mut unblock_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for issue in issues {
+        if !issue.status.is_open() {
+            continue;
+        }
+        for dep in &issue.dependencies {
+            if !dep.r#type.is_blocking() {
+                continue;
+            }
+            let blocker_id = dep.effective_depends_on();
+            if !blocker_id.is_empty() {
+                *unblock_counts.entry(blocker_id.to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+    let max_unblocks = unblock_counts.values().copied().max().unwrap_or(0);
+
+    // 2. Compute blocker depths: how many open blocking deps each issue has.
+    let mut blocker_depths: BTreeMap<String, usize> = BTreeMap::new();
+    for issue in issues {
+        if !issue.status.is_open() {
+            continue;
+        }
+        let depth = issue
+            .dependencies
+            .iter()
+            .filter(|d| d.r#type.is_blocking())
+            .filter(|d| {
+                let bid = d.effective_depends_on();
+                if bid.is_empty() {
+                    return false;
+                }
+                // Count only open blockers
+                issues.iter().any(|i| i.id == bid && i.status.is_open())
+            })
+            .count();
+        blocker_depths.insert(issue.id.clone(), depth);
+    }
+
+    // 3. Apply triage scoring to each recommendation.
+    for rec in &mut recommendations {
+        let unblocks = *unblock_counts.get(&rec.id).unwrap_or(&0);
+        let blocker_depth = *blocker_depths.get(&rec.id).unwrap_or(&0);
+        let base_score = rec.score;
+
+        // Unblock boost: normalized unblocks * weight
+        let unblock_boost = if unblocks > 0 {
+            let norm = unblocks as f64 / (max_unblocks.max(TRIAGE_UNBLOCK_THRESHOLD) as f64);
+            norm.min(1.0) * TRIAGE_UNBLOCK_BOOST
+        } else {
+            0.0
+        };
+
+        // Quick-win boost: depth-based factor * base score * weight
+        let quickwin_boost = if rec.status != Status::InProgress.as_str()
+            && blocker_depth <= TRIAGE_QUICKWIN_MAX_DEPTH
+        {
+            let depth_factor =
+                1.0 - blocker_depth as f64 / (TRIAGE_QUICKWIN_MAX_DEPTH as f64 + 1.0);
+            (depth_factor * base_score * TRIAGE_QUICKWIN_BOOST).min(TRIAGE_QUICKWIN_BOOST)
+        } else {
+            0.0
+        };
+
+        rec.score = base_score * TRIAGE_BASE_WEIGHT + unblock_boost + quickwin_boost;
+    }
+
+    // Re-sort by triage score descending, ID ascending (Go tie-break).
+    recommendations.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.id.cmp(&b.id))
+    });
+
     let blocked_set = compute_blocked_set(issues);
     let (counts, quick_ref) = compute_counts(issues, &blocked_set);
     let velocity = compute_project_velocity(issues, now);

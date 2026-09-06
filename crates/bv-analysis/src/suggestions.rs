@@ -782,8 +782,9 @@ pub fn detect_missing_dependencies(
                 continue;
             }
 
-            // Determine direction.
-            let (from, to) = if issue1.created_at.as_deref() <= issue2.created_at.as_deref()
+            // Determine direction. Go uses `Before` (strictly less than);
+            // `<=` here would reverse direction when timestamps are equal.
+            let (from, to) = if issue1.created_at.as_deref() < issue2.created_at.as_deref()
                 || issue1.priority < issue2.priority
             {
                 (issue2, issue1)

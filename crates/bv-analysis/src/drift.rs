@@ -371,7 +371,12 @@ fn compute_unblocks(issues: &[Issue], issue_id: &str) -> Vec<String> {
 
 /// Emit BlockingCascade alerts for issues whose completion would unblock
 /// many downstream dependents.  Mirrors Go `Calculator.checkBlockingCascade`.
-fn check_blocking_cascade(result: &mut DriftResult, cfg: &DriftConfig, issues: &[Issue]) {
+fn check_blocking_cascade(
+    result: &mut DriftResult,
+    cfg: &DriftConfig,
+    issues: &[Issue],
+    now: jiff::Timestamp,
+) {
     if cfg.is_alert_disabled("blocking_cascade") || issues.is_empty() {
         return;
     }
@@ -380,10 +385,28 @@ fn check_blocking_cascade(result: &mut DriftResult, cfg: &DriftConfig, issues: &
     if info_thresh <= 0 && warn_thresh <= 0 {
         return;
     }
+    let now_str = now.to_string();
 
     // Only check actionable (non-closed, non-deferred) issues.
+    // Go `checkBlockingCascade` only emits for issues that are NOT themselves
+    // blocked by open issues — i.e., issues that can actually be completed now.
+    let by_id: BTreeMap<&str, &Issue> = issues.iter().map(|i| (i.id.as_str(), i)).collect();
+    let mut cascades: Vec<Alert> = Vec::new();
     for issue in issues {
         if issue.status.is_closed() || issue.status == bv_core::model::Status::Deferred {
+            continue;
+        }
+        // Skip issues that have open blockers — they can't be completed yet.
+        let has_open_blocker = issue.dependencies.iter().any(|d| {
+            if !d.r#type.is_blocking() {
+                return false;
+            }
+            let target = d.effective_depends_on();
+            by_id
+                .get(target)
+                .is_some_and(|other| !other.status.is_closed())
+        });
+        if has_open_blocker {
             continue;
         }
         let unblocked = compute_unblocks(issues, &issue.id);
@@ -402,14 +425,13 @@ fn check_blocking_cascade(result: &mut DriftResult, cfg: &DriftConfig, issues: &
 
         // Downstream priority sum for urgency scoring (bv-165).
         // Lower priority values = higher importance (P0=critical, P4=backlog).
-        let issue_map: BTreeMap<&str, &Issue> = issues.iter().map(|i| (i.id.as_str(), i)).collect();
         let priority_sum: i64 = unblocked
             .iter()
-            .filter_map(|id| issue_map.get(id.as_str()))
+            .filter_map(|id| by_id.get(id.as_str()))
             .map(|i| i.priority as i64)
             .sum();
 
-        result.push(Alert {
+        cascades.push(Alert {
             alert_type: AlertType::BlockingCascade,
             severity,
             message: format!(
@@ -417,15 +439,20 @@ fn check_blocking_cascade(result: &mut DriftResult, cfg: &DriftConfig, issues: &
                 issue.id, count
             ),
             baseline_val: None,
-            current_val: Some(count as f64),
+            current_val: None,
             delta: None,
             details: unblocked,
             issue_id: issue.id.clone(),
             label: String::new(),
-            detected_at: None,
+            detected_at: Some(now_str.clone()),
             unblocks_count: Some(count),
             downstream_priority_sum: Some(priority_sum),
         });
+    }
+    // Go sorts blocking_cascade alerts by issue_id for deterministic output.
+    cascades.sort_by(|a, b| a.issue_id.cmp(&b.issue_id));
+    for alert in cascades {
+        result.push(alert);
     }
 }
 
@@ -587,7 +614,7 @@ pub fn calculate(
     check_staleness(&mut r, cfg, issues, now);
 
     // Blocking cascade: BFS downstream through blocked issues.
-    check_blocking_cascade(&mut r, cfg, issues);
+    check_blocking_cascade(&mut r, cfg, issues, now);
 
     r
 }

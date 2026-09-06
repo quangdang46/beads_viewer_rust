@@ -99,7 +99,7 @@ fn recipe_summary_schema() -> Value {
         "properties": {
             "name": s("string"),
             "description": s("string"),
-            "source": s("string"),
+            "source": {"type": "string", "enum": ["builtin", "user", "project"]},
         },
         "required": ["name", "description", "source"],
     })
@@ -135,7 +135,7 @@ fn suggestion_set_schema() -> Value {
                     "high_confidence_count": s("integer"),
                     "actionable_count": s("integer"),
                 },
-                "required": ["total"],
+                "required": ["total", "by_type", "by_confidence", "high_confidence_count", "actionable_count"],
             },
         },
         "required": ["suggestions", "generated_at", "stats"],
@@ -166,10 +166,15 @@ fn label_analysis_result_schema() -> Value {
             "healthy_count": s("integer"),
             "warning_count": s("integer"),
             "critical_count": s("integer"),
-            "labels": array_of(s("object")),
-            "summaries": array_of(s("object")),
-            "attention_needed": string_array(),
+            "labels": {"type": "array"},
+            "summaries": {"type": "array"},
+            "attention_needed": {
+                "items": {"type": "string"},
+                "type": "array",
+            },
+            "cross_label_flow": cross_label_flow_schema(),
         },
+        "required": ["generated_at", "total_labels", "healthy_count", "warning_count", "critical_count", "labels", "summaries", "attention_needed"],
     })
 }
 
@@ -177,13 +182,20 @@ fn cross_label_flow_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "labels": string_array(),
-            "flow_matrix": array_of(array_of(s("integer"))),
-            "dependencies": array_of(s("object")),
-            "critical_paths": array_of(s("object")),
-            "bottleneck_labels": string_array(),
+            "labels": {
+                "items": {"type": "string"},
+                "type": "array",
+            },
+            "flow_matrix": {"type": "array"},
+            "dependencies": {"type": "array"},
+            "critical_paths": {"type": "array"},
+            "bottleneck_labels": {
+                "items": {"type": "string"},
+                "type": "array",
+            },
             "total_cross_label_deps": s("integer"),
         },
+        "required": ["labels", "flow_matrix", "dependencies", "critical_paths", "bottleneck_labels", "total_cross_label_deps"],
     })
 }
 
@@ -195,15 +207,14 @@ fn label_attention_item_schema() -> Value {
             "attention_score": s("number"),
             "normalized_score": s("number"),
             "rank": s("integer"),
+            "reason": s("string"),
             "pagerank_sum": s("number"),
-            "staleness_factor": s("number"),
-            "block_impact": s("number"),
             "velocity_factor": s("number"),
             "open_count": s("integer"),
             "blocked_count": s("integer"),
             "stale_count": s("integer"),
         },
-        "required": ["label", "attention_score", "rank"],
+        "required": ["rank", "label", "attention_score", "normalized_score", "reason", "open_count", "blocked_count", "stale_count", "pagerank_sum", "velocity_factor"],
     })
 }
 
@@ -260,7 +271,7 @@ fn timing_metric_schema() -> Value {
             "max_ms": s("number"),
             "min_ms": s("number"),
         },
-        "required": ["name", "count"],
+        "required": ["name", "count", "total_ms", "avg_ms", "max_ms"],
     })
 }
 
@@ -282,13 +293,14 @@ fn memory_metric_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "heap_alloc_mb": {"type": ["number", "null"]},
-            "heap_sys_mb": {"type": ["number", "null"]},
-            "heap_objects_k": {"type": ["number", "null"]},
-            "gc_cycles": {"type": ["integer", "null"]},
-            "gc_pause_ms": {"type": ["number", "null"]},
-            "goroutine_count": {"type": ["integer", "null"]},
+            "heap_alloc_mb": s("number"),
+            "heap_sys_mb": s("number"),
+            "heap_objects_k": s("number"),
+            "gc_cycles": s("integer"),
+            "gc_pause_ms": s("number"),
+            "goroutine_count": s("integer"),
         },
+        "required": ["heap_alloc_mb", "heap_sys_mb", "heap_objects_k", "gc_cycles", "gc_pause_ms", "goroutine_count"],
     })
 }
 
@@ -355,25 +367,36 @@ fn blocker_chain_schema() -> Value {
 /// Go `genericRobotCommandSchema` — envelope + description fallback.
 fn generic_command_schema(name: &str, doc: &Value) -> Value {
     let mut properties = Map::new();
-    let mut required: Vec<&str> = vec!["generated_at"];
     properties.insert(
         "generated_at".into(),
         json!({"type": "string", "format": "date-time"}),
     );
     if doc["needs_issues"].as_bool().unwrap_or(true) {
         properties.insert("data_hash".into(), s("string"));
-        required.push("data_hash");
     }
     properties.insert("output_format".into(), format_enum());
     properties.insert("version".into(), s("string"));
-    json!({
+
+    // Go genericRobotCommandSchema: commands with extra dynamic fields get
+    // additionalProperties: true so the schema is permissive.
+    let needs_extra = matches!(
+        name,
+        "robot-drift"
+            | "robot-confirm-correlation"
+            | "robot-explain-correlation"
+            | "robot-reject-correlation"
+    );
+    let mut schema = json!({
         "$schema": DRAFT,
         "title": format!("{} Output", title_case_robot_command(name)),
         "description": doc["description"],
         "type": "object",
         "properties": Value::Object(properties),
-        "required": required,
-    })
+    });
+    if needs_extra {
+        schema["additionalProperties"] = json!(true);
+    }
+    schema
 }
 
 fn triage_schema() -> Value {
@@ -401,18 +424,18 @@ fn triage_schema() -> Value {
                     "quick_ref": {
                         "type": "object",
                         "properties": {
-                            "open_count": {"type": "integer", "description": "Strict count of issues with status == open (equals project_health.counts.by_status.open)"},
                             "actionable_count": {"type": "integer", "description": "Non-closed issues ready to work on (no open blocking dependencies)"},
                             "blocked_count": {"type": "integer", "description": "Strict count of issues with status == blocked (equals project_health.counts.by_status.blocked)"},
                             "in_progress_count": {"type": "integer", "description": "Strict count of issues with status == in_progress"},
-                            "not_closed_count": {"type": "integer", "description": "All non-closed issues (open+in_progress+blocked+deferred); equals actionable_count + not_actionable_count"},
                             "not_actionable_count": {"type": "integer", "description": "Non-closed issues blocked by open dependencies, regardless of status"},
+                            "not_closed_count": {"type": "integer", "description": "All non-closed issues (open+in_progress+blocked+deferred); equals actionable_count + not_actionable_count"},
+                            "open_count": {"type": "integer", "description": "Strict count of issues with status == open (equals project_health.counts.by_status.open)"},
                             "top_picks": array_of(json!({"$ref": "#/$defs/recommendation"})),
                         },
                     },
                     "recommendations": array_of(json!({"$ref": "#/$defs/recommendation"})),
-                    "quick_wins": array_of(s("object")),
-                    "blockers_to_clear": array_of(s("object")),
+                    "quick_wins": {"type": "array"},
+                    "blockers_to_clear": {"type": "array"},
                     "project_health": s("object"),
                     "commands": s("object"),
                 },
@@ -460,14 +483,14 @@ fn plan_schema() -> Value {
                         "type": "object",
                         "properties": {
                             "phase": s("integer"),
-                            "issues": array_of(s("object")),
+                            "issues": {"type": "array"},
                         },
                     })),
                     "summary": s("object"),
                 },
             },
             "status": s("object"),
-            "usage_hints": array_of(s("object")),
+            "usage_hints": {"type": "array"},
         },
     })
 }
@@ -482,20 +505,20 @@ fn insights_schema() -> Value {
             "generated_at": {"type": "string", "format": "date-time"},
             "data_hash": s("string"),
             "Stats": s("object"),
-            "Cycles": array_of(s("object")),
-            "Keystones": array_of(s("object")),
-            "Bottlenecks": array_of(s("object")),
-            "Influencers": array_of(s("object")),
-            "Hubs": array_of(s("object")),
-            "Authorities": array_of(s("object")),
-            "Orphans": array_of(s("object")),
+            "Cycles": {"type": "array"},
+            "Keystones": {"type": "array"},
+            "Bottlenecks": {"type": "array"},
+            "Influencers": {"type": "array"},
+            "Hubs": {"type": "array"},
+            "Authorities": {"type": "array"},
+            "Orphans": {"type": "array"},
             "Cores": s("object"),
-            "Articulation": array_of(s("object")),
+            "Articulation": {"type": "array"},
             "Slack": s("object"),
             "Velocity": s("object"),
             "status": s("object"),
             "advanced_insights": s("object"),
-            "usage_hints": array_of(s("object")),
+            "usage_hints": {"type": "array"},
         },
     })
 }
@@ -515,7 +538,7 @@ fn priority_schema() -> Value {
             "status": s("object"),
             "label_scope": s("string"),
             "label_context": s("object"),
-            "recommendations": array_of(s("object")),
+            "recommendations": {"type": "array"},
             "field_descriptions": {"type": "object", "additionalProperties": s("string")},
             "filters": {
                 "type": "object",
@@ -534,7 +557,10 @@ fn priority_schema() -> Value {
                     "high_confidence": s("integer"),
                 },
             },
-            "usage_hints": string_array(),
+            "usage_hints": {
+                "items": {"type": "string"},
+                "type": "array",
+            },
         },
         "required": ["generated_at", "data_hash", "analysis_config", "status", "recommendations", "field_descriptions", "filters", "summary", "usage_hints"],
     })
@@ -565,8 +591,8 @@ fn graph_schema() -> Value {
             "adjacency": {
                 "type": "object",
                 "properties": {
-                    "nodes": array_of(s("object")),
-                    "edges": array_of(s("object")),
+                    "nodes": {"type": "array"},
+                    "edges": {"type": "array"},
                 },
             },
         },
@@ -594,13 +620,13 @@ fn diff_schema() -> Value {
                     "to_timestamp": {"type": "string", "format": "date-time"},
                     "from_revision": s("string"),
                     "to_revision": s("string"),
-                    "new_issues": array_of(s("object")),
-                    "closed_issues": array_of(s("object")),
-                    "removed_issues": array_of(s("object")),
-                    "reopened_issues": array_of(s("object")),
-                    "modified_issues": array_of(s("object")),
-                    "new_cycles": array_of(s("object")),
-                    "resolved_cycles": array_of(s("object")),
+                    "new_issues": {"type": "array"},
+                    "closed_issues": {"type": "array"},
+                    "removed_issues": {"type": "array"},
+                    "reopened_issues": {"type": "array"},
+                    "modified_issues": {"type": "array"},
+                    "new_cycles": {"type": "array"},
+                    "resolved_cycles": {"type": "array"},
                     "metric_deltas": s("object"),
                     "summary": s("object"),
                 },
@@ -699,7 +725,10 @@ fn label_health_schema() -> Value {
             "data_hash": s("string"),
             "analysis_config": label_health_config_schema(),
             "results": label_analysis_result_schema(),
-            "usage_hints": string_array(),
+            "usage_hints": {
+                "items": {"type": "string"},
+                "type": "array",
+            },
         },
         "required": ["generated_at", "data_hash", "analysis_config", "results", "usage_hints"],
     })
@@ -716,7 +745,10 @@ fn label_flow_schema() -> Value {
             "data_hash": s("string"),
             "flow": cross_label_flow_schema(),
             "analysis_config": label_health_config_schema(),
-            "usage_hints": string_array(),
+            "usage_hints": {
+                "items": {"type": "string"},
+                "type": "array",
+            },
         },
         "required": ["generated_at", "data_hash", "flow", "analysis_config", "usage_hints"],
     })
@@ -734,7 +766,10 @@ fn label_attention_schema() -> Value {
             "limit": s("integer"),
             "total_labels": s("integer"),
             "labels": array_of(label_attention_item_schema()),
-            "usage_hints": string_array(),
+            "usage_hints": {
+                "items": {"type": "string"},
+                "type": "array",
+            },
         },
         "required": ["generated_at", "data_hash", "limit", "total_labels", "labels", "usage_hints"],
     })
@@ -875,7 +910,7 @@ fn forecast_schema() -> Value {
             "agents": s("integer"),
             "filters": {"type": "object", "additionalProperties": s("string")},
             "forecast_count": s("integer"),
-            "forecasts": array_of(s("object")),
+            "forecasts": {"type": "array"},
             "summary": {
                 "type": "object",
                 "properties": {
@@ -938,6 +973,679 @@ fn capabilities_schema() -> Value {
     })
 }
 
+// ──────────────────────────────────────────────────────────────────────
+// Detailed schemas for commands that previously used generic fallback
+// ──────────────────────────────────────────────────────────────────────
+
+fn causality_schema() -> Value {
+    json!({
+        "$schema": DRAFT,
+        "title": "Robot Causality Output",
+        "description": "Causal chain analysis for a bead",
+        "type": "object",
+        "properties": {
+            "generated_at": {"type": "string", "format": "date-time"},
+            "data_hash": s("string"),
+            "output_format": format_enum(),
+            "version": s("string"),
+            "chain": {
+                "type": "object",
+                "properties": {
+                    "bead_id": s("string"),
+                    "title": s("string"),
+                    "status": s("string"),
+                    "start_time": {"type": "string", "format": "date-time"},
+                    "end_time": {"type": "string", "format": "date-time"},
+                    "total_time": s("integer"),
+                    "edge_count": s("integer"),
+                    "is_complete": s("boolean"),
+                    "events": array_of(json!({
+                        "type": "object",
+                        "properties": {
+                            "id": s("integer"),
+                            "type": s("string"),
+                            "description": s("string"),
+                            "timestamp": {"type": "string", "format": "date-time"},
+                            "commit_sha": s("string"),
+                            "blocker_id": s("string"),
+                            "caused_by_id": s("integer"),
+                            "duration_next": s("integer"),
+                            "enables_ids": {"type": ["array", "null"], "items": s("integer")},
+                        },
+                    })),
+                },
+            },
+            "insights": {
+                "type": "object",
+                "properties": {
+                    "summary": s("string"),
+                    "total_duration": s("integer"),
+                    "active_duration": s("integer"),
+                    "blocked_duration": s("integer"),
+                    "blocked_percentage": s("number"),
+                    "blocked_periods": {
+                        "type": ["array", "null"],
+                        "items": json!({
+                            "type": "object",
+                            "properties": {
+                                "blocker_id": s("string"),
+                                "start_time": {"type": "string", "format": "date-time"},
+                                "end_time": {"type": "string", "format": "date-time"},
+                                "duration": s("integer"),
+                            },
+                        }),
+                    },
+                    "commit_count": s("integer"),
+                    "longest_gap": s("integer"),
+                    "longest_gap_desc": s("string"),
+                    "avg_time_between": s("integer"),
+                    "estimated_without": s("integer"),
+                    "critical_path": {"type": ["array", "null"], "items": s("integer")},
+                    "critical_path_desc": s("string"),
+                    "recommendations": {"type": ["array", "null"], "items": s("string")},
+                },
+            },
+        },
+        "required": ["generated_at", "data_hash", "output_format", "version", "chain", "insights"],
+    })
+}
+
+fn file_beads_schema() -> Value {
+    json!({
+        "$schema": DRAFT,
+        "title": "Robot File Beads Output",
+        "description": "Beads that touched a specific file path",
+        "type": "object",
+        "properties": {
+            "generated_at": {"type": "string", "format": "date-time"},
+            "data_hash": s("string"),
+            "output_format": format_enum(),
+            "version": s("string"),
+            "file_path": s("string"),
+            "total_beads": s("integer"),
+            "open_beads": {
+                "type": ["array", "null"],
+                "items": json!({
+                    "type": "object",
+                    "properties": {
+                        "bead_id": s("string"),
+                        "title": s("string"),
+                        "status": s("string"),
+                        "last_touch": {"type": "string", "format": "date-time"},
+                        "total_changes": s("integer"),
+                        "commit_shas": {"type": ["array", "null"], "items": s("string")},
+                    },
+                }),
+            },
+            "closed_beads": {
+                "type": ["array", "null"],
+                "items": json!({
+                    "type": "object",
+                    "properties": {
+                        "bead_id": s("string"),
+                        "title": s("string"),
+                        "status": s("string"),
+                        "last_touch": {"type": "string", "format": "date-time"},
+                        "total_changes": s("integer"),
+                        "commit_shas": {"type": ["array", "null"], "items": s("string")},
+                    },
+                }),
+            },
+        },
+        "required": ["generated_at", "data_hash", "output_format", "version", "file_path", "total_beads", "open_beads", "closed_beads"],
+    })
+}
+
+fn file_hotspots_schema() -> Value {
+    json!({
+        "$schema": DRAFT,
+        "title": "Robot File Hotspots Output",
+        "description": "Files touched by the most beads",
+        "type": "object",
+        "properties": {
+            "generated_at": {"type": "string", "format": "date-time"},
+            "data_hash": s("string"),
+            "output_format": format_enum(),
+            "version": s("string"),
+            "hotspots": {
+                "type": ["array", "null"],
+                "items": json!({
+                    "type": "object",
+                    "properties": {
+                        "file_path": s("string"),
+                        "total_beads": s("integer"),
+                        "open_beads": s("integer"),
+                        "closed_beads": s("integer"),
+                    },
+                }),
+            },
+            "stats": {
+                "type": "object",
+                "properties": {
+                    "total_files": s("integer"),
+                    "total_bead_links": s("integer"),
+                    "files_with_multiple_beads": s("integer"),
+                },
+            },
+        },
+        "required": ["generated_at", "data_hash", "output_format", "version", "hotspots", "stats"],
+    })
+}
+
+fn file_relations_schema() -> Value {
+    json!({
+        "$schema": DRAFT,
+        "title": "Robot File Relations Output",
+        "description": "Files that frequently co-change with a given file",
+        "type": "object",
+        "properties": {
+            "generated_at": {"type": "string", "format": "date-time"},
+            "data_hash": s("string"),
+            "output_format": format_enum(),
+            "version": s("string"),
+            "file_path": s("string"),
+            "total_commits": s("integer"),
+            "threshold": s("number"),
+            "related_files": {
+                "type": ["array", "null"],
+                "items": json!({
+                    "type": "object",
+                    "properties": {
+                        "file_path": s("string"),
+                        "co_change_count": s("integer"),
+                        "correlation": s("number"),
+                        "total_commits": s("integer"),
+                        "sample_commits": {"type": ["array", "null"], "items": s("string")},
+                    },
+                }),
+            },
+        },
+        "required": ["generated_at", "data_hash", "output_format", "version", "file_path", "total_commits", "threshold", "related_files"],
+    })
+}
+
+fn impact_network_schema() -> Value {
+    let network_node_item = json!({
+        "type": "object",
+        "properties": {
+            "bead_id": s("string"),
+            "title": s("string"),
+            "status": s("string"),
+            "priority": s("integer"),
+            "degree": s("integer"),
+            "connectivity": s("number"),
+            "commit_count": s("integer"),
+            "file_count": s("integer"),
+            "cluster_id": s("integer"),
+            "last_activity": {"type": "string", "format": "date-time"},
+        },
+    });
+    let network_stats = json!({
+        "type": "object",
+        "properties": {
+            "total_nodes": s("integer"),
+            "total_edges": s("integer"),
+            "density": s("number"),
+            "avg_degree": s("number"),
+            "max_degree": s("integer"),
+            "cluster_count": s("integer"),
+            "largest_cluster": s("integer"),
+            "isolated_nodes": s("integer"),
+        },
+    });
+    let cluster_item = json!({
+        "type": "object",
+        "properties": {
+            "cluster_id": s("integer"),
+            "label": s("string"),
+            "central_bead": s("string"),
+            "bead_ids": {"type": "array", "items": s("string")},
+            "internal_edges": s("integer"),
+            "external_edges": s("integer"),
+            "internal_connectivity": s("number"),
+            "total_commits": s("integer"),
+            "shared_files": {"type": "array", "items": s("string")},
+        },
+    });
+    json!({
+        "$schema": DRAFT,
+        "title": "Robot Impact Network Output",
+        "description": "Impact network graph for all beads or one bead subnetwork",
+        "type": "object",
+        "properties": {
+            "generated_at": {"type": "string", "format": "date-time"},
+            "data_hash": s("string"),
+            "output_format": format_enum(),
+            "version": s("string"),
+            "bead_id": s("string"),
+            "depth": s("integer"),
+            "network": {
+                "type": "object",
+                "properties": {
+                    "data_hash": s("string"),
+                    "generated_at": {"type": "string", "format": "date-time"},
+                    "nodes": {
+                        "type": "object",
+                        "additionalProperties": network_node_item,
+                    },
+                    "edges": {
+                        "type": ["array", "null"],
+                        "items": json!({"type": "object", "additionalProperties": true}),
+                    },
+                    "stats": network_stats.clone(),
+                    "clusters": {
+                        "type": ["array", "null"],
+                        "items": cluster_item.clone(),
+                    },
+                },
+            },
+            "stats": network_stats,
+            "top_clusters": {
+                "type": ["array", "null"],
+                "items": cluster_item.clone(),
+            },
+            "top_connected": {
+                "type": ["array", "null"],
+                "items": network_node_item,
+            },
+        },
+        "required": ["generated_at", "data_hash", "output_format", "version", "depth", "network", "stats"],
+    })
+}
+
+fn orphans_schema() -> Value {
+    json!({
+        "$schema": DRAFT,
+        "title": "Robot Orphans Output",
+        "description": "Orphan commit candidates that should be linked to beads",
+        "type": "object",
+        "properties": {
+            "generated_at": {"type": "string", "format": "date-time"},
+            "data_hash": s("string"),
+            "output_format": format_enum(),
+            "version": s("string"),
+            "git_range": s("string"),
+            "stats": {
+                "type": "object",
+                "properties": {
+                    "total_commits": s("integer"),
+                    "orphan_count": s("integer"),
+                    "candidate_count": s("integer"),
+                    "correlated_count": s("integer"),
+                    "orphan_ratio": s("number"),
+                    "avg_suspicion_score": s("number"),
+                },
+            },
+            "candidates": array_of(json!({
+                "type": "object",
+                "properties": {
+                    "sha": s("string"),
+                    "short_sha": s("string"),
+                    "message": s("string"),
+                    "author": s("string"),
+                    "author_email": s("string"),
+                    "timestamp": {"type": "string", "format": "date-time"},
+                    "files": {"type": ["array", "null"], "items": s("string")},
+                    "suspicion_score": s("integer"),
+                    "probable_beads": array_of(json!({
+                        "type": "object",
+                        "properties": {
+                            "bead_id": s("string"),
+                            "bead_title": s("string"),
+                            "bead_status": s("string"),
+                            "confidence": s("integer"),
+                            "reasons": {"type": "array", "items": s("string")},
+                        },
+                    })),
+                    "signals": array_of(json!({
+                        "type": "object",
+                        "properties": {
+                            "signal": s("string"),
+                            "details": s("string"),
+                            "weight": s("integer"),
+                        },
+                    })),
+                },
+            })),
+            "by_bead": {
+                "type": "object",
+                "additionalProperties": {"type": "array", "items": s("string")},
+            },
+        },
+        "required": ["generated_at", "data_hash", "output_format", "version", "git_range", "stats", "candidates"],
+    })
+}
+
+fn related_schema() -> Value {
+    let bead_item = json!({
+        "type": "object",
+        "properties": {
+            "bead_id": s("string"),
+            "title": s("string"),
+            "status": s("string"),
+            "relation_type": s("string"),
+            "reason": s("string"),
+            "relevance": s("integer"),
+            "shared_files": {"type": ["array", "null"], "items": s("string")},
+            "shared_commits": {"type": ["array", "null"], "items": s("string")},
+        },
+    });
+    json!({
+        "$schema": DRAFT,
+        "title": "Robot Related Output",
+        "description": "Beads related to a specific bead ID",
+        "type": "object",
+        "properties": {
+            "generated_at": {"type": "string", "format": "date-time"},
+            "data_hash": s("string"),
+            "output_format": format_enum(),
+            "version": s("string"),
+            "target_bead_id": s("string"),
+            "target_title": s("string"),
+            "total_related": s("integer"),
+            "file_overlap": array_of(bead_item.clone()),
+            "commit_overlap": array_of(bead_item.clone()),
+            "dependency_cluster": array_of(bead_item.clone()),
+            "concurrent": array_of(bead_item),
+        },
+        "required": ["generated_at", "data_hash", "output_format", "version", "target_bead_id", "target_title", "file_overlap", "commit_overlap", "dependency_cluster", "concurrent", "total_related"],
+    })
+}
+
+fn triage_by_label_schema() -> Value {
+    json!({
+        "$schema": DRAFT,
+        "title": "Robot Triage By Label Output",
+        "description": "Triage recommendations grouped by label for area-focused agents",
+        "type": "object",
+        "properties": {
+            "generated_at": {"type": "string", "format": "date-time"},
+            "data_hash": s("string"),
+            "as_of": s("string"),
+            "as_of_commit": s("string"),
+            "feedback": s("object"),
+            "triage": {
+                "type": "object",
+                "properties": {
+                    "meta": s("object"),
+                    "quick_ref": s("object"),
+                    "recommendations": {"type": "array"},
+                    "quick_wins": {"type": "array"},
+                    "blockers_to_clear": {"type": "array"},
+                    "project_health": s("object"),
+                    "commands": s("object"),
+                    "recommendations_by_label": {
+                        "type": "array",
+                        "items": json!({
+                            "type": "object",
+                            "properties": {
+                                "label": s("string"),
+                                "recommendations": {"type": "array"},
+                                "top_pick": s("object"),
+                                "claim_command": s("string"),
+                                "total_unblocks": s("integer"),
+                            },
+                            "required": ["label", "recommendations", "total_unblocks"],
+                        }),
+                    },
+                },
+                "required": ["meta", "quick_ref", "recommendations"],
+            },
+            "usage_hints": {
+                "items": {"type": "string"},
+                "type": "array",
+            },
+        },
+        "required": ["generated_at", "data_hash", "triage", "usage_hints"],
+    })
+}
+
+fn triage_by_track_schema() -> Value {
+    json!({
+        "$schema": DRAFT,
+        "title": "Robot Triage By Track Output",
+        "description": "Triage recommendations grouped by independent parallel execution tracks",
+        "type": "object",
+        "properties": {
+            "generated_at": {"type": "string", "format": "date-time"},
+            "data_hash": s("string"),
+            "as_of": s("string"),
+            "as_of_commit": s("string"),
+            "feedback": s("object"),
+            "triage": {
+                "type": "object",
+                "properties": {
+                    "meta": s("object"),
+                    "quick_ref": s("object"),
+                    "recommendations": {"type": "array"},
+                    "quick_wins": {"type": "array"},
+                    "blockers_to_clear": {"type": "array"},
+                    "project_health": s("object"),
+                    "commands": s("object"),
+                    "recommendations_by_track": {
+                        "type": "array",
+                        "items": json!({
+                            "type": "object",
+                            "properties": {
+                                "track_id": s("string"),
+                                "reason": s("string"),
+                                "recommendations": {"type": "array"},
+                                "top_pick": s("object"),
+                                "claim_command": s("string"),
+                                "total_unblocks": s("integer"),
+                            },
+                            "required": ["track_id", "reason", "recommendations", "total_unblocks"],
+                        }),
+                    },
+                },
+                "required": ["meta", "quick_ref", "recommendations"],
+            },
+            "usage_hints": {
+                "items": {"type": "string"},
+                "type": "array",
+            },
+        },
+        "required": ["generated_at", "data_hash", "triage", "usage_hints"],
+    })
+}
+
+fn history_schema() -> Value {
+    json!({
+        "$schema": DRAFT,
+        "title": "Robot History Output",
+        "description": "Bead-to-commit correlation history report with aggregate stats and reverse commit index",
+        "type": "object",
+        "properties": {
+            "generated_at": {"type": "string", "format": "date-time"},
+            "data_hash": s("string"),
+            "output_format": format_enum(),
+            "version": s("string"),
+            "git_range": s("string"),
+            "stats": s("object"),
+            "histories": s("object"),
+            "commit_index": s("object"),
+            "latest_commit_sha": s("string"),
+        },
+        "required": ["generated_at", "data_hash", "output_format", "version", "git_range", "stats", "histories", "commit_index"],
+    })
+}
+
+fn search_schema() -> Value {
+    json!({
+        "$schema": DRAFT,
+        "title": "Robot Search Output",
+        "description": "Semantic or hybrid issue search results with index metadata and usage hints",
+        "type": "object",
+        "properties": {
+            "generated_at": {"type": "string", "format": "date-time"},
+            "data_hash": s("string"),
+            "output_format": format_enum(),
+            "version": s("string"),
+            "query": s("string"),
+            "provider": s("string"),
+            "dim": s("integer"),
+            "index_path": s("string"),
+            "index": s("object"),
+            "loaded": s("boolean"),
+            "limit": s("integer"),
+            "mode": {"type": "string", "enum": ["text", "hybrid"]},
+            "preset": s("string"),
+            "model": s("string"),
+            "weights": s("object"),
+            "results": {
+                "type": "array",
+                "items": json!({
+                    "type": "object",
+                    "properties": {
+                        "issue_id": s("string"),
+                        "title": s("string"),
+                        "score": s("number"),
+                        "text_score": s("number"),
+                        "component_scores": s("object"),
+                    },
+                }),
+            },
+            "usage_hints": {
+                "items": {"type": "string"},
+                "type": "array",
+            },
+        },
+        "required": ["generated_at", "data_hash", "output_format", "version", "query", "provider", "dim", "index_path", "index", "loaded", "limit", "mode", "results"],
+    })
+}
+
+fn correlation_stats_schema() -> Value {
+    json!({
+        "$schema": DRAFT,
+        "title": "Robot Correlation Stats Output",
+        "description": "Summary counts and confidence aggregates for saved correlation feedback",
+        "type": "object",
+        "properties": {
+            "generated_at": {"type": "string", "format": "date-time"},
+            "output_format": format_enum(),
+            "version": s("string"),
+            "total_feedback": s("integer"),
+            "confirmed": s("integer"),
+            "rejected": s("integer"),
+            "ignored": s("integer"),
+            "accuracy_rate": s("number"),
+            "avg_confirm_conf": s("number"),
+            "avg_reject_conf": s("number"),
+        },
+        "required": ["generated_at", "output_format", "version", "total_feedback", "confirmed", "rejected", "ignored", "accuracy_rate", "avg_confirm_conf", "avg_reject_conf"],
+    })
+}
+
+fn impact_schema() -> Value {
+    json!({
+        "$schema": DRAFT,
+        "title": "Robot Impact Output",
+        "description": "Bead impact analysis for files that may be modified",
+        "type": "object",
+        "properties": {
+            "generated_at": {"type": "string", "format": "date-time"},
+            "data_hash": s("string"),
+            "output_format": format_enum(),
+            "version": s("string"),
+            "files": {
+                "type": ["array", "null"],
+                "items": s("string"),
+            },
+            "risk_level": s("string"),
+            "risk_score": s("number"),
+            "summary": s("string"),
+            "warnings": {
+                "type": ["array", "null"],
+                "items": s("string"),
+            },
+            "affected_beads": {
+                "type": ["array", "null"],
+                "items": json!({
+                    "type": "object",
+                    "properties": {
+                        "bead_id": s("string"),
+                        "title": s("string"),
+                        "status": s("string"),
+                        "relevance": s("number"),
+                        "overlap_count": s("integer"),
+                        "overlap_files": {"type": ["array", "null"], "items": s("string")},
+                        "total_changes": s("integer"),
+                        "last_activity": {"type": "string", "format": "date-time"},
+                    },
+                }),
+            },
+        },
+        "required": ["generated_at", "data_hash", "output_format", "version", "files", "risk_level", "risk_score", "summary", "warnings", "affected_beads"],
+    })
+}
+
+fn docs_schema() -> Value {
+    json!({
+        "$schema": DRAFT,
+        "title": "Robot Docs Output",
+        "description": "Machine-readable documentation for one robot docs topic, or an unknown-topic diagnostic",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "generated_at": {"type": "string", "format": "date-time"},
+            "output_format": format_enum(),
+            "version": s("string"),
+            "topic": s("string"),
+            "guide": s("object"),
+            "commands": {"type": "object", "additionalProperties": s("object")},
+            "examples": {"type": "array", "items": s("object")},
+            "environment_variables": {"type": "object", "additionalProperties": s("string")},
+            "exit_codes": {"type": "object", "additionalProperties": s("string")},
+            "error": s("string"),
+            "available_topics": {"type": "array", "items": s("string")},
+            "did_you_mean": s("string"),
+            "suggested_action": s("string"),
+        },
+        "required": ["generated_at", "output_format", "version", "topic"],
+    })
+}
+
+fn help_schema() -> Value {
+    json!({
+        "$schema": DRAFT,
+        "title": "Robot Help Output",
+        "description": "Machine-readable guide output emitted by the agent-friendly `bv robot-help --json` invocation",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "generated_at": {"type": "string", "format": "date-time"},
+            "output_format": format_enum(),
+            "version": s("string"),
+            "topic": {"type": "string", "const": "guide"},
+            "guide": s("object"),
+        },
+        "required": ["generated_at", "output_format", "version", "topic", "guide"],
+    })
+}
+
+fn schema_self_schema() -> Value {
+    json!({
+        "$schema": DRAFT,
+        "title": "Robot Schema Output",
+        "description": "JSON Schema definitions for all robot commands, or one command when --schema-command is set",
+        "type": "object",
+        "additionalProperties": false,
+        "oneOf": [
+            {"required": ["schema_version", "generated_at", "envelope", "commands"]},
+            {"required": ["schema_version", "generated_at", "command", "schema"]},
+        ],
+        "properties": {
+            "generated_at": {"type": "string", "format": "date-time"},
+            "schema_version": s("string"),
+            "envelope": s("object"),
+            "commands": {"type": "object", "additionalProperties": s("object")},
+            "command": s("string"),
+            "schema": s("object"),
+        },
+        "required": ["schema_version", "generated_at"],
+    })
+}
+
 /// Recursively sort all Map keys in a Value tree for deterministic JSON output
 /// matching Go's `json.Marshal` which sorts map keys alphabetically.
 fn sort_keys(v: Value) -> Value {
@@ -982,6 +1690,22 @@ pub fn generate_robot_schemas(now: &str) -> Value {
         ("robot-burndown", burndown_schema()),
         ("robot-forecast", forecast_schema()),
         ("robot-blocker-chain", blocker_chain_schema()),
+        ("robot-causality", causality_schema()),
+        ("robot-file-beads", file_beads_schema()),
+        ("robot-file-hotspots", file_hotspots_schema()),
+        ("robot-file-relations", file_relations_schema()),
+        ("robot-impact-network", impact_network_schema()),
+        ("robot-orphans", orphans_schema()),
+        ("robot-related", related_schema()),
+        ("robot-triage-by-label", triage_by_label_schema()),
+        ("robot-triage-by-track", triage_by_track_schema()),
+        ("robot-history", history_schema()),
+        ("robot-search", search_schema()),
+        ("robot-correlation-stats", correlation_stats_schema()),
+        ("robot-impact", impact_schema()),
+        ("robot-docs", docs_schema()),
+        ("robot-help", help_schema()),
+        ("robot-schema", schema_self_schema()),
     ];
     for (name, schema) in detailed {
         commands.insert(name.to_string(), schema.clone());

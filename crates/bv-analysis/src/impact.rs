@@ -104,31 +104,138 @@ pub struct RiskSignals {
     pub composite_risk: f64,
 }
 
-/// Simplified risk computation using graph-local signals.
-/// Full churn/cross-repo ports land with correlation integration; the
-/// weights and composition match Go DefaultRiskWeights exactly.
-pub fn compute_risk_signals(issue: &Issue, g: &DiGraph, idx: usize) -> RiskSignals {
-    let fan_out = g.out_degree(idx) as f64;
-    let fan_in = g.in_degree(idx) as f64;
-    // Fan variance proxy: imbalance between in/out degree normalized.
-    let total = fan_in + fan_out;
-    let fan_variance = if total > 0.0 {
-        (fan_out - fan_in).abs() / total
+/// Compute fan variance: coefficient of variation of in-degrees of blocking
+/// dependencies. Requires >= 2 blocking deps for non-zero result (Go parity).
+fn compute_fan_variance(issue: &Issue, g: &DiGraph) -> f64 {
+    let mut degrees: Vec<f64> = Vec::new();
+    for dep in &issue.dependencies {
+        if !dep.r#type.is_blocking() {
+            continue;
+        }
+        let neighbor_id = dep.effective_depends_on();
+        if neighbor_id.is_empty() {
+            continue;
+        }
+        if let Some(nid) = g.node_idx(neighbor_id) {
+            degrees.push(g.in_degree(nid) as f64);
+        }
+    }
+    if degrees.len() < 2 {
+        return 0.0;
+    }
+    let mean = degrees.iter().sum::<f64>() / degrees.len() as f64;
+    if mean == 0.0 {
+        return 0.0;
+    }
+    let variance = degrees.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / degrees.len() as f64;
+    let std_dev = variance.sqrt();
+    let cv = std_dev / mean;
+    // Normalize: CV > 2 is considered high variance
+    (cv / 2.0).min(1.0)
+}
+
+/// Compute activity churn: comment frequency + update recency (Go parity:
+/// `computeActivityChurn` in risk.go:141).
+fn compute_activity_churn(issue: &Issue, now: &jiff::Timestamp) -> f64 {
+    let created = match issue.created_at.as_deref() {
+        Some(raw) => match raw.parse::<jiff::Timestamp>() {
+            Ok(t) => t,
+            Err(_) => return 0.0,
+        },
+        None => return 0.0,
+    };
+
+    let age_secs = (*now - created).total(jiff::Unit::Second).unwrap_or(0.0);
+    let age_days = (age_secs / 86400.0).max(1.0); // minimum 1 day
+
+    // Comment frequency: comments per day (normalized around 1)
+    let comment_count = issue.comments.len() as f64;
+    let comments_per_day = comment_count / age_days;
+
+    // Update recency: how much of the issue's lifetime has seen updates
+    let update_recency = if let Some(updated_raw) = issue.updated_at.as_deref() {
+        if let Ok(updated) = updated_raw.parse::<jiff::Timestamp>() {
+            let update_span =
+                (updated - created).total(jiff::Unit::Second).unwrap_or(0.0) / 86400.0;
+            if update_span > 0.0 && age_days > 1.0 {
+                update_span / age_days
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        }
     } else {
         0.0
     };
-    // Activity churn proxy: staleness-driven (no comment history in core).
-    let churn = compute_staleness(issue.updated_at.as_deref(), &jiff::Timestamp::now()) * 0.5;
+
+    let churn = comments_per_day * 0.6 + update_recency * 0.4;
+    churn.min(1.0)
+}
+
+/// Compute status risk: blocked/in_progress/open risk signals (Go parity:
+/// `computeStatusRisk` in risk.go:216).
+fn compute_status_risk(issue: &Issue, now: &jiff::Timestamp) -> f64 {
+    match issue.status {
+        Status::Closed | Status::Tombstone => 0.0,
+        Status::Blocked => {
+            if let Some(raw) = issue.updated_at.as_deref() {
+                if let Ok(t) = raw.parse::<jiff::Timestamp>() {
+                    let days = (*now - t).total(jiff::Unit::Second).unwrap_or(0.0) / 86400.0;
+                    if days > 7.0 {
+                        return 0.9;
+                    }
+                }
+            }
+            0.7
+        }
+        Status::InProgress => {
+            if let Some(raw) = issue.updated_at.as_deref() {
+                if let Ok(t) = raw.parse::<jiff::Timestamp>() {
+                    let days = (*now - t).total(jiff::Unit::Second).unwrap_or(0.0) / 86400.0;
+                    if days > 14.0 {
+                        return 0.8;
+                    } else if days > 7.0 {
+                        return 0.4;
+                    } else {
+                        return 0.1;
+                    }
+                }
+            }
+            0.3
+        }
+        Status::Open => {
+            if let Some(raw) = issue.created_at.as_deref() {
+                if let Ok(t) = raw.parse::<jiff::Timestamp>() {
+                    let days = (*now - t).total(jiff::Unit::Second).unwrap_or(0.0) / 86400.0;
+                    if days > 30.0 {
+                        return 0.3;
+                    }
+                }
+            }
+            0.1
+        }
+        _ => 0.0,
+    }
+}
+
+/// Simplified risk computation using graph-local signals.
+/// Full churn/cross-repo ports land with correlation integration; the
+/// weights and composition match Go DefaultRiskWeights exactly.
+pub fn compute_risk_signals(
+    issue: &Issue,
+    g: &DiGraph,
+    _idx: usize,
+    now: &jiff::Timestamp,
+) -> RiskSignals {
+    let fan_variance = compute_fan_variance(issue, g);
+    let churn = compute_activity_churn(issue, now);
     let cross_repo = if issue.source_repo.is_empty() {
         0.0
     } else {
         0.2
     };
-    let status_risk = match issue.status {
-        Status::Blocked => 0.8,
-        Status::InProgress => 0.4,
-        _ => 0.0,
-    };
+    let status_risk = compute_status_risk(issue, now);
     let composite = fan_variance * 0.30 + churn * 0.30 + cross_repo * 0.20 + status_risk * 0.20;
     RiskSignals {
         fan_variance,
@@ -246,7 +353,7 @@ pub fn compute_impact_scores(inputs: &ImpactInputs) -> Vec<IssueImpact> {
             .unwrap_or(0.0);
         let tti_norm = compute_time_to_impact(depth, issue.estimated_minutes, median_minutes);
         let urgency_norm = compute_urgency(&issue.labels, issue.created_at.as_deref(), &inputs.now);
-        let risk = compute_risk_signals(issue, inputs.g, idx);
+        let risk = compute_risk_signals(issue, inputs.g, idx, &inputs.now);
 
         let b = Breakdown {
             pagerank: pr_norm * super::scoring::WEIGHT_PAGE_RANK,
