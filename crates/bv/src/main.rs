@@ -4392,10 +4392,31 @@ fn run_robot_label_flow() -> ExitCode {
     payload["analysis_config"] = serde_json::to_value(&cfg).unwrap_or_default();
     payload["usage_hints"] = serde_json::json!([
         "jq '.flow.bottleneck_labels' - labels blocking the most others",
+        "jq '.flow.dependencies[] | select(.issue_count > 0) | {from:.from_label,to:.to_label,count:.issue_count}'",
         "jq '.flow.flow_matrix' - raw matrix (row=from, col=to, align with .flow.labels)",
-        "jq '.flow.dependencies[] | select(.issue_count > 1)' - High-impact cross-label edges",
     ]);
     emit_json(&payload)
+}
+
+/// Go `buildAttentionReason` — human-readable attention reason.
+fn build_attention_reason(s: &bv_analysis::label_health::LabelAttentionScore) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if s.pagerank_sum > 0.5 {
+        parts.push("High PageRank".into());
+    }
+    if s.blocked_count > 0 {
+        parts.push(format!("{} blocked", s.blocked_count));
+    }
+    if s.stale_count > 0 {
+        parts.push(format!("{} stale", s.stale_count));
+    }
+    if s.velocity_factor <= 1.0 {
+        parts.push("low velocity".into());
+    }
+    if parts.is_empty() {
+        return format!("{} open issues", s.open_count);
+    }
+    parts.join(", ")
 }
 
 fn run_robot_label_attention() -> ExitCode {
@@ -4418,11 +4439,33 @@ fn run_robot_label_attention() -> ExitCode {
     // Go: limit comes from --attention-limit flag (default 0 = no limit).
     payload["limit"] = serde_json::json!(0);
     payload["total_labels"] = serde_json::json!(result.total_labels);
-    payload["labels"] = serde_json::to_value(&result.labels).unwrap_or_default();
+    // Go builds labels from a separate struct with specific field order:
+    // rank, label, attention_score, normalized_score, reason, open_count,
+    // blocked_count, stale_count, pagerank_sum, velocity_factor.
+    let attention_labels: Vec<serde_json::Value> = result
+        .labels
+        .iter()
+        .map(|s| {
+            let reason = build_attention_reason(s);
+            serde_json::json!({
+                "rank": s.rank,
+                "label": s.label,
+                "attention_score": s.attention_score,
+                "normalized_score": s.normalized_score,
+                "reason": reason,
+                "open_count": s.open_count,
+                "blocked_count": s.blocked_count,
+                "stale_count": s.stale_count,
+                "pagerank_sum": s.pagerank_sum,
+                "velocity_factor": s.velocity_factor,
+            })
+        })
+        .collect();
+    payload["labels"] = serde_json::Value::Array(attention_labels);
     payload["usage_hints"] = serde_json::json!([
-        "jq '.labels[0]' - Top attention item",
-        "jq '.top_attention' - Labels needing most attention",
-        "jq '.low_attention' - Labels with least attention needed",
+        "jq '.labels[0]' - top attention label details",
+        "jq '.labels[] | select(.blocked_count > 0)' - labels with blocked issues",
+        "jq '.labels[] | {label:.label,score:.attention_score,reason:.reason}'",
     ]);
     emit_json(&payload)
 }
