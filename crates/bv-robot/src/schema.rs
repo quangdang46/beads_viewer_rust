@@ -307,6 +307,22 @@ fn title_case_robot_command(name: &str) -> String {
         .join(" ")
 }
 
+fn blocker_chain_entry_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "id": s("string"),
+            "title": s("string"),
+            "status": s("string"),
+            "priority": s("integer"),
+            "depth": s("integer"),
+            "is_root": s("boolean"),
+            "actionable": s("boolean"),
+            "blocks_count": s("integer"),
+        },
+    })
+}
+
 fn blocker_chain_schema() -> Value {
     json!({
         "$schema": DRAFT,
@@ -325,8 +341,8 @@ fn blocker_chain_schema() -> Value {
                     "target_title": s("string"),
                     "is_blocked": s("boolean"),
                     "chain_length": s("integer"),
-                    "root_blockers": array_of(s("object")),
-                    "chain": array_of(s("object")),
+                    "root_blockers": array_of(blocker_chain_entry_schema()),
+                    "chain": array_of(blocker_chain_entry_schema()),
                     "has_cycle": s("boolean"),
                     "cycle_ids": {"type": ["array", "null"], "items": s("string")},
                 },
@@ -339,12 +355,14 @@ fn blocker_chain_schema() -> Value {
 /// Go `genericRobotCommandSchema` — envelope + description fallback.
 fn generic_command_schema(name: &str, doc: &Value) -> Value {
     let mut properties = Map::new();
+    let mut required: Vec<&str> = vec!["generated_at"];
     properties.insert(
         "generated_at".into(),
         json!({"type": "string", "format": "date-time"}),
     );
     if doc["needs_issues"].as_bool().unwrap_or(true) {
         properties.insert("data_hash".into(), s("string"));
+        required.push("data_hash");
     }
     properties.insert("output_format".into(), format_enum());
     properties.insert("version".into(), s("string"));
@@ -354,7 +372,7 @@ fn generic_command_schema(name: &str, doc: &Value) -> Value {
         "description": doc["description"],
         "type": "object",
         "properties": Value::Object(properties),
-        "additionalProperties": true,
+        "required": required,
     })
 }
 
