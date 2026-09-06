@@ -438,8 +438,8 @@ pub fn compute_cross_label_flow(issues: &[Issue], cfg: &LabelHealthConfig) -> Cr
 pub struct FlowMetrics {
     pub incoming_deps: i64,
     pub outgoing_deps: i64,
-    pub incoming_labels: Vec<String>,
-    pub outgoing_labels: Vec<String>,
+    pub incoming_labels: Option<Vec<String>>,
+    pub outgoing_labels: Option<Vec<String>>,
     pub blocked_by_external: i64,
     pub blocking_external: i64,
     pub flow_score: i64,
@@ -537,8 +537,8 @@ pub fn compute_label_health_for_label(
             flow: FlowMetrics {
                 incoming_deps: 0,
                 outgoing_deps: 0,
-                incoming_labels: vec![],
-                outgoing_labels: vec![],
+                incoming_labels: None,
+                outgoing_labels: None,
                 blocked_by_external: 0,
                 blocking_external: 0,
                 flow_score: 100,
@@ -617,8 +617,14 @@ pub fn compute_label_health_for_label(
     let flow = FlowMetrics {
         incoming_deps,
         outgoing_deps,
-        incoming_labels: seen_in.into_iter().collect(),
-        outgoing_labels: seen_out.into_iter().collect(),
+        incoming_labels: {
+            let v: Vec<String> = seen_in.into_iter().collect();
+            if v.is_empty() { None } else { Some(v) }
+        },
+        outgoing_labels: {
+            let v: Vec<String> = seen_out.into_iter().collect();
+            if v.is_empty() { None } else { Some(v) }
+        },
         blocked_by_external,
         blocking_external,
         flow_score: clamp_score(100 - incoming_deps * 5),
