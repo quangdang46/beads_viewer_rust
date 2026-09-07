@@ -2,9 +2,12 @@
 
 > **STATUS UPDATE (2026-09-07):** All six phases (A–F) plus the four
 > polish-tier leftovers (G13–G15, AgentPromptModal, velocity_comparison)
-> have shipped — see §7–§12. Nothing from §2's scope remains open except
-> the byte-parity threshold re-audit note at the end of §11 (auditing,
-> not UX).
+> have shipped — see §7–§12. §13 is an independent verification pass
+> (closed the byte-parity threshold audit — confirmed exact match against
+> Go via DeepWiki — plus re-read the riskiest new code paths directly
+> rather than trusting tests alone). Nothing from §2's scope remains open.
+> Not yet done by any of this: an actual live interactive run of the TUI —
+> see §13's closing note.
 
 > Scope: **interactive TUI only** (`crates/bv-tui` + the TUI-launch path in `crates/bv`). Robot/CLI JSON parity is tracked separately in `COMPREHENSIVE_PLAN_FOR_FORT_BEADS_VIEWER.md` (~33/47 `--robot-*` primaries real as of that doc).
 >
@@ -427,3 +430,40 @@ smoke run (exit 0, `data_hash` present — TUI-only diff, no CLI impact).
 
 Nothing from §2 remains open. The drilldown/detail threshold re-audit note
 at the end of §11 still stands (byte-parity auditing, not UX).
+
+---
+
+## 13. Independent verification pass (2026-09-07, same day, after §12)
+
+The §11/§12 note above ("threshold re-audit... not done") is now closed:
+cross-checked `bv_analysis::label_health`'s `HEALTHY_THRESHOLD`/
+`WARNING_THRESHOLD` constants (70/40) and the composite-score weights
+(0.25 each for velocity/freshness/flow/criticality) directly against Go's
+`pkg/analysis/label_health.go` via DeepWiki (`HealthyThreshold`/
+`WarningThreshold`, `ComputeCompositeHealth`, `DefaultLabelHealthConfig`) —
+**exact match**, not approximated.
+
+Also re-read (not just built/tested) the riskiest parts of §12's cleanup
+commit directly: Board's guarded `h`/`l`/`s`/`1`-`9` match arms are ordered
+correctly ahead of the global meanings (verified precedence, not just that
+it compiles); `detect_agents_md()`'s auto-show runs once before the event
+loop starts (not inside the loop, so no repeat-popup flag was needed —
+simpler than `update_modal`'s pattern, and correctly so); the
+`graph_toggle_is_uppercase_g_matching_runtime` regression test was
+correctly updated (not left stale) when `g` got repurposed from "unbound"
+to "agent prompts" partway through this plan's life. Grepped the whole
+crate once more for "not yet implemented"/TODO/placeholder/stub — the only
+hits remaining are the already-documented, deliberate scope cuts (Insights
+panel-switching, recipe YAML loading, History's cass integration), no new
+drift.
+
+Full workspace `cargo fmt --check` + `clippy -D warnings` + `cargo test`
+re-run clean after this pass (no code changes were needed — this was a
+verification-only pass); `bvr` reinstalled, `--robot-triage` re-run against
+the real `.beads/` repo with an unchanged `data_hash`.
+
+**What this pass does *not* cover, stated plainly:** no live interactive
+run of the TUI in a real terminal (no screenshot, no actual keypress-driven
+session) — everything above is static code reading + automated
+build/lint/test, not a human (or agent) actually watching the rendered
+output. That last mile is the user's own manual verification pass.
