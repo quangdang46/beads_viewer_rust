@@ -121,6 +121,12 @@ pub struct App {
     pub searching: bool,
     /// Current search query.
     pub search_query: String,
+    /// Semantic search mode active (Ctrl+S pressed). Ranks by
+    /// `bv_search` cosine similarity over title+description — the same
+    /// text-mode engine `--robot-search` uses.
+    pub semantic_searching: bool,
+    /// Current semantic query.
+    pub semantic_query: String,
     pub show_sidebar: bool,
     /// Which panel has focus: false = list, true = detail
     pub focus_detail: bool,
@@ -568,6 +574,8 @@ impl App {
             current_view: ViewMode::List,
             searching: false,
             search_query: String::new(),
+            semantic_searching: false,
+            semantic_query: String::new(),
             show_sidebar: false,
             focus_detail: false,
             show_help: false,
@@ -702,17 +710,101 @@ impl App {
         }
     }
 
+    /// Fuzzy-ranked search (Go `/` fuzzy entry): nucleo-matcher scores each
+    /// `id + title` haystack; matches sort by score desc, id asc tiebreak.
+    /// Empty query restores the natural row order. Case-insensitive like
+    /// the old substring check, so every previous contains-match still
+    /// surfaces (possibly reordered by score).
     fn apply_search(&mut self) {
-        let q = self.search_query.to_lowercase();
-        if q.is_empty() {
+        if self.search_query.is_empty() {
             self.filtered_indices = (0..self.rows.len()).collect();
         } else {
-            self.filtered_indices = (0..self.rows.len())
-                .filter(|&i| {
-                    let r = &self.rows[i];
-                    r.id.to_lowercase().contains(&q) || r.title.to_lowercase().contains(&q)
-                })
-                .collect();
+            // Lowercase the needle only: `Config::DEFAULT` already folds
+            // haystack case, but folding must not be left to nucleo on the
+            // needle side — an uppercase needle char that can only match via
+            // folding (e.g. "Is" vs "issue") passes the prefilter yet trips
+            // a `debug_assert!`-style reject in the optimal matcher
+            // (nucleo-matcher 0.3.1 `fuzzy_optimal.rs`: "should have been
+            // caught by prefilter"). Pre-folding keeps matching
+            // case-insensitive without touching that path.
+            let mut matcher = nucleo_matcher::Matcher::new(nucleo_matcher::Config::DEFAULT);
+            let mut haystack_buf = Vec::new();
+            let mut needle_buf = Vec::new();
+            let folded = self.search_query.to_lowercase();
+            let needle = nucleo_matcher::Utf32Str::new(&folded, &mut needle_buf);
+            let mut scored: Vec<(u16, usize)> = Vec::new();
+            for (i, r) in self.rows.iter().enumerate() {
+                let haystack = format!("{} {}", r.id, r.title);
+                haystack_buf.clear();
+                let hay = nucleo_matcher::Utf32Str::new(&haystack, &mut haystack_buf);
+                if let Some(score) = matcher.fuzzy_match(hay, needle) {
+                    scored.push((score, i));
+                }
+            }
+            scored.sort_by(|a, b| {
+                b.0.cmp(&a.0)
+                    .then_with(|| self.rows[a.1].id.cmp(&self.rows[b.1].id))
+            });
+            let idx: Vec<usize> = scored.into_iter().map(|(_, i)| i).collect();
+            self.filtered_indices = idx;
+        }
+        self.cursor = 0;
+    }
+    /// Semantic search input (Ctrl+S mode): Esc clears and exits, Enter
+    /// accepts (back to the standard filter order), typing re-ranks.
+    fn handle_semantic_key(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Esc => {
+                self.semantic_searching = false;
+                self.semantic_query.clear();
+                self.apply_filter();
+                true
+            }
+            KeyCode::Enter => {
+                self.semantic_searching = false;
+                self.apply_filter();
+                true
+            }
+            KeyCode::Backspace => {
+                self.semantic_query.pop();
+                self.apply_semantic();
+                true
+            }
+            KeyCode::Char(c) => {
+                self.semantic_query.push(c);
+                self.apply_semantic();
+                true
+            }
+            _ => true,
+        }
+    }
+
+    /// Cosine-similarity ranking over title+description with the same
+    /// hash-embedding text engine `--robot-search` uses
+    /// (`bv_search::embedder::{hash_embed, cosine_similarity}`). Zero-score
+    /// rows are hidden; ties break by id asc. Empty query restores order.
+    fn apply_semantic(&mut self) {
+        if self.semantic_query.is_empty() {
+            self.filtered_indices = (0..self.rows.len()).collect();
+        } else {
+            let dim = bv_search::embedder::DEFAULT_DIM;
+            let query_vec = bv_search::embedder::hash_embed(&self.semantic_query, dim);
+            let mut scored: Vec<(i64, usize)> = Vec::new();
+            for (i, r) in self.rows.iter().enumerate() {
+                let text = format!("{} {}", r.title, r.description);
+                let issue_vec = bv_search::embedder::hash_embed(&text, dim);
+                let score = bv_search::embedder::cosine_similarity(&query_vec, &issue_vec);
+                if score > 0.0 {
+                    // Fixed-point rank key: deterministic across platforms.
+                    scored.push(((score * 1_000_000.0) as i64, i));
+                }
+            }
+            scored.sort_by(|a, b| {
+                b.0.cmp(&a.0)
+                    .then_with(|| self.rows[a.1].id.cmp(&self.rows[b.1].id))
+            });
+            let idx: Vec<usize> = scored.into_iter().map(|(_, i)| i).collect();
+            self.filtered_indices = idx;
         }
         self.cursor = 0;
     }
@@ -776,6 +868,9 @@ impl App {
 
     /// Handle a key event; returns true if the event was consumed.
     pub fn handle_key(&mut self, code: KeyCode) -> bool {
+        if self.semantic_searching {
+            return self.handle_semantic_key(code);
+        }
         if self.searching {
             return self.handle_search_key(code);
         }
@@ -1425,9 +1520,22 @@ impl App {
 
     /// Handle a Ctrl-modified key event; returns true if consumed.
     pub fn handle_ctrl_key(&mut self, code: KeyCode) -> bool {
+        if self.semantic_searching {
+            return self.handle_semantic_key(code);
+        }
         match code {
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 self.reload_from_disk();
+                true
+            }
+            // Go semantic search entry (Ctrl+S): cosine-similarity ranking
+            // via the same `bv_search` text engine `--robot-search` uses.
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                self.semantic_searching = true;
+                self.semantic_query.clear();
+                self.status_msg =
+                    "Semantic search (bv-search cosine) — type to rank, Enter accepts, Esc clears"
+                        .to_string();
                 true
             }
             _ => false,
@@ -2767,6 +2875,16 @@ fn render_status_bar(f: &mut Frame, app: &App) {
         f.render_widget(bar, area);
         return;
     }
+    // Semantic search mode (Ctrl+S): same bar shape, distinct prefix.
+    if app.semantic_searching {
+        let bar = Paragraph::new(Line::from(vec![
+            Span::styled("s/", Style::default().fg(Color::Magenta)),
+            Span::styled(&app.semantic_query, Style::default().fg(Color::White)),
+            Span::styled("_", Style::default().fg(Color::Magenta)),
+        ]));
+        f.render_widget(bar, area);
+        return;
+    }
 
     let mut spans: Vec<Span> = Vec::new();
 
@@ -3571,10 +3689,109 @@ mod tests {
         app.handle_key(KeyCode::Char('q'));
         assert!(app.quit_requested);
     }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.handle_key(KeyCode::Char(c));
+        }
+    }
+
+    #[test]
+    fn fuzzy_search_surfaces_substring_match_ranked() {
+        let mut app = make_app(9);
+        app.handle_key(KeyCode::Char('/'));
+        // Lowercase on purpose: matching must be case-insensitive, and the
+        // old contains-match ("Issue 1") must still surface.
+        type_text(&mut app, "issue 1");
+        let t1 = app.rows.iter().position(|r| r.id == "T-1").unwrap();
+        assert_eq!(
+            app.filtered_indices,
+            vec![t1],
+            "only T-1 contains '1'; fuzzy must not invent matches"
+        );
+        assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn fuzzy_search_empty_query_restores_all_rows() {
+        let mut app = make_app(4);
+        app.handle_key(KeyCode::Char('/'));
+        type_text(&mut app, "Issue");
+        assert!(!app.filtered_indices.is_empty());
+        for _ in 0..5 {
+            app.handle_key(KeyCode::Backspace);
+        }
+        assert_eq!(app.filtered_indices.len(), app.rows.len());
+    }
+
+    #[test]
+    fn semantic_search_ranks_by_embedding_overlap() {
+        let mut app = make_app(3);
+        app.rows[0].title = "database migration".to_string();
+        app.rows[1].title = "database backup".to_string();
+        app.rows[2].title = "button color".to_string();
+        assert!(app.handle_ctrl_key(KeyCode::Char('s')));
+        assert!(app.semantic_searching);
+        type_text(&mut app, "database");
+        let mut ids: Vec<&str> = app
+            .filtered_indices
+            .iter()
+            .map(|&i| app.rows[i].id.as_str())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec!["T-0", "T-1"],
+            "token-overlapping rows rank; disjoint row is hidden"
+        );
+    }
+
+    #[test]
+    fn semantic_esc_clears_and_exits() {
+        let mut app = make_app(3);
+        app.handle_ctrl_key(KeyCode::Char('s'));
+        type_text(&mut app, "x");
+        assert!(app.semantic_searching);
+        app.handle_key(KeyCode::Esc);
+        assert!(!app.semantic_searching);
+        assert!(app.semantic_query.is_empty());
+        assert_eq!(app.filtered_indices.len(), app.rows.len());
+    }
+
+    #[test]
+    fn semantic_enter_accepts_back_to_standard_order() {
+        let mut app = make_app(3);
+        app.handle_ctrl_key(KeyCode::Char('S'));
+        type_text(&mut app, "Issue");
+        app.handle_key(KeyCode::Enter);
+        assert!(!app.semantic_searching);
+        assert_eq!(app.filtered_indices.len(), app.rows.len());
+    }
+    /// Regression: mixed-case needles once panicked inside nucleo-matcher
+    /// 0.3.1 (uppercase char matchable only via case folding passed the
+    /// prefilter but tripped the optimal-matcher's reject assert). The
+    /// needle is pre-folded now, so every ASCII prefix must rank without
+    /// panicking and the full word must still find its row.
+    #[test]
+    fn fuzzy_search_mixed_case_prefixes_never_panic() {
+        for q in [
+            "I", "Is", "Iss", "Issu", "Issue", "i", "is", "issue", "issue 1", "1", "T-", "0",
+        ] {
+            let mut app = make_app(4);
+            app.search_query = q.to_string();
+            app.apply_search();
+        }
+        let mut app = make_app(4);
+        app.search_query = "ISSUE 2".to_string();
+        app.apply_search();
+        let t2 = app.rows.iter().position(|r| r.id == "T-2").unwrap();
+        assert_eq!(app.filtered_indices, vec![t2]);
+    }
 }
 
 pub mod actionable;
 pub mod agent_prompt_modal;
+
 pub mod chrome;
 pub mod context;
 pub mod context_help;

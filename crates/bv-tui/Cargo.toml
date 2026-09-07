@@ -16,3 +16,5 @@ jiff = { workspace = true }
 serde_json = { workspace = true }
 bv-graph-core = { path = "../bv-graph-core" }
 bv-correlation = { path = "../bv-correlation" }
+bv-search = { path = "../bv-search" }
+nucleo-matcher = "0.3"

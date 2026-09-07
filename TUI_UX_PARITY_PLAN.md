@@ -300,3 +300,56 @@ returns to List without quitting.
 originally scoped.
 - G13 (Windows clipboard), G14 (Board columns), G15 (Actionable/Tutorial j/k),
 AgentPromptModal, velocity_comparison — untouched by this pass.
+
+---
+
+## 10. Phase D results (shipped 2026-09-07)
+
+Search upgrade, verified with `cargo fmt --all && cargo clippy --workspace
+--all-targets -- -D warnings && cargo test --workspace` (green — 73 bv-tui
+unit tests incl. 6 new search tests) plus a manual `--robot-triage` /
+`--robot-diff` smoke check (identical `data_hash`, confirming zero
+robot/CLI regression from TUI+dependency changes).
+
+### Shipped
+
+- **D1 (fuzzy `/`):** `apply_search` now ranks by `nucleo-matcher`
+(`nucleo-matcher = "0.3"`, new `bv-tui` dependency — the planned crate, just
+not previously pulled in) over `id + title` haystacks, score desc with id
+asc tiebreak. Empty query still restores natural row order.
+- **D2 (semantic Ctrl+S):** new `semantic_searching`/`semantic_query` mode
+behind the existing `handle_ctrl_key` plumbing (`Ctrl+S`), ranking by
+`bv_search::embedder::{hash_embed, cosine_similarity}` over
+title+description — the exact text-mode engine `--robot-search` uses, no new
+algorithm. Zero-score rows hidden, id asc tiebreak. `s/` status bar mirrors
+the `/` bar shape with a distinct prefix. Esc clears+exits, Enter accepts
+(back to standard filter order, same as fuzzy).
+- **D3 (registry):** stale `"/"` text ("fuzzy ranking not yet implemented")
+fixed; new `ctrl+s` entry under List plus a `Focus::Search` section for the
+in-input keys, so `?` stays accurate.
+
+### Real bug found mid-implementation (not in the original audit)
+
+- **G16 — nucleo-matcher 0.3.1 panics on mixed-case needles.** An uppercase
+needle char that can only match via case folding (e.g. `"Is"` vs `"issue"`)
+passes the crate's prefilter but trips the optimal matcher's reject assert
+(`fuzzy_optimal.rs`: "should have been caught by prefilter") — a hard panic
+on a one-character-then-lowercase keystroke path, i.e. reachable by ordinary
+typing. Workaround on our side: pre-fold only the needle to lowercase and
+let `Config::DEFAULT` (ignore_case) fold the haystack, which avoids the
+defective path while staying case-insensitive. Pinned by
+`fuzzy_search_mixed_case_prefixes_never_panic` (12 ASCII prefixes/queries
+must rank without panicking; `"ISSUE 2"` must still find exactly `T-2`).
+
+### Tests
+
+- 6 TUI tests: substring match surfaces ranked (`"issue 1"` → exactly
+`[T-1]`), empty query restores all rows, semantic ranks token-overlapping
+rows and hides the disjoint one, semantic Esc clears+exits, semantic Enter
+accepts, mixed-case regression above.
+
+### Still open (unchanged)
+
+- Phase E (priority hints), F (live reload) — as originally scoped.
+- G13 (Windows clipboard), G14 (Board columns), G15 (Actionable/Tutorial j/k),
+AgentPromptModal, velocity_comparison — untouched by this pass.

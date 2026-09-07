@@ -90,7 +90,11 @@ pub fn build_default_registry() -> KeyRegistry {
         ("tab", "Focus detail pane"),
         (
             "/",
-            "Search (substring — fuzzy ranking not yet implemented)",
+            "Fuzzy search (nucleo-ranked, Enter accepts, Esc clears)",
+        ),
+        (
+            "ctrl+s",
+            "Semantic search (bv-search cosine over title+description)",
         ),
         ("a", "Show all issues"),
         ("o", "Show open issues"),
@@ -109,6 +113,20 @@ pub fn build_default_registry() -> KeyRegistry {
     ] {
         reg.register(KeyBinding {
             focus: Focus::List,
+            key: key.to_string(),
+            desc: desc.to_string(),
+            category: nav.clone(),
+        });
+    }
+    // Search-input bindings (active while `/` or Ctrl+S mode captures keys).
+    for (key, desc) in [
+        ("type", "Narrow results (fuzzy / cosine rank)"),
+        ("backspace", "Delete query char and re-rank"),
+        ("enter", "Accept (back to standard filter order)"),
+        ("esc", "Clear query and exit search"),
+    ] {
+        reg.register(KeyBinding {
+            focus: Focus::Search,
             key: key.to_string(),
             desc: desc.to_string(),
             category: nav.clone(),
