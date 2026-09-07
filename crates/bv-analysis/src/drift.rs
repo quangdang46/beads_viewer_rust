@@ -449,8 +449,16 @@ fn check_blocking_cascade(
             downstream_priority_sum: Some(priority_sum),
         });
     }
-    // Go sorts blocking_cascade alerts by issue_id for deterministic output.
-    cascades.sort_by(|a, b| a.issue_id.cmp(&b.issue_id));
+    // Go sorts blocking_cascade alerts by numeric issue_id for deterministic
+    // output (e.g. XL-14 < XL-110, not lexicographic XL-110 < XL-14).
+    cascades.sort_by(|a, b| {
+        let na = a.issue_id.rsplit('-').next().and_then(|s| s.parse::<u64>().ok());
+        let nb = b.issue_id.rsplit('-').next().and_then(|s| s.parse::<u64>().ok());
+        match (na, nb) {
+            (Some(a), Some(b)) => a.cmp(&b),
+            _ => a.issue_id.cmp(&b.issue_id),
+        }
+    });
     for alert in cascades {
         result.push(alert);
     }
