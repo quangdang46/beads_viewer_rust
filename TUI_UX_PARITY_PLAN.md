@@ -1,11 +1,14 @@
 # TUI UX Parity Plan — closing the gap to Go `bv`
 
-> **STATUS UPDATE (2026-09-07, later same day):** Phase A shipped — see §7
-> at the bottom for exactly what landed, what it uncovered mid-implementation
-> that wasn't in the original audit (G11–G15), and what's still open for
-> Phases B–F. Read §7 before assuming anything above is still accurate for
-> the *current* code; §1–§6 below are the original audit and plan, kept
-> intact for history.
+> **STATUS UPDATE (2026-09-07):** All six phases (A–F) have shipped. See §7
+> (Phase A + the mid-implementation bugs it uncovered, G11–G15), §8–§10
+> (Phase B, C, D respectively), and §11 (Phase E + F) at the bottom for what
+> actually landed vs the original plan. Read §7–§11 before assuming anything
+> above is still accurate for the *current* code; §1–§6 below are the
+> original audit and plan, kept intact for history. Remaining open items,
+> all small/polish-tier: G13 (Windows clipboard), G14 (Board column nav),
+> G15 (Actionable/Tutorial internal j/k), AgentPromptModal,
+> velocity_comparison — see §11's tail.
 
 > Scope: **interactive TUI only** (`crates/bv-tui` + the TUI-launch path in `crates/bv`). Robot/CLI JSON parity is tracked separately in `COMPREHENSIVE_PLAN_FOR_FORT_BEADS_VIEWER.md` (~33/47 `--robot-*` primaries real as of that doc).
 >
@@ -353,3 +356,25 @@ accepts, mixed-case regression above.
 - Phase E (priority hints), F (live reload) — as originally scoped.
 - G13 (Windows clipboard), G14 (Board columns), G15 (Actionable/Tutorial j/k),
 AgentPromptModal, velocity_comparison — untouched by this pass.
+
+---
+
+## 11. Phase E + F results (shipped 2026-09-07, same day)
+
+Verified the same way as every prior phase: `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace` green (76 bv-tui unit tests, up from 74, + 7 integration tests), `bvr` reinstalled and `--robot-triage` re-run against the real `.beads/` repo with an identical `data_hash` (no CLI regression).
+
+### Phase E — Priority Hints (G4), shipped
+
+`p` toggles `show_priority_hints`; on first toggle-on, lazily computes a suggested-priority map via `bv_analysis::impact::compute_impact_scores` + `bv_analysis::scoring::score_to_priority` — the exact same engine `--robot-priority` already uses (confirmed via `run_robot_priority` in `crates/bv/src/main.rs`), so this was wiring, not a new scoring algorithm. Status message matches Go's copy: `"Priority hints: ↑ increase ↓ decrease (N suggestions)"` / `"Priority hints: No misalignments detected"`. Per-row ↑/↓ arrows render next to the priority badge in the list (Go's `delegate.go` behavior), not just the status line. One deliberate scope note: the existing `--robot-priority` CLI path only ever surfaced *under*-prioritized issues (`suggested < current`); this counts *both* directions to match Go's bidirectional hint UI — same underlying primitives, just not filtered to one direction.
+
+### Phase F — Live reload (G5), shipped — with one deliberate deviation from the original plan
+
+The original plan (§2, Phase F) called for adding the `notify` crate as a background-thread file watcher. Implemented instead as **mtime polling piggybacked on the TUI's existing ~500ms terminal-event-poll tick** (`tui_event_loop`'s `event::poll(Duration::from_millis(500))`), via `App::check_for_reload()`. Rationale: same user-visible acceptance criterion ("editing `.beads/issues.jsonl` externally updates the TUI without a manual keypress") is satisfied with zero new dependencies, no background-thread lifecycle to manage, and no `PollWatcher`-vs-`RecommendedWatcher` fallback complexity — the tick already exists and already drives the freshness badge, so this is strictly fewer moving parts for the same result. `App::refresh_watch_target()` resolves the actual `.beads/*.jsonl` path via the existing `bv_core::discovery::{get_beads_dir, find_jsonl_path_with_warnings}` (same discovery Go's watcher targets — `.beads/issues.jsonl` specifically, not a generalized any-datasource watcher, matching Go's own documented scope); a changed mtime triggers the exact same `reload_from_disk()` path `Ctrl+R` already calls, so behavior on reload (full state reset) is unchanged and already-accepted, just now reachable automatically as well as manually. If discovery fails (no `.beads` dir, or the active datasource is SQLite rather than JSONL — out of scope, matching Go), watching is silently a no-op rather than a startup error.
+
+If a "real" `notify`-based watcher (instant reload vs up-to-500ms latency, and coverage of SQLite-backed setups) turns out to matter later, revisit — but the 500ms-polling version is functionally equivalent for the stated acceptance criterion and was lower-risk to ship today.
+
+### Everything from §2's six phases is now shipped except
+
+- **AgentPromptModal, velocity_comparison** — still fully unreferenced (deferred twice now, from Phase A2/A3).
+- **G13** (Windows clipboard — `arboard` migration), **G14** (Board column nav/grouping cycle), **G15** (Actionable/Tutorial internal j/k) — smaller polish items found during Phase A review, still open.
+- Label Dashboard's Go-side `d` drilldown / `h` detail modal are real per Phase C, but re-verify against Go's exact health-score thresholds if byte-parity with `--robot-label-health` ever needs auditing (not done as part of this TUI-focused pass).

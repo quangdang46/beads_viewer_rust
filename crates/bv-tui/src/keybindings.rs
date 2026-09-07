@@ -110,6 +110,10 @@ pub fn build_default_registry() -> KeyRegistry {
             "U",
             "Show update-available modal (if an update was detected)",
         ),
+        (
+            "p",
+            "Toggle priority hints (\u{2191}/\u{2193} suggested-priority arrows in the list)",
+        ),
     ] {
         reg.register(KeyBinding {
             focus: Focus::List,

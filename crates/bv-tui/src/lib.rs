@@ -197,6 +197,24 @@ pub struct App {
     /// True once the update modal has been auto-shown once this session,
     /// so it doesn't reappear every frame after the user dismisses it.
     pub update_modal_auto_shown: bool,
+    /// Priority hints visibility (Go `p` key — `pkg/ui/model.go`
+    /// `showPriorityHints`). Renders per-row up/down suggestion arrows in
+    /// the list when true.
+    pub show_priority_hints: bool,
+    /// Lazily computed suggested-priority map (issue id -> suggested P),
+    /// built once from `bv_analysis::impact::compute_impact_scores` (the
+    /// same engine `--robot-priority` uses — Go `ComputeImpactScores` +
+    /// `scoreToPriority`). `None` until first computed. Only entries where
+    /// suggested != current are kept (that's the misalignment set).
+    pub priority_hints: Option<std::collections::BTreeMap<String, i32>>,
+    /// Live-reload watch target: the resolved `.beads/*.jsonl` path (Go
+    /// watches this via `fsnotify`; bvr polls its mtime on the existing
+    /// ~500ms terminal-event-poll tick instead of adding a background
+    /// `notify` watcher thread — same user-visible effect, fewer moving
+    /// parts. `None` if discovery failed (watching is then a no-op, not a
+    /// startup error).
+    pub watched_path: Option<std::path::PathBuf>,
+    pub watched_mtime: Option<std::time::SystemTime>,
     /// Sprint dashboard state (loaded from .beads/sprints.jsonl).
     pub sprint: Option<crate::views::sprint::SprintState>,
     /// When the snapshot was loaded (freshness badge, Go bv-h305)
@@ -560,6 +578,10 @@ impl App {
             time_travel_cursor: 0,
             show_update_modal: false,
             update_modal_auto_shown: false,
+            show_priority_hints: false,
+            priority_hints: None,
+            watched_path: None,
+            watched_mtime: None,
             sprint: None,
             filtered_indices: Vec::new(),
             cursor: 0,
@@ -612,12 +634,56 @@ impl App {
             app.issue_map.values().cloned().collect(),
             app.graph_metrics.clone(),
         ));
-        // Initialize history view (empty for now — populated when user presses t).
+        // Initialize history view (empty for now — populated when user presses h).
         app.history = Some(crate::views::history::HistoryState::build_from_beads(
             vec![],
         ));
+        app.refresh_watch_target();
         app.apply_filter();
         app
+    }
+
+    /// (Re)discover the `.beads/*.jsonl` path and record its current mtime,
+    /// for live-reload polling (Go `fsnotify`, `p` — see `check_for_reload`
+    /// below and TUI_UX_PARITY_PLAN.md Phase F). Best-effort: if discovery
+    /// fails (e.g. no `.beads` dir, or the active datasource is SQLite —
+    /// out of scope here, matching Go's own `.beads/issues.jsonl`-specific
+    /// watch target), watching is silently disabled rather than surfaced
+    /// as a startup error.
+    fn refresh_watch_target(&mut self) {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        self.watched_path = bv_core::discovery::get_beads_dir(&cwd)
+            .ok()
+            .and_then(|dir| bv_core::discovery::find_jsonl_path_with_warnings(&dir, |_| {}).ok())
+            .flatten();
+        self.watched_mtime = self
+            .watched_path
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .and_then(|m| m.modified().ok());
+    }
+
+    /// Poll the watched file's mtime and reload if it changed externally.
+    /// Called from the terminal event loop's existing ~500ms poll tick
+    /// (`tui_event_loop`) — no background thread, no `notify` watcher
+    /// dependency; same user-visible effect ("editing issues.jsonl updates
+    /// the TUI without a manual keypress") with fewer moving parts. A no-op
+    /// when `watched_path` is `None` (discovery failed or unsupported
+    /// datasource). Returns true if a reload happened, for the caller to
+    /// avoid double-work in the same tick.
+    pub fn check_for_reload(&mut self) -> bool {
+        let Some(path) = &self.watched_path else {
+            return false;
+        };
+        let Some(current_mtime) = std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
+        else {
+            return false; // file briefly missing mid-write — try again next tick
+        };
+        if self.watched_mtime == Some(current_mtime) {
+            return false;
+        }
+        self.reload_from_disk();
+        true
     }
     pub fn apply_filter(&mut self) {
         let label_filter = self.label_filter.clone();
@@ -1281,8 +1347,67 @@ impl App {
                 }
                 true
             }
+            KeyCode::Char('p') => {
+                self.toggle_priority_hints();
+                true
+            }
             _ => false,
         }
+    }
+
+    /// Toggle Priority Hints (Go `p` — `pkg/ui/model.go`
+    /// `showPriorityHints`). Lazily computes the suggestion set on first
+    /// use via `bv_analysis::impact::compute_impact_scores` +
+    /// `score_to_priority` — the same engine `--robot-priority` already
+    /// uses, so this is wiring, not a new scoring algorithm. Unlike the
+    /// existing `--robot-priority` CLI path (which only surfaces
+    /// under-prioritized issues, `suggested < current`), this counts both
+    /// directions to match Go's bidirectional ↑/↓ hint UI.
+    fn toggle_priority_hints(&mut self) {
+        self.show_priority_hints = !self.show_priority_hints;
+        if !self.show_priority_hints {
+            self.status_msg.clear();
+            return;
+        }
+        if self.priority_hints.is_none() {
+            self.priority_hints = Some(self.compute_priority_hints());
+        }
+        let n = self.priority_hints.as_ref().map(|m| m.len()).unwrap_or(0);
+        self.status_msg = if n > 0 {
+            format!("Priority hints: \u{2191} increase \u{2193} decrease ({n} suggestions)")
+        } else {
+            "Priority hints: No misalignments detected".to_string()
+        };
+    }
+
+    /// Compute the suggested-priority map (Go `ComputeImpactScores` +
+    /// `GenerateRecommendations` — `pkg/analysis/priority.go`). Only open
+    /// issues are scored (Go parity — closed/tombstone are skipped inside
+    /// `compute_impact_scores` itself); only entries where the suggestion
+    /// differs from the current priority are kept, matching "misalignment."
+    fn compute_priority_hints(&self) -> std::collections::BTreeMap<String, i32> {
+        let issues: Vec<bv_core::model::Issue> = self.issue_map.values().cloned().collect();
+        let g = bv_analysis::build_graph(&issues);
+        let empty = BTreeMap::new();
+        let (pagerank, betweenness) = match &self.graph_metrics {
+            Some(gm) => (&gm.pagerank, &gm.betweenness),
+            None => (&empty, &empty),
+        };
+        let inputs = bv_analysis::impact::ImpactInputs {
+            issues: &issues,
+            pagerank,
+            betweenness,
+            critical_path: None,
+            g: &g,
+            now: jiff::Timestamp::now(),
+        };
+        bv_analysis::impact::compute_impact_scores(&inputs)
+            .into_iter()
+            .filter_map(|r| {
+                let suggested = bv_analysis::scoring::score_to_priority(r.score);
+                (suggested != r.priority).then_some((r.id, suggested))
+            })
+            .collect()
     }
 
     /// Build and show the label-filter picker overlay (Go `label_picker.go`
@@ -2714,6 +2839,36 @@ fn render_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                     .bg(pbg)
                     .add_modifier(Modifier::BOLD),
             ));
+
+            // Priority hint arrow (Go `p` — delegate.go): shown only while
+            // hints are toggled on. suggested < current numeric priority
+            // means the issue is under-prioritized (should be more urgent)
+            // -> up-arrow "increase"; suggested > current -> down-arrow.
+            if app.show_priority_hints {
+                if let Some(hints) = &app.priority_hints {
+                    match hints.get(&row.id) {
+                        Some(&suggested) if suggested < row.priority => {
+                            spans.push(Span::styled(
+                                "\u{2191}",
+                                Style::default()
+                                    .fg(Color::Green)
+                                    .add_modifier(Modifier::BOLD),
+                            ));
+                        }
+                        Some(&suggested) if suggested > row.priority => {
+                            spans.push(Span::styled(
+                                "\u{2193}",
+                                Style::default()
+                                    .fg(Color::Yellow)
+                                    .add_modifier(Modifier::BOLD),
+                            ));
+                        }
+                        _ => spans.push(Span::raw(" ")),
+                    }
+                } else {
+                    spans.push(Span::raw(" "));
+                }
+            }
             spans.push(Span::raw(" "));
 
             // Status badge
@@ -3224,6 +3379,9 @@ fn tui_event_loop(
                 app.update_tag = Some(tag);
             }
         }
+        // Live reload (Go fsnotify; TUI_UX_PARITY_PLAN.md Phase F): piggyback
+        // on this same ~500ms tick instead of a background notify watcher.
+        app.check_for_reload();
         // Poll events with timeout so freshness badge stays live
         if event::poll(std::time::Duration::from_millis(500))? {
             match event::read()? {
@@ -3681,6 +3839,66 @@ mod tests {
         app.update_tag = Some("v9.9.9".to_string());
         app.handle_key(KeyCode::Char('U'));
         assert!(app.show_update_modal);
+    }
+
+    #[test]
+    fn priority_hints_toggle_computes_once_and_sets_status() {
+        let mut app = make_app(6);
+        assert!(app.priority_hints.is_none());
+        app.handle_key(KeyCode::Char('p'));
+        assert!(app.show_priority_hints);
+        assert!(
+            app.priority_hints.is_some(),
+            "toggling on should trigger the lazy compute"
+        );
+        assert!(
+            app.status_msg.starts_with("Priority hints:"),
+            "unexpected status message: {}",
+            app.status_msg
+        );
+        let computed_once = app.priority_hints.clone();
+        // Toggling off then on again must not recompute (same Some(map)),
+        // matching the lazy-compute-once pattern used by History/LabelDashboard.
+        app.handle_key(KeyCode::Char('p'));
+        assert!(!app.show_priority_hints);
+        assert!(app.status_msg.is_empty());
+        app.handle_key(KeyCode::Char('p'));
+        assert_eq!(
+            app.priority_hints.as_ref().map(|m| m.len()),
+            computed_once.map(|m| m.len())
+        );
+    }
+
+    #[test]
+    fn check_for_reload_detects_mtime_change() {
+        let mut app = make_app(2);
+        let dir = std::env::temp_dir().join(format!("bvr_watch_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("issues.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let mtime1 = std::fs::metadata(&path).unwrap().modified().unwrap();
+        app.watched_path = Some(path.clone());
+        app.watched_mtime = Some(mtime1);
+        assert!(
+            !app.check_for_reload(),
+            "unchanged mtime must not trigger a reload"
+        );
+        // Some filesystems have coarse mtime resolution — sleep briefly to
+        // guarantee a strictly-later timestamp on the rewrite below.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&path, "{}\n").unwrap();
+        assert!(
+            app.check_for_reload(),
+            "changed mtime must trigger reload_from_disk"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_for_reload_is_noop_without_a_watched_path() {
+        let mut app = make_app(2);
+        app.watched_path = None;
+        assert!(!app.check_for_reload());
     }
 
     #[test]
