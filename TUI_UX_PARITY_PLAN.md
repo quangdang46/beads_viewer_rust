@@ -252,3 +252,51 @@ consumer side (TUI tests) to avoid a bv-core→bv-analysis dev-dependency.
 F (live reload) — as originally scoped.
 - G13 (Windows clipboard), G14 (Board columns), G15 (Actionable/Tutorial j/k),
 AgentPromptModal, velocity_comparison — untouched by this pass.
+
+---
+
+## 9. Phase C results (shipped 2026-09-07)
+
+Label Dashboard, verified with `cargo fmt --all && cargo clippy
+--workspace --all-targets -- -D warnings && cargo test --workspace` (green —
+67 bv-tui unit tests incl. 6 new dashboard tests). TUI-only changes; no
+robot/CLI surface touched.
+
+### Shipped
+
+- **C1 (view + key):** new `ViewMode::LabelDashboard` on `[` (verified
+unbound — no `[`, `d`, or `LabelDashboard` references existed in `bv-tui`
+before this pass), lazy-loaded on first open like History
+(`load_label_health_if_needed`, deferred analysis cost). Worst-health-first
+display order, dedicated `label_dashboard_cursor` on `j`/`k`, `esc` returns
+to List instead of quitting.
+- **C2 (badges, no new thresholds):** rows render badge + score + open/total
++ blocked-ratio from `bv_analysis::label_health::{compute_all_label_health,
+health_level_from_score}` — the same module + Healthy ≥ 70 / Warning ≥ 40 /
+Critical thresholds `--robot-label-health` uses. Zero new constants.
+- **C3 (`h` detail modal):** velocity (closed 7d/30d, avg days to close,
+score, trend), freshness (stale count, avg days since update, score), flow
+(in/out deps, external blocked/blocking, score), work distribution
+(open/closed/blocked + blocked-ratio). View-scoped `h` arm precedes the
+global History toggle, so `h` inside the dashboard never leaves the view.
+- **C4 (`d` drilldown):** picker-convention overlay (`j`/`k` navigate, other
+chars substring-filter id+title, Backspace clears, `Enter` jumps to List
+with `label_filter` set, `Esc` closes). Opening it closes the detail modal
+(one overlay at a time).
+- **C5 (registry):** new `Focus::LabelDashboard` with the real bindings, so
+`?` inside the view is accurate; the existing
+`every_focus_has_at_least_one_binding` guard covers the new variant.
+
+### Tests
+
+- 6 TUI tests: lazy open/load + toggle, `j`/`k` moves dashboard cursor (not
+list cursor), `h` toggles detail without entering History, drilldown
+filter-narrow + Enter-applies-filter, drilldown Esc closes in-view, view Esc
+returns to List without quitting.
+
+### Still open (unchanged)
+
+- Phase D (search upgrade), E (priority hints), F (live reload) — as
+originally scoped.
+- G13 (Windows clipboard), G14 (Board columns), G15 (Actionable/Tutorial j/k),
+AgentPromptModal, velocity_comparison — untouched by this pass.

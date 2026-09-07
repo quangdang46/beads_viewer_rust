@@ -92,6 +92,14 @@ pub struct GraphMetrics {
     pub authorities: BTreeMap<String, f64>,
 }
 
+/// Drilldown overlay state: filtered issue list for one label (Go `d`
+/// drilldown overlay — filterable, `Enter` jumps to List filtered by it).
+pub struct LabelDrilldown {
+    pub label: String,
+    pub filter: String,
+    pub cursor: usize,
+}
+
 pub struct App {
     pub rows: Vec<ListRow>,
     /// Full issue data keyed by ID (for detail pane rendering)
@@ -169,6 +177,15 @@ pub struct App {
     /// Cursor over the flattened Time-Travel diff entry list
     /// (added, then removed, then changed).
     pub time_travel_cursor: usize,
+    /// Per-label health dashboard (Go `focusLabelDashboard`), lazy-loaded
+    /// on first `[` press like History (deferred analysis cost).
+    pub label_health: Option<bv_analysis::label_health::LabelAnalysisResult>,
+    pub label_health_loaded: bool,
+    pub label_dashboard_cursor: usize,
+    /// Detail modal for the cursor label (Go `h` health-detail modal).
+    pub show_label_detail: bool,
+    /// Drilldown overlay (Go `d`): filtered issue list for one label.
+    pub label_drilldown: Option<LabelDrilldown>,
     /// Update-available modal visibility (Go `U` key / auto-show-once).
     pub show_update_modal: bool,
     /// True once the update modal has been auto-shown once this session,
@@ -209,6 +226,10 @@ pub enum ViewMode {
     Board,
     Tree,
     Graph,
+    /// Per-label health dashboard (Go `focusLabelDashboard`, `[` key).
+    /// Badges computed by `bv_analysis::label_health` (same module backing
+    /// Attention/FlowMatrix). See TUI_UX_PARITY_PLAN.md Phase C.
+    LabelDashboard,
     FlowMatrix,
     Attention,
     Insights,
@@ -515,6 +536,11 @@ impl App {
             attention_labels: Vec::new(),
             attention_cursor: 0,
             graph_cursor: 0,
+            label_health: None,
+            label_health_loaded: false,
+            label_dashboard_cursor: 0,
+            show_label_detail: false,
+            label_drilldown: None,
             graph_scroll: 0,
             graph_data: None,
             history: None,
@@ -774,6 +800,9 @@ impl App {
         if self.time_travel_prompt.is_some() {
             return self.handle_time_travel_prompt_key(code);
         }
+        if self.label_drilldown.is_some() {
+            return self.handle_label_drilldown_key(code);
+        }
         match code {
             KeyCode::Tab => {
                 self.focus_detail = !self.focus_detail;
@@ -791,12 +820,15 @@ impl App {
                 if self.searching {
                     self.searching = false;
                     self.search_query.clear();
-                    self.apply_filter();
-                } else if self.focus_detail {
-                    self.focus_detail = false;
                 } else if self.show_detail {
                     self.show_detail = false;
-                } else if self.current_view == ViewMode::TimeTravel {
+                } else if self.label_drilldown.is_some() || self.show_label_detail {
+                    self.label_drilldown = None;
+                    self.show_label_detail = false;
+                } else if matches!(
+                    self.current_view,
+                    ViewMode::TimeTravel | ViewMode::LabelDashboard
+                ) {
                     self.current_view = ViewMode::List;
                 } else {
                     self.quit_requested = true;
@@ -845,6 +877,11 @@ impl App {
                     if max > 0 && self.time_travel_cursor + 1 < max {
                         self.time_travel_cursor += 1;
                     }
+                } else if self.current_view == ViewMode::LabelDashboard {
+                    let max = self.label_dashboard_count();
+                    if max > 0 && self.label_dashboard_cursor + 1 < max {
+                        self.label_dashboard_cursor += 1;
+                    }
                 } else if self.cursor + 1 < self.filtered_indices.len() {
                     self.cursor += 1;
                     self.update_session_count();
@@ -872,6 +909,8 @@ impl App {
                     self.alerts_cursor = self.alerts_cursor.saturating_sub(1);
                 } else if self.current_view == ViewMode::TimeTravel {
                     self.time_travel_cursor = self.time_travel_cursor.saturating_sub(1);
+                } else if self.current_view == ViewMode::LabelDashboard {
+                    self.label_dashboard_cursor = self.label_dashboard_cursor.saturating_sub(1);
                 } else {
                     self.cursor = self.cursor.saturating_sub(1);
                     self.update_session_count();
@@ -961,6 +1000,30 @@ impl App {
                 self.current_view = ViewMode::TimeTravel;
                 self.time_travel_prompt = None;
                 self.run_time_travel("HEAD~5");
+                true
+            }
+            KeyCode::Char('[') => {
+                // Go Label Dashboard (`focusLabelDashboard`).
+                if self.current_view == ViewMode::LabelDashboard {
+                    self.current_view = ViewMode::List;
+                } else {
+                    self.load_label_health_if_needed();
+                    self.current_view = ViewMode::LabelDashboard;
+                }
+                true
+            }
+            // In the dashboard, `h` opens the health-detail modal for the
+            // cursor label (Go `h`) instead of toggling History — this
+            // guarded arm must precede the plain `h` arm below.
+            KeyCode::Char('h') if self.current_view == ViewMode::LabelDashboard => {
+                self.show_label_detail = !self.show_label_detail;
+                self.label_drilldown = None;
+                true
+            }
+            // Go `d` drilldown overlay: filtered issue list for the cursor
+            // label. `d` is unbound elsewhere, so no fallback behavior lost.
+            KeyCode::Char('d') if self.current_view == ViewMode::LabelDashboard => {
+                self.open_label_drilldown();
                 true
             }
             KeyCode::Char('h') => {
@@ -1585,6 +1648,132 @@ impl App {
             _ => true,
         }
     }
+    /// Lazily compute per-label health (Go `focusLabelDashboard` data).
+    /// Deferred to first `[` press like History — same analysis the
+    /// `--robot-label-health` path uses, computed once per session.
+    fn load_label_health_if_needed(&mut self) {
+        if self.label_health_loaded {
+            return;
+        }
+        self.label_health_loaded = true; // don't retry every keypress on failure
+        let issues: Vec<bv_core::model::Issue> = self.issue_map.values().cloned().collect();
+        let cfg = bv_analysis::label_health::LabelHealthConfig::default();
+        let now = jiff::Timestamp::now();
+        let result = bv_analysis::label_health::compute_all_label_health(&issues, &cfg, now);
+        self.status_msg = format!("Label dashboard: {} labels", result.total_labels);
+        self.label_health = Some(result);
+    }
+
+    fn label_dashboard_count(&self) -> usize {
+        self.label_health.as_ref().map_or(0, |r| r.labels.len())
+    }
+
+    /// Display order: worst health first, label asc tiebreak (so the
+    /// labels needing attention sit at the top, Go dashboard style).
+    fn label_dashboard_order(&self) -> Vec<usize> {
+        let mut idx: Vec<usize> = (0..self.label_dashboard_count()).collect();
+        if let Some(r) = &self.label_health {
+            idx.sort_by(|&a, &b| {
+                r.labels[a]
+                    .health
+                    .cmp(&r.labels[b].health)
+                    .then_with(|| r.labels[a].label.cmp(&r.labels[b].label))
+            });
+        }
+        idx
+    }
+
+    fn selected_dashboard_label(&self) -> Option<&bv_analysis::label_health::LabelHealth> {
+        let order = self.label_dashboard_order();
+        order
+            .get(self.label_dashboard_cursor)
+            .and_then(|&i| self.label_health.as_ref().map(|r| &r.labels[i]))
+    }
+
+    fn open_label_drilldown(&mut self) {
+        if let Some(label) = self.selected_dashboard_label().map(|l| l.label.clone()) {
+            // One overlay at a time (same convention as render_overlays).
+            self.show_label_detail = false;
+            self.label_drilldown = Some(LabelDrilldown {
+                label,
+                filter: String::new(),
+                cursor: 0,
+            });
+        }
+    }
+
+    /// (id, title, status) rows for the open drilldown, substring-filtered
+    /// on id+title and sorted by id (same filter semantics as `/` search).
+    fn drilldown_rows(&self) -> Vec<(String, String, bv_core::model::Status)> {
+        let Some(dd) = &self.label_drilldown else {
+            return Vec::new();
+        };
+        let q = dd.filter.to_lowercase();
+        let mut rows: Vec<(String, String, bv_core::model::Status)> = self
+            .issue_map
+            .values()
+            .filter(|i| i.labels.iter().any(|l| l == &dd.label))
+            .filter(|i| {
+                q.is_empty()
+                    || i.id.to_lowercase().contains(&q)
+                    || i.title.to_lowercase().contains(&q)
+            })
+            .map(|i| (i.id.clone(), i.title.clone(), i.status))
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
+    }
+
+    /// Key handling while the drilldown overlay is open: picker convention
+    /// (`j`/`k` navigate, other chars filter, `Enter` jumps, `Esc` closes).
+    fn handle_label_drilldown_key(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Esc => {
+                self.label_drilldown = None;
+                true
+            }
+            KeyCode::Enter => {
+                // Jump to List filtered by this label (Go drilldown Enter).
+                if let Some(dd) = self.label_drilldown.take() {
+                    self.label_filter = Some(dd.label.clone());
+                    self.current_view = ViewMode::List;
+                    self.apply_filter();
+                    self.status_msg = format!("Filtered by label: {}", dd.label);
+                }
+                true
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(dd) = &mut self.label_drilldown {
+                    dd.cursor = dd.cursor.saturating_sub(1);
+                }
+                true
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let max = self.drilldown_rows().len();
+                if let Some(dd) = &mut self.label_drilldown {
+                    if max > 0 && dd.cursor + 1 < max {
+                        dd.cursor += 1;
+                    }
+                }
+                true
+            }
+            KeyCode::Backspace => {
+                if let Some(dd) = &mut self.label_drilldown {
+                    dd.filter.pop();
+                    dd.cursor = 0;
+                }
+                true
+            }
+            KeyCode::Char(c) => {
+                if let Some(dd) = &mut self.label_drilldown {
+                    dd.filter.push(c);
+                    dd.cursor = 0;
+                }
+                true
+            }
+            _ => true,
+        }
+    }
 
     /// Open selected issue in $EDITOR (Go "O" edit).
     fn open_in_editor(&mut self) {
@@ -1872,6 +2061,12 @@ pub fn render(f: &mut Frame, app: &App) {
             render_overlays(f, app);
             return;
         }
+        ViewMode::LabelDashboard => {
+            render_label_dashboard(f, app);
+            render_status_bar(f, app);
+            render_overlays(f, app);
+            return;
+        }
         _ => {}
     }
 
@@ -1898,6 +2093,220 @@ pub fn render(f: &mut Frame, app: &App) {
 
     render_status_bar(f, app);
     render_overlays(f, app);
+}
+
+/// Label Dashboard view (Go `focusLabelDashboard`): per-label health
+/// badges computed by `bv_analysis::label_health` (thresholds
+/// Healthy ≥ 70 / Warning ≥ 40 / else Critical live in that crate, shared
+/// with `--robot-label-health`), worst-first order, `h` detail modal and
+/// `d` drilldown overlay for the cursor label.
+fn render_label_dashboard(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let order = app.label_dashboard_order();
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+        " Label Dashboard ",
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    let Some(result) = &app.label_health else {
+        lines.push(Line::from(""));
+        lines.push(Line::from("No label data (press [ to load)."));
+        let msg = ratatui::widgets::Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title(" LABELS "));
+        f.render_widget(msg, area);
+        return;
+    };
+    lines.push(Line::from(format!(
+        "{} labels: {} healthy  {} warning  {} critical   (j/k move, h detail, d issues, [ close)",
+        result.total_labels, result.healthy_count, result.warning_count, result.critical_count
+    )));
+    lines.push(Line::from(""));
+    if order.is_empty() {
+        lines.push(Line::from("No labeled issues."));
+    }
+    for (row, &i) in order.iter().enumerate() {
+        let l = &result.labels[i];
+        let (badge, color) = match l.health_level {
+            "healthy" => ("●", Color::Green),
+            "warning" => ("●", Color::Yellow),
+            _ => ("●", Color::Red),
+        };
+        let blocked_ratio = if l.issue_count > 0 {
+            l.blocked as f64 / l.issue_count as f64 * 100.0
+        } else {
+            0.0
+        };
+        let text = format!(
+            "{} {:<24} {:>3}  open {:>3}/{:<3}  blocked {:>4.0}%  {}",
+            badge, l.label, l.health, l.open_count, l.issue_count, blocked_ratio, l.health_level
+        );
+        if row == app.label_dashboard_cursor {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "> ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    text,
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!(" {badge}"), Style::default().fg(color)),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("{badge} "), Style::default().fg(color)),
+                Span::raw(text),
+            ]));
+        }
+    }
+    let msg = ratatui::widgets::Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(" LABELS "));
+    f.render_widget(msg, area);
+    if app.show_label_detail {
+        render_label_detail_modal(f, app);
+    }
+    if app.label_drilldown.is_some() {
+        render_label_drilldown(f, app);
+    }
+}
+
+/// Health-detail modal for the cursor label: velocity / staleness /
+/// blocked-ratio / work-distribution breakdown (Go `h` modal).
+fn render_label_detail_modal(f: &mut Frame, app: &App) {
+    let Some(l) = app.selected_dashboard_label() else {
+        return;
+    };
+    let blocked_ratio = if l.issue_count > 0 {
+        l.blocked as f64 / l.issue_count as f64 * 100.0
+    } else {
+        0.0
+    };
+    let body: Vec<Line> = vec![
+        Line::from(Span::styled(
+            format!(" {}  ({} {})", l.label, l.health, l.health_level),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(format!(
+            "Work: {} open / {} closed / {} total, {} blocked ({:.0}%)",
+            l.open_count, l.closed_count, l.issue_count, l.blocked, blocked_ratio
+        )),
+        Line::from(format!(
+            "Velocity: {} closed/7d, {} closed/30d, avg {:.1}d to close (score {}) — {} {:.0}%",
+            l.velocity.closed_last_7_days,
+            l.velocity.closed_last_30_days,
+            l.velocity.avg_days_to_close,
+            l.velocity.velocity_score,
+            l.velocity.trend_direction,
+            l.velocity.trend_percent
+        )),
+        Line::from(format!(
+            "Freshness: {} stale, avg {:.1}d since update (score {})",
+            l.freshness.stale_count, l.freshness.avg_days_since_update, l.freshness.freshness_score
+        )),
+        Line::from(format!(
+            "Flow: {} in / {} out deps, {} blocked-by-external, {} blocking-external (score {})",
+            l.flow.incoming_deps,
+            l.flow.outgoing_deps,
+            l.flow.blocked_by_external,
+            l.flow.blocking_external,
+            l.flow.flow_score
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            " h / esc = close ",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    let w = 72.min(app.width.saturating_sub(4));
+    let h = (body.len() as u16 + 2).min(app.height.saturating_sub(2));
+    let popup = ratatui::layout::Rect {
+        x: app.width.saturating_sub(w) / 2,
+        y: app.height.saturating_sub(h) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(ratatui::widgets::Clear, popup);
+    f.render_widget(
+        ratatui::widgets::Paragraph::new(body).block(
+            ratatui::widgets::Block::default()
+                .borders(ratatui::widgets::Borders::ALL)
+                .title(format!(" LABEL: {} ", l.label))
+                .border_style(Style::default().fg(Color::Yellow)),
+        ),
+        popup,
+    );
+}
+
+/// Drilldown overlay: filtered issue list for one label; `Enter` jumps to
+/// List filtered by that label (Go `d` drilldown).
+fn render_label_drilldown(f: &mut Frame, app: &App) {
+    let Some(dd) = &app.label_drilldown else {
+        return;
+    };
+    let rows = app.drilldown_rows();
+    let mut body: Vec<Line> = vec![Line::from(vec![
+        Span::raw("Filter: "),
+        Span::raw(dd.filter.clone()),
+        Span::styled("█", Style::default().fg(Color::Yellow)),
+    ])];
+    let visible = app.height.saturating_sub(10).max(1) as usize;
+    let start = dd.cursor.saturating_sub(visible.saturating_sub(1));
+    for (row, (id, title, _)) in rows.iter().enumerate().skip(start).take(visible) {
+        let text = format!("{id}  {title}");
+        if row == dd.cursor {
+            body.push(Line::from(vec![
+                Span::styled(
+                    "> ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    text,
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        } else {
+            body.push(Line::from(format!("  {text}")));
+        }
+    }
+    if rows.is_empty() {
+        body.push(Line::from("(no issues match)"));
+    }
+    body.push(Line::from(""));
+    body.push(Line::from(Span::styled(
+        " Enter = list filtered by label   Esc = close ",
+        Style::default().fg(Color::DarkGray),
+    )));
+    let w = 72.min(app.width.saturating_sub(4));
+    let h = (body.len() as u16 + 2).min(app.height.saturating_sub(2));
+    let popup = ratatui::layout::Rect {
+        x: app.width.saturating_sub(w) / 2,
+        y: app.height.saturating_sub(h) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(ratatui::widgets::Clear, popup);
+    f.render_widget(
+        ratatui::widgets::Paragraph::new(body).block(
+            ratatui::widgets::Block::default()
+                .borders(ratatui::widgets::Borders::ALL)
+                .title(format!(" LABEL: {} ({} issues) ", dd.label, rows.len()))
+                .border_style(Style::default().fg(Color::Cyan)),
+        ),
+        popup,
+    );
 }
 
 /// Time-Travel view (Go `focusTimeTravelInput` → `SnapshotDiff`): revision
@@ -2124,6 +2533,7 @@ fn focus_for_view(view: ViewMode) -> crate::keybindings::Focus {
         ViewMode::Alerts => Focus::Alerts,
         ViewMode::History => Focus::History,
         ViewMode::TimeTravel => Focus::TimeTravel,
+        ViewMode::LabelDashboard => Focus::LabelDashboard,
         ViewMode::Sprint => Focus::Sprint,
         ViewMode::Tutorial => Focus::Tutorial,
         ViewMode::Actionable => Focus::Actionable,
@@ -2962,6 +3372,114 @@ mod tests {
             "T must run the diff (or report the error) in the status line, got: {}",
             app.status_msg
         );
+    }
+
+    /// App with two real labels: backend on T-1/T-2, frontend on T-4/T-5
+    /// (make_app statuses: every 3rd id closed, so all four are open).
+    fn make_labeled_app() -> App {
+        let mut app = make_app(6);
+        for id in ["T-1", "T-2"] {
+            app.issue_map.get_mut(id).unwrap().labels = vec!["backend".to_string()];
+        }
+        for id in ["T-4", "T-5"] {
+            app.issue_map.get_mut(id).unwrap().labels = vec!["frontend".to_string()];
+        }
+        app
+    }
+
+    #[test]
+    fn label_dashboard_opens_and_loads_lazily() {
+        let mut app = make_labeled_app();
+        assert!(!app.label_health_loaded);
+        app.handle_key(KeyCode::Char('['));
+        assert_eq!(app.current_view, ViewMode::LabelDashboard);
+        assert!(app.label_health_loaded, "[ should trigger lazy health load");
+        assert_eq!(app.label_dashboard_count(), 2);
+        // Toggling back must not reload.
+        app.handle_key(KeyCode::Char('['));
+        assert_eq!(app.current_view, ViewMode::List);
+        assert!(app.label_health_loaded);
+    }
+
+    #[test]
+    fn label_dashboard_j_k_moves_dashboard_cursor_not_list() {
+        let mut app = make_labeled_app();
+        app.handle_key(KeyCode::Char('['));
+        assert_eq!(app.label_dashboard_count(), 2);
+        let cursor_before = app.cursor;
+        app.handle_key(KeyCode::Char('j'));
+        assert_eq!(app.label_dashboard_cursor, 1);
+        assert_eq!(app.cursor, cursor_before);
+        app.handle_key(KeyCode::Char('j')); // clamped at last
+        assert_eq!(app.label_dashboard_cursor, 1);
+        app.handle_key(KeyCode::Char('k'));
+        assert_eq!(app.label_dashboard_cursor, 0);
+    }
+
+    #[test]
+    fn label_dashboard_h_toggles_detail_not_history() {
+        let mut app = make_labeled_app();
+        app.handle_key(KeyCode::Char('['));
+        app.handle_key(KeyCode::Char('h'));
+        assert!(
+            app.show_label_detail,
+            "h in dashboard must open the detail modal"
+        );
+        assert_eq!(
+            app.current_view,
+            ViewMode::LabelDashboard,
+            "h in dashboard must not switch to History"
+        );
+        app.handle_key(KeyCode::Char('h'));
+        assert!(!app.show_label_detail);
+    }
+
+    #[test]
+    fn label_dashboard_d_drilldown_enter_applies_label_filter() {
+        let mut app = make_labeled_app();
+        app.handle_key(KeyCode::Char('['));
+        let first = app
+            .selected_dashboard_label()
+            .expect("a label is selected")
+            .label
+            .clone();
+        app.handle_key(KeyCode::Char('d'));
+        assert_eq!(
+            app.label_drilldown.as_ref().map(|d| d.label.as_str()),
+            Some(first.as_str())
+        );
+        // Typing narrows the drilldown rows; Enter jumps to List filtered.
+        app.handle_key(KeyCode::Char('T'));
+        assert!(
+            app.drilldown_rows()
+                .iter()
+                .all(|(id, title, _)| id.contains('T') || title.contains('T')),
+            "filter must narrow rows to the typed substring"
+        );
+        app.handle_key(KeyCode::Enter);
+        assert_eq!(app.label_filter, Some(first));
+        assert_eq!(app.current_view, ViewMode::List);
+        assert!(app.label_drilldown.is_none());
+    }
+
+    #[test]
+    fn label_dashboard_drilldown_esc_closes_stays_in_view() {
+        let mut app = make_labeled_app();
+        app.handle_key(KeyCode::Char('['));
+        app.handle_key(KeyCode::Char('d'));
+        assert!(app.label_drilldown.is_some());
+        app.handle_key(KeyCode::Esc);
+        assert!(app.label_drilldown.is_none());
+        assert_eq!(app.current_view, ViewMode::LabelDashboard);
+    }
+
+    #[test]
+    fn label_dashboard_esc_returns_to_list() {
+        let mut app = make_labeled_app();
+        app.handle_key(KeyCode::Char('['));
+        app.handle_key(KeyCode::Esc);
+        assert_eq!(app.current_view, ViewMode::List);
+        assert!(!app.quit_requested, "esc in a view must not quit");
     }
 
     #[test]

@@ -22,6 +22,9 @@ pub enum Focus {
     /// Revision-diff mode (Go `focusTimeTravelInput` → `SnapshotDiff`);
     /// see TUI_UX_PARITY_PLAN.md Phase B.
     TimeTravel,
+    /// Per-label health dashboard (Go `focusLabelDashboard`);
+    /// see TUI_UX_PARITY_PLAN.md Phase C.
+    LabelDashboard,
     Tutorial,
     Actionable,
     Search,
@@ -236,6 +239,25 @@ pub fn build_default_registry() -> KeyRegistry {
     ] {
         reg.register(KeyBinding {
             focus: Focus::TimeTravel,
+            key: key.to_string(),
+            desc: desc.to_string(),
+            category: nav.clone(),
+        });
+    }
+    // Label Dashboard — per-label health (Go `focusLabelDashboard`),
+    // backed by `bv_analysis::label_health` (shared with
+    // `--robot-label-health`); see TUI_UX_PARITY_PLAN.md Phase C.
+    for (key, desc) in [
+        ("[", "Toggle label dashboard"),
+        ("j/↓", "Next label (worst health first)"),
+        ("k/↑", "Previous label"),
+        ("h", "Health-detail modal for selected label"),
+        ("d", "Drilldown: issues for selected label"),
+        ("enter", "List filtered by label (in drilldown)"),
+        ("esc", "Close overlay / back to list"),
+    ] {
+        reg.register(KeyBinding {
+            focus: Focus::LabelDashboard,
             key: key.to_string(),
             desc: desc.to_string(),
             category: nav.clone(),
