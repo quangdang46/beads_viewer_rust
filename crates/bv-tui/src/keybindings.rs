@@ -147,7 +147,7 @@ pub fn build_default_registry() -> KeyRegistry {
         ("F", "Toggle actionable view"),
         (
             "t / T",
-            "Toggle time-travel placeholder (not yet implemented — Phase B)",
+            "Time-travel: t prompts for a revision, T diffs vs HEAD~5",
         ),
         ("`", "Toggle tutorial"),
         (";", "Toggle sidebar"),
