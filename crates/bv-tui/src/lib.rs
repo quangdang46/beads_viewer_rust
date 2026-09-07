@@ -148,6 +148,32 @@ pub struct App {
     pub history: Option<crate::views::history::HistoryState>,
     /// Label picker state.
     pub label_picker: Option<crate::views::pickers::LabelPicker>,
+    /// Recipe picker state (built-in recipes only — see `default_recipes`).
+    pub recipe_picker: Option<crate::views::pickers::RecipePicker>,
+    /// Workspace repo picker state (only meaningful when `workspace_repos`
+    /// is `Some`).
+    pub repo_picker: Option<crate::views::pickers::RepoPicker>,
+    /// True once `history` has been populated with real correlation data
+    /// (lazy-loaded on first `h` press — Go bv-h305-style deferred cost).
+    pub history_loaded: bool,
+    /// Revision-input buffer for Time-Travel (Go `focusTimeTravelInput`).
+    /// `Some` = prompt open and capturing keys, `None` = closed.
+    pub time_travel_prompt: Option<String>,
+    /// Last computed revision diff (Go `SnapshotDiff`), via
+    /// `bv_analysis::diff::diff_issues` over `GitLoader::load_at` output
+    /// (the same plumbing `--robot-diff` uses — see plan Q4).
+    pub time_travel_result: Option<bv_analysis::diff::DiffResult>,
+    /// Error from the last Time-Travel diff attempt (bad ref, not a git
+    /// repo). Shown in the view; mirrors the robot command's message.
+    pub time_travel_error: Option<String>,
+    /// Cursor over the flattened Time-Travel diff entry list
+    /// (added, then removed, then changed).
+    pub time_travel_cursor: usize,
+    /// Update-available modal visibility (Go `U` key / auto-show-once).
+    pub show_update_modal: bool,
+    /// True once the update modal has been auto-shown once this session,
+    /// so it doesn't reappear every frame after the user dismisses it.
+    pub update_modal_auto_shown: bool,
     /// Sprint dashboard state (loaded from .beads/sprints.jsonl).
     pub sprint: Option<crate::views::sprint::SprintState>,
     /// When the snapshot was loaded (freshness badge, Go bv-h305)
@@ -187,10 +213,57 @@ pub enum ViewMode {
     Attention,
     Insights,
     Alerts,
+    /// Bead↔commit correlation view (Go `pkg/ui/history.go`). Was
+    /// previously aliased under `TimeTravel` — split out because Go treats
+    /// History and Time-Travel as two distinct features with distinct keys
+    /// (`h` vs `t`/`T`). See TUI_UX_PARITY_PLAN.md G1/G12.
+    History,
+    /// Revision-diff mode (Go `focusTimeTravelInput` → `SnapshotDiff`).
+    /// `t` opens the revision prompt, `T` diffs instantly vs HEAD~5;
+    /// Enter submits. See TUI_UX_PARITY_PLAN.md Phase B.
     TimeTravel,
     Sprint,
     Tutorial,
     Actionable,
+}
+
+/// A built-in recipe definition (name + description shown in the picker).
+/// Matches Go's embedded `defaults/recipes.yaml` names/descriptions exactly;
+/// user/project YAML recipe loading is not ported (see `open_recipe_picker`
+/// doc comment).
+pub struct RecipeDef {
+    pub name: &'static str,
+    pub description: &'static str,
+}
+
+/// The 6 recipes Go ships as embedded defaults (`recipe.Loader::loadBuiltin`).
+pub fn default_recipe_defs() -> &'static [RecipeDef] {
+    &[
+        RecipeDef {
+            name: "triage",
+            description: "Open/blocked issues, sorted by priority",
+        },
+        RecipeDef {
+            name: "release-cut",
+            description: "Recently closed issues for changelog",
+        },
+        RecipeDef {
+            name: "blocked-review",
+            description: "All blocked items with blocker info",
+        },
+        RecipeDef {
+            name: "dependency-risk",
+            description: "High betweenness/PageRank items",
+        },
+        RecipeDef {
+            name: "quick-wins",
+            description: "Low-priority, no-dependency items",
+        },
+        RecipeDef {
+            name: "stale",
+            description: "Items not updated in 14+ days",
+        },
+    ]
 }
 
 /// Large/huge dataset warning (Go largeDatasetWarning, bv-9thm).
@@ -320,6 +393,41 @@ pub fn release_instance_lock(beads_dir: &std::path::Path) {
     }
 }
 
+/// Shell out to the platform clipboard tool. Shared by issue-copy (`C`) and
+/// commit-SHA-copy (`y`, History view).
+///
+/// NOTE: this shells out to `pbcopy`/`wl-copy`/`xclip`, which has no Windows
+/// branch — on Windows this always fails. The original architecture plan
+/// (COMPREHENSIVE_PLAN_FOR_FORT_BEADS_VIEWER.md §2) specifies `arboard` as
+/// the intended cross-platform clipboard crate; migrating away from this
+/// shell-out is tracked as a follow-up (TUI_UX_PARITY_PLAN.md G13), not
+/// fixed here to keep this pass's diff focused on view/keybinding wiring.
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    let (cmd, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
+        ("pbcopy", &[])
+    } else if std::env::var("WAYLAND_DISPLAY").is_ok() {
+        ("wl-copy", &[])
+    } else {
+        ("xclip", &["-selection", "clipboard"])
+    };
+    let mut child = std::process::Command::new(cmd)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    {
+        use std::io::Write;
+        if let Some(stdin) = child.stdin.as_mut() {
+            stdin
+                .write_all(text.as_bytes())
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    child.wait().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 impl App {
     pub fn new(issues: Vec<bv_core::model::Issue>) -> Self {
         let issue_map: std::collections::HashMap<String, bv_core::model::Issue> =
@@ -411,6 +519,15 @@ impl App {
             graph_data: None,
             history: None,
             label_picker: None,
+            recipe_picker: None,
+            repo_picker: None,
+            history_loaded: false,
+            time_travel_prompt: None,
+            time_travel_result: None,
+            time_travel_error: None,
+            time_travel_cursor: 0,
+            show_update_modal: false,
+            update_modal_auto_shown: false,
             sprint: None,
             filtered_indices: Vec::new(),
             cursor: 0,
@@ -640,6 +757,23 @@ impl App {
             self.show_help = false;
             return true;
         }
+        if self.show_update_modal {
+            // Go: "Press any key to dismiss".
+            self.show_update_modal = false;
+            return true;
+        }
+        if matches!(self.label_picker, Some(ref p) if p.visible) {
+            return self.handle_label_picker_key(code);
+        }
+        if matches!(self.recipe_picker, Some(ref p) if p.visible) {
+            return self.handle_recipe_picker_key(code);
+        }
+        if matches!(self.repo_picker, Some(ref p) if p.visible) {
+            return self.handle_repo_picker_key(code);
+        }
+        if self.time_travel_prompt.is_some() {
+            return self.handle_time_travel_prompt_key(code);
+        }
         match code {
             KeyCode::Tab => {
                 self.focus_detail = !self.focus_detail;
@@ -662,6 +796,8 @@ impl App {
                     self.focus_detail = false;
                 } else if self.show_detail {
                     self.show_detail = false;
+                } else if self.current_view == ViewMode::TimeTravel {
+                    self.current_view = ViewMode::List;
                 } else {
                     self.quit_requested = true;
                 }
@@ -692,14 +828,22 @@ impl App {
                         if self.graph_cursor >= self.graph_scroll + visible {
                             self.graph_scroll = self.graph_cursor.saturating_sub(visible - 1);
                         }
-                    } else if self.current_view == ViewMode::TimeTravel {
-                        if let Some(ref mut h) = self.history {
-                            h.move_bead_down();
-                        }
+                    }
+                } else if self.current_view == ViewMode::History {
+                    // Fixed: was previously nested unreachably inside the
+                    // Graph arm above (dead code — see TUI_UX_PARITY_PLAN.md
+                    // G11), so History's bead cursor never actually moved.
+                    if let Some(ref mut h) = self.history {
+                        h.move_bead_down();
                     }
                 } else if self.current_view == ViewMode::Alerts {
                     if self.alerts_cursor + 1 < self.alerts.len() {
                         self.alerts_cursor += 1;
+                    }
+                } else if self.current_view == ViewMode::TimeTravel {
+                    let max = self.time_travel_entry_count();
+                    if max > 0 && self.time_travel_cursor + 1 < max {
+                        self.time_travel_cursor += 1;
                     }
                 } else if self.cursor + 1 < self.filtered_indices.len() {
                     self.cursor += 1;
@@ -720,8 +864,14 @@ impl App {
                     if self.graph_cursor < self.graph_scroll {
                         self.graph_scroll = self.graph_cursor;
                     }
+                } else if self.current_view == ViewMode::History {
+                    if let Some(ref mut h) = self.history {
+                        h.move_bead_up();
+                    }
                 } else if self.current_view == ViewMode::Alerts {
                     self.alerts_cursor = self.alerts_cursor.saturating_sub(1);
+                } else if self.current_view == ViewMode::TimeTravel {
+                    self.time_travel_cursor = self.time_travel_cursor.saturating_sub(1);
                 } else {
                     self.cursor = self.cursor.saturating_sub(1);
                     self.update_session_count();
@@ -734,8 +884,27 @@ impl App {
                 true
             }
             KeyCode::Char('c') => {
-                self.filter_mode = FilterMode::Closed;
-                self.apply_filter();
+                if self.current_view == ViewMode::History {
+                    // Cycle confidence threshold: 0.0 -> 0.5 -> 0.8 -> 0.0
+                    // (Go's confidence filter cycle; bvr has no dedicated
+                    // cycle method on HistoryState, so it's inlined here).
+                    if let Some(ref mut h) = self.history {
+                        h.min_confidence = if h.min_confidence >= 0.8 {
+                            0.0
+                        } else if h.min_confidence >= 0.5 {
+                            0.8
+                        } else {
+                            0.5
+                        };
+                        self.status_msg = format!(
+                            "History confidence \u{2265} {:.0}%",
+                            h.min_confidence * 100.0
+                        );
+                    }
+                } else {
+                    self.filter_mode = FilterMode::Closed;
+                    self.apply_filter();
+                }
                 true
             }
             KeyCode::Char('r') => {
@@ -777,11 +946,52 @@ impl App {
                 true
             }
             KeyCode::Char('t') => {
-                self.current_view = if self.current_view == ViewMode::TimeTravel {
-                    ViewMode::List
+                // Go Time-Travel (`focusTimeTravelInput` → `SnapshotDiff`):
+                // open the revision-input prompt; Enter submits a
+                // `diff_issues` diff of the loaded set vs `git show <rev>`.
+                // Re-opens over an existing result to run another revision.
+                self.current_view = ViewMode::TimeTravel;
+                if self.time_travel_prompt.is_none() {
+                    self.time_travel_prompt = Some(String::new());
+                }
+                true
+            }
+            KeyCode::Char('T') => {
+                // Go instant variant: diff against HEAD~5 with no prompt.
+                self.current_view = ViewMode::TimeTravel;
+                self.time_travel_prompt = None;
+                self.run_time_travel("HEAD~5");
+                true
+            }
+            KeyCode::Char('h') => {
+                if self.current_view == ViewMode::History {
+                    self.current_view = ViewMode::List;
                 } else {
-                    ViewMode::TimeTravel
-                };
+                    self.load_history_if_needed();
+                    self.current_view = ViewMode::History;
+                }
+                true
+            }
+            KeyCode::Char('J') if self.current_view == ViewMode::History => {
+                if let Some(ref mut h) = self.history {
+                    h.move_commit_down();
+                }
+                true
+            }
+            KeyCode::Char('K') if self.current_view == ViewMode::History => {
+                if let Some(ref mut h) = self.history {
+                    h.move_commit_up();
+                }
+                true
+            }
+            KeyCode::Char('v') if self.current_view == ViewMode::History => {
+                if let Some(ref mut h) = self.history {
+                    h.toggle_mode();
+                }
+                true
+            }
+            KeyCode::Char('y') if self.current_view == ViewMode::History => {
+                self.copy_commit_sha();
                 true
             }
             KeyCode::Char('!') => {
@@ -893,34 +1103,261 @@ impl App {
                 self.cycle_label_filter();
                 true
             }
+            KeyCode::Char('l') => {
+                self.open_label_picker();
+                true
+            }
+            KeyCode::Char('\'') => {
+                self.open_recipe_picker();
+                true
+            }
             KeyCode::Char('w') if self.workspace_repos.is_some() => {
-                self.cycle_repo_filter();
+                self.open_repo_picker();
+                true
+            }
+            KeyCode::Char('U') => {
+                if self.update_tag.is_some() {
+                    self.show_update_modal = !self.show_update_modal;
+                } else {
+                    self.status_msg = "No update available".to_string();
+                }
                 true
             }
             _ => false,
         }
     }
 
-    /// Cycle active repo filter in workspace mode (Go repo picker, simplified).
-    fn cycle_repo_filter(&mut self) {
+    /// Build and show the label-filter picker overlay (Go `label_picker.go`
+    /// — real picker, replacing/augmenting the `L` one-key cycle).
+    fn open_label_picker(&mut self) {
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        for row in &self.rows {
+            for label in &row.labels {
+                *counts.entry(label.clone()).or_insert(0) += 1;
+            }
+        }
+        let options: Vec<crate::views::pickers::LabelOption> = counts
+            .into_iter()
+            .map(|(name, count)| crate::views::pickers::LabelOption { name, count })
+            .collect();
+        let mut picker = crate::views::pickers::LabelPicker::new(options);
+        picker.toggle(); // sets visible = true
+        self.label_picker = Some(picker);
+    }
+
+    fn handle_label_picker_key(&mut self, code: KeyCode) -> bool {
+        let Some(picker) = self.label_picker.as_mut() else {
+            return false;
+        };
+        match code {
+            KeyCode::Esc => picker.visible = false,
+            KeyCode::Up | KeyCode::Char('k') => picker.move_up(),
+            KeyCode::Down | KeyCode::Char('j') => picker.move_down(),
+            KeyCode::Backspace => {
+                let mut t = picker.filter_text.clone();
+                t.pop();
+                picker.update_filter(&t);
+            }
+            KeyCode::Char(c) => {
+                let mut t = picker.filter_text.clone();
+                t.push(c);
+                picker.update_filter(&t);
+            }
+            KeyCode::Enter => {
+                let chosen = picker.selected_label().map(|s| s.to_string());
+                picker.visible = false;
+                if let Some(label) = chosen {
+                    self.label_filter = Some(label);
+                    self.apply_filter();
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// Build and show the workspace repo picker overlay (Go
+    /// `repo_picker.go` — real picker, replacing the old `w` one-key
+    /// cycle-through per TUI_UX_PARITY_PLAN.md Q1).
+    fn open_repo_picker(&mut self) {
         let Some(repos) = &self.workspace_repos else {
             return;
         };
-        if repos.is_empty() {
-            return;
+        let counts: BTreeMap<&str, usize> =
+            self.issue_map
+                .values()
+                .fold(BTreeMap::new(), |mut acc, issue| {
+                    *acc.entry(issue.source_repo.as_str()).or_insert(0) += 1;
+                    acc
+                });
+        let options: Vec<crate::views::pickers::RepoOption> = repos
+            .iter()
+            .map(|name| crate::views::pickers::RepoOption {
+                name: name.clone(),
+                path: name.clone(),
+                issue_count: counts.get(name.as_str()).copied().unwrap_or(0),
+            })
+            .collect();
+        let mut picker = crate::views::pickers::RepoPicker::new(options);
+        picker.toggle();
+        self.repo_picker = Some(picker);
+    }
+
+    fn handle_repo_picker_key(&mut self, code: KeyCode) -> bool {
+        let Some(picker) = self.repo_picker.as_mut() else {
+            return false;
+        };
+        match code {
+            KeyCode::Esc => picker.visible = false,
+            KeyCode::Up | KeyCode::Char('k') => picker.move_up(),
+            KeyCode::Down | KeyCode::Char('j') => picker.move_down(),
+            KeyCode::Enter => {
+                let chosen = picker.selected_repo().map(|r| r.name.clone());
+                picker.visible = false;
+                self.active_repo = chosen;
+                self.status_msg = match &self.active_repo {
+                    Some(r) => format!("Repos: {r}"),
+                    None => "Repos: all".to_string(),
+                };
+                self.apply_filter();
+            }
+            _ => {}
         }
-        self.active_repo = match &self.active_repo {
-            None => Some(repos[0].clone()),
-            Some(current) => match repos.iter().position(|r| r == current) {
-                Some(i) if i + 1 < repos.len() => Some(repos[i + 1].clone()),
-                _ => None,
-            },
+        true
+    }
+
+    /// Build and show the recipe picker overlay (Go `recipe_picker.go`).
+    /// Recipe *definitions* (name/filter/sort) come from
+    /// `crate::views::pickers::default_recipes` — the same 6 built-in
+    /// recipes Go embeds in `defaults/recipes.yaml`
+    /// (triage/release-cut/blocked-review/dependency-risk/quick-wins/stale).
+    /// User/project YAML recipe loading is a documented scope cut (same
+    /// convention as the rest of this port — see `pickers.rs`'s own scope
+    /// note); only the built-in set is real.
+    fn open_recipe_picker(&mut self) {
+        let options: Vec<crate::views::pickers::RecipeOption> = default_recipe_defs()
+            .iter()
+            .map(|r| crate::views::pickers::RecipeOption {
+                name: r.name.to_string(),
+                description: r.description.to_string(),
+                labels: vec![],
+            })
+            .collect();
+        let mut picker = crate::views::pickers::RecipePicker::new(options);
+        picker.toggle();
+        self.recipe_picker = Some(picker);
+    }
+
+    fn handle_recipe_picker_key(&mut self, code: KeyCode) -> bool {
+        let Some(picker) = self.recipe_picker.as_mut() else {
+            return false;
         };
-        self.status_msg = match &self.active_repo {
-            Some(r) => format!("Repos: {r}"),
-            None => "Repos: all".to_string(),
-        };
-        self.apply_filter();
+        let mut apply: Option<usize> = None;
+        match code {
+            KeyCode::Esc => picker.visible = false,
+            KeyCode::Up | KeyCode::Char('k') => picker.move_up(),
+            KeyCode::Down | KeyCode::Char('j') => picker.move_down(),
+            KeyCode::Enter => {
+                apply = Some(picker.selected);
+                picker.visible = false;
+            }
+            _ => {}
+        }
+        if let Some(idx) = apply {
+            self.apply_recipe(idx);
+        }
+        true
+    }
+
+    /// Apply built-in recipe `idx` (from `default_recipe_defs`) by setting
+    /// filter/sort state and, where the recipe needs a predicate the
+    /// FilterMode enum can't express (blocked/dependency-risk/quick-wins/
+    /// stale), computing `filtered_indices` directly — same pattern
+    /// `apply_search` already uses to bypass FilterMode.
+    fn apply_recipe(&mut self, idx: usize) {
+        let defs = default_recipe_defs();
+        let Some(def) = defs.get(idx) else { return };
+        self.label_filter = None;
+        self.active_repo = None;
+        match def.name {
+            "triage" => {
+                self.filter_mode = FilterMode::All;
+                self.apply_filter();
+                let by_id: std::collections::HashMap<&str, &bv_core::model::Issue> = self
+                    .issue_map
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v))
+                    .collect();
+                self.filtered_indices.retain(|&i| {
+                    bv_analysis::blocker_chain::is_actionable(&by_id, &self.rows[i].id)
+                });
+                self.sort_mode = SortMode::Priority;
+                self.filtered_indices
+                    .sort_by_key(|&i| self.rows[i].priority);
+            }
+            "release-cut" => {
+                self.filter_mode = FilterMode::Closed;
+                self.sort_mode = SortMode::Updated;
+                self.apply_filter();
+                self.filtered_indices
+                    .sort_by(|&a, &b| self.rows[b].created_at.cmp(&self.rows[a].created_at));
+            }
+            "blocked-review" => {
+                self.filter_mode = FilterMode::All;
+                self.apply_filter();
+                let by_id: std::collections::HashMap<&str, &bv_core::model::Issue> = self
+                    .issue_map
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v))
+                    .collect();
+                self.filtered_indices.retain(|&i| {
+                    !bv_analysis::blocker_chain::open_blockers(&by_id, &self.rows[i].id).is_empty()
+                });
+            }
+            "dependency-risk" => {
+                self.filter_mode = FilterMode::All;
+                self.apply_filter();
+                if let Some(gm) = &self.graph_metrics {
+                    let bw = gm.betweenness.clone();
+                    self.filtered_indices.sort_by(|&a, &b| {
+                        let sa = bw.get(&self.rows[a].id).copied().unwrap_or(0.0);
+                        let sb = bw.get(&self.rows[b].id).copied().unwrap_or(0.0);
+                        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    self.filtered_indices.truncate(20);
+                }
+            }
+            "quick-wins" => {
+                self.filter_mode = FilterMode::Open;
+                self.apply_filter();
+                self.filtered_indices.retain(|&i| {
+                    self.rows[i].priority >= 2
+                        && self
+                            .issue_map
+                            .get(&self.rows[i].id)
+                            .map(|iss| iss.dependencies.is_empty())
+                            .unwrap_or(false)
+                });
+            }
+            "stale" => {
+                self.filter_mode = FilterMode::Open;
+                self.apply_filter();
+                let now = jiff::Timestamp::now();
+                self.filtered_indices.retain(|&i| {
+                    self.rows[i]
+                        .created_at
+                        .as_ref()
+                        .and_then(|_| self.issue_map.get(&self.rows[i].id))
+                        .and_then(|iss| iss.updated_at.as_ref())
+                        .and_then(|u| u.parse::<jiff::Timestamp>().ok())
+                        .map(|t| now.since(t).map(|d| d.get_days()).unwrap_or(0) >= 14)
+                        .unwrap_or(false)
+                });
+            }
+            _ => {}
+        }
+        self.cursor = 0;
+        self.status_msg = format!("Recipe: {}", def.name);
     }
 
     /// Handle a Ctrl-modified key event; returns true if consumed.
@@ -978,30 +1415,174 @@ impl App {
             row.issue_type,
             row.description,
         );
-        let (cmd, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
-            ("pbcopy", &[])
-        } else if std::env::var("WAYLAND_DISPLAY").is_ok() {
-            ("wl-copy", &[])
-        } else {
-            ("xclip", &["-selection", "clipboard"])
+        let id = row.id.clone();
+        match copy_to_clipboard(&text) {
+            Ok(()) => self.status_msg = format!("Copied {id} to clipboard"),
+            Err(e) => self.status_msg = format!("Clipboard failed: {e}"),
+        }
+    }
+
+    /// Copy the selected commit's SHA in the History view (Go `y`).
+    fn copy_commit_sha(&mut self) {
+        let Some(ref history) = self.history else {
+            return;
         };
-        match std::process::Command::new(cmd)
-            .args(args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .spawn()
-        {
-            Ok(mut child) => {
-                use std::io::Write;
-                if let Some(stdin) = child.stdin.as_mut() {
-                    let _ = stdin.write_all(text.as_bytes());
-                }
-                let _ = child.wait();
-                self.status_msg = format!("Copied {} to clipboard", row.id);
-            }
+        let Some(commit) = history.selected_commit() else {
+            self.status_msg = "No commit selected".to_string();
+            return;
+        };
+        let sha = commit.sha.clone();
+        match copy_to_clipboard(&sha) {
+            Ok(()) => self.status_msg = format!("Copied {sha} to clipboard"),
+            Err(e) => self.status_msg = format!("Clipboard failed: {e}"),
+        }
+    }
+
+    /// Lazily populate the History view with real bead↔commit correlation
+    /// data (Go's `pkg/ui` loads this eagerly; bvr defers the git-log walk
+    /// to first entry, matching the `App::new` comment's original intent —
+    /// see TUI_UX_PARITY_PLAN.md G12). No-op after the first successful load
+    /// or if not inside a git repo.
+    fn load_history_if_needed(&mut self) {
+        if self.history_loaded {
+            return;
+        }
+        self.history_loaded = true; // don't retry every keypress on failure
+        let Ok(cwd) = std::env::current_dir() else {
+            self.status_msg = "History: could not determine working directory".to_string();
+            return;
+        };
+        let commits = match bv_correlation::correlator::walk_commits(&cwd, 1000) {
+            Ok(c) => c,
             Err(e) => {
-                self.status_msg = format!("Clipboard failed: {e}");
+                self.status_msg = format!("History: git log failed ({e})");
+                return;
             }
+        };
+        // CorrelatedCommit carries a correlation `reason`, not the original
+        // commit subject line — look the real message up by sha for display.
+        let messages_by_sha: std::collections::HashMap<String, String> = commits
+            .iter()
+            .map(|c| (c.sha.clone(), c.message.clone()))
+            .collect();
+        let issues: Vec<bv_core::model::Issue> = self.issue_map.values().cloned().collect();
+        let report = bv_correlation::correlator::correlate(&issues, &commits);
+        let mut bead_histories: Vec<crate::views::history::BeadHistory> = report
+            .into_iter()
+            .filter_map(|(bead_id, commits)| {
+                let issue = self.issue_map.get(&bead_id)?;
+                let mut hist_commits: Vec<crate::views::history::HistoryCommit> = commits
+                    .into_iter()
+                    .map(|c| crate::views::history::HistoryCommit {
+                        short_sha: c.sha.chars().take(7).collect(),
+                        message: messages_by_sha
+                            .get(&c.sha)
+                            .cloned()
+                            .unwrap_or_else(|| c.reason.clone()),
+                        sha: c.sha,
+                        author: c.author,
+                        timestamp: c.timestamp,
+                        confidence: c.confidence,
+                        files: c.files,
+                    })
+                    .collect();
+                hist_commits.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+                Some(crate::views::history::BeadHistory {
+                    bead_id: bead_id.clone(),
+                    title: issue.title.clone(),
+                    status: issue.status.as_str().to_string(),
+                    commits: hist_commits,
+                })
+            })
+            .collect();
+        bead_histories.sort_by(|a, b| a.bead_id.cmp(&b.bead_id));
+        let has_data = !bead_histories.is_empty();
+        self.history = Some(crate::views::history::HistoryState::build_from_beads(
+            bead_histories,
+        ));
+        self.status_msg = if has_data {
+            "History loaded".to_string()
+        } else {
+            "History: no correlated commits found".to_string()
+        };
+    }
+    /// Number of flattened entries in the current Time-Travel diff
+    /// (added + removed + changed), for cursor clamping.
+    fn time_travel_entry_count(&self) -> usize {
+        self.time_travel_result
+            .as_ref()
+            .map_or(0, |r| r.added.len() + r.removed.len() + r.changed.len())
+    }
+
+    /// Pure compute+store half of a Time-Travel diff (testable without git):
+    /// diff `previous` (issues at `git_ref`) against the loaded issue set.
+    fn apply_time_travel_result(&mut self, previous: Vec<bv_core::model::Issue>, git_ref: &str) {
+        let current: Vec<bv_core::model::Issue> = self.issue_map.values().cloned().collect();
+        let n_prev = previous.len();
+        let result = bv_analysis::diff::diff_issues(&current, &previous, git_ref);
+        self.time_travel_cursor = 0;
+        self.time_travel_error = None;
+        self.status_msg = format!(
+            "Time-Travel vs {git_ref}: +{} -{} ~{} (from {n_prev} issues at ref)",
+            result.added_count, result.removed_count, result.changed_count
+        );
+        self.time_travel_result = Some(result);
+    }
+
+    /// Fetch issues at `git_ref` via the shared `GitLoader` plumbing (the
+    /// same path `--robot-diff` uses — see plan Q4) and store the diff.
+    /// Error text mirrors the robot command's
+    /// (`could not read issues at ref <ref>`).
+    fn run_time_travel(&mut self, git_ref: &str) {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        match bv_core::discovery::GitLoader::new(&cwd).load_at(git_ref) {
+            Ok(previous) => self.apply_time_travel_result(previous, git_ref),
+            Err(_) => {
+                self.time_travel_result = None;
+                self.time_travel_error = Some(format!("could not read issues at ref {git_ref}"));
+                self.status_msg = format!("Time-Travel: could not read issues at ref {git_ref}");
+            }
+        }
+    }
+
+    /// Key handling while the Time-Travel revision prompt is open: typing
+    /// edits the buffer, Enter submits, Esc cancels (Go `focusTimeTravelInput`).
+    fn handle_time_travel_prompt_key(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Esc => {
+                self.time_travel_prompt = None;
+                if self.time_travel_result.is_none() {
+                    self.current_view = ViewMode::List;
+                }
+                true
+            }
+            KeyCode::Enter => {
+                let rev = self
+                    .time_travel_prompt
+                    .clone()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                if rev.is_empty() {
+                    return true; // keep prompt open; nothing to diff
+                }
+                self.time_travel_prompt = None;
+                self.run_time_travel(&rev);
+                true
+            }
+            KeyCode::Backspace => {
+                if let Some(buf) = &mut self.time_travel_prompt {
+                    buf.pop();
+                }
+                true
+            }
+            KeyCode::Char(c) => {
+                if let Some(buf) = &mut self.time_travel_prompt {
+                    buf.push(c);
+                }
+                true
+            }
+            _ => true,
         }
     }
 
@@ -1139,6 +1720,7 @@ pub fn render(f: &mut Frame, app: &App) {
                 f.area(),
             );
             render_status_bar(f, app);
+            render_overlays(f, app);
             return;
         }
         ViewMode::Insights => {
@@ -1150,11 +1732,13 @@ pub fn render(f: &mut Frame, app: &App) {
             };
             crate::views::insights::render_insights(f, pr, bw, hub, auth);
             render_status_bar(f, app);
+            render_overlays(f, app);
             return;
         }
         ViewMode::Alerts => {
             crate::views::alerts::render_alerts(f, &app.alerts, app.alerts_cursor, f.area());
             render_status_bar(f, app);
+            render_overlays(f, app);
             return;
         }
         ViewMode::FlowMatrix => {
@@ -1165,6 +1749,7 @@ pub fn render(f: &mut Frame, app: &App) {
                 f.render_widget(msg, f.area());
             }
             render_status_bar(f, app);
+            render_overlays(f, app);
             return;
         }
         ViewMode::Attention => {
@@ -1175,6 +1760,7 @@ pub fn render(f: &mut Frame, app: &App) {
                 f.area(),
             );
             render_status_bar(f, app);
+            render_overlays(f, app);
             return;
         }
         ViewMode::Tutorial => {
@@ -1216,6 +1802,7 @@ pub fn render(f: &mut Frame, app: &App) {
                 f.render_widget(msg, f.area());
             }
             render_status_bar(f, app);
+            render_overlays(f, app);
             return;
         }
         ViewMode::Board => {
@@ -1226,6 +1813,7 @@ pub fn render(f: &mut Frame, app: &App) {
                 crate::views::board::SwimlaneMode::Status,
             );
             render_status_bar(f, app);
+            render_overlays(f, app);
             return;
         }
         ViewMode::Graph => {
@@ -1251,6 +1839,7 @@ pub fn render(f: &mut Frame, app: &App) {
                 );
             }
             render_status_bar(f, app);
+            render_overlays(f, app);
             return;
         }
         ViewMode::Sprint => {
@@ -1262,16 +1851,25 @@ pub fn render(f: &mut Frame, app: &App) {
                 f.render_widget(msg, f.area());
             }
             render_status_bar(f, app);
+            render_overlays(f, app);
             return;
         }
-        ViewMode::TimeTravel => {
+        ViewMode::History => {
             if let Some(ref history) = app.history {
                 crate::views::history::render_history(f, history, f.area());
             } else {
-                let msg = ratatui::widgets::Paragraph::new("No history data available");
+                let msg =
+                    ratatui::widgets::Paragraph::new("No history data available (press h to load)");
                 f.render_widget(msg, f.area());
             }
             render_status_bar(f, app);
+            render_overlays(f, app);
+            return;
+        }
+        ViewMode::TimeTravel => {
+            render_time_travel(f, app);
+            render_status_bar(f, app);
+            render_overlays(f, app);
             return;
         }
         _ => {}
@@ -1299,10 +1897,150 @@ pub fn render(f: &mut Frame, app: &App) {
     }
 
     render_status_bar(f, app);
+    render_overlays(f, app);
+}
 
-    // Help overlay (Go "?" help)
+/// Time-Travel view (Go `focusTimeTravelInput` → `SnapshotDiff`): revision
+/// prompt plus the added/removed/changed diff vs that git revision, backed
+/// by `bv_analysis::diff::diff_issues` over `GitLoader::load_at` output.
+fn render_time_travel(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let mut head: Vec<Line> = vec![Line::from(Span::styled(
+        " Time-Travel ",
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    if let Some(buf) = &app.time_travel_prompt {
+        head.push(Line::from(""));
+        head.push(Line::from("Revision (branch / tag / SHA / HEAD~N):"));
+        head.push(Line::from(vec![
+            Span::styled("> ", Style::default().fg(Color::Yellow)),
+            Span::raw(buf.clone()),
+            Span::styled("█", Style::default().fg(Color::Yellow)),
+        ]));
+        head.push(Line::from(Span::styled(
+            " Enter = diff   Esc = cancel",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    // Flattened navigable entries: added, then removed, then changed.
+    let mut entries: Vec<Line> = Vec::new();
+    let mut title = " TIME-TRAVEL ".to_string();
+    match (&app.time_travel_result, &app.time_travel_error) {
+        (Some(r), _) => {
+            title = format!(" TIME-TRAVEL vs {} ", r.diff_ref);
+            head.push(Line::from(""));
+            head.push(Line::from(format!(
+                "+{} added   -{} removed   ~{} changed   (j/k navigate, t new revision, T HEAD~5, esc back)",
+                r.added_count, r.removed_count, r.changed_count
+            )));
+            if r.added_count == 0 && r.removed_count == 0 && r.changed_count == 0 {
+                head.push(Line::from(
+                    "No differences — working set matches this revision.",
+                ));
+            }
+            let mut idx = 0;
+            let mut push_entry = |idx: &mut usize, text: String| {
+                let (marker, style) = if *idx == app.time_travel_cursor {
+                    (
+                        "> ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    ("  ", Style::default())
+                };
+                entries.push(Line::from(vec![
+                    Span::styled(marker, style),
+                    Span::raw(text),
+                ]));
+                *idx += 1;
+            };
+            for id in &r.added {
+                push_entry(&mut idx, format!("+ {id}"));
+            }
+            for id in &r.removed {
+                push_entry(&mut idx, format!("- {id}"));
+            }
+            for c in &r.changed {
+                let mut detail = String::new();
+                if let Some(sc) = &c.status_change {
+                    detail.push_str(&format!(" [{sc}]"));
+                }
+                if c.title_changed {
+                    detail.push_str(" [title]");
+                }
+                if c.priority_changed {
+                    detail.push_str(" [priority]");
+                }
+                push_entry(&mut idx, format!("~ {}{}", c.id, detail));
+            }
+        }
+        (None, Some(e)) => {
+            head.push(Line::from(""));
+            head.push(Line::from(Span::styled(
+                format!("Error: {e}"),
+                Style::default().fg(Color::Red),
+            )));
+            head.push(Line::from("Press t for another revision, T for HEAD~5."));
+        }
+        (None, None) => {
+            if app.time_travel_prompt.is_none() {
+                head.push(Line::from(""));
+                head.push(Line::from(
+                    "Press t to enter a revision, T for instant HEAD~5.",
+                ));
+            }
+        }
+    }
+    // Window the entry list around the cursor so huge diffs fit the view.
+    let chrome = head.len() + 5; // borders + status bar + overflow line
+    let visible = area
+        .height
+        .saturating_sub(chrome.min(u16::MAX as usize) as u16)
+        .max(1) as usize;
+    let start = app
+        .time_travel_cursor
+        .saturating_sub(visible.saturating_sub(1));
+    let mut lines = head;
+    lines.extend(entries.into_iter().skip(start).take(visible));
+    let total = app.time_travel_entry_count();
+    if total > visible {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "… {} of {total} entries (j/k to scroll)",
+                visible.min(total)
+            ),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    let msg = ratatui::widgets::Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(title));
+    f.render_widget(msg, area);
+}
+
+/// Modal/popup overlays shown on top of whichever view is active: help,
+/// update-available modal, and the label/recipe/repo pickers.
+///
+/// Previously the `?` help overlay (and nothing else) was drawn only in the
+/// code path reached after the big `match app.current_view` in `render()`
+/// fell through — which every non-List view `return`s before reaching, so
+/// `?` silently did nothing while inside Board/Tree/Graph/Insights/Alerts/
+/// FlowMatrix/Attention/Actionable/Sprint/History/TimeTravel (see
+/// TUI_UX_PARITY_PLAN.md G8). Centralizing overlay rendering here and
+/// calling it from every early-return branch fixes that for all of them at
+/// once.
+fn render_overlays(f: &mut Frame, app: &App) {
+    // Help overlay (Go "?" help) — now generated from `key_registry`
+    // instead of a separately hand-maintained literal list, so it can't
+    // drift from the registry the way the old hardcoded text had (e.g. it
+    // used to say "g Toggle graph view" while the real binding was `G`).
     if app.show_help {
-        let help_lines = vec![
+        let focus = focus_for_view(app.current_view);
+        let bindings = app.key_registry.bindings_for(focus);
+        let mut help_lines: Vec<Line> = vec![
             Line::from(Span::styled(
                 " Keyboard Shortcuts ",
                 Style::default()
@@ -1310,38 +2048,21 @@ pub fn render(f: &mut Frame, app: &App) {
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
-            Line::from("  j/k, \u{2191}\u{2193}     Navigate list / scroll detail"),
-            Line::from("  \u{23ce}          Toggle detail pane"),
-            Line::from("  tab         Focus detail pane"),
-            Line::from("  esc         Back / quit"),
-            Line::from("  /           Search"),
-            Line::from("  a/o/c/r     Filter: all/open/closed/ready"),
-            Line::from("  s           Cycle sort mode"),
-            Line::from("  S           Triage sort (priority)"),
-            Line::from("  L           Cycle label filter"),
-            Line::from("  b           Toggle board view"),
-            Line::from("  i           Toggle insights view"),
-            Line::from("  t           Toggle time-travel view"),
-            Line::from("  G           Toggle graph view"),
-            Line::from("  f           Toggle flow-matrix view"),
-            Line::from("  A           Toggle attention view"),
-            Line::from("  E           Toggle tree view"),
-            Line::from("  !           Toggle alerts view"),
-            Line::from("  `           Toggle tutorial"),
-            Line::from("  ;           Toggle sidebar"),
-            Line::from("  x           Export markdown report"),
-            Line::from("  C           Copy issue to clipboard"),
-            Line::from("  O           Open issue in $EDITOR"),
-            Line::from("  Ctrl+R      Refresh from disk"),
-            Line::from("  q           Quit"),
-            Line::from(""),
-            Line::from(Span::styled(
-                " Press any key to close ",
-                Style::default().fg(Color::DarkGray),
-            )),
         ];
-        let w = 50.min(app.width.saturating_sub(4));
-        let h = help_lines.len() as u16 + 2;
+        if bindings.is_empty() {
+            help_lines.push(Line::from("  (no bindings documented for this view yet)"));
+        } else {
+            for b in bindings {
+                help_lines.push(Line::from(format!("  {:<12} {}", b.key, b.desc)));
+            }
+        }
+        help_lines.push(Line::from(""));
+        help_lines.push(Line::from(Span::styled(
+            " Press any key to close ",
+            Style::default().fg(Color::DarkGray),
+        )));
+        let w = 56.min(app.width.saturating_sub(4));
+        let h = (help_lines.len() as u16 + 2).min(app.height.saturating_sub(2));
         let x = (app.width.saturating_sub(w)) / 2;
         let y = (app.height.saturating_sub(h)) / 2;
         let popup = ratatui::layout::Rect {
@@ -1359,6 +2080,53 @@ pub fn render(f: &mut Frame, app: &App) {
             ),
             popup,
         );
+        return; // one overlay at a time, matching prior behavior
+    }
+
+    if app.show_update_modal {
+        if let Some(tag) = &app.update_tag {
+            crate::update_modal::render_update_modal(f, env!("CARGO_PKG_VERSION"), tag, f.area());
+        }
+        return;
+    }
+
+    if let Some(picker) = &app.label_picker {
+        if picker.visible {
+            picker.render(f, f.area());
+            return;
+        }
+    }
+    if let Some(picker) = &app.recipe_picker {
+        if picker.visible {
+            picker.render(f, f.area());
+            return;
+        }
+    }
+    if let Some(picker) = &app.repo_picker {
+        if picker.visible {
+            picker.render(f, f.area());
+        }
+    }
+}
+
+/// Map the active `ViewMode` to the `keybindings::Focus` bucket that
+/// documents its bindings (used by the dynamic help overlay above).
+fn focus_for_view(view: ViewMode) -> crate::keybindings::Focus {
+    use crate::keybindings::Focus;
+    match view {
+        ViewMode::List => Focus::List,
+        ViewMode::Board => Focus::Board,
+        ViewMode::Tree => Focus::Tree,
+        ViewMode::Graph => Focus::Graph,
+        ViewMode::FlowMatrix => Focus::FlowMatrix,
+        ViewMode::Attention => Focus::Attention,
+        ViewMode::Insights => Focus::Insights,
+        ViewMode::Alerts => Focus::Alerts,
+        ViewMode::History => Focus::History,
+        ViewMode::TimeTravel => Focus::TimeTravel,
+        ViewMode::Sprint => Focus::Sprint,
+        ViewMode::Tutorial => Focus::Tutorial,
+        ViewMode::Actionable => Focus::Actionable,
     }
 }
 
@@ -2037,6 +2805,249 @@ mod tests {
     }
 
     #[test]
+    fn history_toggle_loads_lazily_and_switches_view() {
+        let mut app = make_app(3);
+        assert!(!app.history_loaded);
+        app.handle_key(KeyCode::Char('h'));
+        assert_eq!(app.current_view, ViewMode::History);
+        assert!(app.history_loaded, "h should trigger lazy history load");
+        // Toggling back to List must not reset history_loaded (no reload
+        // needed the second time `h` is pressed).
+        app.handle_key(KeyCode::Char('h'));
+        assert_eq!(app.current_view, ViewMode::List);
+        assert!(app.history_loaded);
+    }
+
+    /// Regression test for TUI_UX_PARITY_PLAN.md G11: j/k inside the
+    /// History view used to be dead code (misplaced inside the Graph arm's
+    /// else-branch), so pressing j/k while in History silently moved the
+    /// *main list's* cursor instead of doing nothing meaningful in that
+    /// view. Confirm the main list cursor is now left untouched.
+    #[test]
+    fn history_j_k_does_not_move_main_list_cursor() {
+        let mut app = make_app(5);
+        app.handle_key(KeyCode::Char('h')); // enter History
+        let cursor_before = app.cursor;
+        app.handle_key(KeyCode::Char('j'));
+        app.handle_key(KeyCode::Char('j'));
+        app.handle_key(KeyCode::Char('k'));
+        assert_eq!(
+            app.cursor, cursor_before,
+            "History view's j/k must not move the List view's cursor"
+        );
+    }
+
+    #[test]
+    fn time_travel_t_opens_revision_prompt_not_history() {
+        let mut app = make_app(3);
+        app.handle_key(KeyCode::Char('t'));
+        assert_eq!(
+            app.current_view,
+            ViewMode::TimeTravel,
+            "t must open the TimeTravel view, not silently alias to History"
+        );
+        assert_eq!(
+            app.time_travel_prompt,
+            Some(String::new()),
+            "t must open the revision-input prompt (Go focusTimeTravelInput)"
+        );
+    }
+
+    #[test]
+    fn time_travel_prompt_typing_backspace_and_cancel() {
+        let mut app = make_app(3);
+        app.handle_key(KeyCode::Char('t'));
+        for c in "HEAD~".chars() {
+            app.handle_key(KeyCode::Char(c));
+        }
+        app.handle_key(KeyCode::Char('5'));
+        assert_eq!(app.time_travel_prompt.as_deref(), Some("HEAD~5"));
+        app.handle_key(KeyCode::Backspace);
+        assert_eq!(app.time_travel_prompt.as_deref(), Some("HEAD~"));
+        app.handle_key(KeyCode::Esc);
+        assert_eq!(app.time_travel_prompt, None);
+        assert_eq!(
+            app.current_view,
+            ViewMode::List,
+            "cancelling with no result returns to list"
+        );
+    }
+
+    #[test]
+    fn time_travel_prompt_enter_empty_keeps_prompt_open() {
+        let mut app = make_app(3);
+        app.handle_key(KeyCode::Char('t'));
+        app.handle_key(KeyCode::Enter);
+        assert_eq!(
+            app.time_travel_prompt,
+            Some(String::new()),
+            "empty revision must not run git or close the prompt"
+        );
+        assert!(app.time_travel_result.is_none());
+        assert!(app.time_travel_error.is_none());
+    }
+
+    /// Synthetic "previous revision" with one added, one removed, one
+    /// changed issue relative to `make_app(3)` (T-0 closed, T-1/T-2 open).
+    fn seed_time_travel_previous(app: &App) -> Vec<bv_core::model::Issue> {
+        let mut previous: Vec<bv_core::model::Issue> = app.issue_map.values().cloned().collect();
+        previous.retain(|i| i.id != "T-1"); // → added now
+        previous
+            .iter_mut()
+            .find(|i| i.id == "T-0")
+            .expect("T-0 in map")
+            .status = Status::Open; // → changed (now Closed)
+        let mut extra = app.issue_map["T-2"].clone();
+        extra.id = "X-9".to_string();
+        previous.push(extra); // → removed now
+        previous
+    }
+
+    #[test]
+    fn time_travel_apply_computes_added_removed_changed() {
+        let mut app = make_app(3);
+        let previous = seed_time_travel_previous(&app);
+        app.apply_time_travel_result(previous, "HEAD~5");
+        let r = app.time_travel_result.as_ref().expect("result stored");
+        assert_eq!(r.diff_ref, "HEAD~5");
+        assert_eq!(r.added, vec!["T-1".to_string()]);
+        assert_eq!(r.removed, vec!["X-9".to_string()]);
+        assert_eq!(r.changed.len(), 1);
+        assert_eq!(r.changed[0].id, "T-0");
+        assert!(r.changed[0].status_change.is_some());
+        assert!(app.time_travel_error.is_none());
+        assert_eq!(app.time_travel_cursor, 0);
+        assert!(
+            app.status_msg.starts_with("Time-Travel vs HEAD~5"),
+            "unexpected status: {}",
+            app.status_msg
+        );
+    }
+
+    #[test]
+    fn time_travel_j_k_moves_diff_cursor_not_list() {
+        let mut app = make_app(3);
+        let previous = seed_time_travel_previous(&app);
+        app.apply_time_travel_result(previous, "HEAD~5");
+        app.current_view = ViewMode::TimeTravel;
+        assert_eq!(app.time_travel_entry_count(), 3);
+        let cursor_before = app.cursor;
+        app.handle_key(KeyCode::Char('j'));
+        assert_eq!(app.time_travel_cursor, 1);
+        assert_eq!(app.cursor, cursor_before);
+        app.handle_key(KeyCode::Char('j'));
+        app.handle_key(KeyCode::Char('j')); // clamped at last
+        assert_eq!(app.time_travel_cursor, 2);
+        app.handle_key(KeyCode::Char('k'));
+        assert_eq!(app.time_travel_cursor, 1);
+    }
+
+    #[test]
+    fn time_travel_esc_in_view_returns_to_list() {
+        let mut app = make_app(3);
+        app.current_view = ViewMode::TimeTravel;
+        app.handle_key(KeyCode::Esc);
+        assert_eq!(app.current_view, ViewMode::List);
+        assert!(!app.quit_requested, "esc in a view must not quit");
+    }
+
+    #[test]
+    fn time_travel_upper_t_runs_instant_head5_diff() {
+        let mut app = make_app(3);
+        app.handle_key(KeyCode::Char('T'));
+        assert_eq!(app.current_view, ViewMode::TimeTravel);
+        assert_eq!(app.time_travel_prompt, None);
+        assert!(
+            app.status_msg.starts_with("Time-Travel"),
+            "T must run the diff (or report the error) in the status line, got: {}",
+            app.status_msg
+        );
+    }
+
+    #[test]
+    fn label_picker_opens_with_real_label_counts() {
+        let mut app = make_app(4);
+        app.rows[0].labels = vec!["backend".to_string()];
+        app.rows[1].labels = vec!["backend".to_string(), "urgent".to_string()];
+        app.handle_key(KeyCode::Char('l'));
+        let picker = app.label_picker.as_ref().expect("picker should be built");
+        assert!(picker.visible);
+        let backend = picker.labels.iter().find(|l| l.name == "backend").unwrap();
+        assert_eq!(backend.count, 2);
+        let urgent = picker.labels.iter().find(|l| l.name == "urgent").unwrap();
+        assert_eq!(urgent.count, 1);
+    }
+
+    #[test]
+    fn label_picker_enter_applies_filter_and_closes() {
+        let mut app = make_app(4);
+        app.rows[0].labels = vec!["backend".to_string()];
+        app.handle_key(KeyCode::Char('l'));
+        app.handle_key(KeyCode::Enter);
+        assert_eq!(app.label_filter, Some("backend".to_string()));
+        assert!(!app.label_picker.as_ref().unwrap().visible);
+    }
+
+    #[test]
+    fn recipe_picker_opens_with_six_builtin_recipes() {
+        let mut app = make_app(3);
+        app.handle_key(KeyCode::Char('\''));
+        let picker = app
+            .recipe_picker
+            .as_ref()
+            .expect("recipe picker should be built");
+        assert!(picker.visible);
+        assert_eq!(picker.recipes.len(), 6);
+        assert_eq!(picker.recipes[0].name, "triage");
+    }
+
+    #[test]
+    fn quick_wins_recipe_filters_by_priority_and_no_dependencies() {
+        // make_app: status closes every 3rd id (i%3==0), priority = i%4.
+        // With n=8: T-2 (open, p2) and T-7 (open, p3) are the only
+        // open+priority>=2 issues. Give T-2 a dependency so it should be
+        // excluded by quick-wins, leaving T-7 as the sole quick win.
+        let mut app = make_app(8);
+        let dep = bv_core::model::Dependency {
+            issue_id: "T-2".into(),
+            depends_on_id: "T-0".into(),
+            depends_on_legacy: String::new(),
+            target_id_legacy: String::new(),
+            r#type: Default::default(),
+            created_at: None,
+            created_by: String::new(),
+        };
+        app.issue_map.get_mut("T-2").unwrap().dependencies = vec![dep];
+        app.apply_recipe(4); // index 4 == "quick-wins" in default_recipe_defs()
+        let ids: Vec<&str> = app
+            .filtered_indices
+            .iter()
+            .map(|&i| app.rows[i].id.as_str())
+            .collect();
+        assert!(
+            ids.contains(&"T-7"),
+            "T-7 (priority 3, no deps, open) should be a quick win"
+        );
+        assert!(
+            !ids.contains(&"T-2"),
+            "T-2 has a dependency — quick-wins requires none"
+        );
+    }
+
+    #[test]
+    fn update_modal_only_shows_when_tag_present() {
+        let mut app = make_app(2);
+        app.handle_key(KeyCode::Char('U'));
+        assert!(
+            !app.show_update_modal,
+            "U with no update_tag must not open the modal"
+        );
+        app.update_tag = Some("v9.9.9".to_string());
+        app.handle_key(KeyCode::Char('U'));
+        assert!(app.show_update_modal);
+    }
+
+    #[test]
     fn quit_sets_flag() {
         let mut app = make_app(3);
         app.handle_key(KeyCode::Char('q'));
@@ -2053,7 +3064,6 @@ pub mod detail;
 pub mod helpers;
 pub mod keybindings;
 pub mod markdown;
-pub mod shortcuts_sidebar;
 pub mod theme;
 pub mod tutorial;
 pub mod update_modal;

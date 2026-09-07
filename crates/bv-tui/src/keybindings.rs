@@ -19,7 +19,11 @@ pub enum Focus {
     Attention,
     Sprint,
     History,
+    /// Revision-diff mode (Go `focusTimeTravelInput` → `SnapshotDiff`);
+    /// see TUI_UX_PARITY_PLAN.md Phase B.
+    TimeTravel,
     Tutorial,
+    Actionable,
     Search,
 }
 
@@ -77,21 +81,28 @@ pub fn build_default_registry() -> KeyRegistry {
     for (key, desc) in [
         ("j/↓", "Move down"),
         ("k/↑", "Move up"),
-        ("gg", "Go to top"),
-        ("G", "Go to bottom"),
         ("ctrl+d", "Page down (half-screen)"),
         ("ctrl+u", "Page up (half-screen)"),
         ("enter", "Toggle detail pane"),
         ("tab", "Focus detail pane"),
-        ("/", "Search"),
+        (
+            "/",
+            "Search (substring — fuzzy ranking not yet implemented)",
+        ),
         ("a", "Show all issues"),
         ("o", "Show open issues"),
         ("c", "Show closed issues"),
         ("r", "Show ready issues"),
         ("s", "Cycle sort mode"),
         ("S", "Triage sort (priority)"),
-        ("L", "Cycle label filter"),
-        ("w", "Cycle workspace repo filter"),
+        ("L", "Cycle label filter (one-key)"),
+        ("l", "Open label picker (filterable popup)"),
+        ("'", "Open recipe picker (6 built-in recipes)"),
+        ("w", "Open workspace repo picker (workspace mode only)"),
+        (
+            "U",
+            "Show update-available modal (if an update was detected)",
+        ),
     ] {
         reg.register(KeyBinding {
             focus: Focus::List,
@@ -105,15 +116,18 @@ pub fn build_default_registry() -> KeyRegistry {
     for (key, desc) in [
         ("b", "Toggle board view"),
         ("E", "Toggle tree view"),
-        ("g", "Toggle graph view"),
-        ("h", "Toggle history view"),
+        ("G", "Toggle graph view"),
+        ("h", "Toggle history view (bead↔commit correlation)"),
         ("i", "Toggle insights view"),
         ("f", "Toggle flow-matrix view"),
         ("A", "Toggle attention view"),
         ("!", "Toggle alerts view"),
-        ("p", "Toggle priority hints"),
-        ("t", "Time travel forward"),
-        ("T", "Time travel back"),
+        ("P", "Toggle sprint view"),
+        ("F", "Toggle actionable view"),
+        (
+            "t / T",
+            "Toggle time-travel placeholder (not yet implemented — Phase B)",
+        ),
         ("`", "Toggle tutorial"),
         (";", "Toggle sidebar"),
     ] {
@@ -189,16 +203,17 @@ pub fn build_default_registry() -> KeyRegistry {
         });
     }
 
-    // History view bindings
+    // History view bindings (lazy-loaded on first `h` press — real git-log
+    // correlation data, not a placeholder; see TUI_UX_PARITY_PLAN.md G12).
     for (key, desc) in [
         ("j/↓", "Next bead"),
         ("k/↑", "Previous bead"),
-        ("v", "Toggle git/bead mode"),
-        ("tab", "Toggle focus"),
-        ("J", "Detail scroll down"),
-        ("K", "Detail scroll up"),
-        ("o", "Open in browser"),
-        ("c", "Cycle confidence threshold"),
+        ("J", "Next commit"),
+        ("K", "Previous commit"),
+        ("v", "Toggle bead/git mode"),
+        ("c", "Cycle confidence threshold (0% / 50% / 80%)"),
+        ("y", "Copy selected commit SHA to clipboard"),
+        ("h", "Close (back to list)"),
     ] {
         reg.register(KeyBinding {
             focus: Focus::History,
@@ -207,6 +222,123 @@ pub fn build_default_registry() -> KeyRegistry {
             category: nav.clone(),
         });
     }
+
+    // Time-Travel — revision diff vs a git ref (Go `focusTimeTravelInput`
+    // → `SnapshotDiff`), backed by `bv_analysis::diff::diff_issues` over
+    // `GitLoader::load_at` (shared with `--robot-diff`; see plan Q4).
+    for (key, desc) in [
+        ("t", "Enter revision (prompt) and diff vs ref"),
+        ("T", "Instant diff vs HEAD~5"),
+        ("enter", "Submit revision (in prompt)"),
+        ("esc", "Cancel prompt / back to list"),
+        ("j/↓", "Next diff entry"),
+        ("k/↑", "Previous diff entry"),
+    ] {
+        reg.register(KeyBinding {
+            focus: Focus::TimeTravel,
+            key: key.to_string(),
+            desc: desc.to_string(),
+            category: nav.clone(),
+        });
+    }
+
+    // Board — shares List's j/k cursor; Go's column-switching (h/l),
+    // jump-to-column (1-4), and grouping cycle (s) are not ported yet.
+    for (key, desc) in [
+        ("j/↓", "Move down (shared list cursor)"),
+        ("k/↑", "Move up (shared list cursor)"),
+        ("enter", "Toggle detail pane"),
+        ("b / esc", "Close (back to list)"),
+    ] {
+        reg.register(KeyBinding {
+            focus: Focus::Board,
+            key: key.to_string(),
+            desc: desc.to_string(),
+            category: nav.clone(),
+        });
+    }
+
+    // Tree — Go's expand/collapse toggle key is not yet wired to a
+    // dedicated Tree keybinding beyond the shared list cursor.
+    for (key, desc) in [
+        ("j/↓", "Move down (shared list cursor)"),
+        ("k/↑", "Move up (shared list cursor)"),
+        ("E / esc", "Close (back to list)"),
+    ] {
+        reg.register(KeyBinding {
+            focus: Focus::Tree,
+            key: key.to_string(),
+            desc: desc.to_string(),
+            category: nav.clone(),
+        });
+    }
+
+    // Insights — 6-panel metric view; navigated read-only for now (Go's
+    // panel-switching h/l and explanation/proof toggles are not ported).
+    reg.register(KeyBinding {
+        focus: Focus::Insights,
+        key: "i / esc".to_string(),
+        desc: "Close (back to list)".to_string(),
+        category: nav.clone(),
+    });
+
+    // Alerts
+    for (key, desc) in [
+        ("j/↓", "Next alert"),
+        ("k/↑", "Previous alert"),
+        ("! / esc", "Close (back to list)"),
+    ] {
+        reg.register(KeyBinding {
+            focus: Focus::Alerts,
+            key: key.to_string(),
+            desc: desc.to_string(),
+            category: nav.clone(),
+        });
+    }
+
+    // Flow-Matrix
+    for (key, desc) in [
+        ("j/↓", "Next label"),
+        ("k/↑", "Previous label"),
+        ("f / esc", "Close (back to list)"),
+    ] {
+        reg.register(KeyBinding {
+            focus: Focus::FlowMatrix,
+            key: key.to_string(),
+            desc: desc.to_string(),
+            category: nav.clone(),
+        });
+    }
+
+    // Attention
+    for (key, desc) in [
+        ("j/↓", "Next label"),
+        ("k/↑", "Previous label"),
+        ("A / esc", "Close (back to list)"),
+    ] {
+        reg.register(KeyBinding {
+            focus: Focus::Attention,
+            key: key.to_string(),
+            desc: desc.to_string(),
+            category: nav.clone(),
+        });
+    }
+
+    // Tutorial
+    reg.register(KeyBinding {
+        focus: Focus::Tutorial,
+        key: "` / esc".to_string(),
+        desc: "Close tutorial".to_string(),
+        category: nav.clone(),
+    });
+
+    // Actionable
+    reg.register(KeyBinding {
+        focus: Focus::Actionable,
+        key: "F / esc".to_string(),
+        desc: "Close (back to list)".to_string(),
+        category: nav.clone(),
+    });
 
     reg
 }
@@ -230,5 +362,56 @@ mod tests {
         assert!(!reg.bindings_for(Focus::List).is_empty());
         assert!(!reg.bindings_for(Focus::Detail).is_empty());
         assert!(!reg.bindings_for(Focus::Graph).is_empty());
+    }
+
+    /// Every Focus variant must have at least one registered binding —
+    /// otherwise the dynamic `?` help overlay (lib.rs `render_overlays`)
+    /// silently shows an empty popup for that view. Structural regression
+    /// guard for TUI_UX_PARITY_PLAN.md G8 (registry/runtime drift): fails
+    /// loudly if a new ViewMode/Focus is added without registering its
+    /// bindings, instead of leaving `?` broken to be discovered by a user.
+    #[test]
+    fn every_focus_has_at_least_one_binding() {
+        let reg = build_default_registry();
+        for focus in [
+            Focus::List,
+            Focus::Detail,
+            Focus::Board,
+            Focus::Tree,
+            Focus::Graph,
+            Focus::Insights,
+            Focus::Alerts,
+            Focus::FlowMatrix,
+            Focus::Attention,
+            Focus::Sprint,
+            Focus::History,
+            Focus::TimeTravel,
+            Focus::Tutorial,
+            Focus::Actionable,
+        ] {
+            assert!(
+                !reg.bindings_for(focus).is_empty(),
+                "{focus:?} has no registered keybindings — the ? help overlay \
+                 will render empty for this view"
+            );
+        }
+    }
+
+    /// Regression guard for the specific drift TUI_UX_PARITY_PLAN.md G8
+    /// found: the registry said lowercase "g" toggled Graph while runtime
+    /// (`lib.rs` `handle_key`) actually binds uppercase "G". Pin the
+    /// corrected value so it can't silently drift back.
+    #[test]
+    fn graph_toggle_is_uppercase_g_matching_runtime() {
+        let reg = build_default_registry();
+        let list = reg.bindings_for(Focus::List);
+        assert!(
+            list.iter().any(|b| b.key == "G"),
+            "registry should document the real runtime binding (uppercase G)"
+        );
+        assert!(
+            !list.iter().any(|b| b.key == "g"),
+            "lowercase g is unbound at runtime — registry must not claim it toggles Graph"
+        );
     }
 }

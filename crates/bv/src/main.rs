@@ -1924,6 +1924,7 @@ fn go_format_f64(f: f64) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod go_json_tests {
     use super::*;
 
@@ -2019,19 +2020,6 @@ fn to_id_map(
         }
     }
     m
-}
-
-fn top_n(map: &serde_json::Map<String, serde_json::Value>, n: usize) -> Vec<serde_json::Value> {
-    let mut items: Vec<(String, f64)> = map
-        .iter()
-        .filter_map(|(k, v)| v.as_f64().map(|f| (k.clone(), f)))
-        .collect();
-    items.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    items.truncate(n);
-    items
-        .iter()
-        .map(|(id, val)| serde_json::json!({"ID": id, "Value": val}))
-        .collect()
 }
 
 /// Go `ConfigForSize` JSON shape (ns timeouts) — golden-verified per tier.
@@ -3208,7 +3196,7 @@ fn run_robot_plan() -> ExitCode {
     // Build tracks: roots sorted; only components with actionable members.
     let mut tracks: Vec<serde_json::Value> = Vec::new();
     let mut track_num = 1usize;
-    for (_root, members) in &components {
+    for members in components.values() {
         let mut actionable_members: Vec<&bv_core::model::Issue> = members
             .iter()
             .filter(|&id| actionable_set.contains(id.as_str()))
@@ -4999,40 +4987,23 @@ fn run_robot_diff(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    // Try to read previous issues from git ref
-    let previous = std::process::Command::new("git")
-        .args(["show", &format!("{ref_str}:.beads/issues.jsonl")])
-        .current_dir(&cwd)
-        .output()
-        .ok()
-        .and_then(|out| {
-            if out.status.success() {
-                let text = String::from_utf8_lossy(&out.stdout);
-                let mut prev = Vec::new();
-                for line in text.lines() {
-                    if !line.trim().is_empty() {
-                        if let Ok(issue) = serde_json::from_str::<bv_core::model::Issue>(line) {
-                            prev.push(issue);
-                        }
-                    }
-                }
-                Some(prev)
-            } else {
-                None
-            }
-        });
-    match previous {
-        Some(prev) => {
-            let result = bv_analysis::diff::diff_issues(&current, &prev, &ref_str);
-            let mut payload = envelope_json(&hash);
-            payload["diff"] = serde_json::to_value(&result).unwrap_or_default();
-            emit_json(&payload)
-        }
-        None => {
+    // Shared plumbing with the TUI Time-Travel view (TUI_UX_PARITY_PLAN.md
+    // Q4): revision resolution + `git show` + tolerant JSONL parse live in
+    // `bv_core::discovery::GitLoader` (the same loader `--as-of` uses), so
+    // the diff algorithm is built once and reused, not duplicated. Failure
+    // message kept byte-identical to the previous inline implementation
+    // (golden-covered CLI surface: same text, same exit code).
+    let previous = match bv_core::discovery::GitLoader::new(&cwd).load_at(&ref_str) {
+        Ok(prev) => prev,
+        Err(_) => {
             eprintln!("Error: could not read issues at ref {ref_str}");
-            ExitCode::from(1)
+            return ExitCode::from(1);
         }
-    }
+    };
+    let result = bv_analysis::diff::diff_issues(&current, &previous, &ref_str);
+    let mut payload = envelope_json(&hash);
+    payload["diff"] = serde_json::to_value(&result).unwrap_or_default();
+    emit_json(&payload)
 }
 
 /// Go handleRobotNotReadyLabels — filter triage by not-ready labels.

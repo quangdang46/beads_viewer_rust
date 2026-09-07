@@ -67,3 +67,86 @@ fn git_loader_resolves_head_and_loads_selfrepo() {
     assert_eq!(sha.len(), 40);
     let _ = loader.load_at("HEAD").expect("load_at HEAD works");
 }
+
+/// Phase B acceptance (TUI_UX_PARITY_PLAN.md): the exact pipeline the TUI
+/// Time-Travel view and `--robot-diff` share — `git show <rev>` parsed
+/// through the tolerant loader, then `diff_issues` — against a known git
+/// history fixture built hermetically in a temp dir (no dependence on the
+/// outer repo's own history).
+#[test]
+fn git_loader_load_at_sees_committed_snapshot_diff() {
+    use std::process::Command;
+    if Command::new("git").arg("--version").output().is_err() {
+        return; // no git binary — nothing to exercise
+    }
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let tmp = std::env::temp_dir().join(format!("bvr-tt-{}-{n}", std::process::id()));
+    let beads = tmp.join(".beads");
+    std::fs::create_dir_all(&beads).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(&tmp)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    let commit = |msg: &str| {
+        git(&["add", ".beads/issues.jsonl"]);
+        git(&[
+            "-c",
+            "user.email=bvr-test@example.com",
+            "-c",
+            "user.name=bvr-test",
+            "commit",
+            "-qm",
+            msg,
+        ]);
+    };
+    // Rev 1: issue A open.
+    std::fs::write(
+        beads.join("issues.jsonl"),
+        "{\"id\":\"A\",\"title\":\"alpha\",\"status\":\"open\"}\n",
+    )
+    .unwrap();
+    git(&["init", "-q"]);
+    commit("one");
+    // Rev 2 (== HEAD): A closed, B new.
+    std::fs::write(
+        beads.join("issues.jsonl"),
+        "{\"id\":\"A\",\"title\":\"alpha\",\"status\":\"closed\"}\n{\"id\":\"B\",\"title\":\"beta\",\"status\":\"open\"}\n",
+    )
+    .unwrap();
+    commit("two");
+
+    let loader = bv_core::discovery::GitLoader::new(&tmp);
+    let at_prev = loader.load_at("HEAD~1").expect("HEAD~1 loads");
+    assert_eq!(at_prev.len(), 1, "rev 1 has exactly issue A");
+    assert_eq!(at_prev[0].id, "A");
+    assert!(
+        matches!(at_prev[0].status, bv_core::model::Status::Open),
+        "rev 1 must show A open"
+    );
+    let at_head = loader.load_at("HEAD").expect("HEAD loads");
+    assert_eq!(at_head.len(), 2);
+    // The diff half (`diff_issues` over these snapshots) is covered on the
+    // consumer side (bv-tui `time_travel_apply_*` tests); this gate pins
+    // the git-show plumbing feeding it: HEAD shows A closed + B new.
+    assert!(at_head
+        .iter()
+        .any(|i| i.id == "A" && matches!(i.status, bv_core::model::Status::Closed)));
+    assert!(at_head.iter().any(|i| i.id == "B"));
+
+    assert!(
+        loader
+            .load_at("refs/heads/definitely-not-a-bvr-test-ref")
+            .is_err(),
+        "unknown ref must error (robot maps this to exit 1)"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
