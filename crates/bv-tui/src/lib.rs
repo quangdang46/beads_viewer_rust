@@ -115,7 +115,7 @@ pub struct App {
     /// True when terminal width > 100 (split view threshold).
     pub split_view: bool,
     pub status_msg: String,
-    /// Current active view (list is default, toggled by b/E/g/i/etc).
+    /// Current active view (list is default, toggled by b/E/G/i/etc).
     pub current_view: ViewMode,
     /// Search mode active (/ pressed).
     pub searching: bool,
@@ -233,10 +233,21 @@ pub struct App {
     /// cass CLI availability cache
     cass_available: bool,
     cass_cache: std::collections::HashMap<String, usize>,
-    /// Actionable items state.
+    /// Actionable items state (lazy-built on first `F`, like History).
     pub actionable: Option<crate::actionable::ActionableState>,
     /// Tutorial state.
     pub tutorial: Option<crate::tutorial::TutorialState>,
+    /// Board swimlane grouping (Go `s` cycle: Status → Priority → Type).
+    pub board_mode: crate::views::board::SwimlaneMode,
+    /// Board selected column (Go `h`/`l` move, `1`-`9` jump).
+    pub board_column: usize,
+    /// Agent-prompt modal visibility (Go auto-shows on AGENTS.md detection;
+    /// `g` reopens manually).
+    pub show_agent_prompts: bool,
+    /// Cursor inside the agent-prompt modal.
+    pub agent_prompt_cursor: usize,
+    /// Velocity-comparison overlay inside Sprint view (Go `v` sub-toggle).
+    pub show_velocity: bool,
     /// Theme for consistent styling.
     pub theme: crate::theme::Theme,
     /// Key registry for help display.
@@ -438,16 +449,25 @@ pub fn release_instance_lock(beads_dir: &std::path::Path) {
     }
 }
 
-/// Shell out to the platform clipboard tool. Shared by issue-copy (`C`) and
-/// commit-SHA-copy (`y`, History view).
+/// Copy text to the system clipboard (Go copyIssueToClipboard).
+/// Shared by issue-copy (`C`) and commit-SHA-copy (`y`, History view).
 ///
-/// NOTE: this shells out to `pbcopy`/`wl-copy`/`xclip`, which has no Windows
-/// branch — on Windows this always fails. The original architecture plan
-/// (COMPREHENSIVE_PLAN_FOR_FORT_BEADS_VIEWER.md §2) specifies `arboard` as
-/// the intended cross-platform clipboard crate; migrating away from this
-/// shell-out is tracked as a follow-up (TUI_UX_PARITY_PLAN.md G13), not
-/// fixed here to keep this pass's diff focused on view/keybinding wiring.
+/// Primary path is `arboard` (cross-platform: Win32 on Windows, X11/Wayland
+/// on Linux, pbcopy on macOS). When that fails — e.g. headless/SSH sessions
+/// with no display server — fall back to shelling out to `pbcopy`/`wl-copy`/
+/// `xclip`, preserving the pre-arboard behavior instead of hard-failing.
 fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    if let Ok(mut cb) = arboard::Clipboard::new() {
+        if cb.set_text(text.to_string()).is_ok() {
+            return Ok(());
+        }
+    }
+    shell_copy_fallback(text)
+}
+
+/// Legacy shell-out clipboard path, kept as a headless fallback for
+/// `copy_to_clipboard` when `arboard` has no display to talk to.
+fn shell_copy_fallback(text: &str) -> Result<(), String> {
     let (cmd, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
         ("pbcopy", &[])
     } else if std::env::var("WAYLAND_DISPLAY").is_ok() {
@@ -471,6 +491,19 @@ fn copy_to_clipboard(text: &str) -> Result<(), String> {
     }
     child.wait().map_err(|e| e.to_string())?;
     Ok(())
+}
+/// True when the repo being viewed has an AGENTS.md (Go auto-shows the
+/// agent-prompt modal on detection). Checks the cwd and, when running from
+/// inside `.beads/` discovery, the repo root above it.
+fn detect_agents_md() -> bool {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    if cwd.join("AGENTS.md").is_file() {
+        return true;
+    }
+    bv_core::discovery::get_beads_dir(&cwd)
+        .ok()
+        .and_then(|dir| dir.parent().map(|p| p.join("AGENTS.md").is_file()))
+        .unwrap_or(false)
 }
 
 impl App {
@@ -615,6 +648,13 @@ impl App {
             cass_cache: std::collections::HashMap::new(),
             actionable: None,
             tutorial: Some(crate::tutorial::TutorialState::new()),
+            board_mode: crate::views::board::SwimlaneMode::Status,
+            board_column: 0,
+            // Auto-show happens in `tui_event_loop`, not here, so unit
+            // tests (`App::new` directly) start with a clean slate.
+            show_agent_prompts: false,
+            agent_prompt_cursor: 0,
+            show_velocity: false,
             theme: crate::theme::Theme::default(),
             key_registry: crate::keybindings::build_default_registry(),
         };
@@ -964,6 +1004,9 @@ impl App {
         if self.label_drilldown.is_some() {
             return self.handle_label_drilldown_key(code);
         }
+        if self.show_agent_prompts {
+            return self.handle_agent_prompt_key(code);
+        }
         match code {
             KeyCode::Tab => {
                 self.focus_detail = !self.focus_detail;
@@ -986,9 +1029,21 @@ impl App {
                 } else if self.label_drilldown.is_some() || self.show_label_detail {
                     self.label_drilldown = None;
                     self.show_label_detail = false;
+                } else if self.current_view == ViewMode::Sprint && self.show_velocity {
+                    self.show_velocity = false;
                 } else if matches!(
                     self.current_view,
-                    ViewMode::TimeTravel | ViewMode::LabelDashboard
+                    ViewMode::TimeTravel
+                        | ViewMode::LabelDashboard
+                        | ViewMode::Board
+                        | ViewMode::Tree
+                        | ViewMode::Insights
+                        | ViewMode::Alerts
+                        | ViewMode::FlowMatrix
+                        | ViewMode::Attention
+                        | ViewMode::Tutorial
+                        | ViewMode::Actionable
+                        | ViewMode::Sprint
                 ) {
                     self.current_view = ViewMode::List;
                 } else {
@@ -1043,6 +1098,18 @@ impl App {
                     if max > 0 && self.label_dashboard_cursor + 1 < max {
                         self.label_dashboard_cursor += 1;
                     }
+                } else if self.current_view == ViewMode::Sprint {
+                    if let Some(s) = &mut self.sprint {
+                        s.move_down();
+                    }
+                } else if self.current_view == ViewMode::Actionable {
+                    if let Some(a) = &mut self.actionable {
+                        a.move_down();
+                    }
+                } else if self.current_view == ViewMode::Tutorial {
+                    if let Some(t) = &mut self.tutorial {
+                        t.next_page();
+                    }
                 } else if self.cursor + 1 < self.filtered_indices.len() {
                     self.cursor += 1;
                     self.update_session_count();
@@ -1072,6 +1139,18 @@ impl App {
                     self.time_travel_cursor = self.time_travel_cursor.saturating_sub(1);
                 } else if self.current_view == ViewMode::LabelDashboard {
                     self.label_dashboard_cursor = self.label_dashboard_cursor.saturating_sub(1);
+                } else if self.current_view == ViewMode::Sprint {
+                    if let Some(s) = &mut self.sprint {
+                        s.move_up();
+                    }
+                } else if self.current_view == ViewMode::Actionable {
+                    if let Some(a) = &mut self.actionable {
+                        a.move_up();
+                    }
+                } else if self.current_view == ViewMode::Tutorial {
+                    if let Some(t) = &mut self.tutorial {
+                        t.prev_page();
+                    }
                 } else {
                     self.cursor = self.cursor.saturating_sub(1);
                     self.update_session_count();
@@ -1137,12 +1216,11 @@ impl App {
                 self.current_view = if self.current_view == ViewMode::Tutorial {
                     ViewMode::List
                 } else {
+                    if let Some(t) = &mut self.tutorial {
+                        t.current_page = 0;
+                    }
                     ViewMode::Tutorial
                 };
-                true
-            }
-            KeyCode::Char(';') => {
-                self.show_sidebar = !self.show_sidebar;
                 true
             }
             KeyCode::Char('t') => {
@@ -1185,6 +1263,36 @@ impl App {
             // label. `d` is unbound elsewhere, so no fallback behavior lost.
             KeyCode::Char('d') if self.current_view == ViewMode::LabelDashboard => {
                 self.open_label_drilldown();
+                true
+            }
+            // Board column navigation (Go `board.go`): guarded arms must
+            // precede the global `h`/`l`/`s` meanings (History toggle, label
+            // picker, sort cycle), same pattern as the dashboard `h` above.
+            KeyCode::Char('h') if self.current_view == ViewMode::Board => {
+                self.board_column = self.board_column.saturating_sub(1);
+                true
+            }
+            KeyCode::Char('l') if self.current_view == ViewMode::Board => {
+                let max = crate::views::board::column_labels(self, self.board_mode).len();
+                if max > 0 && self.board_column + 1 < max {
+                    self.board_column += 1;
+                }
+                true
+            }
+            KeyCode::Char('s') if self.current_view == ViewMode::Board => {
+                self.board_mode = self.board_mode.next();
+                self.board_column = 0;
+                self.status_msg = format!("Board: grouped by {}", self.board_mode.label());
+                true
+            }
+            KeyCode::Char(c)
+                if self.current_view == ViewMode::Board && ('1'..='9').contains(&c) =>
+            {
+                let idx = (c as u8 - b'1') as usize;
+                let max = crate::views::board::column_labels(self, self.board_mode).len();
+                if idx < max {
+                    self.board_column = idx;
+                }
                 true
             }
             KeyCode::Char('h') => {
@@ -1270,6 +1378,7 @@ impl App {
                 self.current_view = if self.current_view == ViewMode::Sprint {
                     ViewMode::List
                 } else {
+                    self.load_sprint_if_needed();
                     ViewMode::Sprint
                 };
                 true
@@ -1278,8 +1387,15 @@ impl App {
                 self.current_view = if self.current_view == ViewMode::Actionable {
                     ViewMode::List
                 } else {
+                    self.load_actionable_if_needed();
                     ViewMode::Actionable
                 };
+                true
+            }
+            // Sprint velocity comparison (Go `velocity_comparison.go`
+            // sub-toggle). `v` is History-scoped elsewhere, free here.
+            KeyCode::Char('v') if self.current_view == ViewMode::Sprint => {
+                self.show_velocity = !self.show_velocity;
                 true
             }
             KeyCode::Char('a') => {
@@ -1349,6 +1465,13 @@ impl App {
             }
             KeyCode::Char('p') => {
                 self.toggle_priority_hints();
+                true
+            }
+            // Agent-prompt modal (Go auto-shows on AGENTS.md detection;
+            // lowercase `g` was unbound — uppercase `G` is the graph view).
+            KeyCode::Char('g') => {
+                self.agent_prompt_cursor = 0;
+                self.show_agent_prompts = true;
                 true
             }
             _ => false,
@@ -1732,6 +1855,100 @@ impl App {
             Ok(()) => self.status_msg = format!("Copied {sha} to clipboard"),
             Err(e) => self.status_msg = format!("Clipboard failed: {e}"),
         }
+    }
+    /// Lazily build the Actionable view state on first `F` (same deferred
+    /// pattern as History/LabelDashboard — see G15). Rebuilt from scratch on
+    /// `reload_from_disk` because that reconstructs the whole `App`.
+    fn load_actionable_if_needed(&mut self) {
+        if self.actionable.is_some() {
+            return;
+        }
+        let issues: Vec<bv_core::model::Issue> = self.issue_map.values().cloned().collect();
+        self.actionable = Some(crate::actionable::ActionableState::new(&issues));
+    }
+
+    /// Lazily load sprints on first `P` (`.beads/sprints.jsonl` — same
+    /// deferred pattern as History; previously `sprint` stayed `None`
+    /// forever so the view could never show data). Errors resolve to an
+    /// empty state so the view renders "No sprints defined" instead of
+    /// retrying the filesystem on every toggle.
+    fn load_sprint_if_needed(&mut self) {
+        if self.sprint.is_some() {
+            return;
+        }
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let sprints = bv_core::sprint::load_sprints(&cwd).unwrap_or_default();
+        self.sprint = Some(crate::views::sprint::SprintState {
+            sprints,
+            selected_idx: 0,
+        });
+    }
+
+    /// Keys while the agent-prompt modal is open (Go `agent_prompt_modal.go`:
+    /// `j`/`k` navigate, `Enter` copies the command, `Esc` closes).
+    fn handle_agent_prompt_key(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Esc => {
+                self.show_agent_prompts = false;
+                true
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                let max = crate::agent_prompt_modal::default_agent_prompts().len();
+                if max > 0 && self.agent_prompt_cursor + 1 < max {
+                    self.agent_prompt_cursor += 1;
+                }
+                true
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.agent_prompt_cursor = self.agent_prompt_cursor.saturating_sub(1);
+                true
+            }
+            KeyCode::Enter => {
+                let prompts = crate::agent_prompt_modal::default_agent_prompts();
+                if let Some(p) = prompts.get(self.agent_prompt_cursor) {
+                    let cmd = p.command.clone();
+                    let label = p.label.clone();
+                    match copy_to_clipboard(&cmd) {
+                        Ok(()) => self.status_msg = format!("Copied {label} prompt to clipboard"),
+                        Err(e) => self.status_msg = format!("Clipboard failed: {e}"),
+                    }
+                }
+                self.show_agent_prompts = false;
+                true
+            }
+            _ => true, // modal captures all keys; anything else just holds it open
+        }
+    }
+
+    /// Per-sprint velocity points for the comparison overlay (Go
+    /// `velocity_comparison.go`): planned = sprint bead count, completed =
+    /// closed beads, velocity = completed count.
+    fn velocity_points(&self) -> Vec<crate::views::velocity_comparison::VelocityPoint> {
+        let Some(sprint) = &self.sprint else {
+            return Vec::new();
+        };
+        sprint
+            .sprints
+            .iter()
+            .map(|s| {
+                let planned = s.bead_ids.len();
+                let completed = s
+                    .bead_ids
+                    .iter()
+                    .filter(|id| {
+                        self.issue_map
+                            .get(*id)
+                            .is_some_and(|i| i.status.is_closed())
+                    })
+                    .count();
+                crate::views::velocity_comparison::VelocityPoint {
+                    sprint_name: s.name.clone(),
+                    completed,
+                    planned,
+                    velocity: completed as f64,
+                }
+            })
+            .collect()
     }
 
     /// Lazily populate the History view with real bead↔commit correlation
@@ -2186,34 +2403,14 @@ pub fn render(f: &mut Frame, app: &App) {
             return;
         }
         ViewMode::Tutorial => {
-            let help = crate::chrome::default_help_entries();
-            let lines: Vec<Line> = vec![
-                Line::from(Span::styled(
-                    "bvr Tutorial",
-                    Style::default().add_modifier(Modifier::BOLD),
-                )),
-                Line::from(""),
-                Line::from("Navigation:"),
-                Line::from(Span::styled("  j/k     Move down/up", Style::default())),
-                Line::from(Span::styled(
-                    "  g/G     Jump to top/bottom",
-                    Style::default(),
-                )),
-                Line::from(""),
-                Line::from("Views:"),
-            ]
-            .into_iter()
-            .chain(
-                help.iter()
-                    .map(|(k, d)| Line::from(Span::raw(format!("  {k:<12} {d}")))),
-            )
-            .collect();
-            let para = Paragraph::new(lines).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" \u{1f4d6} TUTORIAL — Press ` to close "),
-            );
-            f.render_widget(para, f.area());
+            if let Some(ref t) = app.tutorial {
+                crate::tutorial::render_tutorial(f, t, f.area());
+            } else {
+                let msg = ratatui::widgets::Paragraph::new("No tutorial content");
+                f.render_widget(msg, f.area());
+            }
+            render_status_bar(f, app);
+            render_overlays(f, app);
             return;
         }
         ViewMode::Actionable => {
@@ -2228,12 +2425,7 @@ pub fn render(f: &mut Frame, app: &App) {
             return;
         }
         ViewMode::Board => {
-            crate::views::board::render_board(
-                f,
-                app,
-                f.area(),
-                crate::views::board::SwimlaneMode::Status,
-            );
+            crate::views::board::render_board(f, app, f.area(), app.board_mode, app.board_column);
             render_status_bar(f, app);
             render_overlays(f, app);
             return;
@@ -2271,6 +2463,10 @@ pub fn render(f: &mut Frame, app: &App) {
             } else {
                 let msg = ratatui::widgets::Paragraph::new("No sprint data available");
                 f.render_widget(msg, f.area());
+            }
+            if app.show_velocity {
+                let points = app.velocity_points();
+                crate::views::velocity_comparison::render_velocity_comparison(f, &points, f.area());
             }
             render_status_bar(f, app);
             render_overlays(f, app);
@@ -2729,6 +2925,17 @@ fn render_overlays(f: &mut Frame, app: &App) {
         if let Some(tag) = &app.update_tag {
             crate::update_modal::render_update_modal(f, env!("CARGO_PKG_VERSION"), tag, f.area());
         }
+        return;
+    }
+
+    if app.show_agent_prompts {
+        let prompts = crate::agent_prompt_modal::default_agent_prompts();
+        crate::agent_prompt_modal::render_agent_prompt(
+            f,
+            &prompts,
+            app.agent_prompt_cursor,
+            f.area(),
+        );
         return;
     }
 
@@ -3280,6 +3487,7 @@ fn render_status_bar(f: &mut Frame, app: &App) {
     } else if app.current_view == ViewMode::Board {
         push_hint(&mut hints, "h/l", "col");
         push_hint(&mut hints, "j/k", "move");
+        push_hint(&mut hints, "s", "group");
         push_hint(&mut hints, "b", "list");
         push_hint(&mut hints, "?", "help");
     } else {
@@ -3366,6 +3574,11 @@ fn tui_event_loop(
     app: &mut App,
     update_rx: &std::sync::mpsc::Receiver<String>,
 ) -> io::Result<()> {
+    // Go auto-shows the agent-prompt modal when the repo has an AGENTS.md
+    // (repo root = cwd, or the parent of `.beads/`).
+    if detect_agents_md() {
+        app.show_agent_prompts = true;
+    }
     loop {
         terminal.draw(|f| render(f, app))?;
         if app.quit_requested {
@@ -4004,6 +4217,158 @@ mod tests {
         app.apply_search();
         let t2 = app.rows.iter().position(|r| r.id == "T-2").unwrap();
         assert_eq!(app.filtered_indices, vec![t2]);
+    }
+    #[cfg(test)]
+    mod cleanup_tests {
+        use super::*;
+
+        #[test]
+        fn board_group_cycle_resets_column() {
+            use crate::views::board::SwimlaneMode;
+            let mut app = make_app(6);
+            app.handle_key(KeyCode::Char('b'));
+            assert_eq!(app.current_view, ViewMode::Board);
+            app.handle_key(KeyCode::Char('s'));
+            assert_eq!(app.board_mode, SwimlaneMode::Priority);
+            assert_eq!(app.board_column, 0);
+            assert!(app.status_msg.contains("Priority"));
+            app.handle_key(KeyCode::Char('s'));
+            assert_eq!(app.board_mode, SwimlaneMode::Type);
+            app.handle_key(KeyCode::Char('s'));
+            assert_eq!(app.board_mode, SwimlaneMode::Status);
+        }
+
+        #[test]
+        fn board_column_nav_and_digit_jump() {
+            let mut app = make_app(6);
+            app.handle_key(KeyCode::Char('b'));
+            let cursor_before = app.cursor;
+            // Status mode has 4 columns; `l` advances, `h` retreats, clamped.
+            app.handle_key(KeyCode::Char('l'));
+            assert_eq!(app.board_column, 1);
+            app.handle_key(KeyCode::Char('h'));
+            assert_eq!(app.board_column, 0);
+            app.handle_key(KeyCode::Char('h')); // clamped at first
+            assert_eq!(app.board_column, 0);
+            // Priority mode has exactly 5 columns (P0-P4).
+            app.handle_key(KeyCode::Char('s'));
+            app.handle_key(KeyCode::Char('5'));
+            assert_eq!(app.board_column, 4);
+            app.handle_key(KeyCode::Char('6')); // no-op, clamped
+            assert_eq!(app.board_column, 4);
+            app.handle_key(KeyCode::Char('3'));
+            assert_eq!(app.board_column, 2);
+            assert_eq!(
+                app.cursor, cursor_before,
+                "board nav must not move the list cursor"
+            );
+        }
+
+        #[test]
+        fn board_s_does_not_sort() {
+            let mut app = make_app(3);
+            app.handle_key(KeyCode::Char('b'));
+            let start = app.sort_mode;
+            app.handle_key(KeyCode::Char('s'));
+            assert_eq!(app.sort_mode, start, "s in Board cycles grouping, not sort");
+        }
+
+        #[test]
+        fn actionable_lazy_loads_and_jk_routes_to_items() {
+            let mut app = make_app(6);
+            assert!(app.actionable.is_none());
+            app.handle_key(KeyCode::Char('F'));
+            assert_eq!(app.current_view, ViewMode::Actionable);
+            assert!(
+                app.actionable.is_some(),
+                "F must lazy-build actionable state"
+            );
+            let cursor_before = app.cursor;
+            app.handle_key(KeyCode::Char('j'));
+            app.handle_key(KeyCode::Char('k'));
+            assert_eq!(
+                app.cursor, cursor_before,
+                "actionable j/k must not move the list cursor"
+            );
+        }
+
+        #[test]
+        fn tutorial_jk_turns_pages_and_backtick_resets() {
+            let mut app = make_app(3);
+            app.handle_key(KeyCode::Char('`'));
+            assert_eq!(app.current_view, ViewMode::Tutorial);
+            let cursor_before = app.cursor;
+            app.handle_key(KeyCode::Char('j'));
+            assert_eq!(app.tutorial.as_ref().unwrap().current_page, 1);
+            assert_eq!(app.cursor, cursor_before);
+            app.handle_key(KeyCode::Char('k'));
+            assert_eq!(app.tutorial.as_ref().unwrap().current_page, 0);
+            // Re-entering restarts the walkthrough instead of resuming mid-way.
+            app.handle_key(KeyCode::Char('`'));
+            app.handle_key(KeyCode::Char('j'));
+            app.handle_key(KeyCode::Char('`'));
+            app.handle_key(KeyCode::Char('`'));
+            assert_eq!(app.tutorial.as_ref().unwrap().current_page, 0);
+        }
+
+        #[test]
+        fn sprint_lazy_loads_jk_and_velocity_toggle() {
+            let mut app = make_app(3);
+            assert!(app.sprint.is_none());
+            app.handle_key(KeyCode::Char('P'));
+            assert_eq!(app.current_view, ViewMode::Sprint);
+            assert!(app.sprint.is_some(), "P must lazy-load sprints");
+            let cursor_before = app.cursor;
+            app.handle_key(KeyCode::Char('j'));
+            app.handle_key(KeyCode::Char('k'));
+            assert_eq!(
+                app.cursor, cursor_before,
+                "sprint j/k must not move the list cursor"
+            );
+            app.handle_key(KeyCode::Char('v'));
+            assert!(app.show_velocity);
+            app.handle_key(KeyCode::Esc);
+            assert!(!app.show_velocity, "esc closes the overlay first");
+            assert_eq!(app.current_view, ViewMode::Sprint);
+            app.handle_key(KeyCode::Esc);
+            assert_eq!(app.current_view, ViewMode::List);
+            assert!(!app.quit_requested, "esc in a view must not quit");
+        }
+
+        #[test]
+        fn agent_prompt_modal_open_navigate_close() {
+            let mut app = make_app(3);
+            app.show_agent_prompts = false; // isolate from AGENTS.md auto-detect
+            app.handle_key(KeyCode::Char('g'));
+            assert!(app.show_agent_prompts);
+            app.handle_key(KeyCode::Char('j'));
+            assert_eq!(app.agent_prompt_cursor, 1);
+            app.handle_key(KeyCode::Char('k'));
+            assert_eq!(app.agent_prompt_cursor, 0);
+            app.handle_key(KeyCode::Esc);
+            assert!(!app.show_agent_prompts);
+        }
+
+        #[test]
+        fn esc_returns_toggle_views_to_list() {
+            for key in ['b', 'E', 'i', 'F', '`', 'P', '!', 'f', 'A'] {
+                let mut app = make_app(3);
+                app.show_agent_prompts = false;
+                app.handle_key(KeyCode::Char(key));
+                assert_ne!(
+                    app.current_view,
+                    ViewMode::List,
+                    "key {key} should leave List"
+                );
+                app.handle_key(KeyCode::Esc);
+                assert_eq!(
+                    app.current_view,
+                    ViewMode::List,
+                    "esc should close the {key} view"
+                );
+                assert!(!app.quit_requested, "esc in a view must not quit");
+            }
+        }
     }
 }
 

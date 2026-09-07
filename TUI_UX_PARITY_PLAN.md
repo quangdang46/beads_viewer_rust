@@ -1,14 +1,10 @@
 # TUI UX Parity Plan — closing the gap to Go `bv`
 
-> **STATUS UPDATE (2026-09-07):** All six phases (A–F) have shipped. See §7
-> (Phase A + the mid-implementation bugs it uncovered, G11–G15), §8–§10
-> (Phase B, C, D respectively), and §11 (Phase E + F) at the bottom for what
-> actually landed vs the original plan. Read §7–§11 before assuming anything
-> above is still accurate for the *current* code; §1–§6 below are the
-> original audit and plan, kept intact for history. Remaining open items,
-> all small/polish-tier: G13 (Windows clipboard), G14 (Board column nav),
-> G15 (Actionable/Tutorial internal j/k), AgentPromptModal,
-> velocity_comparison — see §11's tail.
+> **STATUS UPDATE (2026-09-07):** All six phases (A–F) plus the four
+> polish-tier leftovers (G13–G15, AgentPromptModal, velocity_comparison)
+> have shipped — see §7–§12. Nothing from §2's scope remains open except
+> the byte-parity threshold re-audit note at the end of §11 (auditing,
+> not UX).
 
 > Scope: **interactive TUI only** (`crates/bv-tui` + the TUI-launch path in `crates/bv`). Robot/CLI JSON parity is tracked separately in `COMPREHENSIVE_PLAN_FOR_FORT_BEADS_VIEWER.md` (~33/47 `--robot-*` primaries real as of that doc).
 >
@@ -378,3 +374,56 @@ If a "real" `notify`-based watcher (instant reload vs up-to-500ms latency, and c
 - **AgentPromptModal, velocity_comparison** — still fully unreferenced (deferred twice now, from Phase A2/A3).
 - **G13** (Windows clipboard — `arboard` migration), **G14** (Board column nav/grouping cycle), **G15** (Actionable/Tutorial internal j/k) — smaller polish items found during Phase A review, still open.
 - Label Dashboard's Go-side `d` drilldown / `h` detail modal are real per Phase C, but re-verify against Go's exact health-score thresholds if byte-parity with `--robot-label-health` ever needs auditing (not done as part of this TUI-focused pass).
+---
+
+## 12. Cleanup pass results (shipped 2026-09-07, same day)
+
+Closed the four polish-tier leftovers from §7/§11, verified with
+`cargo fmt --all --check` + `cargo clippy --workspace --all-targets --
+-D warnings` + `cargo test --workspace` green (bv-tui 76 → **85 unit** +
+7 integration; zero failures workspace-wide) plus a `--robot-triage`
+smoke run (exit 0, `data_hash` present — TUI-only diff, no CLI impact).
+
+- **G13 (Windows clipboard):** `copy_to_clipboard` now tries `arboard = "3"`
+  (new `bv-tui` dep — Win32 on Windows, X11/Wayland on Linux, pbcopy on
+  macOS) first, falling back to the legacy `pbcopy`/`wl-copy`/`xclip`
+  shell-out when arboard has no display to talk to (headless/SSH). Same
+  call sites (`C`, `y`), same status messages.
+- **G14 (Board columns):** real grouping behind all three `SwimlaneMode`s —
+  Status keeps its 4 fixed columns, Priority is fixed P0–P4, Type is the
+  sorted distinct `issue_type` values present in the rows (`ALL` fallback).
+  `h`/`l` move a highlighted selected column, `1`–`9` jump, `s` cycles the
+  grouping (resets column, status message names the mode). Board-scoped
+  guarded arms precede the global `h`/`l`/`s` meanings, same pattern as the
+  dashboard `h`. Render takes `(mode, selected)` instead of hardcoded
+  `Status`.
+- **G15 (Actionable/Tutorial j/k):** both route through the global `j`/`k`
+  chain now (`ActionableState::move_up/down`, `TutorialState::next/prev_page`)
+  without touching the shared list cursor. Tutorial renders its real pages
+  full-area (the old static help-text arm — including its stale "g/G jump"
+  line — is gone); backtick re-entry restarts at page 0. Two adjacent
+  same-class bugs fixed in the same stroke: `F` lazy-builds
+  `ActionableState` and `P` lazy-loads `SprintState` from
+  `.beads/sprints.jsonl` (both were `None` forever, so neither view could
+  ever show data — the G12 pattern a third and fourth time).
+- **AgentPromptModal:** auto-shows once at real TUI startup when AGENTS.md
+  is detected (cwd or repo root above `.beads/` — Go's trigger), `g`
+  reopens manually (lowercase `g` was the only free mnemonic key; the G8
+  regression test now pins `g` = prompts, `G` = graph). `j`/`k` navigate,
+  `Enter` copies the command via the new clipboard path, `Esc` closes.
+  Detection lives in `tui_event_loop`, not `App::new`, so unit tests keep a
+  clean slate (constructor detection broke 20 tests mid-pass — caught by
+  the suite, fixed same pass).
+- **velocity_comparison:** `v` sub-toggle inside Sprint (free there; `v` is
+  History-scoped elsewhere), rendered as an overlay over the dashboard from
+  per-sprint planned/completed counts; `Esc` closes the overlay before the
+  view. Sprint `j`/`k` now moves `selected_idx` (previously fell through to
+  the hidden list cursor despite the registry claiming otherwise).
+- **Esc honesty:** `Esc` now returns to List from every view whose registry
+  entry claims `esc` closes it (Board, Tree, Insights, Alerts, FlowMatrix,
+  Attention, Tutorial, Actionable, Sprint — plus the existing TimeTravel,
+  LabelDashboard). Graph/History keep prior behavior since their registry
+  entries never claimed `esc`.
+
+Nothing from §2 remains open. The drilldown/detail threshold re-audit note
+at the end of §11 still stands (byte-parity auditing, not UX).

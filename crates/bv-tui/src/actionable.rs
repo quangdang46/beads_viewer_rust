@@ -272,4 +272,21 @@ mod tests {
         let items = compute_actionable(&issues);
         assert!(items.is_empty());
     }
+    #[test]
+    fn cursor_clamps_at_bounds() {
+        let issues = vec![
+            make_issue("A", Status::Blocked, 2),
+            make_issue("B", Status::Blocked, 1),
+        ];
+        let mut state = ActionableState::new(&issues);
+        assert_eq!(state.items.len(), 2);
+        state.move_down();
+        assert_eq!(state.selected, 1);
+        state.move_down(); // clamped at last
+        assert_eq!(state.selected, 1);
+        state.move_up();
+        assert_eq!(state.selected, 0);
+        state.move_up(); // clamped at first
+        assert_eq!(state.selected, 0);
+    }
 }

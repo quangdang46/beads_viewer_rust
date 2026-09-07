@@ -180,34 +180,23 @@ fn build_tutorial_pages() -> Vec<TutorialPage> {
     ]
 }
 
-/// Render the tutorial overlay.
+/// Render the tutorial view (full area — reached via `` ` ``). Pages turn
+/// with `j`/`k` through `TutorialState::next_page`/`prev_page`.
 pub fn render_tutorial(f: &mut Frame, state: &TutorialState, area: Rect) {
-    if !state.visible || state.pages.is_empty() {
+    if state.pages.is_empty() {
         return;
     }
 
-    let page = &state.pages[state.current_page];
-    let popup_width = 60.min(area.width.saturating_sub(4));
-    let popup_height = (area.height.saturating_sub(4)).max(10);
-    let x = (area.width.saturating_sub(popup_width)) / 2;
-    let y = (area.height.saturating_sub(popup_height)) / 2;
-    let popup = Rect {
-        x,
-        y,
-        width: popup_width,
-        height: popup_height,
-    };
-
-    let mut lines: Vec<Line> = Vec::new();
-
-    // Title
-    lines.push(Line::from(Span::styled(
-        format!(" {} ", page.title),
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::from(""));
+    let page = &state.pages[state.current_page.min(state.pages.len() - 1)];
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            format!(" {} ", page.title),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
 
     // Content
     for line in &page.content {
@@ -235,8 +224,8 @@ pub fn render_tutorial(f: &mut Frame, state: &TutorialState, area: Rect) {
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         format!(
-            " Page {}/{} | ←/→ navigate | Esc close",
-            state.current_page + 1,
+            " Page {}/{} | j/k: page | `/esc: close",
+            state.current_page.min(state.pages.len() - 1) + 1,
             state.pages.len()
         ),
         Style::default()
@@ -246,13 +235,13 @@ pub fn render_tutorial(f: &mut Frame, state: &TutorialState, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Tutorial ")
+        .title(" 📖 TUTORIAL ")
         .border_style(Style::default().fg(Color::Cyan));
 
     let para = Paragraph::new(lines)
         .block(block)
         .wrap(Wrap { trim: false });
-    f.render_widget(para, popup);
+    f.render_widget(para, area);
 }
 
 #[cfg(test)]

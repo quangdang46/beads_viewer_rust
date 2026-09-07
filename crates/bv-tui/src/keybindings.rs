@@ -154,6 +154,7 @@ pub fn build_default_registry() -> KeyRegistry {
             "Time-travel: t prompts for a revision, T diffs vs HEAD~5",
         ),
         ("`", "Toggle tutorial"),
+        ("g", "Agent prompts (auto-opens if AGENTS.md detected)"),
         (";", "Toggle sidebar"),
     ] {
         reg.register(KeyBinding {
@@ -202,6 +203,7 @@ pub fn build_default_registry() -> KeyRegistry {
     for (key, desc) in [
         ("j/↓", "Switch to next sprint"),
         ("k/↑", "Switch to previous sprint"),
+        ("v", "Toggle velocity comparison"),
         ("P/esc", "Close sprint view"),
     ] {
         reg.register(KeyBinding {
@@ -286,11 +288,13 @@ pub fn build_default_registry() -> KeyRegistry {
         });
     }
 
-    // Board — shares List's j/k cursor; Go's column-switching (h/l),
-    // jump-to-column (1-4), and grouping cycle (s) are not ported yet.
+    // Board — swimlane grouping with column nav (Go `board.go`).
     for (key, desc) in [
         ("j/↓", "Move down (shared list cursor)"),
         ("k/↑", "Move up (shared list cursor)"),
+        ("h/l", "Previous / next column"),
+        ("1-9", "Jump to column"),
+        ("s", "Cycle grouping (Status → Priority → Type)"),
         ("enter", "Toggle detail pane"),
         ("b / esc", "Close (back to list)"),
     ] {
@@ -301,7 +305,6 @@ pub fn build_default_registry() -> KeyRegistry {
             category: nav.clone(),
         });
     }
-
     // Tree — Go's expand/collapse toggle key is not yet wired to a
     // dedicated Tree keybinding beyond the shared list cursor.
     for (key, desc) in [
@@ -367,22 +370,33 @@ pub fn build_default_registry() -> KeyRegistry {
             category: nav.clone(),
         });
     }
+    // Tutorial — real paged content (`tutorial.rs`), turned with j/k.
+    for (key, desc) in [
+        ("j/↓", "Next page"),
+        ("k/↑", "Previous page"),
+        ("` / esc", "Close tutorial"),
+    ] {
+        reg.register(KeyBinding {
+            focus: Focus::Tutorial,
+            key: key.to_string(),
+            desc: desc.to_string(),
+            category: nav.clone(),
+        });
+    }
 
-    // Tutorial
-    reg.register(KeyBinding {
-        focus: Focus::Tutorial,
-        key: "` / esc".to_string(),
-        desc: "Close tutorial".to_string(),
-        category: nav.clone(),
-    });
-
-    // Actionable
-    reg.register(KeyBinding {
-        focus: Focus::Actionable,
-        key: "F / esc".to_string(),
-        desc: "Close (back to list)".to_string(),
-        category: nav.clone(),
-    });
+    // Actionable — cursor over computed items, moved with j/k.
+    for (key, desc) in [
+        ("j/↓", "Next item"),
+        ("k/↑", "Previous item"),
+        ("F / esc", "Close (back to list)"),
+    ] {
+        reg.register(KeyBinding {
+            focus: Focus::Actionable,
+            key: key.to_string(),
+            desc: desc.to_string(),
+            category: nav.clone(),
+        });
+    }
 
     reg
 }
@@ -444,7 +458,8 @@ mod tests {
     /// Regression guard for the specific drift TUI_UX_PARITY_PLAN.md G8
     /// found: the registry said lowercase "g" toggled Graph while runtime
     /// (`lib.rs` `handle_key`) actually binds uppercase "G". Pin the
-    /// corrected value so it can't silently drift back.
+    /// corrected value so it can't silently drift back. (Lowercase `g` is
+    /// since bound to the agent-prompt modal — also pinned here.)
     #[test]
     fn graph_toggle_is_uppercase_g_matching_runtime() {
         let reg = build_default_registry();
@@ -454,8 +469,12 @@ mod tests {
             "registry should document the real runtime binding (uppercase G)"
         );
         assert!(
-            !list.iter().any(|b| b.key == "g"),
-            "lowercase g is unbound at runtime — registry must not claim it toggles Graph"
+            list.iter().any(|b| b.key == "g"),
+            "lowercase g opens the agent-prompt modal — registry must say so"
+        );
+        assert!(
+            !list.iter().any(|b| b.key == "g" && b.desc.contains("raph")),
+            "registry must not claim lowercase g toggles Graph"
         );
     }
 }

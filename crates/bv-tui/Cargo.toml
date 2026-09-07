@@ -17,4 +17,5 @@ serde_json = { workspace = true }
 bv-graph-core = { path = "../bv-graph-core" }
 bv-correlation = { path = "../bv-correlation" }
 bv-search = { path = "../bv-search" }
+arboard = "3"
 nucleo-matcher = "0.3"
