@@ -33,7 +33,14 @@ jobs:
     name: Golden corpus integrity
     runs-on: ubuntu-latest
     steps:
+      # Full history is required: the selfrepo golden case runs
+      # `bvr --robot-diff --diff-since HEAD~5` in the repo root, which
+      # needs git history present. A shallow checkout (fetch-depth: 1)
+      # resolves HEAD~5 to nothing and fails the golden gate with
+      # FAIL(rust-error) in CI while passing locally with full history.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Verify golden corpus present and non-empty

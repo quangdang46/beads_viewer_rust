@@ -193,6 +193,17 @@ fn rust_output_matches_frozen_go_goldens() {
                 continue;
             }
 
+            // Shallow CI checkouts (actions/checkout default fetch-depth: 1)
+            // have no history, so `HEAD~N` diff cases cannot run there. Skip
+            // them explicitly (counted as skip, not pass) instead of failing
+            // the whole gate on harness infra — the same semantic the old
+            // empty (0-byte) golden files expressed implicitly, but now
+            // readable in code and not dependent on junk files existing.
+            if *fixture_name != "selfrepo" && args.iter().any(|a| a.starts_with("HEAD~")) {
+                skip += 1;
+                continue;
+            }
+
             let Some(rust_out) = run_bvr(cwd, args) else {
                 infra_fails += 1;
                 infra_msgs.push(format!("FAIL(rust-error): {case}"));
