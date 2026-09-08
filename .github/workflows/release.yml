@@ -43,20 +43,12 @@ jobs:
       - name: Install cross
         if: matrix.method == 'cross'
         run: cargo install cross --locked
-      # Placeholder until crates/bv exists (Phase 0 scaffolding).
-      # When the binary crate lands, this builds it for real.
       - name: Build
         run: |
-          if [ -f "crates/bv/Cargo.toml" ]; then
-            if [ "${{ matrix.method }}" = "cross" ]; then
-              cross build --release --target ${{ matrix.target }} -p bv
-            else
-              cargo build --release --target ${{ matrix.target }} -p bv
-            fi
+          if [ "${{ matrix.method }}" = "cross" ]; then
+            cross build --release --target ${{ matrix.target }} -p bv
           else
-            echo "::warning::crates/bv not yet scaffolded — producing empty artifact"
-            mkdir -p staging
-            echo "bvr placeholder — binary crate arrives with Phase 0" > staging/README.txt
+            cargo build --release --target ${{ matrix.target }} -p bv
           fi
         shell: bash
       - name: Package (unix)
