@@ -14,7 +14,17 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
+      # Full history is required: `cargo test --workspace` includes
+      # crates/bv/tests/golden_comparison.rs, which shells out to `git log`
+      # (directly, and via bv-correlation) for --robot-history and other
+      # git-derived robot commands. A shallow checkout (the actions/checkout
+      # default, fetch-depth: 1) starves those commands of history and makes
+      # their output diverge from the frozen goldens, blowing the parity
+      # ratchet even though nothing regressed. See the `differential` job
+      # below, which hit the same issue first.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
