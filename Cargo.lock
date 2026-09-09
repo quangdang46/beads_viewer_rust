@@ -228,6 +228,7 @@ name = "bv-search"
 version = "0.1.2"
 dependencies = [
  "serde",
+ "sha2",
 ]
 
 [[package]]
@@ -246,6 +247,7 @@ dependencies = [
  "jiff",
  "nucleo-matcher",
  "ratatui",
+ "serde",
  "serde_json",
 ]
 

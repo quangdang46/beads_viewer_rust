@@ -2,3 +2,6 @@
 
 pub mod embedder;
 pub mod hybrid;
+pub mod index_sync;
+pub mod query;
+pub mod vector_index;

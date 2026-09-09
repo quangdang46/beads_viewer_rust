@@ -108,6 +108,144 @@ pub fn compute_counts(
     (c, qr)
 }
 
+/// Per-row triage decoration for the TUI list (Go `IssueItem` triage fields:
+/// `IsQuickWin`, `IsBlocker`, `UnblocksCount` — populated in Go from
+/// `triageResult.QuickWins` / `BlockersToClear` / `unblocksMap`).
+#[derive(Debug, Clone, Default)]
+pub struct RowTriage {
+    pub is_quick_win: bool,
+    pub is_blocker: bool,
+    pub unblocks_count: usize,
+}
+
+/// Compute per-row triage decorations for every issue, in one pass.
+///
+/// Semantics (Go `buildUnblocksMap` + `buildQuickWins` + `buildBlockersToClear`):
+/// - `unblocks_count[id]` = number of non-closed-like issues B for which `id`
+///   is the ONLY remaining open blocker (direct blocking edge or
+///   parent-propagated), and B would be actionable once `id` completes.
+/// - `is_blocker` = appears in the blockers-to-clear set: any non-closed-like
+///   issue with >= 1 unblock, sorted by unblock count desc, id asc. The TUI
+///   keeps the full set (not Go's display `limit`) since it's a per-row flag,
+///   not a top-N list.
+/// - `is_quick_win` = claimable (open, non-epic, unassigned, zero open
+///   blockers — Go's `isClaimableRecommendation` minus scheduler-deferral and
+///   not-ready-labels, neither of which the TUI models) AND in the top 5 of
+///   the quick-win ranking (`log2(unblocks+1)*0.4 + simplicity*0.4 +
+///   priority_bonus*0.2`, score desc, id asc; Go `buildQuickWins` with
+///   `BlokerRatioNorm` approximated by the raw blocker ratio — the normalized
+///   value isn't available without the full impact-scoring pipeline).
+///
+/// Shared by the TUI row renderer and (future) CLI callers so the two never
+/// drift apart — `crates/bv/src/main.rs`'s inline `quick_wins` /
+/// `blockers_to_clear` builders are the golden-covered legacy copies and are
+/// intentionally left untouched.
+pub fn compute_row_triage(issues: &[Issue]) -> std::collections::HashMap<String, RowTriage> {
+    use std::collections::{HashMap, HashSet};
+    fn closed_like(s: Status) -> bool {
+        matches!(s, Status::Closed | Status::Tombstone)
+    }
+
+    let by_id: HashMap<&str, &Issue> = issues.iter().map(|i| (i.id.as_str(), i)).collect();
+
+    // Open blockers per issue (direct blocking edges + parent propagation),
+    // via the shared blocker_chain helper (Go `getOpenBlockersInternal`).
+    let open_blockers_of =
+        |id: &str| -> Vec<String> { crate::blocker_chain::open_blockers(&by_id, id) };
+
+    // Go `buildUnblocksMap`: B counts toward A iff A is B's ONLY open blocker
+    // and B is actionable-after-completing-A (approximated here as:
+    // non-closed-like and non-deferred — scheduler deferral has no Rust model
+    // beyond `Status::Deferred`).
+    let mut unblocks: HashMap<String, Vec<String>> = HashMap::new();
+    for issue in issues {
+        unblocks.entry(issue.id.clone()).or_default();
+        if closed_like(issue.status) || issue.status == Status::Deferred {
+            continue;
+        }
+        let blockers = open_blockers_of(&issue.id);
+        if blockers.len() == 1 {
+            unblocks
+                .entry(blockers[0].clone())
+                .or_default()
+                .push(issue.id.clone());
+        }
+    }
+    for list in unblocks.values_mut() {
+        list.sort();
+    }
+
+    // Go `buildQuickWins` ranking over the claimable subset.
+    let blocker_ratio_of = |id: &str| -> f64 {
+        let Some(issue) = by_id.get(id) else {
+            return 0.0;
+        };
+        let total = issues.len().max(1) as f64;
+        let blocked_by_count = issues
+            .iter()
+            .filter(|o| {
+                !closed_like(o.status)
+                    && o.dependencies
+                        .iter()
+                        .any(|d| d.r#type.is_blocking() && d.effective_depends_on() == id)
+            })
+            .count() as f64;
+        let _ = issue;
+        blocked_by_count / total
+    };
+    let mut qw_candidates: Vec<(f64, &str)> = Vec::new();
+    for issue in issues {
+        // Claimable subset (Go `isClaimableRecommendation`, TUI-applicable
+        // parts): open, non-epic, unassigned, zero open blockers.
+        if issue.status != Status::Open {
+            continue;
+        }
+        if issue.issue_type == "epic" {
+            continue;
+        }
+        if !issue.assignee.is_empty() {
+            continue;
+        }
+        if !open_blockers_of(&issue.id).is_empty() {
+            continue;
+        }
+        let unblocks_count = unblocks.get(&issue.id).map(Vec::len).unwrap_or(0);
+        let unblock_impact = ((unblocks_count as f64) + 1.0).log2();
+        let ratio = blocker_ratio_of(&issue.id);
+        let simplicity = if ratio < 0.2 {
+            1.0
+        } else if ratio < 0.4 {
+            0.5
+        } else {
+            0.0
+        };
+        let priority_bonus = if issue.priority <= 1 { 0.5 } else { 0.0 };
+        let qw_score = unblock_impact * 0.4 + simplicity * 0.4 + priority_bonus * 0.2;
+        qw_candidates.push((qw_score, issue.id.as_str()));
+    }
+    qw_candidates.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.cmp(b.1))
+    });
+    let quick_win_set: HashSet<&str> = qw_candidates.iter().take(5).map(|(_, id)| *id).collect();
+
+    let mut out: HashMap<String, RowTriage> = HashMap::new();
+    for issue in issues {
+        let unblocks_count = unblocks.get(&issue.id).map(Vec::len).unwrap_or(0);
+        let is_blocker = !closed_like(issue.status) && unblocks_count > 0;
+        out.insert(
+            issue.id.clone(),
+            RowTriage {
+                is_quick_win: quick_win_set.contains(issue.id.as_str()),
+                is_blocker,
+                unblocks_count,
+            },
+        );
+    }
+    out
+}
+
 /// Compute the set of issue IDs that have >=1 open blocker.
 pub fn compute_blocked_set(issues: &[Issue]) -> std::collections::HashSet<String> {
     use std::collections::HashSet;

@@ -467,3 +467,184 @@ run of the TUI in a real terminal (no screenshot, no actual keypress-driven
 session) — everything above is static code reading + automated
 build/lint/test, not a human (or agent) actually watching the rendered
 output. That last mile is the user's own manual verification pass.
+
+---
+
+## 14. Go v0.24.1 upstream-drift pass (shipped 2026-09-09)
+
+**Context:** §1–§13 above verified parity against the frozen commit
+(`9ace029` / v0.20.0) that `COMPREHENSIVE_PLAN_FOR_FORT_BEADS_VIEWER.md`
+§3.2 pins for FORT v1. The user separately updated their local Go `bv` to
+**v0.24.1** and asked to close the UI/UX gap against that. Investigation
+(Go source cloned at `v0.24.1`, diffed against `9ace029` scoped to non-test
+`pkg/ui/*.go`: 22 files, +14,708/-2,618) found the overwhelming majority is
+`model.go` churn (+2,561/-1,117) and refactors of already-ported views. Five
+genuinely new user-facing deltas were identified and closed:
+
+### 1. Row-decoration parity (`item.go`/`delegate.go`)
+- `DiffBadge` enum (🆕/✅/~) rendered in Time-Travel mode, driven off
+  `time_travel_result`'s added/changed sets (no new Go dependency — reuses
+  Phase B's diff plumbing).
+- `repo_prefix` on `ListRow`: `normalize_repo_key`/`issue_repo_key` port
+  `workspace_repos.go`'s `normalizeRepoKey`/`issueRepoKey` exactly (trim,
+  strip trailing `-:_`, lowercase, reject empty/`.`/path-separators;
+  `source_repo` first, then ID-prefix fallback ≤10 alphanumeric chars).
+  Rendered as a `[XXXX]` badge in workspace mode.
+- New `bv_analysis::triage::compute_row_triage` (shared, not TUI-only):
+  ports `buildUnblocksMap`/`buildQuickWins`/`buildBlockersToClear` at
+  per-row granularity — `is_quick_win`/`is_blocker`/`unblocks_count` badges
+  (⭐/🔓N/↪N) now reflect the real triage engine instead of nothing.
+
+### 2. Quit-confirm (G-new)
+Two-step Esc (Go `showQuitConfirm`/`focusQuitConfirm`): first Esc at List
+clears active filters (`has_active_filters`/`clear_all_filters`, new
+helpers checking filter_mode/label/repo/search state); second Esc (no
+filters) opens a centered "Quit bv?" box — Esc/Y quits, any other key
+cancels. `q` keeps its old immediate-quit behavior (matches Go: only the
+Esc path goes through confirm).
+
+### 3. CapsLock double-tap (`capslock.go`)
+Backtick single-tap → Tutorial (300ms window), double-tap → context help
+for the current view; `~` → context help directly. Implemented without a
+bubbletea-style timer/message-queue: `tutorial_tap_pending: Option<Instant>`
+checked at the top of every `handle_key` call (`resolve_pending_tutorial_tap`)
+— worst case one extra keypress of latency vs Go's async timer, documented
+in the method comment. `context_help.rs` (already existed, previously
+unreachable) is now wired.
+
+### 4. Semantic search full upgrade (`pkg/search/vector_index.go` +
+`index_sync.go` + `query_adjust.go` + `lexical_boost.go`)
+- **`bv-search::vector_index`** (new, ~330 LOC): byte-exact `.bvvi` v1
+  reader/writer (magic/version/dim/count header, per-entry
+  id_len+id+sha256+f32×dim, all of Go's validation bounds), atomic
+  temp-file+rename save, cosine top-K search. Round-trips against
+  hand-verified byte layouts; cross-compat with Go-written files is
+  structural (same format) though not yet tested against a live Go binary
+  output in this pass.
+- **`bv-search::index_sync`** (new, ~110 LOC): `default_index_path` (Go's
+  exact `.bv/semantic/index-hash-<dim>.bvvi` convention), `load_or_new`
+  (corrupt-file backup-and-rebuild), `sync_index` (content-hash skip,
+  batch-32, all-or-nothing publish).
+- **`bv-search::query`** (new, ~140 LOC): `is_short_query`/
+  `adjust_weights_for_query`/`hybrid_candidate_limit`/
+  `short_query_lexical_boost`/`issue_document` — exact ports of
+  `query_adjust.go`+`lexical_boost.go` constants and logic.
+- **`bv-search::hybrid` fixed** (real bug found, not just a gap):
+  `ComponentScores::new`'s status/priority tables didn't match Go's
+  `normalizeStatus`/`normalizePriority` (e.g. Rust had `blocked=0.6`, Go has
+  `0.5`; Rust was missing `hooked`/`pinned` entirely), and `hybrid_score`
+  hardcoded pagerank/impact to 0.0 with a "caller injects" comment no
+  caller ever satisfied. Both fixed; `ComponentScores` gained real
+  `pagerank`/`impact` fields wired from the TUI's `graph_metrics`/
+  `graph_data`.
+- **TUI wiring**: `apply_semantic` now computes true hybrid scores (text ×
+  preset weights × pagerank/status/impact/priority/recency), lazily
+  builds/syncs the persistent index on first `Ctrl+S`
+  (`ensure_semantic_index`, staleness-checked via `data_hash`), falls back
+  to fresh embedding if the index can't be loaded (index is a pure cache —
+  a dedicated test pins that both paths rank identically). `Tab` cycles
+  the 5 presets in the semantic overlay.
+
+### 5. Cass session modal (`cass_session_modal.go` + `pkg/cass/`)
+New `crates/bv-tui/src/cass.rs` (~330 LOC): `extract_keywords` (exact port
+of Go's stopword list + tokenizer), `search_sessions` (shells `cass search
+<query> --robot --limit N` with a manual 3s poll-timeout, reusing the
+shell-out pattern the existing session-count badge already used),
+`correlate` (id-mention-first-then-keywords strategy order, matching Go's
+`Correlator`), `format_match_reason`/`format_relative_time` (byte-exact
+copy string formats). `V` opens the modal (status message, not a crash,
+when cass is unavailable or nothing correlates — Go's exact strings);
+j/k navigate, `y` copies the search command via the existing clipboard
+path, `V`/Esc/Enter/q dismiss. Documented scope cut: no TTL/LRU result
+cache (Go's exists for background-prefetch paths the TUI never uses) and
+no time-decay/workspace-boost re-scoring (internal Go ranking refinements
+that don't change which sessions surface in a 3-item display).
+
+### Verification
+`cargo fmt --all --check` + `cargo clippy --workspace --all-targets -- -D
+warnings` + `cargo test --workspace` green across all 15 workspace crates
+(bv-tui 103 unit + 7 integration tests, up from 96/7; bv-search 25 unit
+tests, up from 14; bv-analysis 71, unchanged — `compute_row_triage` is
+additive). Golden gate (`golden_comparison.rs`, 65s) unaffected — this
+pass touched `bv-tui`/`bv-search`/one new `bv-analysis` function, no
+robot/CLI output paths. Manual smoke: `cargo install --locked --path
+crates/bv` + `bvr --robot-triage` against the real `.beads/` repo —
+`data_hash` (`763200e994c81387`) identical to before this pass.
+
+### Explicitly not done in this pass
+- `.bvvi` cross-binary compat was NOT verified against a live Go-written
+  index file (structural byte-format match only, not an actual
+  interop test with `cass`'s Go binary or Go `bv`'s own index writer).
+  **Closed 2026-09-09** — see §16 below: it turned out to matter. The
+  container format matched, but the embedder didn't.
+- No live interactive terminal run (same caveat as §13). Tracked as
+  `beads_viewer_rust-api-freeze-tui-ux-p14-followups-1xz.2`.
+- Cass modal's `timestamp` correlation strategy (Go's third strategy,
+  needing session-mtime windows from cass index metadata this port
+  doesn't parse) remains a documented scope cut, not implemented.
+  Tracked as `beads_viewer_rust-api-freeze-tui-ux-p14-followups-1xz.3`.
+
+---
+
+## 16. Cross-binary `.bvvi` verification — real embedder bug found and fixed
+(shipped 2026-09-09, closes
+`beads_viewer_rust-api-freeze-tui-ux-p14-followups-1xz.1`)
+
+Installed the real Go `bv` v0.24.1 (`go install
+github.com/Dicklesworthstone/beads_viewer/cmd/bv@latest`), built a 3-issue
+fixture repo, and ran `bv --search "authentication" --robot-search
+--search-mode hybrid` against it to produce a `.bvvi` index file **actually
+written by the Go binary** — not just structurally matched by inspection.
+
+**Format check: passed.** `VectorIndex::load()` parsed the Go-written file
+without error; magic/version/dim/count/entry-layout all matched byte-for-byte
+as designed.
+
+**Content check: failed, then fixed.** Comparing the Go-computed embedding
+vectors against what `bv_search::embedder::hash_embed` produced for the same
+`IssueDocument` text found only 363-366 of 384 components matching per
+issue — a real divergence, not noise. Root cause, found by re-reading Go's
+`pkg/search/hash_embedder.go` line by line: two bugs in the original
+"byte-compatible" embedder port (§0's crate stack table had called
+FNV-1a-based hash embedding straightforward; it wasn't quite):
+
+1. Go lowercases ASCII bytes **inside** the FNV-1a hash loop, per token
+   (`if b >= 'A' && b <= 'Z' { b += 'a' - 'A' }`) — this port didn't
+   lowercase at all, so any token containing an uppercase letter hashed to
+   a different bucket than Go.
+2. Go's bucket update is **signed** feature hashing:
+   `vec[idx] += sign` where `sign` is `-1.0` when the hash's top bit is
+   set, `+1.0` otherwise (a standard collision-debiasing trick) — this
+   port always did unsigned `vec[bucket] += 1.0`.
+
+Fixed both in `crates/bv-search/src/embedder.rs`
+(`fnv1a64_hash`/`add_hashed_token`, now doc-commented with the bug history
+so it doesn't silently regress). Re-ran the same comparison: **384/384
+components match** (to float32 rounding) on all 3 fixture issues, and the
+`.bvvi` file itself (`crates/bv-search/tests/fixtures/go_v0.24.1_sample.bvvi`,
+Go-written, committed) plus `crates/bv-search/tests/go_interop.rs` (3 tests:
+load shape, exact vector reproduction, ranking order) are now a permanent
+regression guard — the first real cross-binary test this project has, versus
+every prior "Go parity" claim being same-language round-trip only.
+
+**Why this was worth doing:** `bvr` and Go `bv` share the same
+`.bv/semantic/index-hash-<dim>.bvvi` path convention when pointed at the
+same project. Before this fix, if both binaries ever ran semantic search
+against the same repo, they'd silently rank results differently while
+reading/writing what looked like the same file format — the kind of bug
+that never shows up in a single-language test suite and would have been
+very confusing to debug from a user report ("search results are different
+between bv and bvr").
+
+**Reverse direction (Rust-written `.bvvi` loading in Go) not automated** —
+documented as manual verification steps in `go_interop.rs`'s module doc
+comment, since it needs a live Go toolchain not assumed present in CI.
+
+**Golden-gate ratchet note:** unrelated to this fix, `git add`-ing the new
+beads-tracking commit from this same session shifted `selfrepo` git
+history enough that `--robot-history`'s golden output drifted too (see
+`crates/bv/tests/golden_comparison.rs`'s updated
+`GOLDEN_GATE_BASELINE_FAILS` comment, 10 → 11) — verified via `git stash`
+that this is pure selfrepo drift unrelated to the embedder change itself,
+consistent with the ratchet's pre-existing documented selfrepo-drift
+class.

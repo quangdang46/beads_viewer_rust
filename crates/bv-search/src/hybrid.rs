@@ -78,61 +78,139 @@ pub fn get_preset(name: &str) -> Option<Weights> {
 }
 
 /// Normalized component scores for a single candidate issue.
+///
+/// Port of Go `pkg/search/normalizers.go` + the `hybridScorer.Score`
+/// component assembly (`hybrid_scorer_impl.go`): status/priority/impact/
+/// recency normalized to [0,1], pagerank passed through from the graph
+/// metrics (Go `IssueMetrics.PageRank`, already 0.0–1.0).
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ComponentScores {
+    pub pagerank: f64,
     pub status: f64,
+    pub impact: f64,
     pub priority: f64,
     pub recency: f64,
 }
 
 impl ComponentScores {
-    /// Go normalizers: open=1.0→tombstone=0.0; P0=1.0→P4=0.2; exp(-days/30).
-    pub fn new(status_str: &str, prio: i32, days_since_update: f64) -> Self {
-        let status = match status_str.trim().to_lowercase().as_str() {
+    /// Go `normalizeStatus`: open=1.0; in_progress/hooked/review=0.8;
+    /// pinned=0.7; blocked=0.5; draft/deferred=0.2; closed=0.1;
+    /// tombstone=0.0; anything else=0.5.
+    pub fn normalize_status(status_str: &str) -> f64 {
+        match status_str.trim().to_lowercase().as_str() {
             "open" => 1.0,
-            "in_progress" => 0.8,
-            "blocked" => 0.6,
-            "draft" => 0.4,
-            "review" => 0.3,
-            "deferred" => 0.3,
-            "closed" | "tombstone" => 0.0,
+            "in_progress" | "hooked" | "review" => 0.8,
+            "pinned" => 0.7,
+            "blocked" => 0.5,
+            "draft" | "deferred" => 0.2,
+            "closed" => 0.1,
+            "tombstone" => 0.0,
             _ => 0.5,
-        };
-        let priority = match prio {
+        }
+    }
+
+    /// Go `normalizePriority`: P0=1.0, P1=0.8, P2=0.6, P3=0.4, P4=0.2,
+    /// anything else (including negative) = 0.5.
+    pub fn normalize_priority(prio: i32) -> f64 {
+        match prio {
             0 => 1.0,
             1 => 0.8,
             2 => 0.6,
             3 => 0.4,
-            _ => 0.2,
-        };
-        let recency = (-days_since_update / 30.0).exp();
+            4 => 0.2,
+            _ => 0.5,
+        }
+    }
+
+    /// Go `normalizeImpact(blockerCount, maxBlockerCount)`: fraction of the
+    /// max, 0 when the issue blocks nothing, 0.5 when there is nothing to
+    /// normalize against (max == 0).
+    pub fn normalize_impact(blocker_count: usize, max_blocker_count: usize) -> f64 {
+        if max_blocker_count == 0 {
+            return 0.5;
+        }
+        if blocker_count == 0 {
+            return 0.0;
+        }
+        if blocker_count >= max_blocker_count {
+            return 1.0;
+        }
+        blocker_count as f64 / max_blocker_count as f64
+    }
+
+    /// Go `normalizeRecencyAt`: exp(-days/30), clamped to [0,1], future
+    /// dates → 1.0. Takes precomputed days (caller owns the clock, matching
+    /// Go's `hybridScorerAt` pinned-reference-time design).
+    pub fn normalize_recency_days(days_since_update: f64) -> f64 {
+        if days_since_update < 0.0 {
+            return 1.0;
+        }
+        let score = (-days_since_update / 30.0).exp();
+        score.clamp(0.0, 1.0)
+    }
+
+    /// Legacy constructor kept for existing callers (CLI text-mode path):
+    /// status/priority/recency via the Go-exact normalizers above,
+    /// pagerank/impact default to 0 (no graph context at the call site).
+    pub fn new(status_str: &str, prio: i32, days_since_update: f64) -> Self {
         ComponentScores {
-            status,
-            priority,
-            recency,
+            pagerank: 0.0,
+            status: Self::normalize_status(status_str),
+            impact: 0.0,
+            priority: Self::normalize_priority(prio),
+            recency: Self::normalize_recency_days(days_since_update),
         }
     }
 }
 
 /// Hybrid score for a single result.
+///
+/// Serializes to Go's `HybridScore` shape (`hybrid_scorer.go`):
+/// `component_scores` is a flat string→float map with exactly the keys
+/// `pagerank/status/impact/priority/recency` (Go omits the map only when
+/// there is no metrics cache at all — i.e. pure-text fallback, handled by
+/// the caller using `text_score` alone, not by emitting a partial map).
 #[derive(Debug, Clone, Serialize)]
 pub struct HybridResult {
     pub issue_id: String,
     pub score: f64,
     #[serde(rename = "text_score")]
     pub text_score: f64,
-    pub component_scores: ComponentScores,
+    pub component_scores: std::collections::BTreeMap<String, f64>,
 }
 
-/// Compute hybrid score.
+impl HybridResult {
+    pub fn new(
+        issue_id: String,
+        text_score: f64,
+        weights: &Weights,
+        components: &ComponentScores,
+    ) -> Self {
+        let score = hybrid_score(text_score, weights, components);
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("pagerank".into(), components.pagerank);
+        map.insert("status".into(), components.status);
+        map.insert("impact".into(), components.impact);
+        map.insert("priority".into(), components.priority);
+        map.insert("recency".into(), components.recency);
+        HybridResult {
+            issue_id,
+            score,
+            text_score,
+            component_scores: map,
+        }
+    }
+}
+
+/// Compute hybrid score (Go `hybridScorer.Score` final assembly):
+/// `text*w_text + pagerank*w_pr + status*w_status + impact*w_impact +
+/// priority*w_prio + recency*w_rec`, where every component is already
+/// normalized to [0,1] by the caller (see `ComponentScores`).
 pub fn hybrid_score(text_score: f64, weights: &Weights, components: &ComponentScores) -> f64 {
-    // Graph metrics are pre-normalized by the caller (pagerank/betweenness/impact).
-    // For this module we use placeholder graph scores of 0 — the caller injects
-    // real PageRank etc. from bv_analysis stats.
     weights.text_relevance * text_score
-        + weights.pagerank * 0.0
+        + weights.pagerank * components.pagerank
         + weights.status * components.status
-        + weights.impact * 0.0
+        + weights.impact * components.impact
         + weights.priority * components.priority
         + weights.recency * components.recency
 }

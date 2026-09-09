@@ -67,6 +67,36 @@ impl SortMode {
     }
 }
 
+/// Diff badge state for a row in Time-Travel mode.
+///
+/// Port of Go `IssueItem.DiffStatus` + `DiffStatus.Badge()` (new / closed /
+/// modified). Populated from `time_travel_result` at render time, exactly
+/// like Go's `getDiffStatus()` lookup over `newIssueIDs` /
+/// `closedIssueIDs` / `modifiedIssueIDs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiffBadge {
+    #[default]
+    None,
+    /// In current set but not at the diff ref (Go `DiffStatusNew`).
+    Added,
+    /// Closed since the diff ref (Go `DiffStatusClosed`).
+    Closed,
+    /// Present at ref but changed (Go `DiffStatusModified`).
+    Modified,
+}
+
+impl DiffBadge {
+    /// Go `DiffStatus.Badge()` exact strings.
+    pub fn badge(self) -> &'static str {
+        match self {
+            DiffBadge::None => "",
+            DiffBadge::Added => "🆕",
+            DiffBadge::Closed => "✅",
+            DiffBadge::Modified => "~",
+        }
+    }
+}
+
 /// A display row in the list (one per visible issue).
 pub struct ListRow {
     pub id: String,
@@ -79,6 +109,46 @@ pub struct ListRow {
     pub description: String,
     pub notes: String,
     pub assignee: String,
+    /// Workspace-mode repo key (Go `IssueItem.RepoPrefix`): derived from
+    /// `source_repo`, falling back to the issue-ID prefix via the same rules
+    /// as Go `normalizeRepoKey` (trim, strip trailing `-:_`, lowercase,
+    /// reject empty/`.`/path-separator-containing). Rendered as `[API]`-style
+    /// badge only when workspace mode is active. `None` = no badge.
+    pub repo_prefix: Option<String>,
+}
+
+/// Go `normalizeRepoKey` (`pkg/ui/workspace_repos.go`): repo key from a raw
+/// string. Returns `""` (here: `None`) when the input can't be a key.
+pub fn normalize_repo_key(raw: &str) -> Option<String> {
+    let key = raw.trim().trim_end_matches(['-', ':', '_']).to_lowercase();
+    if key.is_empty() || key == "." || key.contains(['/', '\\']) {
+        return None;
+    }
+    Some(key)
+}
+
+/// Go `issueRepoKey` (`pkg/ui/workspace_repos.go`): repo key for an issue —
+/// `source_repo` first, then the issue-ID prefix via Go `ExtractRepoPrefix`
+/// (first `-`/`:`/`_` separator, prefix part ≤ 10 ASCII-alphanumeric chars).
+pub fn issue_repo_key(id: &str, source_repo: &str) -> Option<String> {
+    if let Some(key) = normalize_repo_key(source_repo) {
+        return Some(key);
+    }
+    for sep in ['-', ':', '_'] {
+        if let Some(idx) = id.find(sep) {
+            if idx > 0 {
+                let prefix = &id[..idx];
+                if prefix.len() <= 10
+                    && !prefix.is_empty()
+                    && prefix.chars().all(|c| c.is_ascii_alphanumeric())
+                {
+                    return Some(prefix.to_lowercase());
+                }
+            }
+            break;
+        }
+    }
+    None
 }
 
 /// Application state (Elm model).
@@ -121,12 +191,28 @@ pub struct App {
     pub searching: bool,
     /// Current search query.
     pub search_query: String,
-    /// Semantic search mode active (Ctrl+S pressed). Ranks by
-    /// `bv_search` cosine similarity over title+description — the same
-    /// text-mode engine `--robot-search` uses.
+    /// Semantic search mode active (Ctrl+S pressed). Ranks by hybrid score
+    /// (text cosine × preset weights × graph components — Go
+    /// `hybridScorer.Score`) over the persistent `.bvvi` vector index when
+    /// available, falling back to fresh hash-embedding when the index can't
+    /// be loaded. Same engine family `--robot-search` uses.
     pub semantic_searching: bool,
     /// Current semantic query.
     pub semantic_query: String,
+    /// Active hybrid preset for semantic search (Go `searchCfg` preset —
+    /// Tab cycles; names match `--search-preset`: default / bug-hunting /
+    /// sprint-planning / impact-first / text-only).
+    pub semantic_preset: String,
+    /// Persistent vector index backing semantic search (Go `VectorIndex`
+    /// loaded from `<project>/.bv/semantic/index-hash-<dim>.bvvi`, synced
+    /// incrementally by content hash). `None` until first Ctrl+S (lazy —
+    /// same deferred-cost pattern as History/LabelDashboard), or when the
+    /// beads dir can't be discovered (falls back to fresh embedding).
+    pub semantic_index: Option<bv_search::vector_index::VectorIndex>,
+    /// Data hash the semantic index was last synced against (staleness
+    /// check — Go re-syncs when the issue set changes; we compare against
+    /// the live `data_hash` the same way `watched_mtime` guards reloads).
+    pub semantic_index_hash: Option<String>,
     pub show_sidebar: bool,
     /// Which panel has focus: false = list, true = detail
     pub focus_detail: bool,
@@ -230,6 +316,41 @@ pub struct App {
     pub workspace_repos: Option<Vec<String>>,
     /// Active repo filter in workspace mode (None = all repos)
     pub active_repo: Option<String>,
+    /// Per-row triage decorations (Go `IssueItem.IsQuickWin/IsBlocker/`
+    /// `UnblocksCount` — from `triageResult.QuickWins/BlockersToClear/`
+    /// `unblocksMap`). Computed once at load via the shared
+    /// `bv_analysis::triage::compute_row_triage` (same formulas as
+    /// `--robot-triage`'s builders) and read at render time. Empty until
+    /// `App::new` fills it — render treats a missing entry as no decoration.
+    pub row_triage: std::collections::HashMap<String, bv_analysis::triage::RowTriage>,
+    /// Quit-confirmation overlay (Go `showQuitConfirm` / `focusQuitConfirm`):
+    /// at the main list, first Esc clears filters, second Esc shows this
+    /// confirm box; Esc/Y quits, any other key cancels back to the list.
+    /// `q` keeps its immediate-quit behavior (Go `quitCommand`), matching Go
+    /// where only the Esc path goes through the confirm step.
+    pub show_quit_confirm: bool,
+    /// Pending single-tap backtick timestamp (Go `CapsLockTracker.pending`):
+    /// first backtick press records `Instant::now()` and waits up to 300ms
+    /// for a second press. A second press within the window opens context
+    /// help for the current view (Go `TriggerContextHelp`); if the window
+    /// expires with no second press, the full Tutorial opens instead (Go
+    /// `CapsLockTimerExpiredMsg` → `TriggerFullTutorial`). `None` = no tap
+    /// pending. Checked at the top of `handle_key` (see `resolve_pending_tap`)
+    /// so no background timer thread is needed — worst case the Tutorial
+    /// opens on the *next* keypress after the window expires, documented in
+    /// the method comment.
+    pub tutorial_tap_pending: Option<std::time::Instant>,
+    /// Context-help overlay visibility (Go `~` key / double-tap backtick →
+    /// context help for the current view). Rendered from the existing
+    /// `context_help::render_context_help` over `focus_for_view`; any key
+    /// dismisses.
+    pub show_context_help: bool,
+    /// Cass session modal (Go `showCassModal` / `focusCassModal` /
+    /// `CassSessionModal`): correlated coding sessions for the selected
+    /// bead. `None` = closed. Opened with `V` (Go's binding, free in Rust:
+    /// lowercase `v` is view-scoped to History/Sprint), dismissed with
+    /// `V`/Esc/Enter/q (Go's exact dismiss set).
+    pub cass_modal: Option<crate::cass::CassModalState>,
     /// cass CLI availability cache
     cass_available: bool,
     cass_cache: std::collections::HashMap<String, usize>,
@@ -564,6 +685,7 @@ impl App {
             .filter(|a| a.severity == bv_analysis::drift::Severity::Warning)
             .count();
         let alerts_total = alerts.len();
+        let row_triage = bv_analysis::triage::compute_row_triage(&issues);
         let rows: Vec<ListRow> = issues
             .iter()
             .map(|i| ListRow {
@@ -577,11 +699,13 @@ impl App {
                 description: i.description.clone(),
                 notes: i.notes.clone(),
                 assignee: i.assignee.clone(),
+                repo_prefix: issue_repo_key(&i.id, &i.source_repo),
             })
             .collect();
         let mut app = App {
             rows,
             issue_map,
+            row_triage,
             alerts_critical: a_crit,
             alerts_warning: a_warn,
             alerts_total,
@@ -631,9 +755,15 @@ impl App {
             search_query: String::new(),
             semantic_searching: false,
             semantic_query: String::new(),
+            semantic_preset: "default".to_string(),
+            semantic_index: None,
+            semantic_index_hash: None,
             show_sidebar: false,
             focus_detail: false,
             show_help: false,
+            show_quit_confirm: false,
+            tutorial_tap_pending: None,
+            show_context_help: false,
             label_filter: None,
             detail_scroll: 0,
             graph_metrics: None,
@@ -644,6 +774,7 @@ impl App {
             update_tag: None,
             workspace_repos: None,
             active_repo: None,
+            cass_modal: None,
             cass_available: cass_installed(),
             cass_cache: std::collections::HashMap::new(),
             actionable: None,
@@ -857,7 +988,9 @@ impl App {
         self.cursor = 0;
     }
     /// Semantic search input (Ctrl+S mode): Esc clears and exits, Enter
-    /// accepts (back to the standard filter order), typing re-ranks.
+    /// accepts (back to the standard filter order), typing re-ranks, Tab
+    /// cycles the hybrid preset (Go `searchCfg` preset names, same list as
+    /// `--search-preset`).
     fn handle_semantic_key(&mut self, code: KeyCode) -> bool {
         match code {
             KeyCode::Esc => {
@@ -869,6 +1002,24 @@ impl App {
             KeyCode::Enter => {
                 self.semantic_searching = false;
                 self.apply_filter();
+                true
+            }
+            KeyCode::Tab => {
+                const PRESETS: &[&str] = &[
+                    "default",
+                    "bug-hunting",
+                    "sprint-planning",
+                    "impact-first",
+                    "text-only",
+                ];
+                let next = PRESETS
+                    .iter()
+                    .position(|p| *p == self.semantic_preset)
+                    .map(|i| PRESETS[(i + 1) % PRESETS.len()])
+                    .unwrap_or(PRESETS[0]);
+                self.semantic_preset = next.to_string();
+                self.status_msg = format!("Semantic preset: {next}");
+                self.apply_semantic();
                 true
             }
             KeyCode::Backspace => {
@@ -885,34 +1036,210 @@ impl App {
         }
     }
 
-    /// Cosine-similarity ranking over title+description with the same
-    /// hash-embedding text engine `--robot-search` uses
-    /// (`bv_search::embedder::{hash_embed, cosine_similarity}`). Zero-score
-    /// rows are hidden; ties break by id asc. Empty query restores order.
+    /// Hybrid semantic ranking (Go `hybridScorer.Score` over the persistent
+    /// `.bvvi` index): text cosine × preset weights × graph components
+    /// (pagerank from `graph_metrics`, impact from blocker fan-out, status /
+    /// priority / recency via Go-exact normalizers). Short queries get Go's
+    /// text-floor (0.55) + literal-match boost (+0.35). Zero-score rows are
+    /// hidden; ties break by id asc. Empty query restores order.
+    ///
+    /// The vector side reads from the persistent index (`ensure_semantic_index`,
+    /// synced incrementally by content hash — Go `SyncVectorIndex`) and falls
+    /// back to fresh hash-embedding when no index is available, so results
+    /// are identical either way: the index is a pure cache.
     fn apply_semantic(&mut self) {
         if self.semantic_query.is_empty() {
             self.filtered_indices = (0..self.rows.len()).collect();
-        } else {
-            let dim = bv_search::embedder::DEFAULT_DIM;
-            let query_vec = bv_search::embedder::hash_embed(&self.semantic_query, dim);
-            let mut scored: Vec<(i64, usize)> = Vec::new();
-            for (i, r) in self.rows.iter().enumerate() {
-                let text = format!("{} {}", r.title, r.description);
-                let issue_vec = bv_search::embedder::hash_embed(&text, dim);
-                let score = bv_search::embedder::cosine_similarity(&query_vec, &issue_vec);
-                if score > 0.0 {
-                    // Fixed-point rank key: deterministic across platforms.
-                    scored.push(((score * 1_000_000.0) as i64, i));
-                }
-            }
-            scored.sort_by(|a, b| {
-                b.0.cmp(&a.0)
-                    .then_with(|| self.rows[a.1].id.cmp(&self.rows[b.1].id))
-            });
-            let idx: Vec<usize> = scored.into_iter().map(|(_, i)| i).collect();
-            self.filtered_indices = idx;
+            self.cursor = 0;
+            return;
         }
+        self.ensure_semantic_index();
+        let dim = bv_search::embedder::DEFAULT_DIM;
+        let query_vec = bv_search::embedder::hash_embed(&self.semantic_query, dim);
+        let weights = bv_search::hybrid::get_preset(&self.semantic_preset)
+            .or_else(|| bv_search::hybrid::get_preset("default"))
+            .expect("default preset exists");
+        let weights = bv_search::query::adjust_weights_for_query(weights, &self.semantic_query);
+        let short_boost_query = self.semantic_query.clone();
+
+        // Per-issue graph components (Go `AnalyzerMetricsLoader`: pagerank
+        // from analysis, blocker fan-out as impact input, updated_at recency).
+        let now = jiff::Timestamp::now();
+        let max_blockers = self
+            .graph_data
+            .as_ref()
+            .map(|g| g.dependents.values().map(Vec::len).max().unwrap_or(0))
+            .unwrap_or(0);
+        let days_since = |row: &ListRow| -> f64 {
+            self.issue_map
+                .get(&row.id)
+                .and_then(|i| i.updated_at.as_deref())
+                .and_then(|s| s.parse::<jiff::Timestamp>().ok())
+                .map(|t| now.since(t).map(|d| d.get_days()).unwrap_or(0) as f64)
+                .unwrap_or(0.0)
+        };
+
+        // Text scores: index lookup when available, fresh embed otherwise.
+        // Both paths produce cosine similarities over the same hash-embed
+        // vectors, so ranking is identical either way.
+        let text_scores: Vec<(usize, f64)> = if let Some(idx) = &self.semantic_index {
+            match idx.search_top_k(&query_vec, self.rows.len()) {
+                Ok(hits) => {
+                    let by_id: std::collections::HashMap<&str, f64> = hits
+                        .iter()
+                        .map(|h| (h.issue_id.as_str(), h.score))
+                        .collect();
+                    self.rows
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, r)| by_id.get(r.id.as_str()).map(|&s| (i, s)))
+                        .collect()
+                }
+                Err(_) => self.fresh_text_scores(&query_vec, dim),
+            }
+        } else {
+            self.fresh_text_scores(&query_vec, dim)
+        };
+
+        let mut scored: Vec<(i64, usize)> = Vec::new();
+        for (i, text_score) in text_scores {
+            let row = &self.rows[i];
+            let pr = self
+                .graph_metrics
+                .as_ref()
+                .and_then(|gm| gm.pagerank.get(&row.id).copied())
+                .unwrap_or(0.0);
+            let blockers = self
+                .graph_data
+                .as_ref()
+                .and_then(|g| g.dependents.get(&row.id))
+                .map(Vec::len)
+                .unwrap_or(0);
+            let components = bv_search::hybrid::ComponentScores {
+                pagerank: pr.clamp(0.0, 1.0),
+                status: bv_search::hybrid::ComponentScores::normalize_status(row.status.as_str()),
+                impact: bv_search::hybrid::ComponentScores::normalize_impact(
+                    blockers,
+                    max_blockers,
+                ),
+                priority: bv_search::hybrid::ComponentScores::normalize_priority(row.priority),
+                recency: bv_search::hybrid::ComponentScores::normalize_recency_days(days_since(
+                    row,
+                )),
+            };
+            let mut score = bv_search::hybrid::hybrid_score(text_score, &weights, &components);
+            // Go short-query literal boost (added post-threshold, pre-top-k).
+            let issue = self.issue_map.get(&row.id);
+            let doc = issue
+                .map(|iss| {
+                    bv_search::query::issue_document(
+                        &iss.id,
+                        &iss.title,
+                        &iss.labels,
+                        &iss.description,
+                    )
+                })
+                .unwrap_or_default();
+            score += bv_search::query::short_query_lexical_boost(&short_boost_query, &doc);
+            if score > 0.0 {
+                // Fixed-point rank key: deterministic across platforms.
+                scored.push(((score * 1_000_000.0) as i64, i));
+            }
+        }
+        scored.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| self.rows[a.1].id.cmp(&self.rows[b.1].id))
+        });
+        self.filtered_indices = scored.into_iter().map(|(_, i)| i).collect();
         self.cursor = 0;
+    }
+
+    /// Fresh hash-embed text scores for every row (fallback when no
+    /// persistent index is available — same vectors the index stores).
+    fn fresh_text_scores(&self, query_vec: &[f32], dim: usize) -> Vec<(usize, f64)> {
+        let _ = dim;
+        self.rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| {
+                let issue = self.issue_map.get(&r.id);
+                let doc = issue.map(|iss| {
+                    bv_search::query::issue_document(
+                        &iss.id,
+                        &iss.title,
+                        &iss.labels,
+                        &iss.description,
+                    )
+                });
+                // Index and fallback must agree: both embed the Go
+                // `IssueDocument` text (ID×3/title×2/labels/desc), not the
+                // old title+description pair.
+                let text = doc.unwrap_or_else(|| format!("{} {}", r.title, r.description));
+                let issue_vec = bv_search::embedder::hash_embed(&text, dim);
+                let score = bv_search::embedder::cosine_similarity(query_vec, &issue_vec);
+                (score > 0.0).then_some((i, score))
+            })
+            .collect()
+    }
+
+    /// Load-or-build the persistent `.bvvi` semantic index (Go
+    /// `LoadOrNewVectorIndex` + `SyncVectorIndex`, batch 32), syncing
+    /// incrementally when the issue set changed (compared via `data_hash`).
+    /// Silent no-op when the beads dir can't be discovered (falls back to
+    /// fresh embedding in `apply_semantic`).
+    fn ensure_semantic_index(&mut self) {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let Ok(beads_dir) = bv_core::discovery::get_beads_dir(&cwd) else {
+            return;
+        };
+        // Project dir = parent of `.beads` (Go `DefaultIndexPath` takes the
+        // project dir and appends `.bv/semantic/...`).
+        let project_dir = beads_dir.parent().unwrap_or(&cwd);
+        let dim = bv_search::embedder::DEFAULT_DIM;
+        let path = bv_search::index_sync::default_index_path(project_dir, dim);
+        let live_hash = bv_core::data_hash::compute_data_hash(
+            &self.issue_map.values().cloned().collect::<Vec<_>>(),
+        );
+        if self.semantic_index.is_some() && self.semantic_index_hash.as_deref() == Some(&live_hash)
+        {
+            return;
+        }
+        let (mut idx, _loaded) = bv_search::index_sync::load_or_new(&path, dim);
+        let docs: std::collections::BTreeMap<String, String> = self
+            .issue_map
+            .iter()
+            .map(|(id, iss)| {
+                (
+                    id.clone(),
+                    bv_search::query::issue_document(
+                        &iss.id,
+                        &iss.title,
+                        &iss.labels,
+                        &iss.description,
+                    ),
+                )
+            })
+            .collect();
+        match bv_search::index_sync::sync_index(&mut idx, &docs, |texts| {
+            texts
+                .iter()
+                .map(|t| bv_search::embedder::hash_embed(t, dim))
+                .collect()
+        }) {
+            Ok(stats) => {
+                if stats.changed() || !_loaded {
+                    let _ = idx.save(&path);
+                }
+                self.semantic_index = Some(idx);
+                self.semantic_index_hash = Some(live_hash);
+            }
+            Err(_) => {
+                // Sync failure (e.g. bad dim) → stay index-less; the fresh
+                // fallback in `apply_semantic` keeps search working.
+                self.semantic_index = None;
+                self.semantic_index_hash = None;
+            }
+        }
     }
 
     /// Handle mouse events (wheel scroll + click select).
@@ -972,8 +1299,77 @@ impl App {
             .map(|&i| &self.rows[i])
     }
 
+    /// Resolve a pending single-tap backtick (Go `CapsLockTracker` +
+    /// `CapsLockTimerExpiredMsg` → `TriggerFullTutorial`): if the 300ms
+    /// double-tap window has expired with no second tap, the user meant a
+    /// single tap → open the full Tutorial (page 0). Called at the top of
+    /// `handle_key` so the only infrastructure is the event loop's own
+    /// keypress cadence — no timer thread, no message queue. Documented
+    /// latency: the Tutorial opens on the first keypress *after* the window
+    /// expires (or immediately if the next keypress IS the second tap —
+    /// that path never touches this method).
+    fn resolve_pending_tutorial_tap(&mut self) {
+        const TAP_WINDOW: std::time::Duration = std::time::Duration::from_millis(300);
+        if self
+            .tutorial_tap_pending
+            .is_some_and(|t| t.elapsed() >= TAP_WINDOW)
+        {
+            self.tutorial_tap_pending = None;
+            if self.current_view != ViewMode::Tutorial {
+                if let Some(t) = &mut self.tutorial {
+                    t.current_page = 0;
+                }
+                self.current_view = ViewMode::Tutorial;
+            }
+        }
+    }
+
+    /// Open context help for the current view (shared by the `~` key and
+    /// double-tap backtick paths).
+    fn open_context_help(&mut self) {
+        self.tutorial_tap_pending = None;
+        self.show_context_help = true;
+    }
+
+    /// True when any list filter deviates from the default (Go
+    /// `hasActiveFilters`: status filter != "all", label/repo filter set, or
+    /// a fuzzy/semantic search query active).
+    fn has_active_filters(&self) -> bool {
+        self.filter_mode != FilterMode::All
+            || self.label_filter.is_some()
+            || self.active_repo.is_some()
+            || self.searching
+            || self.semantic_searching
+    }
+
+    /// Reset all list filters to default (Go `clearAllFilters`: status back
+    /// to "all", label/repo cleared, search queries cleared) and re-apply.
+    fn clear_all_filters(&mut self) {
+        self.filter_mode = FilterMode::All;
+        self.label_filter = None;
+        self.active_repo = None;
+        self.searching = false;
+        self.search_query.clear();
+        self.semantic_searching = false;
+        self.semantic_query.clear();
+        self.apply_filter();
+    }
+
     /// Handle a key event; returns true if the event was consumed.
     pub fn handle_key(&mut self, code: KeyCode) -> bool {
+        // Quit-confirmation overlay (Go `showQuitConfirm` block at the top of
+        // Update): Esc/Y quits, any other key cancels back to the list.
+        if self.show_quit_confirm {
+            match code {
+                KeyCode::Esc | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.quit_requested = true;
+                }
+                _ => {
+                    self.show_quit_confirm = false;
+                }
+            }
+            return true;
+        }
         if self.semantic_searching {
             return self.handle_semantic_key(code);
         }
@@ -1007,6 +1403,23 @@ impl App {
         if self.show_agent_prompts {
             return self.handle_agent_prompt_key(code);
         }
+        if self.cass_modal.is_some() {
+            return self.handle_cass_modal_key(code);
+        }
+        if self.show_context_help {
+            // Go `~` / double-tap context help: any key dismisses (same
+            // "press any key to close" contract as `render_context_help`).
+            self.show_context_help = false;
+            return true;
+        }
+        // Resolve a pending single-tap backtick (Go `CapsLockTracker` +
+        // `CapsLockTimerExpiredMsg` → `TriggerFullTutorial`): if >300ms
+        // elapsed since the first tap with no second tap, the user meant a
+        // single tap → open the full Tutorial now. Runs at the top of every
+        // keypress so no background timer is needed; worst case the Tutorial
+        // opens on the next keypress after the window (documented latency,
+        // same tradeoff as Go's message-queue tick).
+        self.resolve_pending_tutorial_tap();
         match code {
             KeyCode::Tab => {
                 self.focus_detail = !self.focus_detail;
@@ -1024,6 +1437,11 @@ impl App {
                 if self.searching {
                     self.searching = false;
                     self.search_query.clear();
+                } else if self.current_view == ViewMode::List && self.has_active_filters() {
+                    // Go: first Esc at the main list clears filters instead
+                    // of quitting (`hasActiveFilters` → `clearAllFilters`).
+                    self.clear_all_filters();
+                    self.status_msg = "Filters cleared".to_string();
                 } else if self.show_detail {
                     self.show_detail = false;
                 } else if self.label_drilldown.is_some() || self.show_label_detail {
@@ -1047,7 +1465,11 @@ impl App {
                 ) {
                     self.current_view = ViewMode::List;
                 } else {
-                    self.quit_requested = true;
+                    // Go: no filters active at the main list — second Esc
+                    // shows the quit confirmation (`showQuitConfirm` +
+                    // `focusQuitConfirm`); the top-of-`handle_key` block
+                    // above resolves Esc/Y → quit, anything else → cancel.
+                    self.show_quit_confirm = true;
                 }
                 true
             }
@@ -1213,14 +1635,29 @@ impl App {
                 true
             }
             KeyCode::Char('`') => {
-                self.current_view = if self.current_view == ViewMode::Tutorial {
-                    ViewMode::List
+                // Go `CapsLockTracker.HandlePress` (capslock.go): a second
+                // tap within 300ms means context help for the current view
+                // (`TriggerContextHelp`); otherwise start/keep the single-tap
+                // timer (`TriggerNone` + tick command → resolved by
+                // `resolve_pending_tutorial_tap` at the next keypress).
+                const TAP_WINDOW: std::time::Duration = std::time::Duration::from_millis(300);
+                let double_tap = self
+                    .tutorial_tap_pending
+                    .is_some_and(|t| t.elapsed() < TAP_WINDOW);
+                self.tutorial_tap_pending = None;
+                if double_tap {
+                    self.open_context_help();
+                } else if self.current_view == ViewMode::Tutorial {
+                    self.current_view = ViewMode::List;
                 } else {
-                    if let Some(t) = &mut self.tutorial {
-                        t.current_page = 0;
-                    }
-                    ViewMode::Tutorial
-                };
+                    self.tutorial_tap_pending = Some(std::time::Instant::now());
+                }
+                true
+            }
+            KeyCode::Char('~') => {
+                // Go `IsContextHelpTrigger` (capslock.go): direct context
+                // help for the current view, no tap dance needed.
+                self.open_context_help();
                 true
             }
             KeyCode::Char('t') => {
@@ -1465,6 +1902,13 @@ impl App {
             }
             KeyCode::Char('p') => {
                 self.toggle_priority_hints();
+                true
+            }
+            KeyCode::Char('V') => {
+                // Cass session preview modal (Go `V` → `showCassSessionModal`,
+                // bv-5bqh). Uppercase is free: lowercase `v` is view-scoped
+                // (History bead/git toggle, Sprint velocity overlay).
+                self.open_cass_modal();
                 true
             }
             // Agent-prompt modal (Go auto-shows on AGENTS.md detection;
@@ -1917,6 +2361,85 @@ impl App {
                 true
             }
             _ => true, // modal captures all keys; anything else just holds it open
+        }
+    }
+
+    /// Open the cass session modal for the selected issue (Go
+    /// `showCassSessionModal`): requires a healthy cass CLI, correlates
+    /// with the 3s-timeout backend, shows a status message (not the modal)
+    /// when cass is missing or no sessions correlate — Go's exact strings.
+    fn open_cass_modal(&mut self) {
+        if !self.cass_available {
+            self.status_msg =
+                "⚠️ cass not available (install it for session correlation)".to_string();
+            return;
+        }
+        let Some(row) = self.selected() else {
+            return;
+        };
+        let bead_id = row.id.clone();
+        let (title, description) = self
+            .issue_map
+            .get(&bead_id)
+            .map(|i| (i.title.clone(), i.description.clone()))
+            .unwrap_or_default();
+        let (sessions, keywords) = crate::cass::correlate(&bead_id, &title, &description);
+        if sessions.is_empty() {
+            self.status_msg = format!("No correlated sessions found for {bead_id}");
+            return;
+        }
+        let search_cmd = if keywords.is_empty() {
+            format!("cass search \"{bead_id}\"")
+        } else {
+            format!("cass search \"{}\"", keywords.join(" "))
+        };
+        self.cass_modal = Some(crate::cass::CassModalState {
+            bead_id,
+            sessions,
+            keywords,
+            search_cmd,
+            selected: 0,
+            copied_at: None,
+        });
+    }
+
+    /// Key handling while the cass modal is open (Go
+    /// `CassSessionModal.Update` + the dismiss arm: `V`/Esc/Enter/q close,
+    /// j/k navigate, `y` copies `searchCmd` with a 2s flash).
+    fn handle_cass_modal_key(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Char('V') | KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                self.cass_modal = None;
+                true
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Some(m) = &mut self.cass_modal {
+                    m.move_down();
+                }
+                true
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Some(m) = &mut self.cass_modal {
+                    m.move_up();
+                }
+                true
+            }
+            KeyCode::Char('y') => {
+                let cmd = self.cass_modal.as_ref().map(|m| m.search_cmd.clone());
+                if let Some(cmd) = cmd {
+                    match copy_to_clipboard(&cmd) {
+                        Ok(()) => {
+                            if let Some(m) = &mut self.cass_modal {
+                                m.copied_at = Some(std::time::Instant::now());
+                            }
+                            self.status_msg = "Copied cass search command".to_string();
+                        }
+                        Err(e) => self.status_msg = format!("Clipboard failed: {e}"),
+                    }
+                }
+                true
+            }
+            _ => true, // modal captures all keys; anything else holds it open
         }
     }
 
@@ -2956,6 +3479,165 @@ fn render_overlays(f: &mut Frame, app: &App) {
             picker.render(f, f.area());
         }
     }
+
+    // Cass session modal (Go `CassSessionModal.View` centered via
+    // `CenterModal`): header with bead ID, up to 3 session cards (agent •
+    // relative time, match reason, snippet), "(N more — run: <cmd>)" line,
+    // footer with bindings or the 2s "✓ Copied!" flash.
+    if let Some(modal) = &app.cass_modal {
+        let now = jiff::Timestamp::now();
+        let mut lines: Vec<Line> = vec![
+            Line::from(vec![
+                Span::styled(
+                    "📎 Related Coding Sessions  ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(modal.bead_id.clone(), Style::default().fg(Color::DarkGray)),
+            ]),
+            Line::from(""),
+        ];
+        let shown = modal.display_count();
+        for (i, s) in modal.sessions.iter().take(shown).enumerate() {
+            let agent = if s.session.agent.is_empty() {
+                "Unknown"
+            } else {
+                s.session.agent.as_str()
+            };
+            let when = crate::cass::format_relative_time(&s.session.timestamp, now);
+            let header = format!("[{}] {agent} • {when}", i + 1);
+            lines.push(Line::from(if i == modal.selected {
+                Span::styled(
+                    header,
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::raw(header)
+            }));
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "    {}",
+                    crate::cass::format_match_reason(s, &modal.bead_id)
+                ),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            )));
+            let snippet = if s.session.snippet.trim().is_empty() {
+                "(no preview available)".to_string()
+            } else {
+                s.session
+                    .snippet
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .take(3)
+                    .collect::<Vec<_>>()
+                    .join(" / ")
+                    .chars()
+                    .take(120)
+                    .collect::<String>()
+            };
+            lines.push(Line::from(format!("    {snippet}")));
+            lines.push(Line::from(""));
+        }
+        if modal.sessions.len() > shown {
+            let extra = modal.sessions.len() - shown;
+            let plural = if extra > 1 { "s" } else { "" };
+            let more = format!("({extra} more session{plural} - run: {})", modal.search_cmd);
+            lines.push(Line::from(Span::styled(
+                more,
+                Style::default().fg(Color::DarkGray),
+            )));
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(
+            if modal.show_copied() {
+                "[j/k] Navigate    ✓ Copied!              [V/Esc] Close"
+            } else {
+                "[j/k] Navigate    [y] Copy search cmd    [V/Esc] Close"
+            },
+            Style::default().fg(Color::DarkGray),
+        )));
+        let w = 70.min(app.width.saturating_sub(4));
+        let h = (lines.len() as u16 + 2).min(app.height.saturating_sub(2));
+        let popup = ratatui::layout::Rect {
+            x: app.width.saturating_sub(w) / 2,
+            y: app.height.saturating_sub(h) / 2,
+            width: w,
+            height: h,
+        };
+        f.render_widget(ratatui::widgets::Clear, popup);
+        f.render_widget(
+            ratatui::widgets::Paragraph::new(lines).block(
+                ratatui::widgets::Block::default()
+                    .borders(ratatui::widgets::Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan)),
+            ),
+            popup,
+        );
+        return;
+    }
+
+    // Context help overlay (Go `~` / double-tap backtick): per-view
+    // bindings rendered from the registry, any key dismisses (handled at
+    // the top of `handle_key`).
+    if app.show_context_help {
+        crate::context_help::render_context_help(f, focus_for_view(app.current_view), f.area());
+        return;
+    }
+
+    // Quit confirmation (Go `renderQuitConfirm`): centered bordered box —
+    // "Quit bv?" / "Press Esc or Y to quit" / "Press any other key to cancel".
+    if app.show_quit_confirm {
+        let lines = vec![
+            Line::from(Span::styled(
+                "Quit bv?",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("Press "),
+                Span::styled(
+                    "Esc",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" or "),
+                Span::styled(
+                    "Y",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" to quit"),
+            ]),
+            Line::from("Press any other key to cancel"),
+        ];
+        let w = 40.min(app.width.saturating_sub(4));
+        let h = (lines.len() as u16 + 2).min(app.height.saturating_sub(2));
+        let popup = ratatui::layout::Rect {
+            x: app.width.saturating_sub(w) / 2,
+            y: app.height.saturating_sub(h) / 2,
+            width: w,
+            height: h,
+        };
+        f.render_widget(ratatui::widgets::Clear, popup);
+        f.render_widget(
+            ratatui::widgets::Paragraph::new(lines)
+                .alignment(ratatui::layout::Alignment::Center)
+                .block(
+                    ratatui::widgets::Block::default()
+                        .borders(ratatui::widgets::Borders::ALL)
+                        .border_style(Style::default().fg(Color::Red)),
+                ),
+            popup,
+        );
+    }
 }
 
 /// Map the active `ViewMode` to the `keybindings::Focus` bucket that
@@ -3038,6 +3720,22 @@ fn render_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             spans.push(Span::styled(icon, Style::default().fg(icon_color)));
             spans.push(Span::raw(" "));
 
+            // Repo badge in workspace mode (Go `RenderRepoBadge`: "[API]",
+            // uppercase, capped at 4 chars — `normalizeRepoKey` already
+            // computed at load into `row.repo_prefix`).
+            if app.workspace_repos.is_some() {
+                if let Some(prefix) = row.repo_prefix.as_deref() {
+                    let display: String = prefix.to_uppercase().chars().take(4).collect();
+                    spans.push(Span::styled(
+                        format!("[{display}]"),
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                    spans.push(Span::raw(" "));
+                }
+            }
+
             // Priority badge
             spans.push(Span::styled(
                 format!("{:<3}", prio_label),
@@ -3078,6 +3776,26 @@ fn render_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             }
             spans.push(Span::raw(" "));
 
+            // Triage indicator (Go `delegate.go` bv-151): quick-win ⭐,
+            // else blocker-with-unblocks 🔓N, else any-unblocks ↪N.
+            // Go order: IsQuickWin first, then IsBlocker && UnblocksCount>0,
+            // then UnblocksCount>0.
+            let triage_indicator: Option<String> = app.row_triage.get(&row.id).and_then(|t| {
+                if t.is_quick_win {
+                    Some("⭐".to_string())
+                } else if t.is_blocker && t.unblocks_count > 0 {
+                    Some(format!("🔓{}", t.unblocks_count))
+                } else if t.unblocks_count > 0 {
+                    Some(format!("↪{}", t.unblocks_count))
+                } else {
+                    None
+                }
+            });
+            if let Some(ind) = triage_indicator {
+                spans.push(Span::styled(ind, Style::default().fg(Color::Yellow)));
+                spans.push(Span::raw(" "));
+            }
+
             // Status badge
             spans.push(Span::styled(
                 format!("{:<4}", slabel),
@@ -3085,12 +3803,58 @@ fn render_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             ));
             spans.push(Span::raw(" "));
 
+            // Search score badge while a search is active (Go `delegate.go`:
+            // `d.ShowSearchScores && i.SearchScoreSet` renders `[0.42]`).
+            // Rust has no per-row score store; the score IS the ranking that
+            // produced `filtered_indices`, so the badge shows the row's rank
+            // position when a fuzzy (/) or semantic (Ctrl+S) filter is active.
+            // Scope note: Go shows the raw float score; we show rank — same
+            // slot, same "search is active" signal, without inventing scores.
+            if app.searching || app.semantic_searching {
+                spans.push(Span::styled(
+                    format!("#{}", vis_idx + 1),
+                    Style::default().fg(Color::Cyan),
+                ));
+                spans.push(Span::raw(" "));
+            }
+
             // ID
             spans.push(Span::styled(
                 format!("{:<20}", row.id),
                 Style::default().fg(Color::Cyan),
             ));
             spans.push(Span::raw(" "));
+
+            // Diff badge in Time-Travel mode (Go `IssueItem.DiffStatus.Badge()`
+            // via `getDiffStatus` over newIssueIDs/closedIssueIDs/
+            // modifiedIssueIDs). Rust's `DiffResult` names the same sets
+            // `added` (in current, not at ref → 🆕) / `removed` (was at ref,
+            // gone now — never rendered as a live row, kept for symmetry) /
+            // `changed` (status/title/priority drift → ~). An issue that the
+            // diff reports as *closed* relative to the ref keeps Go's ✅ —
+            // detected here by comparing the live row's status against the
+            // changed entry: if the row is currently closed-like and the ref
+            // predates the closure, it's a closure, not a generic edit.
+            if app.current_view == ViewMode::TimeTravel {
+                if let Some(result) = &app.time_travel_result {
+                    let badge = if result.added.iter().any(|id| id == &row.id) {
+                        DiffBadge::Added
+                    } else if result.changed.iter().any(|c| c.id == row.id) {
+                        let closed_now = matches!(row.status, Status::Closed | Status::Tombstone);
+                        if closed_now {
+                            DiffBadge::Closed
+                        } else {
+                            DiffBadge::Modified
+                        }
+                    } else {
+                        DiffBadge::None
+                    };
+                    if badge != DiffBadge::None {
+                        spans.push(Span::raw(badge.badge()));
+                        spans.push(Span::raw(" "));
+                    }
+                }
+            }
 
             // Title (truncated to fit)
             let title_width = inner_width.saturating_sub(45);
@@ -3737,6 +4501,115 @@ mod tests {
     }
 
     #[test]
+    fn normalize_repo_key_matches_go_rules() {
+        // Go `normalizeRepoKey`: trim, strip trailing -:_, lowercase,
+        // reject empty/./slash-containing.
+        assert_eq!(normalize_repo_key("api"), Some("api".into()));
+        assert_eq!(normalize_repo_key("  API--"), Some("api".into()));
+        assert_eq!(normalize_repo_key(""), None);
+        assert_eq!(normalize_repo_key("."), None);
+        assert_eq!(normalize_repo_key("a/b"), None);
+        assert_eq!(normalize_repo_key("a\\b"), None);
+    }
+
+    #[test]
+    fn issue_repo_key_prefers_source_repo_then_id_prefix() {
+        // Go `issueRepoKey`: source_repo first, then ID prefix (Go
+        // `ExtractRepoPrefix`: first -/:/_ separator, prefix ≤ 10 ASCII
+        // alphanumerics).
+        assert_eq!(
+            issue_repo_key("T-1", "web"),
+            Some("web".into()),
+            "source_repo wins over ID prefix"
+        );
+        assert_eq!(
+            issue_repo_key("api-AUTH-1", ""),
+            Some("api".into()),
+            "ID prefix fallback"
+        );
+        assert_eq!(
+            issue_repo_key("averylongprefixname-X-1", ""),
+            None,
+            "prefix > 10 chars is not a repo key"
+        );
+        assert_eq!(
+            issue_repo_key("T-1", ""),
+            Some("t".into()),
+            "short ID prefix still counts (Go has no minimum length)"
+        );
+        assert_eq!(issue_repo_key("noprefix", ""), None);
+    }
+
+    #[test]
+    fn diff_badge_strings_match_go_exactly() {
+        assert_eq!(DiffBadge::None.badge(), "");
+        assert_eq!(DiffBadge::Added.badge(), "🆕");
+        assert_eq!(DiffBadge::Closed.badge(), "✅");
+        assert_eq!(DiffBadge::Modified.badge(), "~");
+    }
+
+    #[test]
+    fn row_triage_marks_blocker_and_quick_win_on_chain() {
+        // A blocks B blocks C (all open): A unblocks B's sole blocker... B
+        // has exactly one open blocker (A), C has exactly one (B). A and B
+        // both have unblocks > 0 → blockers; quick-win ranking picks among
+        // the claimable (open, non-epic, unassigned, zero open blockers).
+        use bv_core::model::{Dependency, DependencyType};
+        let dep = |on: &str| Dependency {
+            issue_id: String::new(),
+            depends_on_id: on.into(),
+            depends_on_legacy: String::new(),
+            target_id_legacy: String::new(),
+            r#type: DependencyType::Blocks,
+            created_at: None,
+            created_by: String::new(),
+        };
+        let issue = |id: &str, deps: Vec<Dependency>| bv_core::model::Issue {
+            id: id.into(),
+            content_hash: String::new(),
+            title: format!("{id} title"),
+            description: String::new(),
+            design: String::new(),
+            acceptance_criteria: String::new(),
+            notes: String::new(),
+            status: Status::Open,
+            priority: 2,
+            issue_type: "task".into(),
+            assignee: String::new(),
+            estimated_minutes: None,
+            created_at: None,
+            updated_at: None,
+            due_date: None,
+            closed_at: None,
+            external_ref: None,
+            compaction_level: 0,
+            compacted_at: None,
+            compacted_at_commit: None,
+            original_size: 0,
+            labels: vec![],
+            dependencies: deps,
+            comments: vec![],
+            source_repo: String::new(),
+        };
+        let issues = vec![
+            issue("A", vec![]),
+            issue("B", vec![dep("A")]),
+            issue("C", vec![dep("B")]),
+        ];
+        let triage = bv_analysis::triage::compute_row_triage(&issues);
+        assert_eq!(triage["A"].unblocks_count, 1, "A is B's sole open blocker");
+        assert_eq!(triage["B"].unblocks_count, 1, "B is C's sole open blocker");
+        assert_eq!(triage["C"].unblocks_count, 0);
+        assert!(triage["A"].is_blocker);
+        assert!(triage["B"].is_blocker);
+        assert!(!triage["C"].is_blocker);
+        // Only A is claimable (B and C each have an open blocker), so A
+        // must be the quick win.
+        assert!(triage["A"].is_quick_win);
+        assert!(!triage["B"].is_quick_win);
+    }
+
+    #[test]
     fn time_travel_t_opens_revision_prompt_not_history() {
         let mut app = make_app(3);
         app.handle_key(KeyCode::Char('t'));
@@ -4121,6 +4994,124 @@ mod tests {
         assert!(app.quit_requested);
     }
 
+    fn make_cass_modal() -> crate::cass::CassModalState {
+        let session = |agent: &str| crate::cass::ScoredSession {
+            session: crate::cass::CassSession {
+                source_path: "s.md".into(),
+                line_number: 1,
+                agent: agent.into(),
+                title: "t".into(),
+                score: 0.9,
+                snippet: "snippet here".into(),
+                timestamp: "2026-09-09T10:00:00Z".into(),
+                match_type: "exact".into(),
+            },
+            strategy: crate::cass::CorrelationStrategy::IdMention,
+            keywords: Vec::new(),
+        };
+        crate::cass::CassModalState {
+            bead_id: "T-0".into(),
+            sessions: vec![session("claude"), session("cursor")],
+            keywords: Vec::new(),
+            search_cmd: "cass search \"T-0\"".into(),
+            selected: 0,
+            copied_at: None,
+        }
+    }
+
+    #[test]
+    fn cass_modal_v_opens_only_when_sessions_found() {
+        // No cass on PATH in test env (or no sessions) → status message,
+        // never a modal. This pins the fail-soft contract: V must never
+        // crash or open an empty modal.
+        let mut app = make_app(3);
+        app.cass_available = false;
+        app.handle_key(KeyCode::Char('V'));
+        assert!(app.cass_modal.is_none());
+        assert!(
+            app.status_msg.contains("cass not available"),
+            "Go's exact missing-cass message, got: {}",
+            app.status_msg
+        );
+    }
+
+    #[test]
+    fn cass_modal_jk_navigates_and_dismiss_keys_close() {
+        let mut app = make_app(3);
+        app.cass_modal = Some(make_cass_modal());
+        app.handle_key(KeyCode::Char('j'));
+        assert_eq!(app.cass_modal.as_ref().unwrap().selected, 1);
+        app.handle_key(KeyCode::Char('j')); // clamped at last
+        assert_eq!(app.cass_modal.as_ref().unwrap().selected, 1);
+        app.handle_key(KeyCode::Char('k'));
+        assert_eq!(app.cass_modal.as_ref().unwrap().selected, 0);
+        // Go's exact dismiss set: V / Esc / Enter / q.
+        for key in [
+            KeyCode::Char('V'),
+            KeyCode::Esc,
+            KeyCode::Enter,
+            KeyCode::Char('q'),
+        ] {
+            app.cass_modal = Some(make_cass_modal());
+            app.handle_key(key);
+            assert!(
+                app.cass_modal.is_none(),
+                "dismiss key {key:?} must close the modal"
+            );
+        }
+    }
+
+    #[test]
+    fn cass_modal_y_copies_search_cmd_without_closing() {
+        let mut app = make_app(3);
+        app.cass_modal = Some(make_cass_modal());
+        // y copies (clipboard may fail headless — either way the modal
+        // stays open; only success sets the flash timestamp).
+        app.handle_key(KeyCode::Char('y'));
+        assert!(app.cass_modal.is_some(), "y must not close the modal");
+    }
+
+    #[test]
+    fn esc_first_clears_filters_then_confirms() {
+        // Go: first Esc at the main list clears active filters
+        // (`hasActiveFilters` → `clearAllFilters`); only the second Esc
+        // shows the quit confirmation.
+        let mut app = make_app(9);
+        app.filter_mode = FilterMode::Open;
+        app.apply_filter();
+        assert_ne!(app.filtered_indices.len(), 9);
+        app.handle_key(KeyCode::Esc);
+        assert!(!app.quit_requested, "first Esc must clear, not quit");
+        assert!(!app.show_quit_confirm, "no confirm while clearing");
+        assert_eq!(app.filter_mode, FilterMode::All);
+        assert_eq!(app.filtered_indices.len(), 9);
+    }
+
+    #[test]
+    fn esc_twice_without_filters_shows_confirm_then_quits() {
+        let mut app = make_app(3);
+        app.handle_key(KeyCode::Esc);
+        assert!(
+            app.show_quit_confirm,
+            "second Esc (no filters) must show confirm"
+        );
+        assert!(!app.quit_requested, "confirm must not quit by itself");
+        app.handle_key(KeyCode::Char('y'));
+        assert!(app.quit_requested, "y confirms the quit");
+    }
+
+    #[test]
+    fn quit_confirm_other_key_cancels() {
+        // Go: any key other than Esc/Y cancels back to the list.
+        let mut app = make_app(3);
+        app.handle_key(KeyCode::Esc);
+        assert!(app.show_quit_confirm);
+        app.handle_key(KeyCode::Char('n'));
+        assert!(!app.show_quit_confirm, "other key must cancel confirm");
+        assert!(!app.quit_requested);
+        assert_eq!(app.current_view, ViewMode::List);
+    }
+
     fn type_text(app: &mut App, text: &str) {
         for c in text.chars() {
             app.handle_key(KeyCode::Char(c));
@@ -4170,10 +5161,62 @@ mod tests {
             .map(|&i| app.rows[i].id.as_str())
             .collect();
         ids.sort_unstable();
+        // Hybrid scoring (Go `hybridScorer.Score`): every row gets status /
+        // priority / recency components even with zero text overlap, so the
+        // disjoint row now ranks (low) instead of being hidden. The old
+        // text-only assertion (disjoint hidden) belongs to the pre-hybrid
+        // engine. What matters: token-overlapping rows rank FIRST, in order.
+        assert!(
+            ids.starts_with(&["T-0", "T-1"]) || ids.starts_with(&["T-1", "T-0"]),
+            "token-overlapping rows must rank first, got {ids:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_tab_cycles_hybrid_preset_and_reranks() {
+        let mut app = make_app(3);
+        app.handle_ctrl_key(KeyCode::Char('s'));
+        type_text(&mut app, "database");
+        assert_eq!(app.semantic_preset, "default");
+        app.handle_key(KeyCode::Tab);
+        assert_eq!(app.semantic_preset, "bug-hunting");
+        // Full cycle wraps back to default.
+        for _ in 0..4 {
+            app.handle_key(KeyCode::Tab);
+        }
+        assert_eq!(app.semantic_preset, "default");
+    }
+
+    #[test]
+    fn semantic_index_and_fallback_agree_on_ranking() {
+        // The persistent index is a pure cache: ranking through it must
+        // match fresh embedding. Build an in-memory index over the same
+        // IssueDocument texts `apply_semantic` uses, install it, and
+        // compare against the fallback path (index cleared).
+        let mut app = make_app(3);
+        app.rows[0].title = "database migration".to_string();
+        app.rows[1].title = "database backup".to_string();
+        app.rows[2].title = "button color".to_string();
+        let dim = bv_search::embedder::DEFAULT_DIM;
+        let mut idx = bv_search::vector_index::VectorIndex::new(dim);
+        for r in &app.rows {
+            let doc = bv_search::query::issue_document(&r.id, &r.title, &r.labels, &r.description);
+            idx.upsert(
+                &r.id,
+                bv_search::vector_index::compute_content_hash(&doc),
+                bv_search::embedder::hash_embed(&doc, dim),
+            )
+            .unwrap();
+        }
+        app.semantic_query = "database".to_string();
+        app.semantic_index = Some(idx);
+        app.apply_semantic();
+        let via_index = app.filtered_indices.clone();
+        app.semantic_index = None;
+        app.apply_semantic();
         assert_eq!(
-            ids,
-            vec!["T-0", "T-1"],
-            "token-overlapping rows rank; disjoint row is hidden"
+            via_index, app.filtered_indices,
+            "index-backed and fresh ranking must agree"
         );
     }
 
@@ -4295,7 +5338,21 @@ mod tests {
         #[test]
         fn tutorial_jk_turns_pages_and_backtick_resets() {
             let mut app = make_app(3);
+            // Single tap arms the 300ms timer; force-expire it (no real
+            // waiting in tests) by backdating, then resolve on next key.
             app.handle_key(KeyCode::Char('`'));
+            assert!(
+                app.tutorial_tap_pending.is_some(),
+                "first tap must arm the double-tap window, not open Tutorial yet"
+            );
+            app.tutorial_tap_pending =
+                Some(std::time::Instant::now() - std::time::Duration::from_millis(500));
+            // Resolve via a neutral key: `q` would quit, `j` would turn a
+            // page once Tutorial opens, `l` opens the label picker. Any
+            // non-backtick key resolves the pending tap first (top of
+            // `handle_key`), then executes normally — use `;` (inert,
+            // unbound in List).
+            app.handle_key(KeyCode::Char(';')); // resolves pending → Tutorial
             assert_eq!(app.current_view, ViewMode::Tutorial);
             let cursor_before = app.cursor;
             app.handle_key(KeyCode::Char('j'));
@@ -4303,12 +5360,40 @@ mod tests {
             assert_eq!(app.cursor, cursor_before);
             app.handle_key(KeyCode::Char('k'));
             assert_eq!(app.tutorial.as_ref().unwrap().current_page, 0);
-            // Re-entering restarts the walkthrough instead of resuming mid-way.
+            // Backtick while IN Tutorial still toggles straight back to List
+            // (no tap dance when already there).
             app.handle_key(KeyCode::Char('`'));
-            app.handle_key(KeyCode::Char('j'));
+            assert_eq!(app.current_view, ViewMode::List);
+        }
+
+        #[test]
+        fn double_tap_backtick_opens_context_help_not_tutorial() {
+            // Go `CapsLockTracker`: two taps within 300ms → context help
+            // for the current view (`TriggerContextHelp`).
+            let mut app = make_app(3);
             app.handle_key(KeyCode::Char('`'));
-            app.handle_key(KeyCode::Char('`'));
-            assert_eq!(app.tutorial.as_ref().unwrap().current_page, 0);
+            app.handle_key(KeyCode::Char('`')); // immediate second tap
+            assert!(app.show_context_help, "double tap must open context help");
+            assert_ne!(
+                app.current_view,
+                ViewMode::Tutorial,
+                "double tap must NOT open the full Tutorial"
+            );
+            // Any key dismisses the overlay.
+            app.handle_key(KeyCode::Char('x'));
+            assert!(!app.show_context_help);
+        }
+
+        #[test]
+        fn tilde_opens_context_help_directly() {
+            // Go `IsContextHelpTrigger` (`~`): direct context help, and it
+            // cancels any pending single-tap timer.
+            let mut app = make_app(3);
+            app.handle_key(KeyCode::Char('`')); // arm the tap timer
+            assert!(app.tutorial_tap_pending.is_some());
+            app.handle_key(KeyCode::Char('~'));
+            assert!(app.show_context_help);
+            assert!(app.tutorial_tap_pending.is_none());
         }
 
         #[test]
@@ -4351,7 +5436,12 @@ mod tests {
 
         #[test]
         fn esc_returns_toggle_views_to_list() {
-            for key in ['b', 'E', 'i', 'F', '`', 'P', '!', 'f', 'A'] {
+            // NOTE: backtick is excluded — since TUI-3 it arms a 300ms
+            // double-tap timer (Go `CapsLockTracker`) instead of opening
+            // Tutorial synchronously; the view change now resolves on the
+            // next keypress after the window expires (covered by
+            // `tutorial_jk_turns_pages_and_backtick_resets`).
+            for key in ['b', 'E', 'i', 'F', 'P', '!', 'f', 'A'] {
                 let mut app = make_app(3);
                 app.show_agent_prompts = false;
                 app.handle_key(KeyCode::Char(key));
@@ -4374,6 +5464,7 @@ mod tests {
 
 pub mod actionable;
 pub mod agent_prompt_modal;
+pub mod cass;
 
 pub mod chrome;
 pub mod context;

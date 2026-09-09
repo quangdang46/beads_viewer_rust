@@ -24,4 +24,4 @@ pub use analyzer::{
     Phase1Stats, StatusEntry,
 };
 pub use impact::{compute_impact_scores, ImpactInputs};
-pub use triage::{build_triage, compute_blocked_set, TriageOutput};
+pub use triage::{build_triage, compute_blocked_set, compute_row_triage, RowTriage, TriageOutput};

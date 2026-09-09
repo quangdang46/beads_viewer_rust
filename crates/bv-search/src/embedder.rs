@@ -1,31 +1,85 @@
-//! Hash embedder — port of Go `pkg/search/hash_embedder.go`:
-//! FNV-1a 64-bit signed buckets -> f32[dim] -> L2 normalize.
+//! Hash embedder — port of Go `pkg/search/hash_embedder.go`.
+//!
+//! Byte-for-byte port of `hashEmbedInto`/`addHashedToken`/`normalizeL2`,
+//! verified against a real Go-written `.bvvi` index (see
+//! `vector_index::go_interop_investigation` and
+//! `beads_viewer_rust-api-freeze-tui-ux-p14-followups-1xz.1`). Two real
+//! divergences existed before that verification and are now fixed:
+//! - Go lowercases ASCII bytes *inside* the FNV-1a accumulation (per-token,
+//!   not on the whole text up front) — this port did not lowercase at all,
+//!   so any uppercase-containing token hashed to a different bucket than Go.
+//! - Go's bucket update is **signed**: `vec[idx] += sign`, where `sign` is
+//!   `-1.0` when the hash's top bit is set, `+1.0` otherwise (a standard
+//!   feature-hashing trick to de-bias collisions) — this port always did
+//!   `vec[bucket] += 1.0`, an unsigned count. That's why the two embedders
+//!   picked different bucket magnitudes/signs even when tokenization agreed.
 
 /// Default embedding dimension (Go: DefaultEmbeddingDim).
 pub const DEFAULT_DIM: usize = 384;
 
-/// FNV-1a 64-bit hash of a string, mapped to a signed bucket index.
-fn fnv1a64_bucket(token: &str, dim: usize) -> usize {
-    let mut hash: u64 = 0xcbf29ce484222325;
+/// FNV-1a 64-bit hash over a token's ASCII-lowercased bytes (Go
+/// `addHashedToken`'s hash loop — lowercasing only ASCII, matching Go's
+/// `if b >= 'A' && b <= 'Z' { b += 'a' - 'A' }` fast path; other Unicode
+/// case folding is intentionally skipped by Go too, "isn't worth it for a
+/// fallback embedder").
+fn fnv1a64_hash(token: &str) -> u64 {
+    const OFFSET64: u64 = 0xcbf29ce484222325;
+    const PRIME64: u64 = 0x100000001b3;
+    let mut hash = OFFSET64;
     for b in token.as_bytes() {
-        hash ^= *b as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
+        let b = if b.is_ascii_uppercase() {
+            b.to_ascii_lowercase()
+        } else {
+            *b
+        };
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(PRIME64);
     }
-    (hash % dim as u64) as usize
+    hash
 }
 
-/// Hash-embed a document into f32[dim], L2-normalized.
+/// Add one token's hashed, signed contribution to `vec` (Go
+/// `addHashedToken`): bucket = `hash % dim`; sign = `-1.0` when the hash's
+/// top bit is set, else `+1.0`.
+fn add_hashed_token(vec: &mut [f32], token: &str) {
+    let hash = fnv1a64_hash(token);
+    let idx = (hash % vec.len() as u64) as usize;
+    let sign: f32 = if (hash >> 63) & 1 == 1 { -1.0 } else { 1.0 };
+    vec[idx] += sign;
+}
+
+/// Tokenize by maximal letter/digit runs (Go `hashEmbedInto`'s inline
+/// loop: `unicode.IsLetter(r) || unicode.IsDigit(r)`, everything else is a
+/// separator — same rule `bv_search::query::lexical_tokens` already uses
+/// for lexical boosting, kept as a separate free function here so this
+/// module has no dependency on `query`).
+fn hash_embed_tokens(text: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, c) in text.char_indices() {
+        if c.is_alphanumeric() {
+            if start.is_none() {
+                start = Some(i);
+            }
+        } else if let Some(st) = start.take() {
+            tokens.push(&text[st..i]);
+        }
+    }
+    if let Some(st) = start {
+        tokens.push(&text[st..]);
+    }
+    tokens
+}
+
+/// Hash-embed a document into f32[dim], L2-normalized (Go `Embed`:
+/// `hashEmbedInto` then `normalizeL2`).
 pub fn hash_embed(text: &str, dim: usize) -> Vec<f32> {
     let mut vec = vec![0.0f32; dim];
-    // Tokenize by whitespace and punctuation.
-    let tokens: Vec<&str> = text
-        .split(|c: char| c.is_whitespace() || c.is_ascii_punctuation())
-        .filter(|t| !t.is_empty())
-        .collect();
-
-    for token in &tokens {
-        let bucket = fnv1a64_bucket(token, dim);
-        vec[bucket] += 1.0;
+    if dim == 0 {
+        return vec;
+    }
+    for token in hash_embed_tokens(text) {
+        add_hashed_token(&mut vec, token);
     }
 
     // L2 normalize.

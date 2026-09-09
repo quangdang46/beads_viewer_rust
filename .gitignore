@@ -9,6 +9,15 @@ dist/
 # Beads local DB state (JSONL export IS committed; DB is not)
 .beads/*.db
 .beads/*.db-journal
+.beads/*.db-fsqlite-ns-*
+.beads/*.db-lock-*
+.beads/*.db-wal-lock-*
+.beads/.beads.vacuum.*
+
+# Persistent semantic search index (bv_search::index_sync default path;
+# rebuilt on demand from .beads/issues.jsonl, same convention Go bv uses —
+# neither binary commits this).
+.bv/
 
 # Upstream reference clone (local only — do not publish Go source in Rust repo)
 beads_viewer/

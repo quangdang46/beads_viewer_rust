@@ -94,7 +94,7 @@ pub fn build_default_registry() -> KeyRegistry {
         ),
         (
             "ctrl+s",
-            "Semantic search (bv-search cosine over title+description)",
+            "Semantic search (hybrid: text×preset×graph, Tab cycles preset)",
         ),
         ("a", "Show all issues"),
         ("o", "Show open issues"),
@@ -124,10 +124,11 @@ pub fn build_default_registry() -> KeyRegistry {
     }
     // Search-input bindings (active while `/` or Ctrl+S mode captures keys).
     for (key, desc) in [
-        ("type", "Narrow results (fuzzy / cosine rank)"),
+        ("type", "Narrow results (fuzzy / hybrid rank)"),
         ("backspace", "Delete query char and re-rank"),
         ("enter", "Accept (back to standard filter order)"),
         ("esc", "Clear query and exit search"),
+        ("tab", "Cycle hybrid preset (semantic mode only)"),
     ] {
         reg.register(KeyBinding {
             focus: Focus::Search,
@@ -153,7 +154,8 @@ pub fn build_default_registry() -> KeyRegistry {
             "t / T",
             "Time-travel: t prompts for a revision, T diffs vs HEAD~5",
         ),
-        ("`", "Toggle tutorial"),
+        ("`", "Tutorial (single tap) / context help (double tap)"),
+        ("~", "Context help for current view"),
         ("g", "Agent prompts (auto-opens if AGENTS.md detected)"),
         (";", "Toggle sidebar"),
     ] {
@@ -173,6 +175,14 @@ pub fn build_default_registry() -> KeyRegistry {
         ("O", "Open issue in $EDITOR"),
         ("Ctrl+R", "Refresh from disk"),
         ("q", "Quit / close view"),
+        (
+            "esc",
+            "Clear filters, then quit confirm (Esc/Y quits, other key cancels)",
+        ),
+        (
+            "V",
+            "Cass sessions for selected issue (j/k nav, y copies, V/Esc closes)",
+        ),
     ] {
         reg.register(KeyBinding {
             focus: Focus::List,
@@ -253,6 +263,8 @@ pub fn build_default_registry() -> KeyRegistry {
     // Time-Travel — revision diff vs a git ref (Go `focusTimeTravelInput`
     // → `SnapshotDiff`), backed by `bv_analysis::diff::diff_issues` over
     // `GitLoader::load_at` (shared with `--robot-diff`; see plan Q4).
+    // Rows in the List that changed vs the ref carry a diff badge (Go
+    // `DiffStatus.Badge()`: new / closed / ~ modified).
     for (key, desc) in [
         ("t", "Enter revision (prompt) and diff vs ref"),
         ("T", "Instant diff vs HEAD~5"),

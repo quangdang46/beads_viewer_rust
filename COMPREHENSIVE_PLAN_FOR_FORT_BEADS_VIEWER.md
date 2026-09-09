@@ -697,3 +697,62 @@ cross-call index caching for performance.
 None of the above should be treated as "safe to assume implemented" —
 verify against this list (or re-grep `flags::ROBOT_PRIMARIES` vs
 `main.rs`'s dispatch chain) before relying on a command's output.
+
+## 12. Session status log (2026-09-09)
+
+### Fixed this session (commits `147bdef`, `4f1cf7d`, tag `v0.1.2`)
+
+- **CI**: the `check` job's `actions/checkout@v4` had no `fetch-depth`,
+  defaulting to a shallow (depth-1) clone. `cargo test --workspace` runs
+  `crates/bv/tests/golden_comparison.rs`, which shells out to `git log`
+  (directly, and via `bv-correlation`) for `--robot-history` and other
+  git-derived robot commands — shallow history made those outputs diverge
+  from the frozen goldens, pushing content-parity failures past the ratchet
+  baseline (15 > 10) even though nothing had actually regressed. The
+  `differential` job already had `fetch-depth: 0` for this exact reason;
+  `check` didn't. Added it there too.
+- **Release v0.1.2**: workspace version 0.1.1 → 0.1.2; `--version` now
+  reads `env!("CARGO_PKG_VERSION")` instead of a hardcoded string (was
+  drifting from `Cargo.toml` — the CLI printed `0.1.1` while the crate was
+  already `0.1.1`/next bump would've silently gone stale again). Tagged
+  and pushed; release workflow (multi-arch build + GitHub Release) runs
+  from the tag push, unchanged from what's documented in this plan.
+
+### Investigated, no fix needed — Go upstream has moved to v0.24.1
+
+A parity check against a locally-installed `bv` binary surfaced apparent
+regressions across nearly every robot command (`--robot-priority` schema,
+`--robot-triage`/`--robot-insights` ordering, a new `authority_hash` field,
+`Cycles: null` vs `[]`, `robot-alerts` dropping `labels`, `--robot-next`
+behaving completely differently under `BV_TEST_MODE`). Investigation
+(`git clone --depth 1 --branch v0.24.1`, diffed against the frozen
+`9ace029`) found these are **not bugs in `bvr`** — the installed Go binary
+had been `go install`ed at HEAD and was `v0.20.0`/`v0.24.1`, both **ahead**
+of this repo's frozen parity target (§3.2: "freeze on audited commit
+`9ace029`. No automatic syncing of Go source"). Re-verified every
+"divergence" directly against the frozen `golden/*.json` files (not a live
+Go binary) and confirmed `bvr`'s output matches the frozen target exactly
+in every case checked — `Cycles: null` and no `labels` field are what the
+*golden* files themselves contain, matching Rust, not the newer Go binary.
+
+**Real scope of the Go→Go upstream drift** (measured, not estimated): full
+repo diff `9ace029..v0.24.1` is 257 files / 49,363 insertions. Scoped to
+just the packages `bvr` ports (`cmd/bv`, `pkg/robot`, `pkg/analysis`,
+`pkg/correlation`) it's still 102 files / 17,844 insertions —
+`cmd/bv/main.go` alone rewrote 3,576 lines; `pkg/analysis/priority.go`
+changed algorithm (+293 lines, not just field renames — explains the
+`robot-priority` schema change: `direction`/`explanation.status` replaced
+`impact_score`/`issue_id`/`reasoning`); `pkg/analysis/cache.go` added an
+entire new caching subsystem (+1,167 lines); `pkg/correlation/causality.go`
++748 lines.
+
+**Decision** (per §3.2, reaffirmed, not changed): stay pinned to `9ace029`
+for FORT v1. This is comparable in size to the *original* Go→Rust port
+(§0's LOC table) — not a "quick sync", a second parity project. If/when
+this repo is ready to chase v0.24.1, treat it as its own phase: audit the
+real Go diff file-by-file (source, not binary output), port algorithm
+changes deliberately (not cosmetic field renames), re-capture the entire
+`golden/` corpus at the new commit, and re-run every differential gate.
+Do not attempt to shortcut this by pattern-matching new Go binary output
+into Rust — confirmed above that doing so produces changes that look
+right but are algorithmically unverified.
