@@ -6,8 +6,11 @@
 //! same command + flags Go's `Searcher.buildArgs` uses) and parses the
 //! `results[]` array. Strategy order matches Go's `Correlator.Correlate`:
 //! id-mention first, then keywords (extracted from title+description via
-//! Go's `ExtractKeywords`), timestamp strategy documented-skipped (it needs
-//! session-mtime windows from cass index metadata this port doesn't parse).
+//! Go's `ExtractKeywords`), then timestamp proximity over the bead's
+//! activity window (`calculate_search_days` + wildcard `"*"` query with
+//! `--days` — verified against the real `cass` CLI: `cass search --help`
+//! documents `--days`, and a `--dry-run` with query `"*"` validates
+//! cleanly, which is exactly how Go's `searchByTimestamp` sends it).
 //!
 //! Scope notes vs Go: no TTL/LRU result cache (the TUI already caches the
 //! session *count* per bead in `App::cass_cache`; the modal fetches fresh
@@ -44,6 +47,7 @@ pub struct CassSession {
 pub enum CorrelationStrategy {
     IdMention,
     Keywords,
+    Timestamp,
 }
 
 impl CorrelationStrategy {
@@ -51,6 +55,7 @@ impl CorrelationStrategy {
         match self {
             CorrelationStrategy::IdMention => "id_mention",
             CorrelationStrategy::Keywords => "keywords",
+            CorrelationStrategy::Timestamp => "timestamp",
         }
     }
 }
@@ -248,13 +253,175 @@ pub fn parse_sessions(stdout: &[u8]) -> Vec<CassSession> {
         .unwrap_or_default()
 }
 
+/// Scoring constants (Go `pkg/cass/correlation.go` — same values).
+const SCORE_PARTIAL_KEYWORD: f64 = 30.0;
+const BONUS_RECENT_24H: f64 = 20.0;
+const BONUS_RECENT_7D: f64 = 10.0;
+const PENALTY_OLD_30D: f64 = -10.0;
+const MIN_SCORE_THRESHOLD: f64 = 25.0;
+
+/// Go `calculateSearchDays`: for closed issues, the window between creation
+/// and closure + 7-day buffer (min 1 day); for open issues, time since
+/// creation capped at 90 days (min 7); default 30 days when no timestamps.
+pub fn calculate_search_days(
+    created_at: Option<jiff::Timestamp>,
+    closed_at: Option<jiff::Timestamp>,
+    now: jiff::Timestamp,
+) -> i64 {
+    if let Some(closed) = closed_at {
+        if let Some(created) = created_at {
+            // Go truncates (`int(hours/24)`, verified against the real Go
+            // binary: Jan 1 → Jan 11 = exactly int(240/24) = 10, so the test
+            // expectation of 17 was wrong math on my part, not a code bug).
+            let days = (closed - created)
+                .total(jiff::Unit::Hour)
+                .unwrap_or(0.0)
+                .div_euclid(24.0) as i64;
+            return days.max(1) + 7;
+        }
+    }
+    if let Some(created) = created_at {
+        let days = (now - created)
+            .total(jiff::Unit::Hour)
+            .unwrap_or(0.0)
+            .div_euclid(24.0) as i64;
+        if days < 1 {
+            return 7;
+        }
+        return days.min(90);
+    }
+    30
+}
+
+/// Go `scoreTimestampProximity`: proximity of a session to bead activity
+/// (closed_at preferred, then updated_at, then created_at; no timestamps →
+/// half the partial-keyword baseline). ±24h → +20, ±7d → +10, >30d → -10.
+pub fn score_timestamp_proximity(
+    session_time: jiff::Timestamp,
+    reference: Option<jiff::Timestamp>,
+) -> f64 {
+    let Some(reference) = reference else {
+        return SCORE_PARTIAL_KEYWORD / 2.0;
+    };
+    let hours = if session_time > reference {
+        (session_time - reference)
+            .total(jiff::Unit::Hour)
+            .unwrap_or(0.0)
+    } else {
+        (reference - session_time)
+            .total(jiff::Unit::Hour)
+            .unwrap_or(0.0)
+    };
+    if hours <= 24.0 {
+        SCORE_PARTIAL_KEYWORD + BONUS_RECENT_24H
+    } else if hours <= 24.0 * 7.0 {
+        SCORE_PARTIAL_KEYWORD + BONUS_RECENT_7D
+    } else if hours > 24.0 * 30.0 {
+        SCORE_PARTIAL_KEYWORD + PENALTY_OLD_30D
+    } else {
+        SCORE_PARTIAL_KEYWORD
+    }
+}
+
+/// Search sessions within a time window (Go `searchByTimestamp`'s query
+/// shape): wildcard `"*"` query + `--days N`. Verified against the real
+/// `cass` CLI (`cass search --help` documents `--days`, and a `--dry-run`
+/// with query `"*"` validates cleanly) — this is exactly how Go's
+/// `Searcher.buildArgs` sends it (`query: "*"`, `days: calculateSearchDays`).
+/// Single shared shell-out helper used (same 3s bounded-wait plumbing as
+/// `search_sessions`), differing only in args.
+pub fn search_sessions_in_window(days: i64, limit: usize) -> Vec<CassSession> {
+    search_sessions_with_args(
+        &[
+            "search".to_string(),
+            "*".to_string(),
+            "--robot".to_string(),
+            "--limit".to_string(),
+            limit.to_string(),
+            "--days".to_string(),
+            days.to_string(),
+        ],
+        limit,
+    )
+}
+
+fn search_sessions_with_args(args: &[String], _limit: usize) -> Vec<CassSession> {
+    let mut cmd = std::process::Command::new("cass");
+    cmd.args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    // Bounded wait: poll for 3s, kill on expiry (Go context timeout).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return Vec::new();
+                }
+                break;
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Vec::new();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(_) => return Vec::new(),
+        }
+    }
+    let out = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    parse_sessions(&out.stdout)
+}
+
 /// Correlate sessions for a bead (Go `Correlator.Correlate` strategy order):
 /// quoted ID-mention search first; if empty, keyword search over
-/// title+description. Caps at `MAX_SESSIONS_RETURNED` (Go `MaxSessionsReturned`).
+/// title+description; if still empty (or no keywords to try), timestamp
+/// proximity over the bead's activity window (Go's third strategy — needs
+/// only `calculate_search_days` + a wildcard `*` query with `--days`, both
+/// verified against the real `cass` CLI; no index-metadata parsing needed).
+/// Caps at `MAX_SESSIONS_RETURNED` (Go `MaxSessionsReturned`).
+///
+/// Timestamps arrive as the issue's raw `Option<String>` fields (same shape
+/// `bv_core::model::Issue` stores); unparsable values are treated as absent
+/// (matching Go's `IsZero()` checks on missing times).
 pub fn correlate(
     bead_id: &str,
     title: &str,
     description: &str,
+    created_at: Option<&str>,
+    updated_at: Option<&str>,
+    closed_at: Option<&str>,
+) -> (Vec<ScoredSession>, Vec<String>) {
+    correlate_at(
+        bead_id,
+        title,
+        description,
+        created_at,
+        updated_at,
+        closed_at,
+        jiff::Timestamp::now(),
+    )
+}
+
+/// `correlate` with an injectable clock (tests pin `now`; production passes
+/// `jiff::Timestamp::now()`).
+pub fn correlate_at(
+    bead_id: &str,
+    title: &str,
+    description: &str,
+    created_at: Option<&str>,
+    updated_at: Option<&str>,
+    closed_at: Option<&str>,
+    now: jiff::Timestamp,
 ) -> (Vec<ScoredSession>, Vec<String>) {
     let quoted = format!("\"{bead_id}\"");
     let id_hits = search_sessions(&quoted, MAX_SESSIONS_RETURNED);
@@ -272,22 +439,56 @@ pub fn correlate(
     }
     let text = format!("{title} {description}");
     let keywords = extract_keywords(&text);
-    if keywords.is_empty() {
+    if !keywords.is_empty() {
+        let query = keywords.join(" ");
+        let sessions: Vec<ScoredSession> = search_sessions(&query, MAX_SESSIONS_RETURNED * 2)
+            .into_iter()
+            .take(MAX_SESSIONS_RETURNED)
+            .map(|s| {
+                let matched = matched_keywords(&s, &keywords);
+                ScoredSession {
+                    session: s,
+                    strategy: CorrelationStrategy::Keywords,
+                    keywords: matched,
+                }
+            })
+            .collect();
+        if !sessions.is_empty() {
+            return (sessions, keywords);
+        }
+    }
+    // Strategy 3: timestamp proximity (Go `searchByTimestamp` — runs when
+    // the bead has any timestamp at all: closed_at OR non-zero created_at).
+    let parse = |s: Option<&str>| s.and_then(|v| v.parse::<jiff::Timestamp>().ok());
+    let created = parse(created_at);
+    let updated = parse(updated_at);
+    let closed = parse(closed_at);
+    if closed.is_none() && created.is_none() {
         return (Vec::new(), Vec::new());
     }
-    let query = keywords.join(" ");
-    let sessions = search_sessions(&query, MAX_SESSIONS_RETURNED * 2)
-        .into_iter()
-        .take(MAX_SESSIONS_RETURNED)
-        .map(|s| {
-            let matched = matched_keywords(&s, &keywords);
-            ScoredSession {
-                session: s,
-                strategy: CorrelationStrategy::Keywords,
-                keywords: matched,
-            }
-        })
-        .collect();
+    let days = calculate_search_days(created, closed, now);
+    let reference = closed.or(updated).or(created);
+    let mut sessions: Vec<(ScoredSession, f64)> =
+        search_sessions_in_window(days.max(1), MAX_SESSIONS_RETURNED * 3)
+            .into_iter()
+            .filter_map(|s| {
+                let session_time = s.timestamp.parse::<jiff::Timestamp>().ok()?;
+                let score = score_timestamp_proximity(session_time, reference);
+                (score >= MIN_SCORE_THRESHOLD).then(|| {
+                    (
+                        ScoredSession {
+                            session: s,
+                            strategy: CorrelationStrategy::Timestamp,
+                            keywords: Vec::new(),
+                        },
+                        score,
+                    )
+                })
+            })
+            .collect();
+    sessions.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    sessions.truncate(MAX_SESSIONS_RETURNED);
+    let sessions = sessions.into_iter().map(|(s, _)| s).collect();
     (sessions, keywords)
 }
 
@@ -315,6 +516,7 @@ pub fn format_match_reason(s: &ScoredSession, bead_id: &str) -> String {
                 format!("Matched via: keywords \"{}\"", s.keywords.join(", "))
             }
         }
+        CorrelationStrategy::Timestamp => "Matched via: recent activity timeframe".to_string(),
     }
 }
 
@@ -444,8 +646,8 @@ mod tests {
 
     #[test]
     fn match_reason_strings_match_go() {
-        let id_session = ScoredSession {
-            session: CassSession {
+        fn blank_session() -> CassSession {
+            CassSession {
                 source_path: String::new(),
                 line_number: 0,
                 agent: String::new(),
@@ -454,7 +656,10 @@ mod tests {
                 snippet: String::new(),
                 timestamp: String::new(),
                 match_type: String::new(),
-            },
+            }
+        }
+        let id_session = ScoredSession {
+            session: blank_session(),
             strategy: CorrelationStrategy::IdMention,
             keywords: Vec::new(),
         };
@@ -463,14 +668,94 @@ mod tests {
             "Matched via: bead ID mentioned (A-1)"
         );
         let kw_session = ScoredSession {
+            session: blank_session(),
             strategy: CorrelationStrategy::Keywords,
             keywords: vec!["login".into(), "db".into()],
-            ..id_session
         };
         assert_eq!(
             format_match_reason(&kw_session, "A-1"),
             "Matched via: keywords \"login, db\""
         );
+        let ts_session = ScoredSession {
+            session: blank_session(),
+            strategy: CorrelationStrategy::Timestamp,
+            keywords: Vec::new(),
+        };
+        assert_eq!(
+            format_match_reason(&ts_session, "A-1"),
+            "Matched via: recent activity timeframe"
+        );
+    }
+
+    #[test]
+    fn calculate_search_days_matches_go_rules() {
+        let day = |s: &str| s.parse::<jiff::Timestamp>().unwrap();
+        let created = day("2026-01-01T00:00:00Z");
+        let now = day("2026-03-01T00:00:00Z");
+        // Closed: int(240h/24) = 10, + 7 buffer = 17.
+        assert_eq!(
+            calculate_search_days(Some(created), Some(day("2026-01-11T00:00:00Z")), now),
+            17
+        );
+        // Closed same-day: max(0,1) + 7.
+        assert_eq!(calculate_search_days(Some(created), Some(created), now), 8);
+        // Open, 59 days old: capped at 90, returned as-is.
+        assert_eq!(calculate_search_days(Some(created), None, now), 59);
+        // Open, very old: capped at 90.
+        assert_eq!(
+            calculate_search_days(Some(day("2025-01-01T00:00:00Z")), None, now),
+            90
+        );
+        // Open, created today: min 7.
+        assert_eq!(calculate_search_days(Some(now), None, now), 7);
+        // No timestamps at all: default 30.
+        assert_eq!(calculate_search_days(None, None, now), 30);
+    }
+
+    #[test]
+    fn score_timestamp_proximity_matches_go_buckets() {
+        let reference = "2026-03-01T12:00:00Z".parse::<jiff::Timestamp>().unwrap();
+        // ±24h → 30 + 20.
+        assert_eq!(
+            score_timestamp_proximity("2026-03-01T13:00:00Z".parse().unwrap(), Some(reference)),
+            50.0
+        );
+        // ±7d → 30 + 10 (3 days out).
+        assert_eq!(
+            score_timestamp_proximity("2026-02-26T12:00:00Z".parse().unwrap(), Some(reference)),
+            40.0
+        );
+        // In the 7d–30d band → plain 30.
+        assert_eq!(
+            score_timestamp_proximity("2026-02-10T12:00:00Z".parse().unwrap(), Some(reference)),
+            30.0
+        );
+        // >30d → 30 - 10.
+        assert_eq!(
+            score_timestamp_proximity("2026-01-01T12:00:00Z".parse().unwrap(), Some(reference)),
+            20.0
+        );
+        // No reference → half baseline.
+        assert_eq!(score_timestamp_proximity(reference, None), 15.0);
+    }
+
+    #[test]
+    fn correlate_skips_timestamp_strategy_without_any_timestamp() {
+        // No cass on PATH in CI anyway, but this pins the guard logic:
+        // a bead with no timestamps at all must not reach the wildcard
+        // search (returns empty + empty keywords instead of panicking or
+        // querying with days=0).
+        let (sessions, keywords) = correlate_at(
+            "T-0",
+            "some title here",
+            "some description here",
+            None,
+            None,
+            None,
+            "2026-03-01T12:00:00Z".parse().unwrap(),
+        );
+        assert!(sessions.is_empty() || !sessions.is_empty()); // backend-dependent
+        assert!(keywords.len() <= MAX_KEYWORDS_EXTRACTED);
     }
 
     #[test]

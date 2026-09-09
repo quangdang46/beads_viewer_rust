@@ -2378,12 +2378,27 @@ impl App {
             return;
         };
         let bead_id = row.id.clone();
-        let (title, description) = self
+        let (title, description, created_at, updated_at, closed_at) = self
             .issue_map
             .get(&bead_id)
-            .map(|i| (i.title.clone(), i.description.clone()))
+            .map(|i| {
+                (
+                    i.title.clone(),
+                    i.description.clone(),
+                    i.created_at.clone(),
+                    i.updated_at.clone(),
+                    i.closed_at.clone(),
+                )
+            })
             .unwrap_or_default();
-        let (sessions, keywords) = crate::cass::correlate(&bead_id, &title, &description);
+        let (sessions, keywords) = crate::cass::correlate(
+            &bead_id,
+            &title,
+            &description,
+            created_at.as_deref(),
+            updated_at.as_deref(),
+            closed_at.as_deref(),
+        );
         if sessions.is_empty() {
             self.status_msg = format!("No correlated sessions found for {bead_id}");
             return;
