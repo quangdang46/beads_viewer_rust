@@ -33,7 +33,7 @@ function Get-Platform {
         "ARM64" { "aarch64" }
         default { Die "Unsupported arch: $env:PROCESSOR_ARCHITECTURE" }
     }
-    return "windows_$arch"
+    return "windows-$arch"
 }
 
 # === Version resolution ===

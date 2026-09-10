@@ -25,6 +25,10 @@ curl -fsSL "https://raw.githubusercontent.com/quangdang46/beads_viewer_rust/main
   | bash -s -- --easy-mode
 ```
 
+```powershell
+irm "https://raw.githubusercontent.com/quangdang46/beads_viewer_rust/main/install.ps1" | iex
+```
+
 </div>
 
 ---
@@ -134,13 +138,24 @@ bvr --diff-since HEAD~5      # what changed in the last 5 commits
 
 ## Installation
 
-> **Status: under active port.** v0.21.0-rust targets full parity with Go bv v0.20.0. Until the first release, build from source.
+### Linux / macOS
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/quangdang46/beads_viewer_rust/main/install.sh?$(date +%s)" \
+  | bash -s -- --easy-mode
+```
+
+### Windows
+
+```powershell
+irm "https://raw.githubusercontent.com/quangdang46/beads_viewer_rust/main/install.ps1" | iex
+```
 
 ### From source
 
 ```bash
 git clone https://github.com/quangdang46/beads_viewer_rust.git
-cd bv
+cd beads_viewer_rust
 cargo install --path crates/bv
 ```
 

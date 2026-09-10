@@ -77,7 +77,7 @@ fi
 detect_platform() {
     local os arch
     case "$(uname -s)" in
-        Linux*)  os="linux";;   Darwin*) os="darwin";;
+        Linux*)  os="linux";;   Darwin*) os="macos";;
         MINGW*|MSYS*|CYGWIN*) die "Use install.ps1 on Windows";;
         *) die "Unsupported OS: $(uname -s)";;
     esac
@@ -86,7 +86,7 @@ detect_platform() {
         aarch64|arm64) arch="aarch64";;
         *) die "Unsupported arch: $(uname -m)";;
     esac
-    echo "${os}_${arch}"
+    echo "${os}-${arch}"
 }
 
 # === Version resolution (API -> redirect fallback) ===
