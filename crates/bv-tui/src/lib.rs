@@ -3873,8 +3873,13 @@ fn render_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
             // Title (truncated to fit)
             let title_width = inner_width.saturating_sub(45);
-            let title = if row.title.len() > title_width {
-                format!("{}…", &row.title[..title_width.saturating_sub(1)])
+            let title = if row.title.chars().count() > title_width {
+                let truncated: String = row
+                    .title
+                    .chars()
+                    .take(title_width.saturating_sub(1))
+                    .collect();
+                format!("{}…", truncated)
             } else {
                 format!("{:<width$}", row.title, width = title_width)
             };
