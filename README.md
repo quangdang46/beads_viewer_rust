@@ -159,19 +159,6 @@ cd beads_viewer_rust
 cargo install --path crates/bv
 ```
 
-### Homebrew (planned at release)
-
-```bash
-brew install quangdang46/tap/bvr
-```
-
-### Windows (planned)
-
-```powershell
-scoop bucket add quangdang46 https://github.com/quangdang46/scoop-bucket
-scoop install quangdang46/bvr
-```
-
 Requirements: any platform with a C compiler for bundled SQLite (FTS5 included).
 
 ---
