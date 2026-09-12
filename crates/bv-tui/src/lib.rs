@@ -362,11 +362,11 @@ pub struct App {
     pub board_mode: crate::views::board::SwimlaneMode,
     /// Board selected column (Go `h`/`l` move, `1`-`9` jump).
     pub board_column: usize,
-    /// Agent-prompt modal visibility (Go auto-shows on AGENTS.md detection;
-    /// `g` reopens manually).
-    pub show_agent_prompts: bool,
-    /// Cursor inside the agent-prompt modal.
-    pub agent_prompt_cursor: usize,
+    /// Agent blurb prompt visibility (Go auto-shows once at startup when the
+    /// detected agent file needs the blurb; no manual keybinding).
+    pub show_agent_prompt: bool,
+    /// Pending blurb prompt state (Go `AgentPromptModal`).
+    pub agent_prompt_modal: Option<crate::agent_prompt_modal::AgentPromptModal>,
     /// Velocity-comparison overlay inside Sprint view (Go `v` sub-toggle).
     pub show_velocity: bool,
     /// Theme for consistent styling.
@@ -613,18 +613,18 @@ fn shell_copy_fallback(text: &str) -> Result<(), String> {
     child.wait().map_err(|e| e.to_string())?;
     Ok(())
 }
-/// True when the repo being viewed has an AGENTS.md (Go auto-shows the
-/// agent-prompt modal on detection). Checks the cwd and, when running from
-/// inside `.beads/` discovery, the repo root above it.
-fn detect_agents_md() -> bool {
-    let cwd = std::env::current_dir().unwrap_or_default();
-    if cwd.join("AGENTS.md").is_file() {
-        return true;
+/// Detect the agent file for the repo being viewed (Go `CheckAgentFileCmd`):
+/// cwd first (up to 3 parents up), then the repo root above `.beads/`
+/// discovery when running from inside it.
+fn detect_agent_file_for_tui(cwd: &std::path::Path) -> bv_core::agents::detect::AgentFileDetection {
+    let detection = bv_core::agents::detect::detect_agent_file_in_parents(cwd, 3);
+    if detection.found() {
+        return detection;
     }
-    bv_core::discovery::get_beads_dir(&cwd)
+    bv_core::discovery::get_beads_dir(cwd)
         .ok()
-        .and_then(|dir| dir.parent().map(|p| p.join("AGENTS.md").is_file()))
-        .unwrap_or(false)
+        .and_then(|dir| dir.parent().map(bv_core::agents::detect::detect_agent_file))
+        .unwrap_or_default()
 }
 
 impl App {
@@ -783,8 +783,8 @@ impl App {
             board_column: 0,
             // Auto-show happens in `tui_event_loop`, not here, so unit
             // tests (`App::new` directly) start with a clean slate.
-            show_agent_prompts: false,
-            agent_prompt_cursor: 0,
+            show_agent_prompt: false,
+            agent_prompt_modal: None,
             show_velocity: false,
             theme: crate::theme::Theme::default(),
             key_registry: crate::keybindings::build_default_registry(),
@@ -1400,7 +1400,7 @@ impl App {
         if self.label_drilldown.is_some() {
             return self.handle_label_drilldown_key(code);
         }
-        if self.show_agent_prompts {
+        if self.show_agent_prompt {
             return self.handle_agent_prompt_key(code);
         }
         if self.cass_modal.is_some() {
@@ -1911,13 +1911,6 @@ impl App {
                 self.open_cass_modal();
                 true
             }
-            // Agent-prompt modal (Go auto-shows on AGENTS.md detection;
-            // lowercase `g` was unbound — uppercase `G` is the graph view).
-            KeyCode::Char('g') => {
-                self.agent_prompt_cursor = 0;
-                self.show_agent_prompts = true;
-                true
-            }
             _ => false,
         }
     }
@@ -2328,40 +2321,110 @@ impl App {
         });
     }
 
-    /// Keys while the agent-prompt modal is open (Go `agent_prompt_modal.go`:
-    /// `j`/`k` navigate, `Enter` copies the command, `Esc` closes).
+    /// Keys while the agent blurb prompt is open (Go `agent_prompt_modal.go`:
+    /// `←/→,h/l,Tab` move, `Enter/Space` confirm, `y/n/d` quick actions,
+    /// `Esc/q` decline).
     fn handle_agent_prompt_key(&mut self, code: KeyCode) -> bool {
         match code {
-            KeyCode::Esc => {
-                self.show_agent_prompts = false;
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.decline_agent_prompt(false);
                 true
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                let max = crate::agent_prompt_modal::default_agent_prompts().len();
-                if max > 0 && self.agent_prompt_cursor + 1 < max {
-                    self.agent_prompt_cursor += 1;
+            KeyCode::Left | KeyCode::Char('h') => {
+                if let Some(m) = self.agent_prompt_modal.as_mut() {
+                    m.move_left();
                 }
                 true
             }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.agent_prompt_cursor = self.agent_prompt_cursor.saturating_sub(1);
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => {
+                if let Some(m) = self.agent_prompt_modal.as_mut() {
+                    m.move_right();
+                }
                 true
             }
-            KeyCode::Enter => {
-                let prompts = crate::agent_prompt_modal::default_agent_prompts();
-                if let Some(p) = prompts.get(self.agent_prompt_cursor) {
-                    let cmd = p.command.clone();
-                    let label = p.label.clone();
-                    match copy_to_clipboard(&cmd) {
-                        Ok(()) => self.status_msg = format!("Copied {label} prompt to clipboard"),
-                        Err(e) => self.status_msg = format!("Clipboard failed: {e}"),
-                    }
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.accept_agent_prompt();
+                true
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.decline_agent_prompt(false);
+                true
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                self.decline_agent_prompt(true);
+                true
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let selected = self
+                    .agent_prompt_modal
+                    .as_ref()
+                    .map(|m| m.selected)
+                    .unwrap_or(1);
+                match selected {
+                    0 => self.accept_agent_prompt(),
+                    2 => self.decline_agent_prompt(true),
+                    _ => self.decline_agent_prompt(false),
                 }
-                self.show_agent_prompts = false;
                 true
             }
             _ => true, // modal captures all keys; anything else just holds it open
         }
+    }
+
+    /// Blurb prompt accept (Go `AgentPromptAccept`): inject the blurb into the
+    /// detected file, record the acceptance, close the modal.
+    fn accept_agent_prompt(&mut self) {
+        let Some(modal) = self.agent_prompt_modal.clone() else {
+            self.show_agent_prompt = false;
+            return;
+        };
+        let path = std::path::PathBuf::from(&modal.file_path);
+        let result = if modal.needs_upgrade && !self.agent_file_needs_blurb(&path) {
+            bv_core::agents::file::update_blurb_in_file(&path)
+        } else {
+            bv_core::agents::file::append_blurb_to_file(&path)
+        };
+        let project_dir = std::path::PathBuf::from(&modal.project_dir);
+        match result {
+            Ok(()) => {
+                let _ = bv_core::agents::prefs::record_accept(
+                    &project_dir,
+                    bv_core::agents::BLURB_VERSION,
+                );
+                self.status_msg = format!("Added bv instructions to {}", modal.file_type);
+            }
+            Err(e) => {
+                self.status_msg = format!("Could not update {}: {e}", modal.file_type);
+            }
+        }
+        self.show_agent_prompt = false;
+        self.agent_prompt_modal = None;
+    }
+
+    /// Blurb prompt decline (Go `AgentPromptDecline` / `AgentPromptNeverAsk`).
+    /// A plain decline only dismisses; never-ask persists via prefs.
+    fn decline_agent_prompt(&mut self, never: bool) {
+        if never {
+            if let Some(modal) = self.agent_prompt_modal.clone() {
+                let project_dir = std::path::PathBuf::from(&modal.project_dir);
+                let _ = bv_core::agents::prefs::record_decline(
+                    &project_dir,
+                    true,
+                    bv_core::agents::BLURB_VERSION,
+                );
+            }
+            self.status_msg = "Won't ask about agent instructions again".to_string();
+        }
+        self.show_agent_prompt = false;
+        self.agent_prompt_modal = None;
+    }
+
+    /// True when the file at `path` still lacks any blurb (used to pick
+    /// append vs update on accept).
+    fn agent_file_needs_blurb(&self, path: &std::path::Path) -> bool {
+        std::fs::read_to_string(path)
+            .map(|c| !bv_core::agents::contains_any_blurb(&c))
+            .unwrap_or(true)
     }
 
     /// Open the cass session modal for the selected issue (Go
@@ -3466,14 +3529,10 @@ fn render_overlays(f: &mut Frame, app: &App) {
         return;
     }
 
-    if app.show_agent_prompts {
-        let prompts = crate::agent_prompt_modal::default_agent_prompts();
-        crate::agent_prompt_modal::render_agent_prompt(
-            f,
-            &prompts,
-            app.agent_prompt_cursor,
-            f.area(),
-        );
+    if app.show_agent_prompt {
+        if let Some(modal) = &app.agent_prompt_modal {
+            crate::agent_prompt_modal::render_agent_prompt(f, modal, f.area());
+        }
         return;
     }
 
@@ -4358,10 +4417,19 @@ fn tui_event_loop(
     app: &mut App,
     update_rx: &std::sync::mpsc::Receiver<String>,
 ) -> io::Result<()> {
-    // Go auto-shows the agent-prompt modal when the repo has an AGENTS.md
-    // (repo root = cwd, or the parent of `.beads/`).
-    if detect_agents_md() {
-        app.show_agent_prompts = true;
+    // Go auto-shows the blurb prompt once at startup when the detected
+    // agent file needs the blurb and prefs don't suppress it.
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let detection = detect_agent_file_for_tui(&cwd);
+    if bv_core::agents::prefs::should_prompt_for_agent_file(&cwd, &detection) {
+        app.agent_prompt_modal = Some(crate::agent_prompt_modal::AgentPromptModal {
+            file_path: detection.file_path.clone(),
+            file_type: detection.file_type.clone(),
+            needs_upgrade: !detection.needs_blurb() && detection.needs_upgrade(),
+            selected: 0,
+            project_dir: cwd.to_string_lossy().to_string(),
+        });
+        app.show_agent_prompt = true;
     }
     loop {
         terminal.draw(|f| render(f, app))?;
@@ -5441,17 +5509,55 @@ mod tests {
         }
 
         #[test]
-        fn agent_prompt_modal_open_navigate_close() {
+        fn agent_prompt_modal_navigate_select_close() {
+            use crate::agent_prompt_modal::AgentPromptModal;
             let mut app = make_app(3);
-            app.show_agent_prompts = false; // isolate from AGENTS.md auto-detect
-            app.handle_key(KeyCode::Char('g'));
-            assert!(app.show_agent_prompts);
-            app.handle_key(KeyCode::Char('j'));
-            assert_eq!(app.agent_prompt_cursor, 1);
-            app.handle_key(KeyCode::Char('k'));
-            assert_eq!(app.agent_prompt_cursor, 0);
-            app.handle_key(KeyCode::Esc);
-            assert!(!app.show_agent_prompts);
+            // Auto-show happens in `tui_event_loop`, not `App::new`.
+            assert!(!app.show_agent_prompt);
+            app.agent_prompt_modal = Some(AgentPromptModal {
+                file_path: "AGENTS.md".into(),
+                file_type: "AGENTS.md".into(),
+                needs_upgrade: false,
+                selected: 0,
+                project_dir: String::new(),
+            });
+            app.show_agent_prompt = true;
+            app.handle_key(KeyCode::Right);
+            assert_eq!(app.agent_prompt_modal.as_ref().unwrap().selected, 1);
+            app.handle_key(KeyCode::Left);
+            assert_eq!(app.agent_prompt_modal.as_ref().unwrap().selected, 0);
+            app.handle_key(KeyCode::Char('d'));
+            assert!(!app.show_agent_prompt);
+            assert!(app.agent_prompt_modal.is_none());
+        }
+
+        #[test]
+        fn agent_prompt_modal_accept_appends_blurb() {
+            use crate::agent_prompt_modal::AgentPromptModal;
+            let dir = std::env::temp_dir().join("bvr_tui_agent_accept");
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            // Isolate prefs + cwd-dependent detection from the real user config.
+            let cfg = std::env::temp_dir().join("bvr_tui_agent_accept_cfg");
+            let _ = std::fs::remove_dir_all(&cfg);
+            std::env::set_var("XDG_CONFIG_HOME", &cfg);
+            let file = dir.join("AGENTS.md");
+            std::fs::write(&file, "# Project\n\n").unwrap();
+            let mut app = make_app(3);
+            app.agent_prompt_modal = Some(AgentPromptModal {
+                file_path: file.to_string_lossy().to_string(),
+                file_type: "AGENTS.md".into(),
+                needs_upgrade: false,
+                selected: 0,
+                project_dir: dir.to_string_lossy().to_string(),
+            });
+            app.show_agent_prompt = true;
+            app.handle_key(KeyCode::Char('y'));
+            assert!(!app.show_agent_prompt);
+            let content = std::fs::read_to_string(&file).unwrap();
+            assert!(bv_core::agents::verify_blurb_present(&content));
+            let _ = std::fs::remove_dir_all(&cfg);
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         #[test]
@@ -5463,7 +5569,7 @@ mod tests {
             // `tutorial_jk_turns_pages_and_backtick_resets`).
             for key in ['b', 'E', 'i', 'F', 'P', '!', 'f', 'A'] {
                 let mut app = make_app(3);
-                app.show_agent_prompts = false;
+                app.show_agent_prompt = false;
                 app.handle_key(KeyCode::Char(key));
                 assert_ne!(
                     app.current_view,

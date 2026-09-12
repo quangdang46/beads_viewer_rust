@@ -409,14 +409,18 @@ smoke run (exit 0, `data_hash` present — TUI-only diff, no CLI impact).
   `ActionableState` and `P` lazy-loads `SprintState` from
   `.beads/sprints.jsonl` (both were `None` forever, so neither view could
   ever show data — the G12 pattern a third and fourth time).
-- **AgentPromptModal:** auto-shows once at real TUI startup when AGENTS.md
-  is detected (cwd or repo root above `.beads/` — Go's trigger), `g`
-  reopens manually (lowercase `g` was the only free mnemonic key; the G8
-  regression test now pins `g` = prompts, `G` = graph). `j`/`k` navigate,
-  `Enter` copies the command via the new clipboard path, `Esc` closes.
-  Detection lives in `tui_event_loop`, not `App::new`, so unit tests keep a
-  clean slate (constructor detection broke 20 tests mid-pass — caught by
-  the suite, fixed same pass).
+- **AgentPromptModal:** Go-parity blurb prompt (Yes / No / Don't ask again),
+  auto-shows once at real TUI startup when the detected agent file
+  `needs_blurb()` or `needs_upgrade()` and prefs don't suppress it
+  (`bv_core::agents::prefs::should_prompt_for_agent_file`; Go's
+  `CheckAgentFileCmd` trigger — cwd up to 3 parents, then repo root above
+  `.beads/`). No manual keybinding (Go has none; lowercase `g` stays unbound,
+  `G` = graph). Keys: `←/→,h/l,Tab` move, `Enter/Space` confirm, `y/n/d`
+  quick actions, `Esc/q` decline. Accept injects via
+  `append/update_blurb_in_file` + `record_accept`; never-ask persists via
+  `record_decline`. Detection lives in `tui_event_loop`, not `App::new`, so
+  unit tests keep a clean slate (constructor detection broke 20 tests
+  mid-pass — caught by the suite, fixed same pass).
 - **velocity_comparison:** `v` sub-toggle inside Sprint (free there; `v` is
   History-scoped elsewhere), rendered as an overlay over the dashboard from
   per-sprint planned/completed counts; `Esc` closes the overlay before the

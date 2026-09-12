@@ -156,7 +156,6 @@ pub fn build_default_registry() -> KeyRegistry {
         ),
         ("`", "Tutorial (single tap) / context help (double tap)"),
         ("~", "Context help for current view"),
-        ("g", "Agent prompts (auto-opens if AGENTS.md detected)"),
         (";", "Toggle sidebar"),
     ] {
         reg.register(KeyBinding {
@@ -471,7 +470,8 @@ mod tests {
     /// found: the registry said lowercase "g" toggled Graph while runtime
     /// (`lib.rs` `handle_key`) actually binds uppercase "G". Pin the
     /// corrected value so it can't silently drift back. (Lowercase `g` is
-    /// since bound to the agent-prompt modal — also pinned here.)
+    /// unbound — Go has no manual key for the agent blurb prompt, which
+    /// auto-shows once at startup instead.)
     #[test]
     fn graph_toggle_is_uppercase_g_matching_runtime() {
         let reg = build_default_registry();
@@ -481,12 +481,8 @@ mod tests {
             "registry should document the real runtime binding (uppercase G)"
         );
         assert!(
-            list.iter().any(|b| b.key == "g"),
-            "lowercase g opens the agent-prompt modal — registry must say so"
-        );
-        assert!(
-            !list.iter().any(|b| b.key == "g" && b.desc.contains("raph")),
-            "registry must not claim lowercase g toggles Graph"
+            !list.iter().any(|b| b.key == "g"),
+            "lowercase g must stay unbound — no manual agent-prompt key"
         );
     }
 }
