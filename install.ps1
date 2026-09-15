@@ -85,6 +85,14 @@ if ($FromSource) {
     }
     if (-not $ok) { Log-Warn "Download failed — building from source..."; Build-FromSource }
     else {
+        # Verify checksum when the .sha256 sidecar was published (matches install.sh).
+        try {
+            $expected = ((Invoke-WebRequest -Uri "$url.sha256" -TimeoutSec 60 -ErrorAction Stop).Content -split '\s+')[0].ToLower()
+            $actual = (Get-FileHash $tmpZip -Algorithm SHA256).Hash.ToLower()
+            if ($expected -ne $actual) { Die "Checksum mismatch for $archive" }
+            Log-Info "Checksum verified"
+        } catch [System.Management.Automation.HaltCommandException] { throw }
+        catch { Log-Warn "Skipping checksum verification ($($_.Exception.Message))" }
         Expand-Archive -Path $tmpZip -DestinationPath $tmpDir -Force
         $bin = Get-ChildItem -Path $tmpDir -Recurse -Filter $BinaryExe | Select-Object -First 1
         if (-not $bin) { Die "Binary not found after extract" }

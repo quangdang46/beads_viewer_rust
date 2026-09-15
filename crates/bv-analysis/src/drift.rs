@@ -820,15 +820,11 @@ mod tests {
     fn stale_open_issue_triggers_warning_after_fourteen_days() {
         let s = snap(10, 10, 0.1, 0, 5);
         // 20 days ago: exceeds 14-day warning but not 30-day critical.
-        let issue = stale_issue("X-1", bv_core::model::Status::Open, "2026-08-16T00:00:00Z");
-        let r = calculate(
-            &s,
-            &s,
-            &DriftConfig::default(),
-            &[],
-            &[issue],
-            jiff::Timestamp::now(),
-        );
+        // Computed relative to `now` so the test doesn't rot as wall-clock moves.
+        let now = jiff::Timestamp::now();
+        let updated = (now - jiff::SignedDuration::from_secs(20 * 86400)).to_string();
+        let issue = stale_issue("X-1", bv_core::model::Status::Open, &updated);
+        let r = calculate(&s, &s, &DriftConfig::default(), &[], &[issue], now);
         assert!(
             r.alerts
                 .iter()
@@ -841,15 +837,11 @@ mod tests {
     fn stale_open_issue_triggers_critical_after_thirty_days() {
         let s = snap(10, 10, 0.1, 0, 5);
         // 40 days ago: exceeds 30-day critical.
-        let issue = stale_issue("X-2", bv_core::model::Status::Open, "2026-07-27T00:00:00Z");
-        let r = calculate(
-            &s,
-            &s,
-            &DriftConfig::default(),
-            &[],
-            &[issue],
-            jiff::Timestamp::now(),
-        );
+        // Computed relative to `now` so the test doesn't rot as wall-clock moves.
+        let now = jiff::Timestamp::now();
+        let updated = (now - jiff::SignedDuration::from_secs(40 * 86400)).to_string();
+        let issue = stale_issue("X-2", bv_core::model::Status::Open, &updated);
+        let r = calculate(&s, &s, &DriftConfig::default(), &[], &[issue], now);
         assert!(
             r.alerts
                 .iter()
@@ -863,19 +855,11 @@ mod tests {
         let s = snap(10, 10, 0.1, 0, 5);
         // 8 days ago: below 14-day warning, but in_progress multiplier 0.5
         // makes effective warn = 7 days -> should trigger.
-        let issue = stale_issue(
-            "X-3",
-            bv_core::model::Status::InProgress,
-            "2026-08-28T00:00:00Z",
-        );
-        let r = calculate(
-            &s,
-            &s,
-            &DriftConfig::default(),
-            &[],
-            &[issue],
-            jiff::Timestamp::now(),
-        );
+        // Computed relative to `now` so the test doesn't rot as wall-clock moves.
+        let now = jiff::Timestamp::now();
+        let updated = (now - jiff::SignedDuration::from_secs(8 * 86400)).to_string();
+        let issue = stale_issue("X-3", bv_core::model::Status::InProgress, &updated);
+        let r = calculate(&s, &s, &DriftConfig::default(), &[], &[issue], now);
         assert!(
             r.alerts
                 .iter()
