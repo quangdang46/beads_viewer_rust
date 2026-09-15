@@ -9,7 +9,7 @@
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)
 ![Rust](https://img.shields.io/badge/Rust-stable-orange.svg)
 ![License](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)
-![Release](https://img.shields.io/github/v/release/quangdang46/bv?include_prereleases)
+![Release](https://img.shields.io/github/v/release/quangdang46/beads_viewer_rust?include_prereleases)
 [![Upstream](https://img.shields.io/badge/upstream-Dicklesworthstone%2Fbeads__viewer-8A2BE2)](https://github.com/Dicklesworthstone/beads_viewer)
 
 </div>
@@ -63,15 +63,15 @@ bvr --robot-triage --format toon
 <summary>AGENTS.md blurb — paste into your repo's agent instructions</summary>
 
 ```markdown
-### Using bv as an AI sidecar
+### Using bvr as an AI sidecar
 
-bv is a graph-aware triage engine for Beads projects (.beads/issues.jsonl).
-Use ONLY --robot-* flags. Bare bv launches an interactive TUI that blocks your session.
+bvr is a graph-aware triage engine for Beads projects (.beads/issues.jsonl).
+Use ONLY --robot-* flags. Bare bvr launches an interactive TUI that blocks your session.
 
-bv --robot-triage        # THE MEGA-COMMAND: start here
-bv --robot-next          # Minimal: single top pick + claim command
-bv --robot-plan          # Parallel execution tracks with unblocks lists
-bv --robot-insights      # PageRank/betweenness/HITS/cycles + status flags
+bvr --robot-triage        # THE MEGA-COMMAND: start here
+bvr --robot-next          # Minimal: single top pick + claim command
+bvr --robot-plan          # Parallel execution tracks with unblocks lists
+bvr --robot-insights      # PageRank/betweenness/HITS/cycles + status flags
 
 All outputs include data_hash + status flags. Verify .status before trusting
 heavy metrics on graphs >500 nodes. Prefer --format toon to cut token cost.

@@ -4380,7 +4380,7 @@ pub fn run_tui(app: &mut App) -> io::Result<()> {
                     "5",
                     "-H",
                     "User-Agent: OpenAI File Downloader, XaiImageApiFetch/1.0",
-                    "https://api.github.com/repos/Dicklesworthstone/beads_viewer/releases/latest",
+                    "https://api.github.com/repos/quangdang46/beads_viewer_rust/releases/latest",
                 ])
                 .output();
             if let Ok(out) = output {

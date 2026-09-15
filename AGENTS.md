@@ -105,8 +105,8 @@ br sync --flush-only   # after mutations; then git add .beads/ && commit
 **NEVER run bare `bv`/`bvr`** — launches interactive TUI. Use `--robot-*` flags only (once the binary exists):
 
 ```bash
-bv --robot-triage     # prioritized recommendations
-bv --robot-next       # single top pick
+bvr --robot-triage     # prioritized recommendations
+bvr --robot-next       # single top pick
 ```
 
 Until our own binary works, use the Go reference build for triage if needed:
