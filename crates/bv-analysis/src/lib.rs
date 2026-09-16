@@ -25,3 +25,4 @@ pub use analyzer::{
 };
 pub use impact::{compute_impact_scores, ImpactInputs};
 pub use triage::{build_triage, compute_blocked_set, compute_row_triage, RowTriage, TriageOutput};
+pub use blocker_chain::{is_actionable, open_blockers};

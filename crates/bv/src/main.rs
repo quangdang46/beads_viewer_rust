@@ -677,7 +677,12 @@ fn run_robot_next() -> ExitCode {
         if !assignee.is_empty() {
             reasons.push(format!("{id} is already assigned to {assignee}"));
         }
-        let mut open_blockers: Vec<String> = Vec::new();
+        // Ancestor-epic parity (#2): route through the shared
+        // blocker_chain helper so parent-child inherited blocking gates
+        // the claimability filter, exactly like compute_blocked_set.
+        let mut open_blockers: Vec<String> =
+            bv_analysis::open_blockers(&issue_by_id, &issue.id);
+        // Surface dangling direct-blocking edges as unclaimable too.
         for dep in &issue.dependencies {
             if !dep.r#type.is_blocking() {
                 continue;
@@ -685,18 +690,10 @@ fn run_robot_next() -> ExitCode {
             let blocker_id = dep.effective_depends_on().trim().to_string();
             if blocker_id.is_empty() {
                 open_blockers.push("<missing blocker id>".into());
-                continue;
-            }
-            match issue_by_id.get(blocker_id.as_str()) {
-                None => open_blockers.push(format!("{blocker_id} (missing)")),
-                Some(b) => {
-                    if !matches!(
-                        b.status,
-                        bv_core::model::Status::Closed | bv_core::model::Status::Tombstone
-                    ) {
-                        open_blockers.push(blocker_id);
-                    }
-                }
+            } else if !issue_by_id.contains_key(blocker_id.as_str())
+                && !open_blockers.iter().any(|b| b == &blocker_id)
+            {
+                open_blockers.push(format!("{blocker_id} (missing)"));
             }
         }
         if !open_blockers.is_empty() {
@@ -851,21 +848,8 @@ fn run_robot_triage() -> ExitCode {
                 if !issue.assignee.trim().is_empty() {
                     return false;
                 }
-                // Check for open blockers
-                let has_open_blockers = issue.dependencies.iter().any(|dep| {
-                    dep.r#type.is_blocking()
-                        && issue_by_id
-                            .get(dep.effective_depends_on())
-                            .map(|b| {
-                                !matches!(
-                                    b.status,
-                                    bv_core::model::Status::Closed
-                                        | bv_core::model::Status::Tombstone
-                                )
-                            })
-                            .unwrap_or(false)
-                });
-                if has_open_blockers {
+                // Ancestor-epic parity (#2): shared blocker_chain helper.
+                if !bv_analysis::open_blockers(&issue_by_id, &issue.id).is_empty() {
                     return false;
                 }
             }

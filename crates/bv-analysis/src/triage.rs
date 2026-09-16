@@ -247,24 +247,19 @@ pub fn compute_row_triage(issues: &[Issue]) -> std::collections::HashMap<String,
 }
 
 /// Compute the set of issue IDs that have >=1 open blocker.
+///
+/// Go parity (`br ready`/`br blocked`): blocking is inherited through
+/// parent-child links — a child of a (transitively) blocked parent is
+/// blocked even when it carries no direct `blocks` edge itself. Routes
+/// through [`crate::blocker_chain::open_blockers`] (direct blocking edges
+/// + transitive parent-blocked propagation) so every consumer agrees.
 pub fn compute_blocked_set(issues: &[Issue]) -> std::collections::HashSet<String> {
-    use std::collections::HashSet;
-    let mut open_ids: HashSet<&str> = HashSet::new();
-    for i in issues {
-        if i.status.is_open() {
-            open_ids.insert(&i.id);
-        }
-    }
+    use std::collections::{HashMap, HashSet};
+    let by_id: HashMap<&str, &Issue> = issues.iter().map(|i| (i.id.as_str(), i)).collect();
     let mut blocked = HashSet::new();
     for i in issues {
-        for dep in &i.dependencies {
-            if dep.r#type.is_blocking() {
-                let target = dep.effective_depends_on().to_string();
-                if open_ids.contains(target.as_str()) && target != i.id {
-                    blocked.insert(i.id.clone());
-                    break;
-                }
-            }
+        if !crate::blocker_chain::open_blockers(&by_id, &i.id).is_empty() {
+            blocked.insert(i.id.clone());
         }
     }
     blocked

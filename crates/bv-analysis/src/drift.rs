@@ -391,22 +391,16 @@ fn check_blocking_cascade(
     // Go `checkBlockingCascade` only emits for issues that are NOT themselves
     // blocked by open issues — i.e., issues that can actually be completed now.
     let by_id: BTreeMap<&str, &Issue> = issues.iter().map(|i| (i.id.as_str(), i)).collect();
+    // Ancestor-epic parity (#2): inherited parent-child blocking gates this too.
+    let by_id_map: std::collections::HashMap<&str, &Issue> =
+        issues.iter().map(|i| (i.id.as_str(), i)).collect();
     let mut cascades: Vec<Alert> = Vec::new();
     for issue in issues {
         if issue.status.is_closed() || issue.status == bv_core::model::Status::Deferred {
             continue;
         }
         // Skip issues that have open blockers — they can't be completed yet.
-        let has_open_blocker = issue.dependencies.iter().any(|d| {
-            if !d.r#type.is_blocking() {
-                return false;
-            }
-            let target = d.effective_depends_on();
-            by_id
-                .get(target)
-                .is_some_and(|other| !other.status.is_closed())
-        });
-        if has_open_blocker {
+        if !crate::blocker_chain::open_blockers(&by_id_map, &issue.id).is_empty() {
             continue;
         }
         let unblocked = compute_unblocks(issues, &issue.id);
