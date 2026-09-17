@@ -680,8 +680,7 @@ fn run_robot_next() -> ExitCode {
         // Ancestor-epic parity (#2): route through the shared
         // blocker_chain helper so parent-child inherited blocking gates
         // the claimability filter, exactly like compute_blocked_set.
-        let mut open_blockers: Vec<String> =
-            bv_analysis::open_blockers(&issue_by_id, &issue.id);
+        let mut open_blockers: Vec<String> = bv_analysis::open_blockers(&issue_by_id, &issue.id);
         // Surface dangling direct-blocking edges as unclaimable too.
         for dep in &issue.dependencies {
             if !dep.r#type.is_blocking() {

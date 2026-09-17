@@ -387,8 +387,7 @@ mod tests {
         let mut ep1 = issue("EP1", Status::Open, "phase 1");
         ep1.dependencies.push(blocks("EP1", "EP0"));
         let mut task = issue("TASK-1", Status::Open, "task under ep1");
-        task.dependencies
-            .push(parent_child("TASK-1", "EP1"));
+        task.dependencies.push(parent_child("TASK-1", "EP1"));
         let issues = vec![ep0, ep1, task];
         let by_id = by_id_map(&issues);
         assert_eq!(open_blockers(&by_id, "TASK-1"), vec!["EP1".to_string()]);
@@ -411,9 +410,7 @@ mod tests {
         let by_id = by_id_map(&issues);
         assert!(open_blockers(&by_id, "TASK-0").is_empty());
         assert!(is_actionable(&by_id, "TASK-0"));
-        assert!(
-            !crate::triage::compute_blocked_set(&issues).contains("TASK-0")
-        );
+        assert!(!crate::triage::compute_blocked_set(&issues).contains("TASK-0"));
     }
 
     #[test]

@@ -258,7 +258,37 @@ pub fn compute_blocked_set(issues: &[Issue]) -> std::collections::HashSet<String
     let by_id: HashMap<&str, &Issue> = issues.iter().map(|i| (i.id.as_str(), i)).collect();
     let mut blocked = HashSet::new();
     for i in issues {
-        if !crate::blocker_chain::open_blockers(&by_id, &i.id).is_empty() {
+        // Skip self-loops: Go's graph drops them (gonum SimpleGraph rejects
+        // self-edges), so a self-edge must not count as its own blocker.
+        let direct = i.dependencies.iter().any(|dep| {
+            if !dep.r#type.is_blocking() {
+                return false;
+            }
+            let target = dep.effective_depends_on();
+            target != i.id
+                && by_id
+                    .get(target)
+                    .is_some_and(|b| b.status.is_open() && b.id != i.id)
+        });
+        if direct {
+            blocked.insert(i.id.clone());
+            continue;
+        }
+        // Ancestor-epic inheritance (#2): a child of a (transitively)
+        // blocked parent is blocked even with no direct `blocks` edge.
+        // Go's getOpenBlockersInternal surfaces the open parent only when
+        // the parent is itself transitively blocked — never for a
+        // standalone open parent — which is exactly what open_blockers
+        // computes; here we only accept the parent-propagated part.
+        let inherited = crate::blocker_chain::open_blockers(&by_id, &i.id)
+            .into_iter()
+            .any(|b| {
+                i.dependencies.iter().any(|d| {
+                    d.r#type == bv_core::model::DependencyType::ParentChild
+                        && d.effective_depends_on() == b.as_str()
+                })
+            });
+        if inherited {
             blocked.insert(i.id.clone());
         }
     }

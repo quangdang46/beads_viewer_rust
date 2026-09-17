@@ -462,11 +462,11 @@ pub fn compute_impact_scores(inputs: &ImpactInputs) -> Vec<IssueImpact> {
         }
 
         // 5b. Blocked-by reason (Go parity: BlockedByIDs in triage reasons).
-        //     Ancestor-epic parity (#2): inherited parent-child blockers
-        //     surface here too, via the shared blocker_chain helper. The
-        //     graph `blockers` in-degree only counts direct `blocks` edges,
-        //     so gate on the inherited list instead.
-        {
+        //     Only for non-open issues (Go goldens: open issues never carry
+        //     this reason, even when blocked). Ancestor-epic parity (#2):
+        //     inherited parent-child blockers surface here too, via the
+        //     shared blocker_chain helper.
+        if !issue.status.is_open() {
             let by_id_map: std::collections::HashMap<&str, &Issue> =
                 inputs.issues.iter().map(|i| (i.id.as_str(), i)).collect();
             let blocker_ids: Vec<String> =

@@ -23,6 +23,6 @@ pub use analyzer::{
     analyze_phase1, analyze_phase2_blocking, AnalysisBudget, GraphAnalysisPhase2, MetricStatus,
     Phase1Stats, StatusEntry,
 };
+pub use blocker_chain::{is_actionable, open_blockers};
 pub use impact::{compute_impact_scores, ImpactInputs};
 pub use triage::{build_triage, compute_blocked_set, compute_row_triage, RowTriage, TriageOutput};
-pub use blocker_chain::{is_actionable, open_blockers};
