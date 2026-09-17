@@ -321,6 +321,22 @@ mod tests {
         }
     }
 
+    fn parent_child(issue_id: &str, depends_on_id: &str) -> Dependency {
+        Dependency {
+            issue_id: issue_id.to_string(),
+            depends_on_id: depends_on_id.to_string(),
+            depends_on_legacy: String::new(),
+            target_id_legacy: String::new(),
+            r#type: DependencyType::ParentChild,
+            created_at: None,
+            created_by: String::new(),
+        }
+    }
+
+    fn by_id_map(issues: &[Issue]) -> HashMap<&str, &Issue> {
+        issues.iter().map(|i| (i.id.as_str(), i)).collect()
+    }
+
     #[test]
     fn unblocked_issue_is_its_own_root() {
         let issues = vec![issue("A-1", Status::Open, "solo")];
@@ -360,6 +376,41 @@ mod tests {
             !result.is_blocked,
             "closed blocker must not count as blocking"
         );
+    }
+
+    /// Issue #2: a task with only a parent-child edge to a blocked epic
+    /// inherits the ancestor's blocked state (br ready/blocked parity).
+    #[test]
+    fn child_inherits_blocked_ancestor_epic() {
+        // EP1 blocked on open EP0; TASK-1 has only a parent-child link to EP1.
+        let ep0 = issue("EP0", Status::Open, "phase 0");
+        let mut ep1 = issue("EP1", Status::Open, "phase 1");
+        ep1.dependencies.push(blocks("EP1", "EP0"));
+        let mut task = issue("TASK-1", Status::Open, "task under ep1");
+        task.dependencies.push(parent_child("TASK-1", "EP1"));
+        let issues = vec![ep0, ep1, task];
+        let by_id = by_id_map(&issues);
+        assert_eq!(open_blockers(&by_id, "TASK-1"), vec!["EP1".to_string()]);
+        assert!(!is_actionable(&by_id, "TASK-1"));
+        assert!(is_actionable(&by_id, "EP0"));
+        assert!(!crate::triage::compute_blocked_set(&issues).is_disjoint(
+            &["TASK-1".to_string(), "EP1".to_string()]
+                .into_iter()
+                .collect()
+        ));
+    }
+
+    /// Issue #2: an open, unblocked parent does NOT gate its child.
+    #[test]
+    fn child_of_open_unblocked_parent_stays_actionable() {
+        let ep0 = issue("EP0", Status::Open, "phase 0");
+        let mut task = issue("TASK-0", Status::Open, "task under ep0");
+        task.dependencies.push(parent_child("TASK-0", "EP0"));
+        let issues = vec![ep0, task];
+        let by_id = by_id_map(&issues);
+        assert!(open_blockers(&by_id, "TASK-0").is_empty());
+        assert!(is_actionable(&by_id, "TASK-0"));
+        assert!(!crate::triage::compute_blocked_set(&issues).contains("TASK-0"));
     }
 
     #[test]

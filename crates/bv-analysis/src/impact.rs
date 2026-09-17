@@ -462,29 +462,15 @@ pub fn compute_impact_scores(inputs: &ImpactInputs) -> Vec<IssueImpact> {
         }
 
         // 5b. Blocked-by reason (Go parity: BlockedByIDs in triage reasons).
-        //     Only for issues that have open blockers (status != open or
-        //     has blocking dependencies).
-        if blockers > 0 && !issue.status.is_open() {
-            // Collect open blocker IDs from the issue's dependencies.
-            let blocker_ids: Vec<String> = issue
-                .dependencies
-                .iter()
-                .filter(|d| d.r#type.is_blocking())
-                .filter_map(|d| {
-                    let bid = d.effective_depends_on();
-                    if bid.is_empty() {
-                        return None;
-                    }
-                    // Check if blocker is still open (not closed/tombstone).
-                    inputs.issues.iter().find(|i| i.id == bid).and_then(|bi| {
-                        if matches!(bi.status, Status::Closed | Status::Tombstone) {
-                            None
-                        } else {
-                            Some(bid.to_string())
-                        }
-                    })
-                })
-                .collect();
+        //     Only for non-open issues (Go goldens: open issues never carry
+        //     this reason, even when blocked). Ancestor-epic parity (#2):
+        //     inherited parent-child blockers surface here too, via the
+        //     shared blocker_chain helper.
+        if !issue.status.is_open() {
+            let by_id_map: std::collections::HashMap<&str, &Issue> =
+                inputs.issues.iter().map(|i| (i.id.as_str(), i)).collect();
+            let blocker_ids: Vec<String> =
+                crate::blocker_chain::open_blockers(&by_id_map, &issue.id);
             if blocker_ids.len() == 1 {
                 reasons.push(format!(
                     "⏳ Blocked by {} - complete that first",

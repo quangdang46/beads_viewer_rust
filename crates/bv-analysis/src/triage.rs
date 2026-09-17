@@ -247,24 +247,49 @@ pub fn compute_row_triage(issues: &[Issue]) -> std::collections::HashMap<String,
 }
 
 /// Compute the set of issue IDs that have >=1 open blocker.
+///
+/// Go parity (`br ready`/`br blocked`): blocking is inherited through
+/// parent-child links — a child of a (transitively) blocked parent is
+/// blocked even when it carries no direct `blocks` edge itself. Routes
+/// through [`crate::blocker_chain::open_blockers`] (direct blocking edges
+/// + transitive parent-blocked propagation) so every consumer agrees.
 pub fn compute_blocked_set(issues: &[Issue]) -> std::collections::HashSet<String> {
-    use std::collections::HashSet;
-    let mut open_ids: HashSet<&str> = HashSet::new();
-    for i in issues {
-        if i.status.is_open() {
-            open_ids.insert(&i.id);
-        }
-    }
+    use std::collections::{HashMap, HashSet};
+    let by_id: HashMap<&str, &Issue> = issues.iter().map(|i| (i.id.as_str(), i)).collect();
     let mut blocked = HashSet::new();
     for i in issues {
-        for dep in &i.dependencies {
-            if dep.r#type.is_blocking() {
-                let target = dep.effective_depends_on().to_string();
-                if open_ids.contains(target.as_str()) && target != i.id {
-                    blocked.insert(i.id.clone());
-                    break;
-                }
+        // Skip self-loops: Go's graph drops them (gonum SimpleGraph rejects
+        // self-edges), so a self-edge must not count as its own blocker.
+        let direct = i.dependencies.iter().any(|dep| {
+            if !dep.r#type.is_blocking() {
+                return false;
             }
+            let target = dep.effective_depends_on();
+            target != i.id
+                && by_id
+                    .get(target)
+                    .is_some_and(|b| b.status.is_open() && b.id != i.id)
+        });
+        if direct {
+            blocked.insert(i.id.clone());
+            continue;
+        }
+        // Ancestor-epic inheritance (#2): a child of a (transitively)
+        // blocked parent is blocked even with no direct `blocks` edge.
+        // Go's getOpenBlockersInternal surfaces the open parent only when
+        // the parent is itself transitively blocked — never for a
+        // standalone open parent — which is exactly what open_blockers
+        // computes; here we only accept the parent-propagated part.
+        let inherited = crate::blocker_chain::open_blockers(&by_id, &i.id)
+            .into_iter()
+            .any(|b| {
+                i.dependencies.iter().any(|d| {
+                    d.r#type == bv_core::model::DependencyType::ParentChild
+                        && d.effective_depends_on() == b.as_str()
+                })
+            });
+        if inherited {
+            blocked.insert(i.id.clone());
         }
     }
     blocked
