@@ -93,7 +93,18 @@ if ($FromSource) {
     # so a corrupted/retried archive download can't also poison this value).
     $expected = $null
     try {
-        $expected = ((Invoke-WebRequest -Uri "$url.sha256" -TimeoutSec 60 -UseBasicParsing -ErrorAction Stop).Content -split '\s+')[0].ToLower()
+        $sumResp = Invoke-WebRequest -Uri "$url.sha256" -TimeoutSec 60 -UseBasicParsing -ErrorAction Stop
+        # GitHub serves this sidecar as application/octet-stream, so
+        # Invoke-WebRequest can't infer a text encoding and hands back
+        # .Content as a raw byte[] instead of a string — splitting that on
+        # whitespace yields individual bytes-as-decimal (e.g. "102" for 'f'),
+        # not the hash. Decode explicitly regardless of what type we got.
+        if ($sumResp.Content -is [byte[]]) {
+            $sumText = [System.Text.Encoding]::UTF8.GetString($sumResp.Content)
+        } else {
+            $sumText = $sumResp.Content
+        }
+        $expected = ($sumText -split '\s+')[0].ToLower()
     } catch { Log-Warn "Could not fetch .sha256 sidecar ($($_.Exception.Message)) — skipping verification" }
 
     $ok = $false
