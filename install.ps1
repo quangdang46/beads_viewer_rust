@@ -1,6 +1,19 @@
 # bvr installer — Beads Viewer in Rust (Windows)
 # Usage: irm "https://raw.githubusercontent.com/quangdang46/beads_viewer_rust/main/install.ps1" | iex
 $ErrorActionPreference = "Stop"
+# Disables the slow IE-style progress bar in Invoke-WebRequest, which can
+# slow large downloads from seconds to minutes.
+$ProgressPreference = "SilentlyContinue"
+
+# Force TLS 1.2 (and 1.3 if available). Windows PowerShell 5.1 still defaults
+# to TLS 1.0/1.1 for .NET HTTP clients, which GitHub now rejects or which can
+# silently truncate a download mid-stream — surfacing here as a checksum
+# mismatch rather than a connection error. The -bor preserves any newer
+# protocols the runtime already has enabled.
+try {
+    [Net.ServicePointManager]::SecurityProtocol =
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+} catch { }
 
 # === Config ===
 $BinaryName = "bvr"
@@ -41,7 +54,7 @@ function Resolve-Version {
     if ($Version) { return }
     try {
         $script:Version = (Invoke-RestMethod -Uri "https://api.github.com/repos/$Owner/$Repo/releases/latest" `
-            -TimeoutSec 30).tag_name
+            -TimeoutSec 30 -UseBasicParsing).tag_name
     } catch {
         Die "Could not resolve latest version (no releases yet?). Use --from-source or install Rust and build."
     }
@@ -79,7 +92,7 @@ if ($FromSource) {
     $ok = $false
     for ($i = 1; $i -le $MaxRetries; $i++) {
         try {
-            Invoke-WebRequest -Uri $url -OutFile $tmpZip -TimeoutSec 120 -ErrorAction Stop
+            Invoke-WebRequest -Uri $url -OutFile $tmpZip -TimeoutSec 120 -UseBasicParsing -ErrorAction Stop
             $ok = $true; break
         } catch { Log-Warn "Retry $i/$MaxRetries..."; Start-Sleep 3 }
     }
@@ -87,7 +100,7 @@ if ($FromSource) {
     else {
         # Verify checksum when the .sha256 sidecar was published (matches install.sh).
         try {
-            $expected = ((Invoke-WebRequest -Uri "$url.sha256" -TimeoutSec 60 -ErrorAction Stop).Content -split '\s+')[0].ToLower()
+            $expected = ((Invoke-WebRequest -Uri "$url.sha256" -TimeoutSec 60 -UseBasicParsing -ErrorAction Stop).Content -split '\s+')[0].ToLower()
             $actual = (Get-FileHash $tmpZip -Algorithm SHA256).Hash.ToLower()
             if ($expected -ne $actual) { Die "Checksum mismatch for $archive" }
             Log-Info "Checksum verified"
