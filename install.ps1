@@ -89,23 +89,34 @@ if ($FromSource) {
     $tmpZip   = Join-Path $env:TEMP "$archive"
     $tmpDir   = Join-Path $env:TEMP "bvr-extract-$(Get-Random)"
 
+    # Fetch the expected checksum once (independent of the archive itself,
+    # so a corrupted/retried archive download can't also poison this value).
+    $expected = $null
+    try {
+        $expected = ((Invoke-WebRequest -Uri "$url.sha256" -TimeoutSec 60 -UseBasicParsing -ErrorAction Stop).Content -split '\s+')[0].ToLower()
+    } catch { Log-Warn "Could not fetch .sha256 sidecar ($($_.Exception.Message)) — skipping verification" }
+
     $ok = $false
     for ($i = 1; $i -le $MaxRetries; $i++) {
+        Remove-Item $tmpZip -ErrorAction SilentlyContinue
         try {
             Invoke-WebRequest -Uri $url -OutFile $tmpZip -TimeoutSec 120 -UseBasicParsing -ErrorAction Stop
-            $ok = $true; break
-        } catch { Log-Warn "Retry $i/$MaxRetries..."; Start-Sleep 3 }
+        } catch {
+            Log-Warn "Download attempt $i/$MaxRetries failed: $($_.Exception.Message)"; Start-Sleep 3; continue
+        }
+        if (-not $expected) { $ok = $true; break }
+        $actual = (Get-FileHash $tmpZip -Algorithm SHA256).Hash.ToLower()
+        if ($actual -eq $expected) { Log-Info "Checksum verified"; $ok = $true; break }
+        $size = (Get-Item $tmpZip).Length
+        Log-Warn "Checksum mismatch on attempt $i/$MaxRetries (expected $expected, got $actual, size $size bytes) — retrying..."
+        Start-Sleep 3
     }
-    if (-not $ok) { Log-Warn "Download failed — building from source..."; Build-FromSource }
-    else {
-        # Verify checksum when the .sha256 sidecar was published (matches install.sh).
-        try {
-            $expected = ((Invoke-WebRequest -Uri "$url.sha256" -TimeoutSec 60 -UseBasicParsing -ErrorAction Stop).Content -split '\s+')[0].ToLower()
-            $actual = (Get-FileHash $tmpZip -Algorithm SHA256).Hash.ToLower()
-            if ($expected -ne $actual) { Die "Checksum mismatch for $archive" }
-            Log-Info "Checksum verified"
-        } catch [System.Management.Automation.HaltCommandException] { throw }
-        catch { Log-Warn "Skipping checksum verification ($($_.Exception.Message))" }
+    if (-not $ok) {
+        Log-Warn "Download kept failing verification after $MaxRetries attempts."
+        Log-Warn "This usually means something between you and GitHub (proxy/AV/VPN) is altering the download, not that the release is broken."
+        Log-Warn "Falling back to building from source..."
+        Build-FromSource
+    } else {
         Expand-Archive -Path $tmpZip -DestinationPath $tmpDir -Force
         $bin = Get-ChildItem -Path $tmpDir -Recurse -Filter $BinaryExe | Select-Object -First 1
         if (-not $bin) { Die "Binary not found after extract" }
