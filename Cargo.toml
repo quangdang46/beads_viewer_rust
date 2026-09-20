@@ -9,6 +9,7 @@ members = [
     "crates/bv-robot",
     "crates/bv-tui",
     "crates/bv-graph-core",
+    "crates/bv-update",
     "crates/bv",
 ]
 exclude = [

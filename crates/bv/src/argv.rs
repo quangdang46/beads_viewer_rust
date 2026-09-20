@@ -107,6 +107,49 @@ pub fn rewrite_args(args: &[String]) -> Vec<String> {
         }
     }
 
+    // Upgrade intent expansion (Go rewriteUpgradeIntent parity) — runs AFTER
+    // alias rewriting so `upgrade` has already become `--update`. (Go rewriteUpgradeIntent parity):
+    // `bvr upgrade [--check|--dry-run|--rollback] [--yes|-y]` maps onto the
+    // self-update flags. Bare-word aliases accepted; unknown tokens pass through.
+    if out.get(1).map(|s| s.as_str()) == Some("--update") {
+        let mut mode = "update";
+        let mut yes = false;
+        let mut passthrough: Vec<String> = Vec::new();
+        for arg in out.iter().skip(2) {
+            match arg.to_lowercase().trim() {
+                "check" | "--check" | "check-update" | "--check-update" => {
+                    if mode == "update" {
+                        mode = "check";
+                    }
+                }
+                "dry-run" | "--dry-run" | "dryrun" | "--dryrun" => {
+                    if mode == "update" {
+                        mode = "dry-run";
+                    }
+                }
+                "rollback" | "--rollback" => mode = "rollback",
+                "yes" | "--yes" | "-y" | "force" | "--force" => yes = true,
+                _ => passthrough.push(arg.clone()),
+            }
+        }
+        let mut expanded = match mode {
+            "check" => vec!["--check-update".to_string()],
+            "dry-run" => vec!["--update-dry-run".to_string()],
+            "rollback" => vec!["--rollback".to_string()],
+            _ => {
+                let mut v = vec!["--update".to_string()];
+                if yes {
+                    v.push("--yes".to_string());
+                }
+                v
+            }
+        };
+        expanded.extend(passthrough);
+        let mut result = vec![out[0].clone()];
+        result.extend(expanded);
+        return result;
+    }
+
     // Bare --json auto-promote: if no robot primary flag is present after alias
     // rewriting, but the user passed a structured-output flag (--json, --toon,
     // --output=json, -o=json, etc.), insert --robot-triage as the default
@@ -305,6 +348,25 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_subcommand_variants() {
+        assert_eq!(
+            rewrite_args(&s(&["bvr", "upgrade", "check"])),
+            s(&["bvr", "--check-update"])
+        );
+        assert_eq!(
+            rewrite_args(&s(&["bvr", "upgrade", "dry-run"])),
+            s(&["bvr", "--update-dry-run"])
+        );
+        assert_eq!(
+            rewrite_args(&s(&["bvr", "upgrade", "rollback"])),
+            s(&["bvr", "--rollback"])
+        );
+        assert_eq!(
+            rewrite_args(&s(&["bvr", "upgrade", "--yes"])),
+            s(&["bvr", "--update", "--yes"])
+        );
+    }
+
     fn alias_upgrade_goes_to_update() {
         assert_eq!(
             rewrite_args(&s(&["bvr", "upgrade"])),

@@ -45,7 +45,7 @@ pub fn render_update_modal(f: &mut Frame, current_version: &str, latest_version:
         ]),
         Line::from(""),
         Line::from(Span::styled(
-            "  Run `bvr --check-update` to install",
+            "  Run `bvr --update` to install",
             Style::default().fg(Color::Cyan),
         )),
         Line::from(Span::styled(

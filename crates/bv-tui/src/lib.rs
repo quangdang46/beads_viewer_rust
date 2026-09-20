@@ -4369,29 +4369,14 @@ pub fn run_tui(app: &mut App) -> io::Result<()> {
         .unwrap_or_default();
     app.instance_pid = acquire_instance_lock(&beads_dir);
 
-    // Update check (Go updater): background thread, gated by BV_NO_UPDATE_CHECK
+    // Update check (Go updater.CheckUpdateCmd): background thread through
+    // bv-update (proper semver compare incl. dev-build rule), gated by
+    // BV_NO_UPDATE_CHECK.
     let (update_tx, update_rx) = std::sync::mpsc::channel::<String>();
     if std::env::var("BV_NO_UPDATE_CHECK").is_err() {
         std::thread::spawn(move || {
-            let output = std::process::Command::new("curl")
-                .args([
-                    "-sf",
-                    "-m",
-                    "5",
-                    "-H",
-                    "User-Agent: OpenAI File Downloader, XaiImageApiFetch/1.0",
-                    "https://api.github.com/repos/quangdang46/beads_viewer_rust/releases/latest",
-                ])
-                .output();
-            if let Ok(out) = output {
-                if let Ok(body) = String::from_utf8(out.stdout) {
-                    if let Some(tag) = serde_json::from_str::<serde_json::Value>(&body)
-                        .ok()
-                        .and_then(|v| v.get("tag_name").and_then(|t| t.as_str().map(String::from)))
-                    {
-                        let _ = update_tx.send(tag);
-                    }
-                }
+            if let Ok(Some(info)) = bv_update::github::check_for_updates() {
+                let _ = update_tx.send(info.new_version);
             }
         });
     }
@@ -4436,12 +4421,18 @@ fn tui_event_loop(
         if app.quit_requested {
             break;
         }
-        // Drain update-check channel (non-blocking)
+        // Drain update-check channel (non-blocking). The tag was already
+        // vetted by bv-update semver compare (incl. dev-build rule);
+        // re-verify here in case the binary version changed mid-session.
         if let Ok(tag) = update_rx.try_recv() {
-            let current = env!("CARGO_PKG_VERSION");
-            let tag_clean = tag.trim_start_matches('v');
-            if tag_clean != current {
-                app.update_tag = Some(tag);
+            if bv_update::is_newer_than_current(&tag) {
+                app.update_tag = Some(tag.clone());
+                // Auto-notify once per session (Go: update badge + prompt);
+                // `U` toggles afterwards.
+                if !app.update_modal_auto_shown {
+                    app.update_modal_auto_shown = true;
+                    app.show_update_modal = true;
+                }
             }
         }
         // Live reload (Go fsnotify; TUI_UX_PARITY_PLAN.md Phase F): piggyback
