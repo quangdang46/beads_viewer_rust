@@ -1236,7 +1236,10 @@ fn run_check_update() -> ExitCode {
             ExitCode::from(1)
         }
         Ok(None) => {
-            println!("bvr is up to date (version {})", bv_update::current_version());
+            println!(
+                "bvr is up to date (version {})",
+                bv_update::current_version()
+            );
             ExitCode::from(0)
         }
         Ok(Some(info)) => {
@@ -1262,7 +1265,10 @@ fn run_update_dry_run() -> ExitCode {
         Ok(r) => r,
     };
     if !bv_update::is_newer_than_current(&release.tag_name) {
-        println!("bvr is already up to date (version {})", bv_update::current_version());
+        println!(
+            "bvr is already up to date (version {})",
+            bv_update::current_version()
+        );
         return ExitCode::from(0);
     }
     println!(
@@ -1302,7 +1308,10 @@ fn run_update(args: &[String]) -> ExitCode {
         Ok(r) => r,
     };
     if !bv_update::is_newer_than_current(&release.tag_name) {
-        println!("bvr is already up to date (version {})", bv_update::current_version());
+        println!(
+            "bvr is already up to date (version {})",
+            bv_update::current_version()
+        );
         return ExitCode::from(0);
     }
     if !args.iter().any(|a| a == "--yes" || a == "-y") {

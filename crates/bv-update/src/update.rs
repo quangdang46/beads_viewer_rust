@@ -94,7 +94,9 @@ pub fn safe_asset_name(name: &str) -> Result<&str, UpdateError> {
 
 /// Parse a `checksums.txt`-style file into filename → sha256.
 /// Mirrors Go `parseChecksums`: skips blanks/invalid, rejects duplicates.
-pub fn parse_checksums(data: &str) -> Result<std::collections::HashMap<String, String>, UpdateError> {
+pub fn parse_checksums(
+    data: &str,
+) -> Result<std::collections::HashMap<String, String>, UpdateError> {
     use std::collections::HashMap;
     let mut out = HashMap::new();
     for line in data.lines() {
@@ -112,10 +114,7 @@ pub fn parse_checksums(data: &str) -> Result<std::collections::HashMap<String, S
         if rest.is_empty() {
             continue;
         }
-        let filename = rest
-            .trim_start_matches(['*', ' '])
-            .trim()
-            .to_string();
+        let filename = rest.trim_start_matches(['*', ' ']).trim().to_string();
         if filename.is_empty() {
             continue;
         }
@@ -143,7 +142,9 @@ pub fn verify_checksum(path: &Path, expected: &str) -> Result<(), UpdateError> {
     let mut h = Sha256::new();
     let mut buf = [0u8; 65536];
     loop {
-        let n = f.read(&mut buf).map_err(|e| UpdateError::Io(e.to_string()))?;
+        let n = f
+            .read(&mut buf)
+            .map_err(|e| UpdateError::Io(e.to_string()))?;
         if n == 0 {
             break;
         }
@@ -157,11 +158,7 @@ pub fn verify_checksum(path: &Path, expected: &str) -> Result<(), UpdateError> {
 }
 
 fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
-    bytes
-        .as_ref()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    bytes.as_ref().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Download `url` to `dest`, enforcing `expected_size` when > 0.
@@ -254,7 +251,8 @@ fn write_bounded(src: impl Read, dest: &Path) -> Result<(), UpdateError> {
     let out = std::fs::File::create(dest).map_err(|e| UpdateError::Extract(e.to_string()))?;
     let mut out = std::io::BufWriter::new(out);
     let n = std::io::copy(&mut src, &mut out).map_err(|e| UpdateError::Extract(e.to_string()))?;
-    out.flush().map_err(|e| UpdateError::Extract(e.to_string()))?;
+    out.flush()
+        .map_err(|e| UpdateError::Extract(e.to_string()))?;
     if n > MAX_DOWNLOAD_BYTES {
         return Err(UpdateError::Extract(format!(
             "extracted binary exceeds maximum size {MAX_DOWNLOAD_BYTES}"
@@ -272,10 +270,14 @@ fn extract_from_tar_gz(archive: &Path, dest: &Path) -> Result<(), UpdateError> {
     let f = std::fs::File::open(archive).map_err(|e| UpdateError::Extract(e.to_string()))?;
     let gz = flate2::read::GzDecoder::new(f);
     let mut tar = tar::Archive::new(gz);
-    let entries = tar.entries().map_err(|e| UpdateError::Extract(e.to_string()))?;
+    let entries = tar
+        .entries()
+        .map_err(|e| UpdateError::Extract(e.to_string()))?;
     for entry in entries {
         let entry = entry.map_err(|e| UpdateError::Extract(e.to_string()))?;
-        let path = entry.path().map_err(|e| UpdateError::Extract(e.to_string()))?;
+        let path = entry
+            .path()
+            .map_err(|e| UpdateError::Extract(e.to_string()))?;
         let name = path.to_string_lossy().into_owned();
         if !binary_name_in_archive(&name) {
             continue;
@@ -283,7 +285,10 @@ fn extract_from_tar_gz(archive: &Path, dest: &Path) -> Result<(), UpdateError> {
         if entry.header().entry_type().is_dir() {
             continue;
         }
-        let size = entry.header().size().map_err(|e| UpdateError::Extract(e.to_string()))?;
+        let size = entry
+            .header()
+            .size()
+            .map_err(|e| UpdateError::Extract(e.to_string()))?;
         if size > MAX_DOWNLOAD_BYTES {
             return Err(UpdateError::Extract(format!(
                 "extracted binary size {size} exceeds maximum {MAX_DOWNLOAD_BYTES}"
@@ -298,7 +303,9 @@ fn extract_from_zip(archive: &Path, dest: &Path) -> Result<(), UpdateError> {
     let f = std::fs::File::open(archive).map_err(|e| UpdateError::Extract(e.to_string()))?;
     let mut zip = zip::ZipArchive::new(f).map_err(|e| UpdateError::Extract(e.to_string()))?;
     for i in 0..zip.len() {
-        let entry = zip.by_index(i).map_err(|e| UpdateError::Extract(e.to_string()))?;
+        let entry = zip
+            .by_index(i)
+            .map_err(|e| UpdateError::Extract(e.to_string()))?;
         let name = entry.name().to_string();
         if !binary_name_in_archive(&name) || entry.is_dir() {
             continue;
@@ -368,7 +375,9 @@ pub fn perform_update(
         let sum_path = tmp.join("checksums.txt");
         if let Err(e) = download_file(&sum_asset.browser_download_url, &sum_path, sum_asset.size) {
             cleanup_tmp();
-            return Err(UpdateError::Download(format!("checksum download failed: {e}")));
+            return Err(UpdateError::Download(format!(
+                "checksum download failed: {e}"
+            )));
         }
         let data =
             std::fs::read_to_string(&sum_path).map_err(|e| UpdateError::Io(e.to_string()))?;
@@ -416,7 +425,10 @@ pub fn perform_update(
 
     // Verify the new binary runs.
     progress("Verifying new binary...");
-    match std::process::Command::new(&new_bin).arg("--version").output() {
+    match std::process::Command::new(&new_bin)
+        .arg("--version")
+        .output()
+    {
         Ok(out) if out.status.success() => {}
         Ok(out) => {
             cleanup_tmp();
@@ -435,7 +447,10 @@ pub fn perform_update(
     // Backup: rename current out of the way (avoids ETXTBSY / file-in-use),
     // fall back to copy so an existing backup is never destroyed first.
     let backup = backup_path(&binary_path);
-    progress(&format!("Backing up current binary to {}...", backup.display()));
+    progress(&format!(
+        "Backing up current binary to {}...",
+        backup.display()
+    ));
     let mut moved_for_backup = false;
     if std::fs::rename(&binary_path, &backup).is_ok() {
         moved_for_backup = true;
@@ -462,13 +477,17 @@ pub fn perform_update(
                     binary_path.display()
                 )));
             }
-            return Err(UpdateError::Install("installation failed (restored from backup)".into()));
+            return Err(UpdateError::Install(
+                "installation failed (restored from backup)".into(),
+            ));
         }
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        if let Err(e) = std::fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o755)) {
+        if let Err(e) =
+            std::fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o755))
+        {
             eprintln!("Warning: could not set permissions: {e}");
         }
     }
@@ -575,7 +594,8 @@ mod tests {
         {
             let f = std::fs::File::create(&arch).unwrap();
             let mut zip = zip::ZipWriter::new(f);
-            zip.start_file("bvr", zip::write::SimpleFileOptions::default()).unwrap();
+            zip.start_file("bvr", zip::write::SimpleFileOptions::default())
+                .unwrap();
             use std::io::Write as _;
             zip.write_all(b"fake-bvr-binary").unwrap();
             zip.finish().unwrap();

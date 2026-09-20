@@ -367,6 +367,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn alias_upgrade_goes_to_update() {
         assert_eq!(
             rewrite_args(&s(&["bvr", "upgrade"])),

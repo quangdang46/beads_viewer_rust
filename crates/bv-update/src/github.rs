@@ -81,7 +81,9 @@ fn agent(timeout: Duration) -> ureq::Agent {
 
 /// Apply `Authorization: Bearer <token>` — callers only invoke this for
 /// api.github.com requests, never for CDN redirect targets.
-fn with_auth(req: ureq::RequestBuilder<ureq::typestate::WithoutBody>) -> ureq::RequestBuilder<ureq::typestate::WithoutBody> {
+fn with_auth(
+    req: ureq::RequestBuilder<ureq::typestate::WithoutBody>,
+) -> ureq::RequestBuilder<ureq::typestate::WithoutBody> {
     match github_token() {
         Some(tok) => req.header("Authorization", &format!("Bearer {tok}")),
         None => req,
@@ -172,10 +174,9 @@ impl Release {
 
     /// Find the `checksums.txt`-style asset (`.sha256` sidecar also accepted).
     pub fn find_checksum_asset(&self) -> Option<&Asset> {
-        self.assets.iter().find(|a| {
-            a.name == "checksums.txt"
-                || a.name.ends_with(".sha256")
-        })
+        self.assets
+            .iter()
+            .find(|a| a.name == "checksums.txt" || a.name.ends_with(".sha256"))
     }
 }
 
