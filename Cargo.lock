@@ -161,7 +161,7 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
 name = "bv"
-version = "0.1.7"
+version = "0.2.0"
 dependencies = [
  "bv-analysis",
  "bv-core",
@@ -180,7 +180,7 @@ dependencies = [
 
 [[package]]
 name = "bv-analysis"
-version = "0.1.7"
+version = "0.2.0"
 dependencies = [
  "bv-core",
  "bv-correlation",
@@ -193,7 +193,7 @@ dependencies = [
 
 [[package]]
 name = "bv-core"
-version = "0.1.7"
+version = "0.2.0"
 dependencies = [
  "jiff",
  "rusqlite",
@@ -206,7 +206,7 @@ dependencies = [
 
 [[package]]
 name = "bv-correlation"
-version = "0.1.7"
+version = "0.2.0"
 dependencies = [
  "bv-core",
  "jiff",
@@ -217,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "bv-export"
-version = "0.1.7"
+version = "0.2.0"
 dependencies = [
  "bv-core",
  "jiff",
@@ -229,7 +229,7 @@ dependencies = [
 
 [[package]]
 name = "bv-graph-core"
-version = "0.1.7"
+version = "0.2.0"
 dependencies = [
  "getrandom 0.4.3",
  "serde",
@@ -237,7 +237,7 @@ dependencies = [
 
 [[package]]
 name = "bv-robot"
-version = "0.1.7"
+version = "0.2.0"
 dependencies = [
  "bv-core",
  "jiff",
@@ -247,7 +247,7 @@ dependencies = [
 
 [[package]]
 name = "bv-search"
-version = "0.1.7"
+version = "0.2.0"
 dependencies = [
  "serde",
  "sha2",
@@ -255,7 +255,7 @@ dependencies = [
 
 [[package]]
 name = "bv-tui"
-version = "0.1.7"
+version = "0.2.0"
 dependencies = [
  "arboard",
  "bv-analysis",
@@ -276,7 +276,7 @@ dependencies = [
 
 [[package]]
 name = "bv-update"
-version = "0.1.7"
+version = "0.2.0"
 dependencies = [
  "flate2",
  "serde",
