@@ -64,6 +64,19 @@ fn main() -> ExitCode {
         return ExitCode::from(0);
     }
 
+    // Self-update (Go: --check-update / --update-dry-run / --update / --rollback).
+    if presence.has("check-update") {
+        return run_check_update();
+    }
+    if presence.has("update-dry-run") {
+        return run_update_dry_run();
+    }
+    if presence.has("update") {
+        return run_update(&args);
+    }
+    if presence.has("rollback") {
+        return run_rollback();
+    }
     if presence.has("robot-help") {
         print_robot_help();
         return ExitCode::from(0);
@@ -1211,6 +1224,139 @@ fn run_save_baseline(desc: &str) -> ExitCode {
                     ExitCode::from(1)
                 }
             }
+        }
+    }
+}
+
+/// Handle `--check-update` (Go bv-182): report whether a newer release exists.
+fn run_check_update() -> ExitCode {
+    match bv_update::github::check_for_updates() {
+        Err(e) => {
+            eprintln!("Error checking for updates: {e}");
+            ExitCode::from(1)
+        }
+        Ok(None) => {
+            println!(
+                "bvr is up to date (version {})",
+                bv_update::current_version()
+            );
+            ExitCode::from(0)
+        }
+        Ok(Some(info)) => {
+            println!(
+                "New version available: {} (current: {})",
+                info.new_version,
+                bv_update::current_version()
+            );
+            println!("Download: {}", info.release_url);
+            println!("\nRun 'bvr --update' to update automatically");
+            ExitCode::from(0)
+        }
+    }
+}
+
+/// Handle `--update-dry-run`: report what an update would fetch/verify/install.
+fn run_update_dry_run() -> ExitCode {
+    let release = match bv_update::github::get_latest_release() {
+        Err(e) => {
+            eprintln!("Error fetching release info: {e}");
+            return ExitCode::from(1);
+        }
+        Ok(r) => r,
+    };
+    if !bv_update::is_newer_than_current(&release.tag_name) {
+        println!(
+            "bvr is already up to date (version {})",
+            bv_update::current_version()
+        );
+        return ExitCode::from(0);
+    }
+    println!(
+        "[dry-run] Would update bvr from {} to {}",
+        bv_update::current_version(),
+        release.tag_name
+    );
+    match release.find_platform_asset() {
+        Some(asset) => {
+            println!(
+                "[dry-run] Would download {} ({} bytes)",
+                asset.name, asset.size
+            );
+            println!("[dry-run] From: {}", asset.browser_download_url);
+        }
+        None => {
+            eprintln!("[dry-run] No matching release asset found for this platform");
+        }
+    }
+    match release.find_checksum_asset() {
+        Some(sum) => println!("[dry-run] Would verify SHA-256 checksum via {}", sum.name),
+        None => println!(
+            "[dry-run] Warning: no checksum file found; download integrity could not be verified"
+        ),
+    }
+    println!("[dry-run] No changes made. Run 'bvr --update' to apply.");
+    ExitCode::from(0)
+}
+
+/// Handle `--update` (Go bv-182): confirm unless `--yes`, then self-update.
+fn run_update(args: &[String]) -> ExitCode {
+    let release = match bv_update::github::get_latest_release() {
+        Err(e) => {
+            eprintln!("Error fetching release info: {e}");
+            return ExitCode::from(1);
+        }
+        Ok(r) => r,
+    };
+    if !bv_update::is_newer_than_current(&release.tag_name) {
+        println!(
+            "bvr is already up to date (version {})",
+            bv_update::current_version()
+        );
+        return ExitCode::from(0);
+    }
+    if !args.iter().any(|a| a == "--yes" || a == "-y") {
+        print!(
+            "Update bvr from {} to {}? [Y/n]: ",
+            bv_update::current_version(),
+            release.tag_name
+        );
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        let mut response = String::new();
+        if std::io::stdin().read_line(&mut response).is_ok() {
+            let r = response.trim().to_lowercase();
+            if !r.is_empty() && r != "y" && r != "yes" {
+                println!("Update cancelled");
+                return ExitCode::from(0);
+            }
+        }
+    }
+    match bv_update::perform_update(&release, &|line| println!("{line}")) {
+        Ok(result) => {
+            println!("{}", result.message);
+            if let Some(backup) = result.backup_path {
+                println!("Backup saved to: {backup}");
+                println!("Run 'bvr --rollback' to restore if needed");
+            }
+            ExitCode::from(0)
+        }
+        Err(e) => {
+            eprintln!("Update failed: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Handle `--rollback` (Go bv-182): restore the previous binary from backup.
+fn run_rollback() -> ExitCode {
+    match bv_update::perform_rollback() {
+        Ok(()) => {
+            println!("Rollback complete");
+            ExitCode::from(0)
+        }
+        Err(e) => {
+            eprintln!("Rollback failed: {e}");
+            ExitCode::from(1)
         }
     }
 }
