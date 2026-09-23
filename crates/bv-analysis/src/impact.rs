@@ -94,6 +94,97 @@ pub fn compute_urgency(labels: &[String], created_at: Option<&str>, now: &jiff::
     score.min(1.0)
 }
 
+/// Go `computeTimeToImpact` explanation (pkg/analysis/priority.go:512).
+pub fn time_to_impact_explanation(
+    critical_path_depth: f64,
+    estimated_minutes: Option<i64>,
+    median_minutes: i64,
+) -> String {
+    let (effective, source) = match estimated_minutes {
+        Some(m) if m > 0 => (m, "explicit"),
+        _ => (median_minutes, "median"),
+    };
+    if critical_path_depth >= 3.0 {
+        format!(
+            "Deep in critical path (depth {:.0}), {} estimate {}m",
+            critical_path_depth, source, effective
+        )
+    } else if critical_path_depth >= 1.0 {
+        format!(
+            "On dependency chain (depth {:.0}), {} estimate {}m",
+            critical_path_depth, source, effective
+        )
+    } else {
+        format!("Leaf node, {} estimate {}m", source, effective)
+    }
+}
+
+/// Go `computeUrgency` explanation (pkg/analysis/priority.go:590).
+pub fn urgency_explanation(
+    labels: &[String],
+    created_at: Option<&str>,
+    now: &jiff::Timestamp,
+) -> String {
+    let mut reasons: Vec<String> = Vec::new();
+    let mut urgent_label = String::new();
+    'outer: for label in labels {
+        let lower = label.to_lowercase();
+        for urgent in URGENCY_LABELS {
+            if lower.contains(urgent) {
+                urgent_label = label.clone();
+                break 'outer;
+            }
+        }
+    }
+    if !urgent_label.is_empty() {
+        reasons.push(format!("has '{urgent_label}' label"));
+    }
+    let Some(raw) = created_at else {
+        return reasons.join(", ");
+    };
+    let Ok(created) = raw.parse::<jiff::Timestamp>() else {
+        return reasons.join(", ");
+    };
+    let days = (*now - created).total(jiff::Unit::Second).unwrap_or(0.0) / 86400.0;
+    if days >= 14.0 {
+        reasons.push(format!("aging ({days:.0} days)"));
+    }
+    if reasons.is_empty() {
+        return String::new();
+    }
+    reasons.join(", ")
+}
+
+/// Go `generateRiskExplanation` (pkg/analysis/risk.go:117).
+pub fn risk_explanation(r: &RiskSignals) -> String {
+    if r.composite_risk < 0.2 {
+        return "Low risk - stable dependency structure".to_string();
+    }
+    let mut factors: Vec<&str> = Vec::new();
+    if r.fan_variance > 0.5 {
+        factors.push("high dependency variance");
+    }
+    if r.activity_churn > 0.6 {
+        factors.push("high activity churn");
+    }
+    if r.cross_repo_risk > 0.3 {
+        factors.push("cross-repo dependencies");
+    }
+    if r.status_risk > 0.5 {
+        factors.push("status indicates potential blockers");
+    }
+    if factors.is_empty() {
+        return "Moderate risk".to_string();
+    }
+    // Go `joinRiskFactors`: "a", "a and b", "a, b, and c".
+    let joined = match factors.len() {
+        1 => factors[0].to_string(),
+        2 => format!("{} and {}", factors[0], factors[1]),
+        n => format!("{}, and {}", factors[..n - 1].join(", "), factors[n - 1]),
+    };
+    format!("Risk factors: {joined}")
+}
+
 /// Risk signals composite — port of Go `pkg/analysis/risk.go` weights.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct RiskSignals {
@@ -293,7 +384,9 @@ pub struct IssueImpact {
     pub reasons: Vec<String>,
 }
 
-/// Golden field names + order.
+/// Golden field names + order. Mirrors Go `ScoreBreakdown`
+/// (pkg/analysis/priority.go:24): weighted values first, then the raw
+/// normalized values, then the explanation text, then the risk detail.
 #[derive(Debug, Clone, Serialize)]
 pub struct Breakdown {
     pub pagerank: f64,
@@ -304,6 +397,34 @@ pub struct Breakdown {
     pub time_to_impact: f64,
     pub urgency: f64,
     pub risk: f64,
+    pub pagerank_norm: f64,
+    pub betweenness_norm: f64,
+    pub blocker_ratio_norm: f64,
+    pub staleness_norm: f64,
+    pub priority_boost_norm: f64,
+    pub time_to_impact_norm: f64,
+    pub urgency_norm: f64,
+    pub risk_norm: f64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub time_to_impact_explanation: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub urgency_explanation: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub risk_explanation: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub risk_signals: Option<RiskSignalsDetail>,
+}
+
+/// Go `RiskSignals` JSON shape (pkg/analysis/risk.go:20) including `explanation`.
+#[derive(Debug, Clone, Serialize)]
+pub struct RiskSignalsDetail {
+    pub fan_variance: f64,
+    pub activity_churn: f64,
+    pub cross_repo_risk: f64,
+    pub status_risk: f64,
+    pub composite_risk: f64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub explanation: String,
 }
 
 /// Compute the median estimated_minutes across all issues that have estimates.
@@ -386,6 +507,7 @@ pub fn compute_impact_scores(inputs: &ImpactInputs) -> Vec<IssueImpact> {
         let urgency_norm = compute_urgency(&issue.labels, issue.created_at.as_deref(), &inputs.now);
         let risk = compute_risk_signals(issue, inputs.g, inputs.issues, &inputs.now);
 
+        let risk_expl = risk_explanation(&risk);
         let b = Breakdown {
             pagerank: pr_norm * super::scoring::WEIGHT_PAGE_RANK,
             betweenness: bw_norm * super::scoring::WEIGHT_BETWEENNESS,
@@ -395,6 +517,33 @@ pub fn compute_impact_scores(inputs: &ImpactInputs) -> Vec<IssueImpact> {
             time_to_impact: tti_norm * super::scoring::WEIGHT_TIME_TO_IMPACT,
             urgency: urgency_norm * super::scoring::WEIGHT_URGENCY,
             risk: risk.composite_risk * super::scoring::WEIGHT_RISK,
+            pagerank_norm: pr_norm,
+            betweenness_norm: bw_norm,
+            blocker_ratio_norm: blocker_norm,
+            staleness_norm,
+            priority_boost_norm: prio_norm,
+            time_to_impact_norm: tti_norm,
+            urgency_norm,
+            risk_norm: risk.composite_risk,
+            time_to_impact_explanation: time_to_impact_explanation(
+                depth,
+                issue.estimated_minutes,
+                median_minutes,
+            ),
+            urgency_explanation: urgency_explanation(
+                &issue.labels,
+                issue.created_at.as_deref(),
+                &inputs.now,
+            ),
+            risk_explanation: risk_expl.clone(),
+            risk_signals: Some(RiskSignalsDetail {
+                fan_variance: risk.fan_variance,
+                activity_churn: risk.activity_churn,
+                cross_repo_risk: risk.cross_repo_risk,
+                status_risk: risk.status_risk,
+                composite_risk: risk.composite_risk,
+                explanation: risk_expl,
+            }),
         };
         let score = b.pagerank
             + b.betweenness
