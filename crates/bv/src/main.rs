@@ -659,6 +659,26 @@ fn load_issues_auto(
     load_issues_auto_meta(cwd, as_of).map(|(i, h, c, _)| (i, h, c))
 }
 
+/// Derive `SourceMeta` for a repo that was loaded by `load_issues_auto`. Used
+/// by command handlers that build their envelope from the 3-tuple loader.
+fn source_meta_for(cwd: &std::path::Path, issues: &[bv_core::model::Issue]) -> SourceMeta {
+    if let Ok(dir) = bv_core::discovery::get_beads_dir(cwd) {
+        if let Ok(Some(jsonl)) = bv_core::discovery::find_jsonl_path_with_warnings(&dir, |_| {}) {
+            return SourceMeta {
+                path: jsonl.to_string_lossy().to_string(),
+                kind: "jsonl_local".to_string(),
+                valid: issues.len(),
+                errors: 0,
+                skipped: 0,
+            };
+        }
+    }
+    SourceMeta {
+        valid: issues.len(),
+        ..Default::default()
+    }
+}
+
 /// Go `RobotContext` loader — returns the issues, their hash, the resolved
 /// `--as-of` commit, and the source provenance the envelope reports.
 fn load_issues_auto_meta(
@@ -3880,7 +3900,8 @@ fn run_robot_alerts() -> ExitCode {
 
     // Go robot-alerts embeds the full RobotEnvelope (output_format+version)
     // and provides non-empty usage hints.
-    let mut payload = full_envelope_json(&hash);
+    let source = source_meta_for(&cwd, &issues);
+    let mut payload = full_envelope_json_with_source(&hash, Some(&source), &issues);
     payload["alerts"] = serde_json::to_value(&result.alerts).unwrap_or_default();
     payload["summary"] = serde_json::json!({
         "total": result.alerts.len(),
