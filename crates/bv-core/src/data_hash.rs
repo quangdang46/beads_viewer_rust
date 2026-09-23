@@ -449,7 +449,11 @@ mod tests {
         let h1 = compute_data_hash(&[a.clone(), b.clone()]);
         let h2 = compute_data_hash(&[b, a]);
         assert_eq!(h1, h2);
-        assert_eq!(h1.len(), 16);
+        // v0.25.0 returns the full SHA-256 digest as 64 lowercase hex chars
+        // (`fmt.Sprintf("%x", sha256.Sum256(raw))`). v0.20.0 emitted a
+        // 16-char truncation, so this assertion changed with the algorithm.
+        assert_eq!(h1.len(), 64);
+        assert!(h1.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
     #[test]
