@@ -36,6 +36,35 @@ fn envelope_schema() -> Value {
             "data_hash": {"type": "string", "description": "Fingerprint of source beads.jsonl for cache validation"},
             "output_format": {"type": "string", "enum": ["json", "toon"], "description": "Output format used (json or toon)"},
             "version": {"type": "string", "description": "bv version that generated this output"},
+            // v0.25.0 added the source-authority and scope half of the envelope.
+            "source_path": {"type": "string", "description": "File the issue set was loaded from (or '<beads>@<rev>' for --as-of, or the workspace config path)"},
+            "source_kind": {"type": "string", "enum": ["jsonl_local", "jsonl_worktree", "sqlite", "git", "workspace"], "description": "Kind of source behind source_path"},
+            "source_authority": {
+                "type": "object",
+                "description": "Per-source accounting; readiness is provisional and claim_safe is false when any required source is failed, incomplete, stale, or unknown",
+                "properties": {
+                    "state": {"type": "string", "enum": ["complete", "partial", "unknown"]},
+                    "claim_safe": {"type": "boolean"},
+                    "readiness": {"type": "string", "enum": ["proven", "provisional"]},
+                    "sources": {"type": "array", "items": {"type": "object"}},
+                },
+                "required": ["state", "claim_safe", "readiness", "sources"],
+            },
+            "authority_hash": {"type": "string", "description": "Fingerprint of source identities, source data, and completeness diagnostics before view projection"},
+            "scope": {
+                "type": "object",
+                "description": "Active --label/--recipe/--repo scoping; 'unsupported' lists scoping flags this command could not honour (for example as_of for commands that read sprint files or live git history)",
+                "properties": {
+                    "label": {"type": "string"},
+                    "recipe": {"type": "string"},
+                    "repo": {"type": "string"},
+                    "unsupported": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+            "scope_hash": {"type": "string", "description": "Fingerprint of selected candidates and active scope, distinct from source authority"},
+            "as_of": {"type": "string", "description": "The --as-of ref when time-travelling"},
+            "as_of_commit": {"type": "string", "description": "Resolved commit SHA for --as-of"},
+            "load_stats": {"type": "object", "description": "Present only when records were dropped during load (#190)"},
         },
         "required": ["generated_at", "data_hash"],
     })
