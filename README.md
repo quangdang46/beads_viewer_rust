@@ -287,7 +287,7 @@ Config file: `~/.config/bv/config.yaml` (e.g. `theme: light`).
 ## Limitations
 
 - **Port in progress**: robot CLI lands first (usable by agents before TUI completes); see roadmap in `COMPREHENSIVE_PLAN_FOR_FORT_BEADS_VIEWER.md`.
-- Parity target is Go bv **v0.20.0**; newer upstream features arrive via monthly sync audits post-release.
+- Parity target is Go bv **v0.25.0** (was v0.20.0); newer upstream features arrive via monthly sync audits post-release.
 - Correlation confidence depends on commit hygiene — repos without bead-ID references get weaker temporal-only matches.
 - Semantic search uses a lightweight hash embedder by design (no model downloads); ranking quality ≠ embedding-model-based tools.
 - Windows terminal support requires Windows Terminal + Nerd Font for glyphs.

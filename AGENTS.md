@@ -73,16 +73,18 @@ cargo fmt --all
 
 ## The One Non-Negotiable: Compatibility Contract
 
-Everything in this repo exists to produce a **drop-in replacement** for Go bv v0.20.0. These contracts are verified by differential testing against frozen Go goldens (`golden/`, captured from commit `9ace029`):
+Everything in this repo exists to produce a **drop-in replacement** for Go bv **v0.25.0**. These contracts are verified by differential testing against frozen Go goldens (`golden/`, captured from commit `18afafa`; see `golden/METADATA.txt`):
 
 1. **Robot JSON schemas** — field-for-field identical, stable field order.
-2. **`data_hash`** — byte-equal sha256 algorithm (see plan §3 item 2).
+2. **`data_hash`** — byte-equal sha256 algorithm. **NOTE:** Go rewrote this between v0.20.0 and v0.25.0 — v0.20.0 hashed flat NUL-joined fields; v0.25.0 (`pkg/analysis/cache.go:167`) uses a fingerprint algorithm (`writeUintHash(len)` then `ID` + `ContentHash` + `DependencyHash` per issue). `crates/bv-core/src/data_hash.rs` still implements the **v0.20.0** form, so `golden_comparison` is RED until that is ported. See the envelope/hash issue.
 3. **CLI surface** — same flags, modifier-requires validation, argv rewriting.
 4. **Exit codes** — 0 success / 1 general+critical-drift / 2 usage+warning-drift.
 5. **TOON format** — byte-stable vs golden corpus (`golden/toon/`).
 6. **Count semantics (#165)** — `open_count` = status exactly `open`; partition invariant `not_closed == actionable + not_actionable`.
 
-When porting any Go logic: read the Go source first (reference clone at `./beads_viewer/`, commit `9ace029`), copy constants EXACTLY, then write Rust. When in doubt, the Go code wins over this document.
+v0.25.0 also added five envelope fields Rust does not yet emit: `source_path`, `source_kind`, `source_authority`, `authority_hash`, `scope_hash`. Rust additionally emits `unblocks`, which v0.25.0 does not.
+
+When porting any Go logic: read the Go source first (reference clone at `./beads_viewer/`, commit `18afafa`), copy constants EXACTLY, then write Rust. When in doubt, the Go code wins over this document.
 
 Full design rationale: [COMPREHENSIVE_PLAN_FOR_FORT_BEADS_VIEWER.md](COMPREHENSIVE_PLAN_FOR_FORT_BEADS_VIEWER.md).
 
@@ -139,8 +141,9 @@ A task is NOT complete until formatted, tested, committed, AND pushed.
 
 ## Upstream Sync Policy
 
-- Parity phase: frozen on upstream `9ace029`. Do NOT pull upstream changes.
-- Post-v0.21.0-rust: monthly audits; cherry-pick compatible fixes; regenerate affected goldens.
+- Parity phase: frozen on upstream `18afafa` (v0.25.0). Do NOT pull upstream changes. The previous target was `9ace029` (v0.20.0); goldens were rebaselined to v0.25.0 in commit `26c0b03`.
+- **Regenerating goldens:** `scripts/capture_goldens.sh` only WARNs on a SHA mismatch and does not update `golden/METADATA.txt` by itself. Commands that fail (e.g. `--robot-history` on non-git fixtures) leave the existing golden untouched — verify `golden/METADATA.txt` `stale_pending_recapture` after any run.
+- Post-v0.25.0-rust: monthly audits; cherry-pick compatible fixes; regenerate affected goldens.
 
 ---
 
