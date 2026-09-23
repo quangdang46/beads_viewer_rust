@@ -999,6 +999,7 @@ fn run_robot_triage() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    let source = source_meta_for(&cwd, &issues);
     if issues.is_empty() {
         println!(
             "{{\"generated_at\":\"{}\",\"data_hash\":\"empty\",\"triage\":{{}}}}",
@@ -1180,22 +1181,30 @@ fn run_robot_triage() -> ExitCode {
         "velocity": out.velocity,
     });
 
-    // Pre-built br commands (Go parity).
+    // Go `buildCommands` (pkg/analysis/triage.go:1243): helper commands come
+    // from the live tracker route's `actions`. `show_top`/`claim_top` are the
+    // tracker's shell strings (empty when no route is established) and
+    // `list_ready`/`list_blocked` are always empty — there is no unique route
+    // to name. `refresh_triage` is literally "bv --robot-triage".
     let top_id = out
         .recommendations
         .first()
         .map(|r| r.id.as_str())
         .unwrap_or("");
+    let top_actions = bv_core::tracker::build_actions(
+        &bv_core::tracker::resolve_issue_origin(&source.path, top_id),
+        true,
+    );
     let commands = serde_json::json!({
-        "claim_top": format!("br update {top_id} --status in_progress --assignee agent"),
-        "show_top": format!("br show {top_id}"),
-        "list_ready": "br ready".to_string(),
-        "list_blocked": "br list --status blocked".to_string(),
-        "refresh_triage": "bvr --robot-triage".to_string(),
+        "claim_top": top_actions.claim.as_ref().map(|c| c.shell.as_str()).unwrap_or(""),
+        "show_top": top_actions.show.as_ref().map(|c| c.shell.as_str()).unwrap_or(""),
+        "list_ready": "",
+        "list_blocked": "",
+        "refresh_triage": "bv --robot-triage",
     });
 
     let mut env = bv_robot::RobotEnvelope::new(
-        data_hash,
+        data_hash.clone(),
         env!("CARGO_PKG_VERSION"),
         None,
         bv_robot::OutputFormat::Json,
@@ -1244,12 +1253,12 @@ fn run_robot_triage() -> ExitCode {
     if triage_status.slack.state == "skipped" {
         triage_status.slack.reason.clear();
     }
-    let mut payload = serde_json::json!({
-        "generated_at": env.generated_at,
-        "data_hash": env.data_hash,
-        "triage": {
-            "meta": meta,
-            "status": triage_status.to_json_map(),
+    let mut payload = full_envelope_json_with_source(&data_hash, Some(&source), &issues);
+    payload["output_format"] = serde_json::json!(env.output_format);
+    payload["version"] = serde_json::json!(GO_APP_VERSION);
+    let triage_body = serde_json::json!({
+        "meta": meta,
+        "status": triage_status.to_json_map(),
             "quick_ref": {
                 "open_count": out.quick_ref.open_count,
                 "actionable_count": out.quick_ref.actionable_count,
@@ -1264,8 +1273,8 @@ fn run_robot_triage() -> ExitCode {
             "blockers_to_clear": blockers_to_clear,
             "project_health": project_health,
             "commands": commands,
-        },
     });
+    payload["triage"] = triage_body;
     // Add as_of/as_of_commit only when --as-of was used (Go omitempty parity).
     if let Some(ref a) = as_of {
         payload["triage"]["as_of"] = serde_json::json!(a);
