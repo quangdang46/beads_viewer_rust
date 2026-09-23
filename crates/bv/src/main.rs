@@ -659,10 +659,18 @@ fn load_issues_auto(
     load_issues_auto_meta(cwd, as_of).map(|(i, h, c, _)| (i, h, c))
 }
 
-/// Derive `SourceMeta` for a repo that was loaded by `load_issues_auto`. Used
-/// by command handlers that build their envelope from the 3-tuple loader.
-fn source_meta_for(cwd: &std::path::Path, issues: &[bv_core::model::Issue]) -> SourceMeta {
-    if let Ok(dir) = bv_core::discovery::get_beads_dir(cwd) {
+/// Envelope for a command that already loaded `issues` — derives the source
+/// provenance from the current directory so callers do not thread `cwd`.
+fn full_envelope_for(data_hash: &str, issues: &[bv_core::model::Issue]) -> serde_json::Value {
+    let source = source_meta_for(issues);
+    full_envelope_json_with_source(data_hash, Some(&source), issues)
+}
+
+/// Derive `SourceMeta` for the current working directory. Used by command
+/// handlers that build their envelope without an explicit cwd in scope.
+fn source_meta_for(issues: &[bv_core::model::Issue]) -> SourceMeta {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    if let Ok(dir) = bv_core::discovery::get_beads_dir(&cwd) {
         if let Ok(Some(jsonl)) = bv_core::discovery::find_jsonl_path_with_warnings(&dir, |_| {}) {
             return SourceMeta {
                 path: jsonl.to_string_lossy().to_string(),
@@ -795,7 +803,7 @@ fn run_robot_next() -> ExitCode {
         }
     };
 
-    let mut payload = full_envelope_json_with_source(&hash, Some(&source), &issues);
+    let mut payload = full_envelope_for(&hash, &issues);
     if let Some(ref a) = as_of {
         payload["as_of"] = serde_json::json!(a);
     }
@@ -999,7 +1007,7 @@ fn run_robot_triage() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let source = source_meta_for(&cwd, &issues);
+    let source = source_meta_for(&issues);
     if issues.is_empty() {
         println!(
             "{{\"generated_at\":\"{}\",\"data_hash\":\"empty\",\"triage\":{{}}}}",
@@ -1253,7 +1261,7 @@ fn run_robot_triage() -> ExitCode {
     if triage_status.slack.state == "skipped" {
         triage_status.slack.reason.clear();
     }
-    let mut payload = full_envelope_json_with_source(&data_hash, Some(&source), &issues);
+    let mut payload = full_envelope_for(&data_hash, &issues);
     payload["output_format"] = serde_json::json!(env.output_format);
     payload["version"] = serde_json::json!(GO_APP_VERSION);
     let triage_body = serde_json::json!({
@@ -2135,16 +2143,6 @@ fn load_and_analyze() -> Result<AnalysisTuple, ExitCode> {
     Ok((issues, data_hash, p1, status, g))
 }
 
-fn envelope_json(data_hash: &str) -> serde_json::Value {
-    serde_json::json!({
-        "generated_at": jiff_now(),
-        "data_hash": data_hash,
-        // output_format/version omitted: Go handlers with hand-rolled inline
-        // output structs (triage, plan, insights, priority, label-*, suggest)
-        // don't embed RobotEnvelope, so those keys are absent there too.
-    })
-}
-
 /// Go `NewRobotEnvelope` parity: for handlers whose Go output embeds the
 /// full `RobotEnvelope` struct (alerts, next, history, …) the envelope also
 /// carries `output_format` and `version` — golden-verified.
@@ -2519,7 +2517,7 @@ fn run_robot_insights() -> ExitCode {
         g.edge_count() as f64 / (n * (n - 1.0))
     };
 
-    let mut payload = envelope_json(&hash);
+    let mut payload = full_envelope_for(&hash, &issues);
     payload["analysis_config"] = insights_analysis_config(g.len());
     // Go parity: only "approximate" reason is non-empty for skipped entries.
     // All other skipped metrics emit {"state":"skipped"} without reason field.
@@ -3756,7 +3754,7 @@ fn run_robot_priority(args: &[String]) -> ExitCode {
     });
     recommendations.truncate(10);
 
-    let mut payload = envelope_json(&hash);
+    let mut payload = full_envelope_for(&hash, &issues);
     payload["analysis_config"] = priority_analysis_config(g.len());
     // Real status from phase2 analysis (Go priority uses full config).
     let priority_status = {
@@ -3905,8 +3903,7 @@ fn run_robot_alerts() -> ExitCode {
 
     // Go robot-alerts embeds the full RobotEnvelope (output_format+version)
     // and provides non-empty usage hints.
-    let source = source_meta_for(&cwd, &issues);
-    let mut payload = full_envelope_json_with_source(&hash, Some(&source), &issues);
+    let mut payload = full_envelope_for(&hash, &issues);
     payload["alerts"] = serde_json::to_value(&result.alerts).unwrap_or_default();
     payload["summary"] = serde_json::json!({
         "total": result.alerts.len(),
@@ -3966,7 +3963,7 @@ fn run_robot_graph(args: &[String]) -> ExitCode {
         } else {
             bv_export::graph_export::generate_mermaid_graph(&issues)
         };
-        let mut payload = envelope_json(&hash);
+        let mut payload = full_envelope_for(&hash, &issues);
         payload["format"] = serde_json::json!(fmt);
         payload["graph"] = serde_json::json!(content);
         payload["nodes"] = serde_json::json!(issues.len());
@@ -4210,7 +4207,7 @@ fn run_robot_search(args: &[String]) -> ExitCode {
     }
     results.truncate(limit);
 
-    let mut payload = envelope_json(&hash);
+    let mut payload = full_envelope_for(&hash, &issues);
     payload["query"] = serde_json::json!(query);
     payload["mode"] = serde_json::json!(mode);
     if mode == "hybrid" {
@@ -4261,7 +4258,7 @@ fn run_robot_causality(args: &[String]) -> ExitCode {
     };
     match bv_correlation::causality::build_causality_chain(&bead_id, &events) {
         Some(result) => {
-            let mut payload = envelope_json(&hash);
+            let mut payload = full_envelope_for(&hash, &issues);
             payload["chain"] = serde_json::to_value(&result.chain).unwrap_or_default();
             payload["insights"] = serde_json::to_value(&result.insights).unwrap_or_default();
             emit_json(&payload)
@@ -4321,7 +4318,7 @@ fn run_robot_related(args: &[String]) -> ExitCode {
     related.sort_by(|a, b| b["weight"].as_u64().cmp(&a["weight"].as_u64()));
     related.truncate(max_results);
 
-    let mut payload = envelope_json(&hash);
+    let mut payload = full_envelope_for(&hash, &issues);
     payload["bead_id"] = serde_json::json!(bead_id);
     payload["related"] = serde_json::Value::Array(related);
     emit_json(&payload)
@@ -4363,7 +4360,7 @@ fn run_robot_impact_network(args: &[String]) -> ExitCode {
         bv_correlation::network::sub_network(&network, &target, depth)
     };
 
-    let mut payload = envelope_json(&hash);
+    let mut payload = full_envelope_for(&hash, &issues);
     payload["network"] = serde_json::to_value(&result).unwrap_or_default();
     payload["node_count"] = serde_json::json!(result.nodes.len());
     payload["edge_count"] = serde_json::json!(result.edges.len());
@@ -4388,7 +4385,7 @@ fn run_robot_sprint_list() -> ExitCode {
         }
     };
     let active_id = sprints.iter().find(|s| s.is_active()).map(|s| s.id.clone());
-    let mut payload = envelope_json(&hash);
+    let mut payload = full_envelope_for(&hash, &issues);
     payload["sprint_count"] = serde_json::json!(sprints.len());
     payload["sprints"] = serde_json::to_value(&sprints).unwrap_or_default();
     if let Some(id) = &active_id {
@@ -4445,7 +4442,7 @@ fn run_robot_sprint_show(args: &[String]) -> ExitCode {
         .filter(|d| d["status"] != "closed" && d["status"] != "tombstone")
         .count();
     let closed_count = issue_details.len() - open_count;
-    let mut payload = envelope_json(&hash);
+    let mut payload = full_envelope_for(&hash, &issues);
     payload["sprint"] = serde_json::to_value(sprint).unwrap_or_default();
     payload["issues"] = serde_json::Value::Array(issue_details);
     payload["open_count"] = serde_json::json!(open_count);
@@ -4494,7 +4491,7 @@ fn run_robot_burndown(args: &[String]) -> ExitCode {
     };
     let now = robot_now();
     let (points, total) = bv_core::sprint::calculate_burndown(sprint, &issues, now);
-    let mut payload = envelope_json(&hash);
+    let mut payload = full_envelope_for(&hash, &issues);
     payload["sprint"] = serde_json::to_value(sprint).unwrap_or_default();
     payload["total_issues"] = serde_json::json!(total);
     payload["points"] = serde_json::to_value(&points).unwrap_or_default();
@@ -4541,7 +4538,7 @@ fn run_robot_forecast(args: &[String]) -> ExitCode {
     };
     let now = robot_now();
     let forecast = bv_core::sprint::estimate_forecast(sprint, &issues, now);
-    let mut payload = envelope_json(&hash);
+    let mut payload = full_envelope_for(&hash, &issues);
     payload["sprint"] = serde_json::to_value(sprint).unwrap_or_default();
     match forecast {
         Some(f) => {
@@ -4594,7 +4591,7 @@ fn run_robot_capacity(args: &[String]) -> ExitCode {
         0.0
     };
     let estimated_minutes: i64 = filtered.iter().filter_map(|i| i.estimated_minutes).sum();
-    let mut payload = envelope_json(&hash);
+    let mut payload = full_envelope_for(&hash, &issues);
     payload["capacity"] = serde_json::json!({
         "open_count": open_count,
         "blocked_count": blocked_count,
@@ -4657,7 +4654,7 @@ fn run_robot_explain_correlation(args: &[String]) -> ExitCode {
         eprintln!("Commit {sha} not found in bead {bead_id} correlations");
         return ExitCode::from(1);
     };
-    let mut payload = envelope_json(&hash);
+    let mut payload = full_envelope_for(&hash, &[]);
     payload["explanation"] = serde_json::to_value(hit).unwrap_or_default();
     emit_json(&payload)
 }
@@ -4695,7 +4692,7 @@ fn run_robot_correlation_stats() -> ExitCode {
     let store = bv_correlation::feedback::FeedbackStore::new(&beads_dir);
     let (confirmed, rejected, ignored, accuracy) = store.stats();
 
-    let mut payload = envelope_json(&hash);
+    let mut payload = full_envelope_for(&hash, &_issues);
     payload["stats"] = serde_json::json!({
         "correlated_beads": report.len(),
         "total_correlated_commits": total_commits,
@@ -4748,7 +4745,7 @@ fn run_robot_file_beads(args: &[String]) -> ExitCode {
             .partial_cmp(&a["max_confidence"].as_f64())
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    let mut payload = envelope_json(&hash);
+    let mut payload = full_envelope_for(&hash, &_issues);
     payload["path"] = serde_json::json!(path);
     payload["beads"] = serde_json::Value::Array(beads);
     emit_json(&payload)
@@ -4793,7 +4790,7 @@ fn run_robot_file_hotspots() -> ExitCode {
             .then_with(|| a["path"].as_str().cmp(&b["path"].as_str()))
     });
     hotspots.truncate(20);
-    let mut payload = envelope_json(&hash);
+    let mut payload = full_envelope_for(&hash, &_issues);
     payload["hotspots"] = serde_json::Value::Array(hotspots);
     emit_json(&payload)
 }
@@ -4840,7 +4837,7 @@ fn run_robot_file_relations(args: &[String]) -> ExitCode {
             .then_with(|| a["path"].as_str().cmp(&b["path"].as_str()))
     });
     related.truncate(20);
-    let mut payload = envelope_json(&hash);
+    let mut payload = full_envelope_for(&hash, &_issues);
     payload["path"] = serde_json::json!(path);
     payload["related_files"] = serde_json::Value::Array(related);
     emit_json(&payload)
@@ -5051,7 +5048,7 @@ fn run_robot_blocker_chain(args: &[String]) -> ExitCode {
     };
     match bv_analysis::blocker_chain::get_blocker_chain(&issues, &issue_id) {
         Some(result) => {
-            let mut payload = envelope_json(&hash);
+            let mut payload = full_envelope_for(&hash, &issues);
             payload["result"] = serde_json::to_value(&result).unwrap_or_default();
             emit_json(&payload)
         }
@@ -5137,7 +5134,7 @@ fn run_robot_correlation_feedback(args: &[String], flag: &str, feedback_type: &s
         return ExitCode::from(1);
     }
 
-    let mut payload = envelope_json(&hash);
+    let mut payload = full_envelope_for(&hash, &[]);
     payload["commit"] = serde_json::json!(resolved_sha);
     payload["bead"] = serde_json::json!(bead_id);
     payload["status"] = serde_json::json!(if feedback_type == "confirm" {
@@ -5156,7 +5153,7 @@ fn run_robot_label_health() -> ExitCode {
     };
     let cfg = bv_analysis::label_health::LabelHealthConfig::default();
     let results = bv_analysis::label_health::compute_all_label_health(&issues, &cfg, robot_now());
-    let mut payload = envelope_json(&hash);
+    let mut payload = full_envelope_for(&hash, &issues);
     payload["analysis_config"] = serde_json::to_value(&cfg).unwrap_or_default();
     payload["results"] = serde_json::to_value(&results).unwrap_or_default();
     payload["usage_hints"] = serde_json::json!([
@@ -5174,7 +5171,7 @@ fn run_robot_label_flow() -> ExitCode {
     };
     let cfg = bv_analysis::label_health::LabelHealthConfig::default();
     let flow = bv_analysis::label_health::compute_cross_label_flow(&issues, &cfg);
-    let mut payload = envelope_json(&hash);
+    let mut payload = full_envelope_for(&hash, &issues);
     // Go: nil arrays serialize as null (not []) for empty list fields.
     let mut flow_obj = serde_json::Map::new();
     flow_obj.insert("labels".into(), serde_json::json!(flow.labels));
@@ -5251,7 +5248,7 @@ fn run_robot_label_attention() -> ExitCode {
     let cfg = bv_analysis::label_health::LabelHealthConfig::default();
     let result =
         bv_analysis::label_health::compute_label_attention_scores(&issues, &cfg, robot_now());
-    let mut payload = envelope_json(&hash);
+    let mut payload = full_envelope_for(&hash, &issues);
     // Go: limit comes from --attention-limit flag (default 0 = no limit).
     // Go: if limit flag is 0 (default), limit = len(scores). JSON shows
     // the EFFECTIVE limit, not the raw flag value.
@@ -5315,7 +5312,7 @@ fn run_robot_impact(args: &[String]) -> ExitCode {
         }
     };
     let result = bv_analysis::file_impact::compute_file_impact(&files, &report);
-    let mut payload = envelope_json(&hash);
+    let mut payload = full_envelope_for(&hash, &[]);
     payload["files"] = serde_json::json!(result.files);
     payload["risk_level"] = serde_json::json!(result.risk_level);
     payload["risk_score"] = serde_json::json!(result.risk_score);
@@ -5357,7 +5354,7 @@ fn run_robot_diff(args: &[String]) -> ExitCode {
         }
     };
     let result = bv_analysis::diff::diff_issues(&current, &previous, &ref_str);
-    let mut payload = envelope_json(&hash);
+    let mut payload = full_envelope_for(&hash, &[]);
     payload["diff"] = serde_json::to_value(&result).unwrap_or_default();
     emit_json(&payload)
 }
@@ -5396,7 +5393,7 @@ fn run_robot_not_ready_labels(args: &[String]) -> ExitCode {
         .filter(|i| !i.labels.iter().any(|l| not_ready.contains(l)))
         .map(|i| i.id.as_str())
         .collect();
-    let mut payload = envelope_json(&hash);
+    let mut payload = full_envelope_for(&hash, &issues);
     payload["not_ready_labels"] = serde_json::json!(not_ready);
     payload["total_issues"] = serde_json::json!(issues.len());
     payload["excluded_count"] = serde_json::json!(excluded);
