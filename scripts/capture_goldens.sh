@@ -54,11 +54,23 @@ for fixture in "${FIXTURES[@]}"; do
     for cmd in "${COMMANDS[@]}"; do
         slug=$(echo "$cmd" | tr ' -' '__')
         f="$OUT/${name}__${slug}.json"
-        # Run from a copy of the fixture so .bv state doesn't leak between runs
+        # Capture to a temp file first: a bare `> "$f"` redirect truncates the
+        # golden BEFORE the command runs, so a command that fails (e.g.
+        # --robot-history outside a git repo) silently leaves a 0-byte golden
+        # that looks like a legitimate capture. Only replace the golden on
+        # success, so a failed command leaves the previous corpus intact.
+        tmp="$f.tmp"
+        rm -f "$tmp"
         if [ "$fixture" != "." ]; then
-            (cd "$fixture" && BV_NO_CACHE=1 BV_TEST_MODE=1 "$OLDPWD/$BV" $cmd > "$OLDPWD/$f" 2>/dev/null) || echo "SKIP (cmd failed): $name $cmd"
+            (cd "$fixture" && BV_NO_CACHE=1 BV_TEST_MODE=1 "$OLDPWD/$BV" $cmd > "$OLDPWD/$tmp" 2>/dev/null)
         else
-            (BV_NO_CACHE=1 BV_TEST_MODE=1 $BV $cmd > "$f" 2>/dev/null) || echo "SKIP (cmd failed): selfrepo $cmd"
+            (BV_NO_CACHE=1 BV_TEST_MODE=1 $BV $cmd > "$tmp" 2>/dev/null)
+        fi
+        if [ $? -ne 0 ] || [ ! -s "$tmp" ]; then
+            echo "SKIP (cmd failed, golden left unchanged): $name $cmd"
+            rm -f "$tmp"
+        else
+            mv "$tmp" "$f"
         fi
     done
 done
