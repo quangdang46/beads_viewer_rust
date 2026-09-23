@@ -217,12 +217,31 @@ fn is_zero(v: &f64) -> bool {
 }
 
 /// The JSON output structure for --robot-suggest.
+///
+/// Field order mirrors Go's output: the v0.25.0 envelope fields precede
+/// `filters`. The envelope values are filled in by the CLI layer, which owns
+/// the source path; they are omitted when empty so this struct stays usable
+/// on its own.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RobotSuggestOutput {
     #[serde(rename = "generated_at")]
     pub generated_at: String,
     #[serde(rename = "data_hash")]
     pub data_hash: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub output_format: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub version: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_path: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_authority: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub authority_hash: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub scope_hash: String,
     pub filters: SuggestFilter,
     pub suggestions: SuggestionSet,
     #[serde(rename = "usage_hints")]
@@ -1274,6 +1293,15 @@ pub fn generate_robot_suggest_output(
     RobotSuggestOutput {
         generated_at: now_rfc3339(),
         data_hash: data_hash.to_string(),
+        // Envelope values are filled in by the CLI layer, which owns the
+        // source path (see the handler for --robot-suggest).
+        output_format: String::new(),
+        version: String::new(),
+        source_path: String::new(),
+        source_kind: String::new(),
+        source_authority: None,
+        authority_hash: String::new(),
+        scope_hash: String::new(),
         filters: SuggestFilter {
             filter_type: config.filter_type.clone().unwrap_or_default(),
             min_confidence: config.min_confidence,
@@ -1298,7 +1326,14 @@ pub fn generate_robot_suggest_output(
 // ---------------------------------------------------------------------------
 
 fn now_rfc3339() -> String {
-    let ts = jiff::Timestamp::now();
+    // Go `robotNow` (main.go:1165) honors SOURCE_DATE_EPOCH so robot output is
+    // reproducible; reading the wall clock here made --robot-suggest ignore
+    // the pinned capture instant that golden_comparison uses.
+    let ts = std::env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .and_then(|secs| jiff::Timestamp::from_second(secs).ok())
+        .unwrap_or_else(jiff::Timestamp::now);
     let s = ts.to_string();
     // Truncate to second precision (Go parity).
     if let Some(pos) = s.find('.') {

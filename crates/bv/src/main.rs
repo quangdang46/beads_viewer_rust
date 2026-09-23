@@ -4245,16 +4245,37 @@ fn run_robot_suggest(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     }
-
     let output = bv_analysis::suggestions::generate_robot_suggest_output(&issues, &config, &hash);
     match serde_json::to_value(&output) {
-        Ok(v) => emit_json(&v),
+        Ok(mut v) => {
+            // Go v0.25.0 stamps the full envelope ahead of the suggestion
+            // payload; the analysis layer has no source path, so fill it in
+            // from the shared envelope helper here.
+            let envelope = full_envelope_for(&hash, &issues);
+            if let Some(obj) = v.as_object_mut() {
+                for key in [
+                    "output_format",
+                    "version",
+                    "source_path",
+                    "source_kind",
+                    "source_authority",
+                    "authority_hash",
+                    "scope_hash",
+                ] {
+                    if let Some(env) = envelope.get(key) {
+                        obj.insert(key.to_string(), env.clone());
+                    }
+                }
+            }
+            emit_json(&v)
+        }
         Err(e) => {
             eprintln!("Error: serialization failed: {e}");
             ExitCode::from(1)
         }
     }
 }
+
 fn run_robot_alerts() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
     let (issues, hash, _as_of_commit) = match load_issues_auto(&cwd, None) {
