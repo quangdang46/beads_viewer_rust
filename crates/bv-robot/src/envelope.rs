@@ -18,8 +18,72 @@ pub struct RobotLoadStats {
     pub warnings: Vec<String>,
 }
 
+/// Go `RobotSourceReport` (cmd/bv/main.go:7235) — one configured source before
+/// view projection. Field order is part of the serialized contract.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct RobotSourceReport {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub repo_path: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_path: String,
+    pub source_kind: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub data_hash: String,
+    pub valid: usize,
+    pub errors: usize,
+    pub skipped: usize,
+    pub read_errors: usize,
+    pub visible: usize,
+    pub tombstones: usize,
+    pub stale: bool,
+    pub warning_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+}
+
+/// Go `RobotSourceAuthority` (cmd/bv/main.go:7250) — distinguishes proven
+/// readiness from calculations over incomplete or stale source data.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct RobotSourceAuthority {
+    pub state: String,
+    pub claim_safe: bool,
+    pub readiness: String,
+    pub loaded: usize,
+    pub failed: usize,
+    pub disabled: usize,
+    pub valid: usize,
+    pub errors: usize,
+    pub skipped: usize,
+    pub read_errors: usize,
+    pub visible: usize,
+    pub tombstones: usize,
+    pub warning_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<RobotSourceReport>,
+}
+
+/// Go `RobotScope` (cmd/bv/main.go:7418) — scoping flags in effect, plus the
+/// flags the command could not honour.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct RobotScope {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub recipe: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub repo: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsupported: Vec<String>,
+}
+
 /// Standard envelope for all robot outputs. Field order = serialization
 /// order (serde preserves declaration order) — part of the contract.
+/// Mirrors Go `RobotEnvelope` (cmd/bv/main.go:7215).
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct RobotEnvelope {
     /// RFC3339 UTC timestamp.
@@ -32,9 +96,30 @@ pub struct RobotEnvelope {
     /// bv version string.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub version: String,
+    /// File (or "<file>@<rev>") the issue set was loaded from.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_path: String,
+    /// jsonl | sqlite | git | workspace | bd
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_kind: String,
+    /// --as-of ref, when time-travelling.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub as_of: String,
+    /// Resolved SHA for --as-of.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub as_of_commit: String,
+    /// Active --label/--recipe/--repo scoping and what this command could not honour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<RobotScope>,
     /// Present only when loader dropped records (#190).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_stats: Option<RobotLoadStats>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_authority: Option<RobotSourceAuthority>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub authority_hash: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub scope_hash: String,
 }
 
 impl RobotEnvelope {
@@ -70,9 +155,62 @@ impl RobotEnvelope {
             data_hash: data_hash.into(),
             output_format: output_format.as_str().to_string(),
             version: version.into(),
+            source_path: String::new(),
+            source_kind: String::new(),
+            as_of: String::new(),
+            as_of_commit: String::new(),
+            scope: None,
             load_stats,
+            source_authority: None,
+            authority_hash: String::new(),
+            scope_hash: String::new(),
         }
     }
+}
+
+/// Go `robotAuthorityHash` (cmd/bv/main.go:7393) — SHA-256 over the JSON
+/// encoding of the authority struct, lowercase hex. Field order must match the
+/// struct declaration for the digest to match.
+pub fn authority_hash(authority: &RobotSourceAuthority) -> String {
+    match serde_json::to_vec(authority) {
+        Ok(raw) => sha256_hex(&raw),
+        Err(_) => String::new(),
+    }
+}
+
+/// Go `robotScopeHash` (cmd/bv/main.go:7404) — SHA-256 over a JSON object with
+/// the field order Label, Recipe, Repo, DataHash, IDs.
+pub fn scope_hash(
+    label: &str,
+    recipe: &str,
+    repo: &str,
+    data_hash: &str,
+    ids: &[String],
+) -> String {
+    // Build the exact anonymous-struct JSON Go marshals.
+    let value = serde_json::json!({
+        "Label": label,
+        "Recipe": recipe,
+        "Repo": repo,
+        "DataHash": data_hash,
+        "IDs": ids,
+    });
+    // serde_json::json! uses a Map; with preserve_order it keeps insertion order.
+    match serde_json::to_vec(&value) {
+        Ok(raw) => sha256_hex(&raw),
+        Err(_) => String::new(),
+    }
+}
+
+fn sha256_hex(raw: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(raw);
+    let mut out = String::with_capacity(64);
+    for b in digest.iter() {
+        out.push(char::from_digit((b >> 4) as u32, 16).unwrap());
+        out.push(char::from_digit((b & 0x0f) as u32, 16).unwrap());
+    }
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
