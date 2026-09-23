@@ -485,6 +485,15 @@ th {{ background: #44475a; }}
         return ExitCode::from(2);
     }
 
+    // Go's `flag` package rejects any non-flag argument with
+    // `unknown command "X" for "bv"` (exit 1). Without this guard `bvr
+    // version` fell through to the TUI, which an agent or CI caller cannot
+    // drive — it blocks until the process is killed. Reject before the TUI.
+    if let Some(unknown) = argv::unconsumed_positional(&args) {
+        eprintln!("unknown command \"{unknown}\" for \"bvr\"");
+        return ExitCode::from(1);
+    }
+
     // Interactive TUI: no robot flags present.
     let cwd = std::env::current_dir().unwrap_or_default();
 

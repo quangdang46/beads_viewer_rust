@@ -265,6 +265,64 @@ const ROBOT_PRIMARY_NAMES: &[&str] = &[
     "robot-label-attention",
 ];
 
+/// First bare positional left unconsumed after `rewrite_args`, if any.
+///
+/// Go's `flag` package rejects any non-flag argument with
+/// `unknown command "X" for "bv"`, so only agent-intent words (which
+/// `rewrite_args` rewrites into `--robot-*`) and flag values are legal.
+/// `bvr` must do the same instead of silently falling through to the
+/// interactive TUI — an agent or CI caller has no way to drive a TUI and
+/// would just block. Returns `None` when every bare token was consumed
+/// (rewritten to a flag) or belongs to a flag's value.
+pub fn unconsumed_positional(rewritten: &[String]) -> Option<String> {
+    // Track whether the previous token was a flag awaiting a value. A flag
+    // that takes a value swallows the next token, so `bv --label triage`
+    // must not report `triage` as an unknown command.
+    let mut prev_is_flag = false;
+    // Input is argv-minus-program (see `rewrite_args` callers), so index 0 is
+    // the first real argument — do not skip it.
+    for tok in rewritten.iter() {
+        if prev_is_flag && !tok.starts_with('-') {
+            prev_is_flag = false;
+            continue;
+        }
+        if tok.starts_with('-') {
+            prev_is_flag = flag_takes_value(tok);
+            continue;
+        }
+        return Some(tok.clone());
+    }
+    None
+}
+
+/// Whether a `--flag` consumes the following token as its value.
+fn flag_takes_value(tok: &str) -> bool {
+    let name = tok.split('=').next().unwrap_or(tok);
+    let name = name.trim_start_matches('-');
+    // A `-`/`--` token written as `name=value` never takes a following value.
+    if tok.contains('=') {
+        return false;
+    }
+    // Boolean switches listed in the Go flag registry never consume the next
+    // token. Everything else in the registry is a string/number flag.
+    !matches!(
+        name,
+        "help"
+            | "version"
+            | "robot-robot"
+            | "brief"
+            | "no-cache"
+            | "stats"
+            | "export-include-graph"
+            | "generate-docs"
+            | "force-full-analysis"
+            | "profile-startup"
+            | "profile-json"
+            | "cpu-profile"
+            | "check-update"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,6 +344,63 @@ mod tests {
         // Unmapped short flags (e.g. -x) still pass through; Go only advertises
         // -f/-l/-r/-h, so anything else is left alone.
         assert_eq!(rewrite_args(&s(&["bvr", "-x"])), s(&["bvr", "-x"]));
+    }
+
+    /// Go's `flag` package rejects bare positionals with
+    /// `unknown command "X" for "bv"` (exit 1). `bvr` used to fall through to
+    /// the TUI instead, which blocks any non-interactive caller.
+    #[test]
+    fn unknown_positional_is_reported() {
+        for word in ["version", "help", "check-update", "rollback", "bogusxyz"] {
+            let args = rewrite_args(&s(&[word]));
+            assert_eq!(
+                unconsumed_positional(&args).as_deref(),
+                Some(word),
+                "expected {word} to be reported as an unknown command"
+            );
+        }
+    }
+
+    /// A bare word that is an agent-intent alias is rewritten to `--robot-*`
+    /// and must therefore NOT be reported as unknown.
+    #[test]
+    fn intent_alias_is_not_unknown() {
+        let args = rewrite_args(&s(&["triage"]));
+        assert_eq!(args, s(&["--robot-triage"]));
+        assert_eq!(unconsumed_positional(&args), None);
+    }
+
+    /// A flag's value must be consumed, never mistaken for a command. This is
+    /// the false-positive guard: `bv --label triage` is a filter, not a command.
+    #[test]
+    fn flag_value_is_not_unknown() {
+        for argv in [
+            vec!["--label", "triage"],
+            vec!["--format", "toon"],
+            vec!["--repo", "myrepo"],
+            // `--flag=value` carries its own value.
+            vec!["--label=triage"],
+        ] {
+            let args = rewrite_args(&s(&argv));
+            assert_eq!(
+                unconsumed_positional(&args),
+                None,
+                "expected {argv:?} to be fully consumed"
+            );
+        }
+    }
+
+    /// A boolean switch does not swallow the next token, so a following bare
+    /// word is still an unknown command.
+    #[test]
+    fn bool_flag_does_not_swallow_next() {
+        let args = rewrite_args(&s(&["--brief", "version"]));
+        assert_eq!(unconsumed_positional(&args).as_deref(), Some("version"));
+    }
+
+    #[test]
+    fn no_args_is_clean() {
+        assert_eq!(unconsumed_positional(&rewrite_args(&[])), None);
     }
 
     /// Issue #5: Go `bv --help` advertises `-f/--format`, `-l/--label`, `-r/--recipe`.
