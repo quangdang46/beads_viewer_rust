@@ -376,7 +376,10 @@ fn action_hint(issue: &Issue) -> String {
         Status::InProgress => "Continue work on this issue".to_string(),
         Status::Blocked => "Resolve blocked status before claiming this issue".to_string(),
         Status::Open => "Start work on this issue".to_string(),
-        other => format!("Wait for status {} to become open before claiming", other.as_str()),
+        other => format!(
+            "Wait for status {} to become open before claiming",
+            other.as_str()
+        ),
     }
 }
 

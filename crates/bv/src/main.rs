@@ -4245,7 +4245,15 @@ fn run_robot_suggest(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     }
-    let output = bv_analysis::suggestions::generate_robot_suggest_output(&issues, &config, &hash);
+    // Tracker-backed mutation commands need the loaded source path; the
+    // suggestion layer cannot resolve an issue's live route without it.
+    let source = source_meta_for(&issues);
+    let output = bv_analysis::suggestions::generate_robot_suggest_output(
+        &issues,
+        &config,
+        &hash,
+        &source.path,
+    );
     match serde_json::to_value(&output) {
         Ok(mut v) => {
             // Go v0.25.0 stamps the full envelope ahead of the suggestion

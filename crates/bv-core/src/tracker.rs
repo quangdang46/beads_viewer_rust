@@ -59,6 +59,103 @@ pub struct IssueActions {
     pub unavailable_reason: String,
 }
 
+/// Go `MutationKind` (pkg/model/types.go:108-116).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MutationKind {
+    AddDependency,
+    Relate,
+    RemoveDependency,
+    AddLabel,
+}
+
+/// Go `Issue.MutationAction` (pkg/model/types.go:120-145). Returns the shell
+/// command for a tracker mutation, or the reason it cannot be built — which
+/// the caller surfaces as the suggestion's `action_unavailable_reason`
+/// metadata. The absent-route wording is Go's own, deliberately not reusing
+/// `origin.read_only_reason`.
+pub fn mutation_action(
+    origin: &IssueOrigin,
+    kind: MutationKind,
+    peer: Option<&IssueOrigin>,
+    value: &str,
+) -> Result<String, String> {
+    // Go (types.go:120-145) returns the command, or a reason string. Its
+    // wording for an absent route is its own, not whatever the origin
+    // recorded, so return it explicitly rather than reusing
+    // read_only_reason.
+    if !origin.route_available() {
+        return Err("source has no verified live tracker route".to_string());
+    }
+    if !origin.read_only_reason.is_empty() {
+        return Err(origin.read_only_reason.clone());
+    }
+    match kind {
+        MutationKind::AddLabel => {
+            if value.trim().is_empty() || value.contains('\0') {
+                return Err("suggested label is empty or contains a NUL byte".to_string());
+            }
+            Ok(build_command(
+                origin,
+                true,
+                &[
+                    "update",
+                    "--json",
+                    &format!("--add-label={value}"),
+                    "--",
+                    &origin.local_id,
+                ],
+            )
+            .shell)
+        }
+        MutationKind::AddDependency => {
+            let peer =
+                peer.ok_or_else(|| "related issue has no verified live tracker route".to_string())?;
+            if !peer.route_available() {
+                return Err("related issue has no verified live tracker route".to_string());
+            }
+            Ok(build_command(
+                origin,
+                true,
+                &["dep", "add", &peer.local_id, "--", &origin.local_id],
+            )
+            .shell)
+        }
+        MutationKind::Relate => {
+            let peer =
+                peer.ok_or_else(|| "related issue has no verified live tracker route".to_string())?;
+            if !peer.route_available() {
+                return Err("related issue has no verified live tracker route".to_string());
+            }
+            Ok(build_command(
+                origin,
+                true,
+                &[
+                    "dep",
+                    "add",
+                    &peer.local_id,
+                    "--type=related",
+                    "--",
+                    &origin.local_id,
+                ],
+            )
+            .shell)
+        }
+        MutationKind::RemoveDependency => {
+            let peer =
+                peer.ok_or_else(|| "related issue has no verified live tracker route".to_string())?;
+            if !peer.route_available() {
+                return Err("related issue has no verified live tracker route".to_string());
+            }
+            Ok(build_command(
+                origin,
+                true,
+                &["dep", "remove", &peer.local_id, "--", &origin.local_id],
+            )
+            .shell)
+        }
+    }
+}
+
 /// Go `ShellQuote` (pkg/model/types.go:76) — wrap one literal argument.
 pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))

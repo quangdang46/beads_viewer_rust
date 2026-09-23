@@ -320,7 +320,10 @@ fn probe_toon_binary(path: &std::path::Path) -> bool {
     use std::process::Command;
     if let Ok(out) = Command::new(path).arg("--help").output() {
         let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
-        let text = format!("{text}{}", String::from_utf8_lossy(&out.stderr).to_lowercase());
+        let text = format!(
+            "{text}{}",
+            String::from_utf8_lossy(&out.stderr).to_lowercase()
+        );
         if text.contains("reference implementation in rust") {
             return true;
         }

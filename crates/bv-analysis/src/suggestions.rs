@@ -121,6 +121,26 @@ impl Suggestion {
         self
     }
 
+    /// Go `Suggestion.withMutationAction` (suggestions.go:200-207): build the
+    /// command from the issue's live tracker route, and record why it is
+    /// unavailable when the route cannot be resolved.
+    fn with_mutation_action(
+        self,
+        source_path: &str,
+        from_id: &str,
+        peer_id: &str,
+        kind: bv_core::tracker::MutationKind,
+    ) -> Self {
+        let origin = bv_core::tracker::resolve_issue_origin(source_path, from_id);
+        let peer_origin = bv_core::tracker::resolve_issue_origin(source_path, peer_id);
+        match bv_core::tracker::mutation_action(&origin, kind, Some(&peer_origin), "") {
+            Ok(cmd) => self.with_action(&cmd),
+            Err(reason) => {
+                self.with_metadata("action_unavailable_reason", serde_json::json!(reason))
+            }
+        }
+    }
+
     fn with_metadata(mut self, key: &str, value: serde_json::Value) -> Self {
         let m = self.metadata.get_or_insert_with(|| serde_json::json!({}));
         if let Some(obj) = m.as_object_mut() {
@@ -514,6 +534,17 @@ struct DuplicatePair {
 /// Detect potential duplicate issues using keyword-based Jaccard similarity
 /// with an inverted index. Matches Go `DetectDuplicates` exactly.
 pub fn detect_duplicates(issues: &[Issue], config: &DuplicateConfig) -> Vec<Suggestion> {
+    detect_duplicates_with_source(issues, config, "")
+}
+
+/// Duplicate detection that can build tracker-backed mutation commands.
+/// `source_path` is the loaded issues file; when it is empty the suggestions
+/// carry no action, matching a source with no resolvable tracker route.
+fn detect_duplicates_with_source(
+    issues: &[Issue],
+    config: &DuplicateConfig,
+    source_path: &str,
+) -> Vec<Suggestion> {
     if issues.len() < 2 {
         return Vec::new();
     }
@@ -625,14 +656,21 @@ pub fn detect_duplicates(issues: &[Issue], config: &DuplicateConfig) -> Vec<Sugg
             .with_related_bead(&pair.issue2)
             .with_metadata("method", serde_json::json!(pair.method));
 
-            // Add action command if both are open.
+            // Add action command if both are open. Go routes the mutation
+            // through the issue's live tracker origin (duplicates.go:259 ->
+            // withMutationAction -> Issue.MutationAction), which returns no
+            // command and an `action_unavailable_reason` when the source has
+            // no verified route. The previous hardcoded `br dep add ...`
+            // string claimed an action the fixtures cannot actually perform.
             if !is_closed_like_duplicate_status(issue1.status)
                 && !is_closed_like_duplicate_status(issue2.status)
             {
-                sug = sug.with_action(&format!(
-                    "br dep add {} {} --type=related",
-                    pair.issue1, pair.issue2
-                ));
+                sug = sug.with_mutation_action(
+                    source_path,
+                    &pair.issue1,
+                    &pair.issue2,
+                    bv_core::tracker::MutationKind::Relate,
+                );
             }
 
             sug
@@ -670,6 +708,16 @@ struct DependencyMatch {
 pub fn detect_missing_dependencies(
     issues: &[Issue],
     config: &DependencySuggestionConfig,
+) -> Vec<Suggestion> {
+    detect_missing_dependencies_with_source(issues, config, "")
+}
+
+/// Variant that can build tracker-backed mutation commands; see
+/// `detect_duplicates_with_source`.
+fn detect_missing_dependencies_with_source(
+    issues: &[Issue],
+    config: &DependencySuggestionConfig,
+    source_path: &str,
 ) -> Vec<Suggestion> {
     if issues.len() < 2 {
         return Vec::new();
@@ -841,7 +889,15 @@ pub fn detect_missing_dependencies(
                 m.confidence,
             )
             .with_related_bead(&m.to)
-            .with_action(&format!("br dep add {} {}", m.from, m.to))
+            // Go routes this through withMutationAction too
+            // (dependency_suggest.go:250), so the command is omitted and the
+            // reason recorded when the source has no live tracker route.
+            .with_mutation_action(
+                source_path,
+                &m.from,
+                &m.to,
+                bv_core::tracker::MutationKind::AddDependency,
+            )
             .with_metadata("shared_keywords", serde_json::json!(m.shared_keywords));
 
             if !m.shared_labels.is_empty() {
@@ -1207,6 +1263,7 @@ pub fn generate_all_suggestions(
     issues: &[Issue],
     config: &SuggestAllConfig,
     data_hash: &str,
+    source_path: &str,
 ) -> SuggestionSet {
     let mut all_suggestions: Vec<Suggestion> = Vec::new();
 
@@ -1214,7 +1271,7 @@ pub fn generate_all_suggestions(
         && (config.filter_type.is_none()
             || config.filter_type.as_deref() == Some(SuggestionType::PotentialDuplicate.as_str()))
     {
-        let duplicates = detect_duplicates(issues, &config.duplicates);
+        let duplicates = detect_duplicates_with_source(issues, &config.duplicates, source_path);
         all_suggestions.extend(duplicates);
     }
 
@@ -1222,7 +1279,8 @@ pub fn generate_all_suggestions(
         && (config.filter_type.is_none()
             || config.filter_type.as_deref() == Some(SuggestionType::MissingDependency.as_str()))
     {
-        let dependencies = detect_missing_dependencies(issues, &config.dependencies);
+        let dependencies =
+            detect_missing_dependencies_with_source(issues, &config.dependencies, source_path);
         all_suggestions.extend(dependencies);
     }
 
@@ -1287,8 +1345,9 @@ pub fn generate_robot_suggest_output(
     issues: &[Issue],
     config: &SuggestAllConfig,
     data_hash: &str,
+    source_path: &str,
 ) -> RobotSuggestOutput {
-    let set = generate_all_suggestions(issues, config, data_hash);
+    let set = generate_all_suggestions(issues, config, data_hash, source_path);
 
     RobotSuggestOutput {
         generated_at: now_rfc3339(),

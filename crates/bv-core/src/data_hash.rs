@@ -453,7 +453,9 @@ mod tests {
         // (`fmt.Sprintf("%x", sha256.Sum256(raw))`). v0.20.0 emitted a
         // 16-char truncation, so this assertion changed with the algorithm.
         assert_eq!(h1.len(), 64);
-        assert!(h1.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(h1
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
     #[test]
