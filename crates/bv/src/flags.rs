@@ -320,6 +320,8 @@ pub const MODIFIER_FLAGS: &[FlagDef] = &[
     b("background-mode"),
     b("no-background-mode"),
     s("cpu-profile"),
+    // Doc generation (Go main.go:1461) — emits markdown + JSON artifacts.
+    b("generate-docs"),
     // Triage modifiers
     b("brief"),
     i("attention-limit"),
@@ -332,6 +334,11 @@ pub const MODIFIER_FLAGS: &[FlagDef] = &[
     s("graph-preset"),
     s("graph-title"),
     s("export-graph"),
+    // Report export (Go main.go:1471-1474) — recipe defaults or explicit options.
+    s("export"),
+    s("export-format"),
+    b("export-include-graph"),
+    s("export-template"),
     // Alerts/suggest filters
     s("severity"),
     s("alert-type"),
@@ -369,6 +376,7 @@ pub const MODIFIER_FLAGS: &[FlagDef] = &[
     // Search
     s("search"),
     i("search-limit"),
+    s("search-min-score"),
     s("search-mode"),
     s("search-preset"),
     s("search-weights"),
@@ -430,9 +438,14 @@ const fn f2(name: &'static str) -> FlagDef {
 
 /// Modifier-requires table (subset of Go's ~50 rules covering all pairs).
 pub const MODIFIER_REQUIRES: &[(&str, &[&str])] = &[
+    // Go main.go:1786-1792 — report-export options ride with a report command.
+    ("export-format", &["export", "export-md"]),
+    ("export-include-graph", &["export", "export-md"]),
+    ("export-template", &["export", "export-md"]),
     ("robot-diff", &["diff-since"]),
     ("robot-search", &["search"]),
     ("search-limit", &["search"]),
+    ("search-min-score", &["search"]),
     ("search-mode", &["search"]),
     ("search-preset", &["search"]),
     ("search-weights", &["search"]),
@@ -541,5 +554,46 @@ mod tests {
             .filter(|f| f.group == Some("triage"))
             .collect();
         assert_eq!(group.len(), 4);
+    }
+
+    /// Issue #5: the six long flags Go advertises in `bv --help` must be
+    /// registered or the CLI rejects a flag upstream accepts.
+    #[test]
+    fn issue_5_missing_flags_are_registered() {
+        let registered: Vec<&str> = MODIFIER_FLAGS.iter().map(|f| f.name).collect();
+        for flag in [
+            "export",
+            "export-format",
+            "export-include-graph",
+            "export-template",
+            "generate-docs",
+            "search-min-score",
+        ] {
+            assert!(
+                registered.contains(&flag),
+                "flag --{flag} is in Go --help but missing from MODIFIER_FLAGS"
+            );
+        }
+    }
+
+    /// Go main.go:1786-1792 — export options are rejected without a report command.
+    #[test]
+    fn issue_5_export_options_require_report_command() {
+        for modifier in ["export-format", "export-include-graph", "export-template"] {
+            let row = MODIFIER_REQUIRES
+                .iter()
+                .find(|(name, _)| *name == modifier)
+                .unwrap_or_else(|| panic!("{modifier} missing from MODIFIER_REQUIRES"));
+            assert_eq!(row.1, &["export", "export-md"]);
+        }
+    }
+
+    #[test]
+    fn search_min_score_requires_search() {
+        let row = MODIFIER_REQUIRES
+            .iter()
+            .find(|(name, _)| *name == "search-min-score")
+            .expect("search-min-score missing from MODIFIER_REQUIRES");
+        assert_eq!(row.1, &["search"]);
     }
 }

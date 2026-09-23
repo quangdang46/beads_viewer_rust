@@ -1,12 +1,36 @@
 //! Argv rewriter — port of Go argv normalization:
 //! - single-dash long flags (`-robot-triage`) -> double dash
+//! - short-flag aliases (`-f`, `-l`, `-r`) -> their long form
 //! - agent-intent aliases: `bv triage` -> `bv --robot-triage`
 //! - bare `--json` (when no primary) -> `bv --robot-triage --json`
+
+/// Short-flag -> long-flag aliases advertised in Go `bv --help` (issue #5).
+/// Go declares `-f, --format`, `-l, --label`, `-r, --recipe`; `-h, --help` is
+/// handled separately by the help path, not by alias expansion.
+const SHORT_ALIASES: &[(&str, &str)] = &[("-f", "--format"), ("-l", "--label"), ("-r", "--recipe")];
 
 /// Rewrite raw args into canonical form.
 pub fn rewrite_args(args: &[String]) -> Vec<String> {
     let mut out = Vec::with_capacity(args.len());
     for arg in args {
+        // Short-flag alias expansion first: `-f toon` -> `--format toon`,
+        // `-l=foo` -> `--label=foo`. Only the flag token itself is rewritten;
+        // a following value token is left for the normal parse path.
+        let (head, tail) = match arg.strip_prefix('-') {
+            Some(rest) if !rest.starts_with('-') => match rest.find('=') {
+                Some(eq) => (&rest[..eq], &rest[eq..]),
+                None => (rest, ""),
+            },
+            _ => ("", ""),
+        };
+        if let Some((_, long)) = SHORT_ALIASES
+            .iter()
+            .find(|(short, _)| head.len() == 1 && short.trim_start_matches('-') == head)
+        {
+            out.push(format!("{long}{tail}"));
+            continue;
+        }
+
         // single-dash long flag: starts with exactly one '-', len > 2, not a
         // known short cluster, and the rest matches a long-flag pattern.
         // Skip single-char flags like -o=val or -f (flag name before '=' or
@@ -259,8 +283,39 @@ mod tests {
 
     #[test]
     fn short_flags_untouched() {
-        // -l is a legit short flag; stays as-is
-        assert_eq!(rewrite_args(&s(&["bvr", "-l"])), s(&["bvr", "-l"]));
+        // Unmapped short flags (e.g. -x) still pass through; Go only advertises
+        // -f/-l/-r/-h, so anything else is left alone.
+        assert_eq!(rewrite_args(&s(&["bvr", "-x"])), s(&["bvr", "-x"]));
+    }
+
+    /// Issue #5: Go `bv --help` advertises `-f/--format`, `-l/--label`, `-r/--recipe`.
+    /// These were previously passing through unexpanded (a documented gap).
+    #[test]
+    fn short_flag_aliases_expanded() {
+        assert_eq!(
+            rewrite_args(&s(&["bvr", "-f", "toon"])),
+            s(&["bvr", "--format", "toon"])
+        );
+        assert_eq!(
+            rewrite_args(&s(&["bvr", "-l", "backend"])),
+            s(&["bvr", "--label", "backend"])
+        );
+        assert_eq!(
+            rewrite_args(&s(&["bvr", "-r", "mytable"])),
+            s(&["bvr", "--recipe", "mytable"])
+        );
+    }
+
+    #[test]
+    fn short_flag_alias_with_equals_expanded() {
+        assert_eq!(
+            rewrite_args(&s(&["bvr", "-f=toon"])),
+            s(&["bvr", "--format=toon"])
+        );
+        assert_eq!(
+            rewrite_args(&s(&["bvr", "-l=backend"])),
+            s(&["bvr", "--label=backend"])
+        );
     }
 
     #[test]
