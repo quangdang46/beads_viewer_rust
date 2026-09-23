@@ -368,7 +368,34 @@ pub fn compute_risk_signals(
     }
 }
 
+/// Go `reasons.ActionHint` (triage.go:1538-1546). Suggested next action, keyed
+/// off status; the deferred branch is handled by the CLI, which owns
+/// `defer_until` parsing.
+fn action_hint(issue: &Issue) -> String {
+    match issue.status {
+        Status::InProgress => "Continue work on this issue".to_string(),
+        Status::Blocked => "Resolve blocked status before claiming this issue".to_string(),
+        Status::Open => "Start work on this issue".to_string(),
+        other => format!("Wait for status {} to become open before claiming", other.as_str()),
+    }
+}
+
+/// Analysis-local half of Go `isClaimableRecommendation` (triage.go:1191).
+///
+/// Go also requires an empty `BlockedBy` and an explicit not-ready-label /
+/// parent-with-open-children gate, both of which need graph context this
+/// function does not receive; the CLI completes the gate on top of this value.
+fn is_claimable(issue: &Issue) -> bool {
+    issue.status == Status::Open
+        && !issue.issue_type.eq_ignore_ascii_case("epic")
+        && issue.assignee.trim().is_empty()
+}
+
 /// Per-issue impact result matching golden `recommendations[]` breakdown.
+///
+/// Field order mirrors Go `analysis.Recommendation` (triage.go:120): the
+/// weighted score block, then the human-readable `action` hint, then the
+/// machine-readable `reasons`, `actions` and `claimable` gate.
 #[derive(Debug, Clone, Serialize)]
 pub struct IssueImpact {
     pub id: String,
@@ -380,8 +407,18 @@ pub struct IssueImpact {
     pub labels: Vec<String>,
     pub score: f64,
     pub breakdown: Breakdown,
+    /// Go `reasons.ActionHint` (triage.go:1538-1546) — the suggested next
+    /// action, derived from status (and defer_until when in the future).
+    pub action: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasons: Vec<String>,
+    /// Go `model.IssueActions` — the live tracker route for this issue.
+    /// `None` when no tracker origin could be resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actions: Option<serde_json::Value>,
+    /// Go `Recommendation.Claimable` (triage.go:658) — true iff this item
+    /// passes `isClaimableRecommendation`.
+    pub claimable: bool,
 }
 
 /// Golden field names + order. Mirrors Go `ScoreBreakdown`
@@ -692,7 +729,12 @@ pub fn compute_impact_scores(inputs: &ImpactInputs) -> Vec<IssueImpact> {
             labels: issue.labels.clone(),
             score,
             breakdown: b,
+            action: action_hint(issue),
             reasons,
+            // Tracker route is resolved by the CLI layer, which owns the
+            // source path; the analysis layer has no origin to build it from.
+            actions: None,
+            claimable: is_claimable(issue),
         });
     }
     results.sort_by(|a, b| {
