@@ -35,6 +35,10 @@ pub struct Alert {
     pub alert_type: AlertType,
     pub severity: Severity,
     pub message: String,
+    /// Go populates this on every alert (e.g. drift.go:560); the Rust struct
+    /// previously dropped it, so alerts serialized without the field.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub suggested_action: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "baseline_value")]
     pub baseline_val: Option<f64>,
@@ -300,6 +304,8 @@ fn check_staleness(
         result.push(Alert {
             alert_type: AlertType::StaleIssue,
             severity,
+            suggested_action:
+                "Update, close, or re-triage the issue; stale work hides real priorities".into(),
             message: format!("Issue {} inactive for {:.0} days", issue.id, inactive_days),
             baseline_val: None,
             // Go leaves BaselineVal/CurrentVal unset (omitempty → absent).
@@ -428,6 +434,8 @@ fn check_blocking_cascade(
         cascades.push(Alert {
             alert_type: AlertType::BlockingCascade,
             severity,
+            suggested_action:
+                "Prioritize this issue: closing it releases the listed downstream items".into(),
             message: format!(
                 "Completing {} unblocks {} downstream item(s)",
                 issue.id, count
@@ -518,16 +526,19 @@ pub fn calculate(
     // Node count change (info at threshold).
     if let Some(pct) = pct_change(baseline.node_count as f64, current.node_count as f64) {
         if pct.abs() >= cfg.node_growth_info_pct {
+            let delta = current.node_count as i64 - baseline.node_count as i64;
             r.push(Alert {
                 alert_type: AlertType::NodeCountChange,
                 severity: Severity::Info,
-                message: format!(
-                    "Node count changed from {} to {} ({pct:+.1}%)",
-                    baseline.node_count, current.node_count
-                ),
+                suggested_action:
+                    "Confirm the graph change is intended (bv --robot-diff --diff-since <baseline commit> lists it)"
+                        .into(),
+                // Go drift.go:421 phrases this as a signed delta plus a
+                // percentage, not as "from X to Y".
+                message: format!("Node count changed by {delta:+} ({pct:.1}%)"),
                 baseline_val: Some(baseline.node_count as f64),
                 current_val: Some(current.node_count as f64),
-                delta: Some((current.node_count as i64 - baseline.node_count as i64) as f64),
+                delta: Some(delta as f64),
                 ..Default::default()
             });
         }
@@ -601,22 +612,41 @@ pub fn calculate(
         }
     }
 
-    // PageRank shifts on shared issues (warning at threshold).
-    for (id, bl_pr) in &baseline.pagerank {
-        if let Some(cur_pr) = current.pagerank.get(id) {
-            if let Some(pct) = pct_change(*bl_pr, *cur_pr) {
-                if pct.abs() >= cfg.pagerank_change_warning_pct {
-                    r.push(Alert {
-                        alert_type: AlertType::PagerankChange,
-                        severity: Severity::Warning,
-                        message: format!("PageRank of {id} changed by {pct:+.1}%"),
-                        baseline_val: Some(*bl_pr),
-                        current_val: Some(*cur_pr),
-                        delta: Some(cur_pr - bl_pr),
-                        ..Default::default()
-                    });
+    // PageRank drift. Go (drift.go:520-565) collects every change into a
+    // single aggregated warning rather than one alert per issue: entries that
+    // left the top, entries whose value moved past the threshold, and entries
+    // that newly entered. The message is the count and `details` carries the
+    // sorted change strings.
+    {
+        let mut changes: Vec<String> = Vec::new();
+        for (id, bl_val) in &baseline.pagerank {
+            match current.pagerank.get(id) {
+                None => changes.push(format!("{id} dropped from top")),
+                Some(cur_val) if *bl_val > 0.0 => {
+                    let pct = ((cur_val - bl_val) / bl_val) * 100.0;
+                    if pct.abs() >= cfg.pagerank_change_warning_pct {
+                        changes.push(format!("{id}: {pct:.1}% change"));
+                    }
                 }
+                Some(_) => {}
             }
+        }
+        for id in current.pagerank.keys() {
+            if !baseline.pagerank.contains_key(id) {
+                changes.push(format!("{id} entered top"));
+            }
+        }
+        if !changes.is_empty() {
+            changes.sort();
+            r.push(Alert {
+                alert_type: AlertType::PagerankChange,
+                severity: Severity::Warning,
+                suggested_action:
+                    "Re-check the priority of the issues whose structural importance moved".into(),
+                message: format!("{} PageRank changes detected", changes.len()),
+                details: changes,
+                ..Default::default()
+            });
         }
     }
 

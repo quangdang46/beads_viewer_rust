@@ -1345,10 +1345,15 @@ fn capture_baseline(
             );
         }
     }
+    // Go keeps only the top 10 PageRank entries for drift comparison
+    // (robot_registry.go:1169, `buildMetricItems(stats.PageRank(), 10)`).
+    // Keeping every node made "entered top" fire for far more issues than
+    // the oracle reports.
     let mut pr_map = std::collections::BTreeMap::new();
     for (i, v) in bv_analysis::algorithms::pagerank::pagerank_default(&g)
         .into_iter()
         .enumerate()
+        .take(10)
     {
         pr_map.insert(g.node_id(i).unwrap_or_default().to_string(), v);
     }
@@ -3889,15 +3894,28 @@ fn run_robot_alerts() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let stats = bv_analysis::drift::BaselineStats {
-        node_count: issues.len(),
-        ..Default::default()
+    // Go (robot_registry.go:1158-1186) compares the live graph against the
+    // saved baseline at `.bv/baseline.json`, falling back to comparing the
+    // current stats against themselves when no baseline exists. Passing the
+    // same stats for both sides — as this handler used to — made every
+    // drift check trivially zero, so --robot-alerts always reported none.
+    let (current, cycles, _hash) = match capture_baseline() {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
     };
+    let baseline_stats: bv_analysis::drift::BaselineStats = std::fs::read_to_string(BASELINE_PATH)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|doc| serde_json::from_value(doc.get("stats")?.clone()).ok())
+        .unwrap_or_else(|| current.clone());
     let result = bv_analysis::drift::calculate(
-        &stats,
-        &stats,
+        &baseline_stats,
+        &current,
         &bv_analysis::drift::DriftConfig::default(),
-        &[],
+        &cycles,
         &issues,
         robot_now(),
     );
@@ -3912,10 +3930,16 @@ fn run_robot_alerts() -> ExitCode {
         "warning": result.warning_count,
         "info": result.info_count,
     });
+    // Go robot_registry.go:1240-1248 — the full seven-hint list, including the
+    // proactive and drift-vs-baseline filter combinations.
     payload["usage_hints"] = serde_json::json!([
         "--severity=warning --alert-type=stale_issue   # stale warnings only",
         "--alert-type=blocking_cascade                 # high-unblock opportunities",
-        "jq '.alerts | map(.issue_id)'                # list impacted issues",
+        "--alert-type=high_impact_unblock|abandoned_claim|potential_duplicate|priority_mismatch|velocity_drop   # proactive checks (no baseline needed)",
+        "--alert-type=new_cycle|density_growth|node_count_change|edge_count_change|scope_creep|blocked_increase|actionable_change|pagerank_change   # drift vs saved baseline (bv --save-baseline)",
+        "--alert-label=backend                        # only alerts on issues carrying that label",
+        "jq '.alerts | map({issue_id, type, suggested_action})'   # what to do about each",
+        "thresholds: .bv/drift.yaml; every key and its default is listed in the README 'Alerts System' table",
     ]);
     emit_json(&payload)
 }
