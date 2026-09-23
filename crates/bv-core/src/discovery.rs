@@ -268,6 +268,22 @@ pub fn load_issues_from_repo(
 ) -> Result<(Vec<Issue>, crate::loader::ParseStats), DiscoveryError> {
     let beads_dir = get_beads_dir(repo_path)?;
 
+    // Go `loader.LoadIssues` (pkg/loader/loader.go:768) reads the JSONL, NOT
+    // the SQLite db. Preferring the db here diverged on the v0.25.0
+    // `data_hash` because the SQLite reader omits fields (e.g. dependency
+    // created_at/created_by) that the JSONL carries. Match Go: JSONL first.
+    if let Ok(Some(jsonl)) = find_jsonl_path_with_warnings(&beads_dir, |_| {}) {
+        if let Ok(raw) = std::fs::read_to_string(&jsonl) {
+            let mut rdr = raw.as_bytes();
+            if let Ok(parsed) =
+                parse_issues_with_options(&mut rdr, &ParseOptions::default(), |_| {})
+            {
+                return Ok(parsed);
+            }
+        }
+    }
+
+    // Fallback to the SQLite db when no usable JSONL is present.
     let db_path = beads_dir.join("beads.db");
     if db_path.exists() {
         if let Ok(issues) = crate::sqlite::load_issues_sqlite(&db_path) {
@@ -283,14 +299,10 @@ pub fn load_issues_from_repo(
         }
     }
 
-    let jsonl = find_jsonl_path_with_warnings(&beads_dir, |_| {})?.ok_or_else(|| {
-        DiscoveryError::Git(format!("no beads JSONL found in {}", beads_dir.display()))
-    })?;
-    let raw = std::fs::read_to_string(&jsonl)
-        .map_err(|e| DiscoveryError::Git(format!("reading {}: {}", jsonl.display(), e)))?;
-    let mut rdr = raw.as_bytes();
-    parse_issues_with_options(&mut rdr, &ParseOptions::default(), |_| {})
-        .map_err(|e| DiscoveryError::Git(e.to_string()))
+    Err(DiscoveryError::Git(format!(
+        "no beads JSONL or SQLite database found in {}",
+        beads_dir.display()
+    )))
 }
 
 // ---------------------------------------------------------------------------

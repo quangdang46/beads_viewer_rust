@@ -9,6 +9,7 @@ pub use model::{Comment, Dependency, DependencyType, Issue, Sprint, Status, Vali
 
 pub mod data_hash;
 pub mod discovery;
+pub mod fingerprint;
 pub mod loader;
 pub mod sqlite;
 

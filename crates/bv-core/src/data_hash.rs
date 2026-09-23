@@ -3,6 +3,7 @@
 //! Contract: the Rust output MUST equal the Go output for identical issue
 //! sets. Verified against golden fixtures captured from commit 9ace029.
 
+use crate::fingerprint::FingerprintWriter;
 use crate::model::Issue;
 use sha2::{Digest, Sha256};
 
@@ -144,8 +145,178 @@ fn write_field(h: &mut Sha256, field: &[u8]) {
     h.update([0u8]);
 }
 
-/// Compute the 16-hex-char data hash. Empty input -> "empty".
+/// Go v0.25.0 per-issue content fingerprint (pkg/analysis/cache.go:305).
+/// Covers everything that is not a dependency edge.
+fn compute_issue_content_hash(w: &mut FingerprintWriter, issue: &Issue) -> String {
+    w.reset();
+
+    w.write_string_hash(&issue.title);
+    w.write_string_hash(&issue.description);
+    w.write_string_hash(&issue.design);
+    w.write_string_hash(&issue.acceptance_criteria);
+    w.write_string_hash(&issue.notes);
+    w.write_string_hash(&issue.assignee);
+    w.write_string_hash(&issue.source_repo);
+    w.write_string_ptr_hash(issue.external_ref.as_deref());
+
+    w.write_string_hash(issue.status.as_str());
+    w.write_string_hash(&issue.issue_type);
+    w.write_int_hash(issue.priority as i64);
+    w.write_int_ptr_hash(issue.estimated_minutes);
+    w.write_time_hash(issue.created_at.as_deref());
+    w.write_time_hash(issue.updated_at.as_deref());
+    w.write_time_ptr_hash(issue.due_date.as_deref());
+    // Go hashes issue.DeferUntil (a *time.Time). The Rust model has no
+    // defer_until field — the loader never populates it — so it is always nil.
+    w.write_time_ptr_hash(None);
+    w.write_time_ptr_hash(issue.closed_at.as_deref());
+
+    w.write_int_hash(issue.compaction_level);
+    w.write_time_ptr_hash(issue.compacted_at.as_deref());
+    w.write_string_ptr_hash(issue.compacted_at_commit.as_deref());
+    w.write_int_hash(issue.original_size);
+
+    if issue.labels.is_empty() {
+        w.write_uint_hash(0);
+    } else {
+        let mut labels = issue.labels.clone();
+        labels.sort();
+        w.write_uint_hash(labels.len() as u64);
+        for label in &labels {
+            w.write_string_hash(label);
+        }
+    }
+
+    let mut comments: Vec<&crate::model::Comment> = issue.comments.iter().collect();
+    comments.sort_by(|a, b| {
+        a.id.cmp(&b.id)
+            .then_with(|| a.created_at.cmp(&b.created_at))
+            .then_with(|| a.issue_id.cmp(&b.issue_id))
+            .then_with(|| a.author.cmp(&b.author))
+            .then_with(|| a.text.cmp(&b.text))
+    });
+    w.write_uint_hash(comments.len() as u64);
+    for comment in comments {
+        w.write_string_hash(&comment.id);
+        w.write_string_hash(&comment.issue_id);
+        w.write_string_hash(&comment.author);
+        w.write_string_hash(&comment.text);
+        w.write_time_hash(comment.created_at.as_deref());
+    }
+
+    w.sum_hex()
+}
+
+/// Go v0.25.0 per-issue dependency fingerprint (pkg/analysis/cache.go:378).
+/// Returns the literal "none" when the issue has no dependency edges.
+fn compute_issue_dependency_hash(w: &mut FingerprintWriter, issue: &Issue) -> String {
+    if issue.dependencies.is_empty() {
+        return "none".to_string();
+    }
+    struct DepKey {
+        issue_id: String,
+        depends_on: String,
+        dep_type: String,
+        created_at: String,
+        created_by: String,
+    }
+    let mut deps: Vec<DepKey> = issue
+        .dependencies
+        .iter()
+        .map(|dep| DepKey {
+            issue_id: dep.issue_id.clone(),
+            depends_on: dep.depends_on_id.clone(),
+            dep_type: dep.r#type.as_str().to_string(),
+            // Go: dep.CreatedAt.UTC().Format(RFC3339Nano) — a non-pointer time,
+            // so an absent value formats as the Go zero time.
+            created_at: dep
+                .created_at
+                .as_deref()
+                .map(normalize_time_for_hash)
+                .unwrap_or_else(|| GO_ZERO_TIME.to_string()),
+            created_by: dep.created_by.clone(),
+        })
+        .collect();
+    if deps.is_empty() {
+        return "none".to_string();
+    }
+    deps.sort_by(|a, b| {
+        a.issue_id
+            .cmp(&b.issue_id)
+            .then_with(|| a.depends_on.cmp(&b.depends_on))
+            .then_with(|| a.dep_type.cmp(&b.dep_type))
+            .then_with(|| a.created_at.cmp(&b.created_at))
+            .then_with(|| a.created_by.cmp(&b.created_by))
+    });
+
+    w.reset();
+    w.write_uint_hash(deps.len() as u64);
+    for dep in &deps {
+        w.write_string_hash(&dep.issue_id);
+        w.write_string_hash(&dep.depends_on);
+        w.write_string_hash(&dep.dep_type);
+        w.write_string_hash(&dep.created_at);
+        w.write_string_hash(&dep.created_by);
+    }
+    w.sum_hex()
+}
+
+/// Dependency timestamps go through the same UTC-`Z` normalization as issue
+/// timestamps so both sides of the hash agree with Go's Format output.
+fn normalize_time_for_hash(raw: &str) -> String {
+    crate::fingerprint::normalize_time_public(raw)
+}
+
+/// Compute the aggregate data hash. Empty input -> "empty".
+///
+/// Go v0.25.0 (pkg/analysis/cache.go:168) assembles a per-issue
+/// (ID, ContentHash, DependencyHash) fingerprint list, sorts it by ID
+/// (encounter order breaks duplicate-ID ties), and hashes the whole list.
+/// The result is a full 64-char SHA-256 hex digest.
 pub fn compute_data_hash(issues: &[Issue]) -> String {
+    if issues.is_empty() {
+        return "empty".to_string();
+    }
+
+    struct OrderedFingerprint {
+        id: String,
+        content_hash: String,
+        dependency_hash: String,
+        position: usize,
+    }
+    let mut w = FingerprintWriter::new();
+    let mut fingerprints: Vec<OrderedFingerprint> = issues
+        .iter()
+        .enumerate()
+        .map(|(i, issue)| OrderedFingerprint {
+            id: issue.id.clone(),
+            content_hash: compute_issue_content_hash(&mut w, issue),
+            dependency_hash: compute_issue_dependency_hash(&mut w, issue),
+            position: i,
+        })
+        .collect();
+    fingerprints.sort_by(|a, b| {
+        if a.id != b.id {
+            a.id.cmp(&b.id)
+        } else {
+            a.position.cmp(&b.position)
+        }
+    });
+
+    w.reset();
+    w.write_uint_hash(fingerprints.len() as u64);
+    for fp in &fingerprints {
+        w.write_string_hash(&fp.id);
+        w.write_string_hash(&fp.content_hash);
+        w.write_string_hash(&fp.dependency_hash);
+    }
+    w.sum_hex()
+}
+
+/// v0.20.0 data hash — retained so the historical goldens stay reproducible and
+/// so drift against the old oracle remains testable. Not used on the CLI path.
+#[deprecated(note = "v0.20.0 encoding; use compute_data_hash for the v0.25.0 oracle")]
+pub fn compute_data_hash_v020(issues: &[Issue]) -> String {
     if issues.is_empty() {
         return "empty".to_string();
     }

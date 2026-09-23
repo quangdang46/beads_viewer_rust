@@ -1,9 +1,12 @@
 //! SQLite reader — port of Go `internal/datasource/sqlite.go` load path,
 //! including its deliberate quirks:
-//! - SELECT column list omits source_repo/created_by → those stay empty
 //! - dependencies: only depends_on_id + type (created_at/by stay zero)
 //! - ORDER BY updated_at DESC when the column exists
 //! - labels from JSON column or separate labels-table fallback
+//!
+//! Corrected 2026-09-24: the SELECT now includes `closed_at` and `source_repo`
+//! (Go internal/datasource/sqlite.go:308-313 selects both). Omitting them made
+//! the v0.25.0 `data_hash` diverge from Go whenever the SQLite path was used.
 
 use crate::model::{Comment, Dependency, DependencyType, Issue};
 use rusqlite::Connection;
@@ -97,8 +100,11 @@ pub fn load_issues_sqlite(db_path: &Path) -> Result<Vec<Issue>, SqliteError> {
         ""
     };
 
+    // Go internal/datasource/sqlite.go:308-313 selects closed_at and
+    // source_repo; omitting them changes the v0.25.0 data_hash, so both are
+    // selected here whenever the columns exist.
     let query = format!(
-        "SELECT id, title, {}, status, {}, {}, {}, {}, {}, {} FROM issues {} {}",
+        "SELECT id, title, {}, status, {}, {}, {}, {}, {}, {}, {}, {} FROM issues {} {}",
         expr("description", "NULL"),
         coalesce("priority", "3"),
         coalesce("issue_type", "'task'"),
@@ -106,6 +112,8 @@ pub fn load_issues_sqlite(db_path: &Path) -> Result<Vec<Issue>, SqliteError> {
         expr("created_at", "NULL"),
         expr("updated_at", "NULL"),
         expr("labels", "NULL"),
+        expr("closed_at", "NULL"),
+        expr("source_repo", "''"),
         where_clause,
         order_by,
     );
@@ -200,6 +208,10 @@ pub fn load_issues_sqlite(db_path: &Path) -> Result<Vec<Issue>, SqliteError> {
             .get::<_, Option<String>>(8)?
             .and_then(|s| parse_sqlite_time(&s));
         let labels_json: Option<String> = row.get(9)?;
+        let closed_at: Option<String> = row
+            .get::<_, Option<String>>(10)?
+            .and_then(|s| parse_sqlite_time(&s));
+        let source_repo: Option<String> = row.get(11)?;
 
         let mut labels = labels_json
             .as_deref()
@@ -229,7 +241,7 @@ pub fn load_issues_sqlite(db_path: &Path) -> Result<Vec<Issue>, SqliteError> {
             created_at,
             updated_at,
             due_date: None,
-            closed_at: None, // not selected (Go parity)
+            closed_at,
             external_ref: None,
             compaction_level: 0,
             compacted_at: None,
@@ -238,7 +250,7 @@ pub fn load_issues_sqlite(db_path: &Path) -> Result<Vec<Issue>, SqliteError> {
             labels,
             dependencies: deps_by_issue.remove(&id).unwrap_or_default(),
             comments: comments_by_issue.remove(&id).unwrap_or_default(),
-            source_repo: String::new(), // not selected (Go parity)
+            source_repo: source_repo.unwrap_or_default(),
         });
     }
     Ok(issues)
