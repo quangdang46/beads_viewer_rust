@@ -3564,12 +3564,11 @@ fn run_robot_plan() -> ExitCode {
             .iter()
             .map(|i| {
                 let unblocks = compute_unblocks(&i.id);
-                // Go: nil slice serializes as null (not []).
-                let unblocks_val = if unblocks.is_empty() {
-                    serde_json::Value::Null
-                } else {
-                    serde_json::json!(unblocks)
-                };
+                // Go `PlanItem.UnblocksIDs` (plan.go:15) has no `omitempty`,
+                // so an item that unblocks nothing still emits `"unblocks": []`.
+                // A nil slice would serialize as null, which the oracle does
+                // not produce — verified against bv v0.25.0.
+                let unblocks_val = serde_json::json!(unblocks);
                 serde_json::json!({
                     "id": i.id, "title": i.title, "priority": i.priority,
                     "status": i.status.as_str(),
@@ -3625,28 +3624,30 @@ fn run_robot_plan() -> ExitCode {
         .count();
     let total_blocked_count = total_open - actionable.len();
 
-    let payload = serde_json::json!({
-        "generated_at": jiff_now(), "data_hash": hash,
-        "analysis_config": plan_analysis_config(g.len()),
-        "status": plan_priority_status(&g),
-        "plan": {
-            "tracks": tracks,
-            "total_actionable": actionable.len(),
-            "total_blocked": total_blocked_count,
-            "summary": {
-                "highest_impact": highest_id,
-                "impact_reason": impact_reason,
-                "unblocks_count": highest_count,
-            },
+    // Go emits the full v0.25.0 envelope ahead of the plan payload
+    // (generated_at, data_hash, output_format, version, source_path,
+    // source_kind, source_authority, authority_hash, scope_hash), so build it
+    // with the shared helper instead of the hand-rolled two-field prefix.
+    let mut payload = full_envelope_for(&hash, &issues);
+    payload["analysis_config"] = plan_analysis_config(g.len());
+    payload["status"] = plan_priority_status(&g);
+    payload["plan"] = serde_json::json!({
+        "tracks": tracks,
+        "total_actionable": actionable.len(),
+        "total_blocked": total_blocked_count,
+        "summary": {
+            "highest_impact": highest_id,
+            "impact_reason": impact_reason,
+            "unblocks_count": highest_count,
         },
-        "usage_hints": [
-            "jq '.plan.tracks | length' - Number of parallel execution tracks",
-            "jq '.plan.tracks[0].items | map(.id)' - First track item IDs",
-            "jq '.plan.tracks[].items[] | select(.unblocks | length > 0)' - Items that unblock others",
-            "jq '.plan.summary' - High-level execution summary",
-            "jq '[.plan.tracks[].items[]] | length' - Total items across all tracks",
-        ],
     });
+    payload["usage_hints"] = serde_json::json!([
+        "jq '.plan.tracks | length' - Number of parallel execution tracks",
+        "jq '.plan.tracks[0].items | map(.id)' - First track item IDs",
+        "jq '.plan.tracks[].items[] | select(.unblocks | length > 0)' - Items that unblock others",
+        "jq '.plan.summary' - High-level execution summary",
+        "jq '[.plan.tracks[].items[]] | length' - Total items across all tracks",
+    ]);
     emit_json(&payload)
 }
 
