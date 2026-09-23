@@ -5201,6 +5201,7 @@ fn run_robot_label_health() -> ExitCode {
     payload["usage_hints"] = serde_json::json!([
         "jq '.results.summaries | sort_by(.health) | .[:3]' - Critical labels",
         "jq '.results.labels[] | select(.health_level == \"critical\")' - Critical details",
+        "jq '.results.cross_label_flow.bottleneck_labels' - Bottleneck labels",
         "jq '.results.attention_needed' - Labels needing attention",
     ]);
     emit_json(&payload)

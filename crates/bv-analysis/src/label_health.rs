@@ -150,7 +150,6 @@ pub struct VelocityMetrics {
 }
 
 pub fn compute_velocity_metrics(issues: &[Issue], now: jiff::Timestamp) -> VelocityMetrics {
-    let day_secs = 86400.0;
     let week_ago = now - jiff::SignedDuration::from_secs(7 * 86400);
     let month_ago = now - jiff::SignedDuration::from_secs(30 * 86400);
     let prev_week_start = now - jiff::SignedDuration::from_secs(14 * 86400);
@@ -181,13 +180,18 @@ pub fn compute_velocity_metrics(issues: &[Issue], now: jiff::Timestamp) -> Veloc
             let secs = (closed_at - created_at)
                 .total(jiff::Unit::Second)
                 .unwrap_or(0.0);
-            total_close_days += secs / day_secs;
+            // Go accumulates a time.Duration and only converts at the end via
+            // `totalCloseDur.Hours() / 24.0` (label_health.go:379). Dividing
+            // by 86400 per issue here rounded differently, so avg_days_to_close
+            // disagreed in the last f64 digits.
+            total_close_days += secs / 3600.0;
             close_samples += 1;
         }
     }
 
     let avg_days = if close_samples > 0 {
-        total_close_days / close_samples as f64
+        // total_close_days holds summed hours; Go divides by 24 here.
+        total_close_days / 24.0 / close_samples as f64
     } else {
         0.0
     };
@@ -224,15 +228,46 @@ pub fn compute_velocity_metrics(issues: &[Issue], now: jiff::Timestamp) -> Veloc
     }
 }
 
+/// Go `FreshnessMetrics` (label_health.go:73). Both timestamps are plain
+/// `time.Time`, not pointers, so they are always present: an absent value
+/// marshals as Go's zero time rather than as `null`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct FreshnessMetrics {
-    pub most_recent_update: Option<String>,
-    pub oldest_open_issue: Option<String>,
+    pub most_recent_update: String,
+    pub oldest_open_issue: String,
     pub avg_days_since_update: f64,
     pub stale_count: i64,
     pub stale_threshold_days: i64,
     pub freshness_score: i64,
+}
+
+/// Go's zero `time.Time` in RFC3339Nano form. Emitted when a label has no open
+/// issues, so `oldest_open_issue` is not null.
+const GO_ZERO_TIME: &str = "0001-01-01T00:00:00Z";
+
+/// Render a timestamp the way Go marshals a `time.Time`: UTC, RFC3339Nano,
+/// trailing zeros in the fractional part removed.
+fn go_time_string(ts: Option<jiff::Timestamp>) -> String {
+    match ts {
+        None => GO_ZERO_TIME.to_string(),
+        Some(t) => {
+            // jiff already appends the "Z"; only the fractional part needs
+            // Go's RFC3339Nano trailing-zero trim.
+            let s = t.to_string();
+            match s.find('.') {
+                Some(dot) => {
+                    let frac = s[dot + 1..].trim_end_matches(['0', 'Z']);
+                    if frac.is_empty() {
+                        format!("{}Z", &s[..dot])
+                    } else {
+                        format!("{}.{}Z", &s[..dot], frac)
+                    }
+                }
+                None => s,
+            }
+        }
+    }
 }
 
 pub fn compute_freshness_metrics(
@@ -246,9 +281,7 @@ pub fn compute_freshness_metrics(
         stale_days
     };
     let mut most_recent: Option<jiff::Timestamp> = None;
-    let mut most_recent_raw: Option<String> = None;
     let mut oldest_open: Option<jiff::Timestamp> = None;
-    let mut oldest_open_raw: Option<String> = None;
     let mut total_staleness = 0.0;
     let mut count = 0i64;
     let mut stale_count = 0i64;
@@ -258,7 +291,6 @@ pub fn compute_freshness_metrics(
         if let Some(updated) = parse_ts(&iss.updated_at) {
             if most_recent.is_none_or(|m| updated > m) {
                 most_recent = Some(updated);
-                most_recent_raw = iss.updated_at.clone();
             }
             let hours = (now - updated).total(jiff::Unit::Second).unwrap_or(0.0) / 3600.0;
             let days = hours / 24.0;
@@ -272,7 +304,6 @@ pub fn compute_freshness_metrics(
             if let Some(created) = parse_ts(&iss.created_at) {
                 if oldest_open.is_none_or(|o| created < o) {
                     oldest_open = Some(created);
-                    oldest_open_raw = iss.created_at.clone();
                 }
             }
         }
@@ -286,8 +317,11 @@ pub fn compute_freshness_metrics(
     let freshness_score = (100.0 - (avg_staleness / (threshold * 2.0)) * 100.0).max(0.0) as i64;
 
     FreshnessMetrics {
-        most_recent_update: most_recent_raw,
-        oldest_open_issue: oldest_open_raw,
+        // Go marshals these as time.Time, so they are re-rendered in UTC
+        // RFC3339Nano rather than passed through verbatim from the source
+        // record — the raw text can carry a different offset or precision.
+        most_recent_update: go_time_string(most_recent),
+        oldest_open_issue: go_time_string(oldest_open),
         avg_days_since_update: avg_staleness,
         stale_count,
         stale_threshold_days: stale_days,
