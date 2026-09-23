@@ -618,9 +618,19 @@ fn detect_duplicates_with_source(
 
             let common = intersect_keywords(&keywords[i], &keywords[j]);
 
+            // Go (duplicates.go:217-219) normalises every pair so the
+            // lexicographically smaller id is Issue1. Without it the pair's
+            // orientation depended on the outer loop's index order, so half
+            // the pairs came out reversed relative to the oracle.
+            let (id1, id2) = if issue2.id < issue1.id {
+                (&issue2.id, &issue1.id)
+            } else {
+                (&issue1.id, &issue2.id)
+            };
+
             pairs.push(DuplicatePair {
-                issue1: issue1.id.clone(),
-                issue2: issue2.id.clone(),
+                issue1: id1.clone(),
+                issue2: id2.clone(),
                 similarity,
                 method: "jaccard".to_string(),
                 keywords: common,
@@ -819,23 +829,27 @@ fn detect_missing_dependencies_with_source(
                 base_conf = 0.5;
             }
 
+            let title1_lower = issue1.title.to_lowercase();
             let title2_lower = issue2.title.to_lowercase();
             let id1_lower = issue1.id.to_lowercase();
             let id2_lower = issue2.id.to_lowercase();
             let desc1_lower = issue1.description.to_lowercase();
             let desc2_lower = issue2.description.to_lowercase();
 
-            // ID mentioned.
-            if desc2_lower.contains(&id1_lower) || desc1_lower.contains(&id2_lower) {
+            // ID mentioned. Go requires a whole ID token on both sides, so a
+            // bare substring test would credit `bv-42` inside `bv-420`.
+            if contains_exact_issue_id(&desc2_lower, &id1_lower)
+                || contains_exact_issue_id(&desc1_lower, &id2_lower)
+            {
                 base_conf += config.exact_match_bonus * 2.0;
             }
 
-            // Title words of issue1 mentioned in issue2's title.
-            for word in &keywords[i] {
-                if word.len() >= 5 && title2_lower.contains(word.as_str()) {
-                    base_conf += config.exact_match_bonus;
-                    break;
-                }
+            // Title overlap, checked symmetrically (dependency_suggest.go:186)
+            // so confidence does not depend on the input slice order.
+            if title_contains_keyword(&title2_lower, &keywords[i])
+                || title_contains_keyword(&title1_lower, &keywords[j])
+            {
+                base_conf += config.exact_match_bonus;
             }
 
             // Label overlap bonus.
@@ -850,10 +864,12 @@ fn detect_missing_dependencies_with_source(
             }
 
             // Determine direction. Go uses `Before` (strictly less than);
-            // `<=` here would reverse direction when timestamps are equal.
-            let (from, to) = if issue1.created_at.as_deref() < issue2.created_at.as_deref()
-                || issue1.priority < issue2.priority
-            {
+            // Go `dependencyPrerequisiteLess` (dependency_suggest.go:307-315)
+            // is a strict total order checked one key at a time: creation
+            // time, then priority, then id. Comparing the two keys with `||`
+            // instead reversed the direction whenever one issue was older but
+            // the other had the higher priority.
+            let (from, to) = if dependency_prerequisite_less(issue1, issue2) {
                 (issue2, issue1)
             } else {
                 (issue1, issue2)
@@ -889,16 +905,24 @@ fn detect_missing_dependencies_with_source(
                 m.confidence,
             )
             .with_related_bead(&m.to)
-            // Go routes this through withMutationAction too
-            // (dependency_suggest.go:250), so the command is omitted and the
-            // reason recorded when the source has no live tracker route.
-            .with_mutation_action(
-                source_path,
-                &m.from,
-                &m.to,
-                bv_core::tracker::MutationKind::AddDependency,
-            )
             .with_metadata("shared_keywords", serde_json::json!(m.shared_keywords));
+
+            // Go checks the cycle first and only asks for a mutation command
+            // when the edge is addable (dependency_suggest.go:249-254); a
+            // cycle short-circuits with its own reason and cycle_path.
+            let (can_add, cycle_path, warning) = check_dependency_addition(issues, &m.from, &m.to);
+            if can_add {
+                sug = sug.with_mutation_action(
+                    source_path,
+                    &m.from,
+                    &m.to,
+                    bv_core::tracker::MutationKind::AddDependency,
+                );
+            } else {
+                sug = sug
+                    .with_metadata("action_unavailable_reason", serde_json::json!(warning))
+                    .with_metadata("cycle_path", serde_json::json!(cycle_path));
+            }
 
             if !m.shared_labels.is_empty() {
                 sug = sug.with_metadata("shared_labels", serde_json::json!(m.shared_labels));
@@ -1158,6 +1182,136 @@ fn format_cycle_path(cycle: &[String]) -> String {
     cycle.join(" \u{2192} ") // → Unicode arrow
 }
 
+/// Go `titleContainsKeyword` (dependency_suggest.go:266-273).
+fn title_contains_keyword(title_lower: &str, keywords: &[String]) -> bool {
+    keywords
+        .iter()
+        .any(|w| w.len() >= 5 && title_lower.contains(w.as_str()))
+}
+
+/// Go `isIssueIDRune` (dependency_suggest.go:319-321).
+fn is_issue_id_rune(c: char) -> bool {
+    c.is_alphanumeric() || c == '-' || c == '_' || c == '.'
+}
+
+/// Go `containsExactIssueID` (dependency_suggest.go:278-305). A bare substring
+/// test would treat `bv-42` as an exact mention inside `bv-420`, so the match
+/// must not be flanked by further ID characters on either side.
+fn contains_exact_issue_id(text: &str, id: &str) -> bool {
+    if id.is_empty() {
+        return false;
+    }
+    let bytes = text.as_bytes();
+    let id_bytes = id.as_bytes();
+    if id_bytes.len() > bytes.len() {
+        return false;
+    }
+    for start in 0..=(bytes.len() - id_bytes.len()) {
+        if &bytes[start..start + id_bytes.len()] != id_bytes {
+            continue;
+        }
+        let before_is_id =
+            start > 0 && is_issue_id_rune(text[..start].chars().next_back().unwrap());
+        let after_is_id = start + id_bytes.len() < bytes.len()
+            && is_issue_id_rune(text[start + id_bytes.len()..].chars().next().unwrap());
+        if !before_is_id && !after_is_id {
+            return true;
+        }
+    }
+    false
+}
+
+/// Go `dependencyPrerequisiteLess` (dependency_suggest.go:307-315): a strict
+/// total order over the two issues, compared one key at a time — creation
+/// time, then priority, then id. The older issue is the prerequisite.
+fn dependency_prerequisite_less(a: &Issue, b: &Issue) -> bool {
+    if a.created_at != b.created_at {
+        return a.created_at < b.created_at;
+    }
+    if a.priority != b.priority {
+        return a.priority < b.priority;
+    }
+    a.id < b.id
+}
+
+/// Go `WouldCreateCycle` (cycle_warnings.go:141-194). Builds the blocking-edge
+/// adjacency, adds the proposed edge, then DFSes from `to_id` looking for
+/// `from_id`; the returned path is the full proposed cycle, from_id first.
+fn would_create_cycle(issues: &[Issue], from_id: &str, to_id: &str) -> (bool, Vec<String>) {
+    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+    for issue in issues {
+        for dep in &issue.dependencies {
+            if !dep.r#type.is_blocking() {
+                continue;
+            }
+            adj.entry(issue.id.clone())
+                .or_default()
+                .push(dep.effective_depends_on().to_string());
+        }
+    }
+    adj.entry(from_id.to_string())
+        .or_default()
+        .push(to_id.to_string());
+    // Go sorts each adjacency list so the DFS visit order is deterministic.
+    for neighbours in adj.values_mut() {
+        neighbours.sort();
+    }
+
+    fn dfs(
+        node: &str,
+        from_id: &str,
+        adj: &HashMap<String, Vec<String>>,
+        visited: &mut HashSet<String>,
+        path: &mut Vec<String>,
+    ) -> bool {
+        if node == from_id {
+            path.push(node.to_string());
+            return true;
+        }
+        if visited.contains(node) {
+            return false;
+        }
+        visited.insert(node.to_string());
+        path.push(node.to_string());
+        if let Some(neighbours) = adj.get(node) {
+            for next in neighbours {
+                if dfs(next, from_id, adj, visited, path) {
+                    return true;
+                }
+            }
+        }
+        path.pop();
+        false
+    }
+
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut path: Vec<String> = Vec::new();
+    if dfs(to_id, from_id, &adj, &mut visited, &mut path) {
+        let mut cycle = vec![from_id.to_string()];
+        cycle.extend(path);
+        return (true, cycle);
+    }
+    (false, Vec::new())
+}
+
+/// Go `CheckDependencyAddition` (cycle_warnings.go:199-207). Returns
+/// (can_add, cycle_path, warning).
+fn check_dependency_addition(
+    issues: &[Issue],
+    from_id: &str,
+    to_id: &str,
+) -> (bool, Vec<String>, String) {
+    let (would_cycle, path) = would_create_cycle(issues, from_id, to_id);
+    if would_cycle {
+        let warning = format!(
+            "Adding dependency {from_id} \u{2192} {to_id} would create cycle: {}",
+            format_cycle_path(&path)
+        );
+        return (false, path, warning);
+    }
+    (true, Vec::new(), String::new())
+}
+
 /// Generate suggestions for dependency cycles in the graph.
 /// Matches Go `DetectCycleWarnings` exactly.
 pub fn detect_cycle_warnings(issues: &[Issue], config: &CycleWarningConfig) -> Vec<Suggestion> {
@@ -1322,13 +1476,22 @@ pub fn generate_all_suggestions(
         })
         .collect();
 
-    // Sort by confidence (highest first). Go uses unstable sort for equal
-    // confidence — golden order is non-deterministic and not reproducible.
+    // Go (suggest_all.go:121-141) sorts by confidence, then by a chain of
+    // semantic fields. The tiebreaks are load-bearing: some detectors build
+    // candidates through maps, so confidence alone would leave equal-score
+    // output dependent on iteration order. An earlier comment here claimed Go's
+    // order was non-deterministic; it is not.
     let mut filtered = filtered;
     filtered.sort_by(|a, b| {
         b.confidence
             .partial_cmp(&a.confidence)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.sug_type.cmp(&b.sug_type))
+            .then_with(|| a.target_bead.cmp(&b.target_bead))
+            .then_with(|| a.related_bead.cmp(&b.related_bead))
+            .then_with(|| a.summary.cmp(&b.summary))
+            .then_with(|| a.reason.cmp(&b.reason))
+            .then_with(|| a.action_command.cmp(&b.action_command))
     });
 
     let mut filtered = filtered;
