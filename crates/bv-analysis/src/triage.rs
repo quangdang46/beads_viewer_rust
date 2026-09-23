@@ -369,7 +369,7 @@ pub fn compute_project_velocity(
     // Weekly buckets: key = (iso_year, iso_week), value = count.
     // Go uses 8 weeks, Monday-start ISO weeks.
     use std::collections::BTreeMap;
-    let mut week_buckets: BTreeMap<(i32, u32), usize> = BTreeMap::new();
+    let mut week_buckets: BTreeMap<i64, usize> = BTreeMap::new();
 
     for issue in issues {
         if !matches!(issue.status, Status::Closed | Status::Tombstone) {
@@ -395,11 +395,17 @@ pub fn compute_project_velocity(
         if closed_at >= month_ago {
             closed_last_30 += 1;
         }
-        // Bucket by ISO week (year, week_of_year) from timestamp string.
+        // Bucket by the Monday of the closure's ISO week.
+        // Go (triage.go:299-304) keys `weekBuckets` by `isoWeekStart(year,
+        // week)` — a time.Time Monday — and emits it as an RFC3339 date, not
+        // an ISO week label. Keying by (year, week) and formatting as
+        // "YYYY-Www" produced "2026-W34" where Go emits "2026-08-17T00:00:00Z".
         if let Some(ts_str) = issue.closed_at.as_deref().or(issue.updated_at.as_deref()) {
             if let Some((y, m, d)) = parse_ymd(ts_str) {
                 let (iso_year, iso_week) = ymd_to_iso_week(y, m, d);
-                *week_buckets.entry((iso_year, iso_week)).or_insert(0) += 1;
+                if let Some(monday) = iso_week_start(iso_year, iso_week) {
+                    *week_buckets.entry(monday).or_insert(0) += 1;
+                }
             }
         }
 
@@ -422,35 +428,57 @@ pub fn compute_project_velocity(
     };
 
     // Build weekly array (newest first, 8 weeks). Go parity: VelocityWeek.
-    // Compute the most recent Monday and iterate backwards.
+    // Go (triage.go:314-321) starts at `truncateToMonday(now)` and steps back
+    // 7 days at a time, emitting each cursor as an RFC3339 timestamp.
     let mut weekly: Vec<serde_json::Value> = Vec::new();
-    let now_str = now.to_string();
-    if let Some((ny, nm, nd)) = parse_ymd(&now_str) {
+    if let Some((ny, nm, nd)) = parse_ymd(&now.to_string()) {
         let (cur_y, cur_w) = ymd_to_iso_week(ny, nm, nd);
-        for offset in 0..8i32 {
-            // Subtract offset weeks from current ISO week.
-            let mut wy = cur_y;
-            let mut ww = cur_w as i32 - offset;
-            while ww <= 0 {
-                wy -= 1;
-                let (_, prev_w52) = ymd_to_iso_week(wy + 1, 1, 4);
-                ww += prev_w52 as i32;
+        if let Some(mut cursor) = iso_week_start(cur_y, cur_w) {
+            for _ in 0..8 {
+                let count = week_buckets.get(&cursor).copied().unwrap_or(0);
+                let ts = jiff::Timestamp::from_second(cursor * 86400)
+                    .map(|t| format!("{}T00:00:00Z", t.strftime("%Y-%m-%d")))
+                    .unwrap_or_default();
+                weekly.push(serde_json::json!({
+                    "week_start": ts,
+                    "closed": count,
+                }));
+                cursor -= 7;
             }
-            let count = week_buckets.get(&(wy, ww as u32)).copied().unwrap_or(0);
-            weekly.push(serde_json::json!({
-                "week_start": format!("{wy}-W{ww:02}"),
-                "closed": count,
-            }));
         }
     }
 
     Some(serde_json::json!({
         "closed_last_7_days": closed_last_7,
         "closed_last_30_days": closed_last_30,
-        "avg_days_to_close": (avg_days * 100.0).round() / 100.0,
+        "avg_days_to_close": avg_days,
         "weekly": weekly,
         "estimated": estimated,
     }))
+}
+
+/// Days since the Unix epoch for the Monday that starts the given ISO week.
+/// Go `isoWeekStart` (triage.go) reconstructs the Monday from the ISO
+/// year/week pair; the four-day rule puts the reference in that same week.
+fn iso_week_start(iso_year: i32, iso_week: u32) -> Option<i64> {
+    // Jan 4 is always in ISO week 1.
+    let jan4 = days_from_civil(iso_year, 1, 4);
+    // Weekday of Jan 4, 0=Monday.
+    let jan4_dow = (jan4 + 3).rem_euclid(7);
+    let week1_monday = jan4 - jan4_dow;
+    Some(week1_monday + (iso_week as i64 - 1) * 7)
+}
+
+/// Days since 1970-01-01 for a proleptic-Gregorian y/m/d (Howard Hinnant's
+/// `days_from_civil`), matching Go's `time.Date(...).Unix()` / 86400.
+fn days_from_civil(y: i32, m: i32, d: i32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y } as i64;
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = ((m + 9) % 12) as i64;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
 }
 
 pub fn build_triage(issues: &[Issue], g: &DiGraph, now: jiff::Timestamp) -> TriageOutput {
