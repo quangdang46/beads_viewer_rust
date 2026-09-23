@@ -83,6 +83,8 @@ fn recommendation_def() -> Value {
             "score": s("number"),
             "reasons": string_array(),
             "unblocks": s("integer"),
+            // v0.25.0 attaches the live tracker route to every recommendation.
+            "actions": issue_actions_schema(),
         },
         "required": ["id", "title", "score"],
     })
@@ -128,7 +130,10 @@ fn recipe_summary_schema() -> Value {
         "properties": {
             "name": s("string"),
             "description": s("string"),
-            "source": {"type": "string", "enum": ["builtin", "user", "project"]},
+            // v0.25.0 added project-file recipes, which carry the defining
+            // file path they were loaded from.
+            "source": {"type": "string", "enum": ["builtin", "user", "project", "project-file"]},
+            "path": {"type": "string", "description": "Defining file for project-file recipes"},
         },
         "required": ["name", "description", "source"],
     })
@@ -148,6 +153,18 @@ fn suggestion_set_schema() -> Value {
                     "reason": s("string"),
                     "confidence": s("number"),
                     "action_command": s("string"),
+                    // v0.25.0 reports the action as a structured route rather
+                    // than a bare command string.
+                    "action": {
+                        "description": "Literal argv with an explicit working directory and equivalent POSIX shell command",
+                        "type": "object",
+                        "properties": {
+                            "working_directory": {"type": "string", "minLength": 1},
+                            "argv": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                            "shell": {"type": "string", "minLength": 1},
+                        },
+                        "required": ["working_directory", "argv", "shell"],
+                    },
                     "generated_at": {"type": "string", "format": "date-time"},
                     "metadata": {"type": "object", "additionalProperties": true},
                 },
@@ -447,16 +464,16 @@ fn triage_schema() -> Value {
                             "generated_at": s("string"),
                             "phase2_ready": s("boolean"),
                             "issue_count": s("integer"),
-                            "history_status": {"type": "string", "enum": ["ok", "error", "timeout"], "description": "Outcome of the git-history correlation prologue; omitted when history was not attempted (#166)"},
+                            "history_status": {"type": "string", "enum": ["ok", "error", "timeout", "skipped"], "description": "Outcome of the git-history correlation prologue; omitted when history was not attempted (#166)"},
                         },
                     },
                     "quick_ref": {
                         "type": "object",
                         "properties": {
-                            "actionable_count": {"type": "integer", "description": "Non-closed issues ready to work on (no open blocking dependencies)"},
+                            "actionable_count": {"type": "integer", "description": "Issues ready to work on: status open or in_progress, no open blocking dependencies, no future defer_until (parked statuses such as blocked/deferred/draft are excluded, matching br ready)"},
                             "blocked_count": {"type": "integer", "description": "Strict count of issues with status == blocked (equals project_health.counts.by_status.blocked)"},
                             "in_progress_count": {"type": "integer", "description": "Strict count of issues with status == in_progress"},
-                            "not_actionable_count": {"type": "integer", "description": "Non-closed issues blocked by open dependencies, regardless of status"},
+                            "not_actionable_count": {"type": "integer", "description": "Non-closed issues that are not actionable: blocked by open dependencies, parked in a non-actionable status, or scheduler-deferred"},
                             "not_closed_count": {"type": "integer", "description": "All non-closed issues (open+in_progress+blocked+deferred); equals actionable_count + not_actionable_count"},
                             "open_count": {"type": "integer", "description": "Strict count of issues with status == open (equals project_health.counts.by_status.open)"},
                             "top_picks": array_of(json!({"$ref": "#/$defs/recommendation"})),
