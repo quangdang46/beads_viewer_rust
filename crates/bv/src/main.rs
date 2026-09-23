@@ -949,25 +949,51 @@ fn run_robot_next() -> ExitCode {
     };
     match chosen {
         Some(top) => {
-            payload["actionable"] = serde_json::json!(true);
             payload["phase2_ready"] = serde_json::json!(true);
             payload["status"] = cleared_status.clone();
-            payload["id"] = top["id"].clone();
-            payload["title"] = top["title"].clone();
-            payload["score"] = top["score"].clone();
-            payload["reasons"] = top["reasons"].clone();
             let id = top["id"].as_str().unwrap_or_default().to_string();
             // Go v0.25.0: live tracker route suggestions replace the flat
             // claim_command/show_command strings.
             let origin = bv_core::tracker::resolve_issue_origin(&source.path, &id);
             let actions = bv_core::tracker::build_actions(&origin, true);
-            if let Some(cmd) = &actions.claim {
-                payload["claim_command"] = serde_json::json!(cmd.shell);
-            }
-            if let Some(cmd) = &actions.show {
-                payload["show_command"] = serde_json::json!(cmd.shell);
-            }
             payload["actions"] = serde_json::to_value(&actions).unwrap_or(serde_json::Value::Null);
+
+            // Go (robot_registry.go:2558-2566) treats a missing claim route as a
+            // degradation, not as an actionable pick: it reports the candidate
+            // under `diagnostic_top_pick`, sets actionable=false, and explains
+            // why. Claimability alone is not enough — a source with no readable
+            // tracker metadata (every synthetic fixture) must take this path.
+            if actions.claim.is_none() {
+                payload["actionable"] = serde_json::json!(false);
+                payload["message"] = serde_json::json!(format!(
+                    "No claim command emitted: {}",
+                    actions.unavailable_reason
+                ));
+                payload["diagnostic_top_pick"] = serde_json::json!({
+                    "id": top["id"],
+                    "title": top["title"],
+                    "score": top["score"],
+                    "reasons": top["reasons"],
+                    "unblocks": top.get("unblocks").cloned().unwrap_or(serde_json::json!(0)),
+                });
+                payload["degraded"] = serde_json::json!([{
+                    "code": "live_action_route_unavailable",
+                    "severity": "info",
+                    "message": actions.unavailable_reason,
+                }]);
+            } else {
+                payload["actionable"] = serde_json::json!(true);
+                payload["id"] = top["id"].clone();
+                payload["title"] = top["title"].clone();
+                payload["score"] = top["score"].clone();
+                payload["reasons"] = top["reasons"].clone();
+                if let Some(cmd) = &actions.claim {
+                    payload["claim_command"] = serde_json::json!(cmd.shell);
+                }
+                if let Some(cmd) = &actions.show {
+                    payload["show_command"] = serde_json::json!(cmd.shell);
+                }
+            }
         }
         None => {
             payload["actionable"] = serde_json::json!(false);
