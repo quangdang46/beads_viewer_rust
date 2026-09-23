@@ -2141,10 +2141,6 @@ fn envelope_json(data_hash: &str) -> serde_json::Value {
 /// carries `output_format` and `version` — golden-verified.
 /// Build the v0.25.0 envelope prefix. Field order matches Go `RobotEnvelope`
 /// (cmd/bv/main.go:7215) because the serializer preserves insertion order.
-fn full_envelope_json(data_hash: &str) -> serde_json::Value {
-    full_envelope_json_with_source(data_hash, None, &[])
-}
-
 /// Envelope with Go v0.25.0 source provenance + scope/authority hashes.
 fn full_envelope_json_with_source(
     data_hash: &str,

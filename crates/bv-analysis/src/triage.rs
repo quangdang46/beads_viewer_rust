@@ -525,23 +525,40 @@ pub fn build_triage(issues: &[Issue], g: &DiGraph, now: jiff::Timestamp) -> Tria
     // triageScore = baseScore * 0.70 + unblockBoost + quickwinBoost
     // This transforms raw impact scores into triage-prioritized scores.
 
-    // 1. Compute unblock counts: how many open issues each issue unblocks.
-    let mut unblock_counts: BTreeMap<String, usize> = BTreeMap::new();
+    // 1. Compute the unblocks map (Go `buildUnblocksMap`, triage.go:797).
+    //    Reverse map: blocker_id -> the issues it would unblock. Only an issue
+    //    blocked by EXACTLY ONE open blocker counts, and only when completing
+    //    that blocker makes the issue actionable. This is deliberately not
+    //    plain in-degree: Go only credits a blocker for issues it alone holds up.
+    let mut unblocks_map: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for issue in issues {
-        if !issue.status.is_open() {
+        if matches!(issue.status, Status::Closed | Status::Tombstone) {
             continue;
         }
-        for dep in &issue.dependencies {
-            if !dep.r#type.is_blocking() {
-                continue;
-            }
-            let blocker_id = dep.effective_depends_on();
-            if !blocker_id.is_empty() {
-                *unblock_counts.entry(blocker_id.to_string()).or_insert(0) += 1;
-            }
+        unblocks_map.entry(issue.id.clone()).or_default();
+        let open_blockers: Vec<&str> = issue
+            .dependencies
+            .iter()
+            .filter(|d| d.r#type.is_blocking())
+            .map(|d| d.effective_depends_on())
+            .filter(|bid| !bid.is_empty())
+            .filter(|bid| {
+                issues.iter().any(|i| {
+                    i.id == *bid && !matches!(i.status, Status::Closed | Status::Tombstone)
+                })
+            })
+            .collect();
+        if open_blockers.len() == 1 {
+            unblocks_map
+                .entry(open_blockers[0].to_string())
+                .or_default()
+                .push(issue.id.clone());
         }
     }
-    let max_unblocks = unblock_counts.values().copied().max().unwrap_or(0);
+    for list in unblocks_map.values_mut() {
+        list.sort();
+    }
+    let max_unblocks = unblocks_map.values().map(|v| v.len()).max().unwrap_or(0);
 
     // 2. Compute blocker depths: how many open blocking deps each issue has.
     let mut blocker_depths: BTreeMap<String, usize> = BTreeMap::new();
@@ -567,7 +584,7 @@ pub fn build_triage(issues: &[Issue], g: &DiGraph, now: jiff::Timestamp) -> Tria
 
     // 3. Apply triage scoring to each recommendation.
     for rec in &mut recommendations {
-        let unblocks = *unblock_counts.get(&rec.id).unwrap_or(&0);
+        let unblocks = unblocks_map.get(&rec.id).map(|v| v.len()).unwrap_or(0);
         let blocker_depth = *blocker_depths.get(&rec.id).unwrap_or(&0);
         let base_score = rec.score;
 
