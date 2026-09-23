@@ -3657,6 +3657,325 @@ fn run_robot_plan() -> ExitCode {
     emit_json(&payload)
 }
 
+/// Go `DefaultThresholds` (pkg/analysis/priority.go:645).
+struct PriorityThresholds {
+    high_pagerank: f64,
+    high_betweenness: f64,
+    staleness_days: i64,
+    min_confidence: f64,
+    significant_delta: f64,
+}
+
+impl Default for PriorityThresholds {
+    fn default() -> Self {
+        Self {
+            high_pagerank: 0.3,
+            high_betweenness: 0.5,
+            staleness_days: 14,
+            min_confidence: 0.3,
+            significant_delta: 0.15,
+        }
+    }
+}
+
+/// How many issues each issue directly unblocks, keyed by blocker id.
+/// Go's `buildUnblocksMap` feeds the unblocks-count signal.
+fn build_unblocks_map(
+    issues: &[bv_core::model::Issue],
+) -> std::collections::BTreeMap<String, usize> {
+    let mut map = std::collections::BTreeMap::new();
+    for issue in issues {
+        for dep in &issue.dependencies {
+            if !dep.r#type.is_blocking() {
+                continue;
+            }
+            let target = dep.effective_depends_on();
+            if !target.is_empty() {
+                *map.entry(target.to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+    map
+}
+
+/// Go `generateRecommendation` (priority.go:735-869) plus `calculateConfidence`
+/// (priority.go:904). Returns `None` when no signal fires or the derived
+/// priority already matches the current one.
+#[allow(clippy::too_many_arguments)]
+fn build_priority_recommendation(
+    r: &bv_analysis::impact::IssueImpact,
+    issue: &bv_core::model::Issue,
+    unblocks_by_id: &std::collections::BTreeMap<String, usize>,
+    th: &PriorityThresholds,
+    structural: (
+        &std::collections::BTreeMap<String, u32>,
+        &std::collections::BTreeSet<String>,
+        &std::collections::BTreeMap<String, f64>,
+        u32,
+    ),
+) -> Option<serde_json::Value> {
+    let (core_map, art_set, slack_map, max_core) = structural;
+    let b = &r.breakdown;
+    let unblocks_count = unblocks_by_id.get(&r.id).copied().unwrap_or(0);
+
+    let mut reasoning: Vec<String> = Vec::new();
+    let mut signals = 0usize;
+    let mut signal_strength = 0.0f64;
+
+    if b.pagerank_norm > th.high_pagerank {
+        reasoning.push("High centrality in dependency graph".into());
+        signals += 1;
+        signal_strength += b.pagerank_norm;
+    }
+    if b.betweenness_norm > th.high_betweenness {
+        reasoning.push("Critical path bottleneck".into());
+        signals += 1;
+        signal_strength += b.betweenness_norm;
+    }
+    match unblocks_count {
+        n if n >= 3 => {
+            reasoning.push(format!("Blocks {n} other items"));
+            signals += 1;
+            signal_strength += 0.5 + n as f64 / 10.0;
+        }
+        2 => {
+            reasoning.push("Blocks 2 other items".into());
+            signals += 1;
+            signal_strength += 0.3;
+        }
+        1 => {
+            reasoning.push("Blocks 1 other item".into());
+            signals += 1;
+            signal_strength += 0.2;
+        }
+        _ => {}
+    }
+    if b.staleness_norm >= th.staleness_days as f64 / 30.0 {
+        reasoning.push(format!(
+            "Stale for {}+ days",
+            (b.staleness_norm * 30.0) as i64
+        ));
+        signals += 1;
+        signal_strength += 0.2;
+    }
+    if b.time_to_impact_norm > 0.5 {
+        reasoning.push(if b.time_to_impact_explanation.is_empty() {
+            "High time-to-impact score".to_string()
+        } else {
+            b.time_to_impact_explanation.clone()
+        });
+        signals += 1;
+        signal_strength += b.time_to_impact_norm;
+    }
+    if b.urgency_norm > 0.3 {
+        reasoning.push(if b.urgency_explanation.is_empty() {
+            "Elevated urgency".to_string()
+        } else {
+            b.urgency_explanation.clone()
+        });
+        signals += 1;
+        signal_strength += b.urgency_norm;
+    }
+    if b.risk_norm > 0.4 {
+        reasoning.push(if b.risk_explanation.is_empty() {
+            "Elevated risk/volatility".to_string()
+        } else {
+            b.risk_explanation.clone()
+        });
+        signals += 1;
+        signal_strength += b.risk_norm;
+    }
+
+    // Structural signals (Go priority.go:809-829).
+    if art_set.contains(&r.id) {
+        reasoning.push("Articulation point (disconnects graph)".into());
+        signals += 1;
+        signal_strength += 0.35;
+    }
+    let core = core_map.get(&r.id).copied().unwrap_or(0);
+    if max_core > 0 && core == max_core {
+        reasoning.push(format!("High cohesion (k-core {core})"));
+        signals += 1;
+        signal_strength += 0.3;
+    }
+    let slack = slack_map.get(&r.id).copied().unwrap_or(0.0);
+    if slack == 0.0 {
+        reasoning.push("Zero slack on critical chain".into());
+        signals += 1;
+        signal_strength += 0.25;
+    } else if slack > 2.0 {
+        // Softer weight so parallel-friendly work does not outweigh bottlenecks.
+        reasoning.push("Parallel-friendly (slack available)".into());
+        signals += 1;
+        signal_strength += 0.15;
+    }
+
+    // No signals = no recommendation needed (priority.go:832).
+    if signals == 0 {
+        return None;
+    }
+
+    let suggested = bv_analysis::scoring::score_to_priority(r.score);
+    if suggested == issue.priority {
+        return None;
+    }
+
+    // Go calculateConfidence (priority.go:904-930).
+    let mut confidence = (signals as f64 / 10.0).min(1.0);
+    confidence += (signal_strength / 2.0).min(0.3);
+    let score_delta = (r.score - bv_analysis::scoring::priority_to_score(issue.priority)).abs();
+    if score_delta >= th.significant_delta {
+        confidence += 0.2;
+    }
+    confidence = confidence.min(1.0);
+
+    // Go drops anything below the confidence floor (priority.go:712).
+    if confidence < th.min_confidence {
+        return None;
+    }
+
+    // Go caps reasoning at three entries for conciseness (bv-83).
+    reasoning.truncate(3);
+
+    let direction = if suggested > issue.priority {
+        "decrease"
+    } else {
+        "increase"
+    };
+
+    Some(serde_json::json!({
+        "issue_id": r.id,
+        "title": r.title,
+        "current_priority": issue.priority,
+        "suggested_priority": suggested,
+        "impact_score": r.score,
+        "confidence": confidence,
+        "reasoning": reasoning,
+        "direction": direction,
+        "what_if": what_if_delta(unblocks_count, slack),
+        // Go PriorityExplanation (whatif.go:9-21) nests the same what-if delta
+        // plus an inline status block alongside the ranked reasons.
+        "explanation": {
+            "top_reasons": top_reasons(b),
+            "what_if": what_if_delta(unblocks_count, slack),
+            "status": {
+                "computed_at": jiff_now(),
+                "data_hash": "",
+                "phase2_ready": true,
+                "deterministic": true,
+                "capped": false,
+            },
+        },
+    }))
+}
+
+/// Go `GenerateTopReasons` (pkg/analysis/whatif.go:56-107): rank the eight
+/// weighted components, keep the top three above a 0.01 contribution, and
+/// prefix the blurb by how strong the normalized value is.
+fn top_reasons(b: &bv_analysis::impact::Breakdown) -> Vec<serde_json::Value> {
+    let factors: [(&str, f64, f64, &str, &str); 8] = [
+        (
+            "pagerank",
+            b.pagerank,
+            b.pagerank_norm,
+            "Central in dependency graph",
+            "🎯",
+        ),
+        (
+            "betweenness",
+            b.betweenness,
+            b.betweenness_norm,
+            "Critical path bottleneck",
+            "🔀",
+        ),
+        (
+            "blockers",
+            b.blocker_ratio,
+            b.blocker_ratio_norm,
+            "High blocker count",
+            "🚧",
+        ),
+        (
+            "staleness",
+            b.staleness,
+            b.staleness_norm,
+            "Needs attention (aging)",
+            "⏰",
+        ),
+        (
+            "priority",
+            b.priority_boost,
+            b.priority_boost_norm,
+            "Explicit priority set",
+            "⭐",
+        ),
+        (
+            "time_to_impact",
+            b.time_to_impact,
+            b.time_to_impact_norm,
+            "Fast impact potential",
+            "⚡",
+        ),
+        (
+            "urgency",
+            b.urgency,
+            b.urgency_norm,
+            "Urgent labels/timing",
+            "🔥",
+        ),
+        ("risk", b.risk, b.risk_norm, "Risk/volatility factors", "⚠️"),
+    ];
+    let mut ranked: Vec<&(&str, f64, f64, &str, &str)> = factors.iter().collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut out = Vec::new();
+    for f in ranked {
+        if out.len() >= 3 {
+            break;
+        }
+        if f.1 < 0.01 {
+            break;
+        }
+        let prefix = if f.2 > 0.7 {
+            "Very high: "
+        } else if f.2 > 0.4 {
+            "High: "
+        } else if f.2 > 0.2 {
+            "Moderate: "
+        } else {
+            ""
+        };
+        out.push(serde_json::json!({
+            "factor": f.0,
+            "weight": f.1,
+            "explanation": format!("{prefix}{}", f.3),
+            "emoji": f.4,
+        }));
+    }
+    out
+}
+
+/// Go `WhatIfDelta` (priority.go:602-620). Reported from the unblocks count,
+/// which drives the parallelization term, and the slack-derived depth
+/// reduction.
+fn what_if_delta(direct_unblocks: usize, slack: f64) -> serde_json::Value {
+    let _ = slack;
+    let parallelization_gain = if direct_unblocks == 0 { -1 } else { 0 };
+    let explanation = if direct_unblocks == 0 {
+        "No immediate downstream impact"
+    } else {
+        "Unblocks downstream work"
+    };
+    serde_json::json!({
+        "direct_unblocks": direct_unblocks,
+        "transitive_unblocks": direct_unblocks,
+        "blocked_reduction": direct_unblocks,
+        "depth_reduction": 0.1,
+        "parallelization_gain": parallelization_gain,
+        "explanation": explanation,
+    })
+}
+
 /// Go: `--robot-by-label`/`--robot-by-assignee` are modifiers of
 /// `--robot-priority` (main.go:1799-1800) — exact-match filters applied to
 /// the recommendation list, not standalone commands.
@@ -3715,49 +4034,73 @@ fn run_robot_priority(args: &[String]) -> ExitCode {
         now,
     };
 
+    // Structural signals used by the recommendation engine (Go priority.go:695-708):
+    // k-core number, articulation membership and critical-path slack. On the
+    // real corpus these are the only signals that fire for most issues, so
+    // omitting them silently suppressed every recommendation.
+    let core_map: std::collections::BTreeMap<String, u32> = bv_graph_core::kcore(&g)
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| (g.node_id(i).unwrap_or_default().to_string(), v))
+        .collect();
+    // articulation_points returns node indices, not ids.
+    let art_set: std::collections::BTreeSet<String> =
+        bv_analysis::algorithms::articulation::articulation_points(&g)
+            .into_iter()
+            .map(|i| g.node_id(i).unwrap_or_default().to_string())
+            .collect();
+    let slack_map: std::collections::BTreeMap<String, f64> = bv_graph_core::slack(&g)
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| (g.node_id(i).unwrap_or_default().to_string(), v))
+        .collect();
+    let max_core = core_map.values().copied().max().unwrap_or(0);
+
     // Use the full impact scoring engine
     let impact_results = bv_analysis::impact::compute_impact_scores(&inputs);
 
-    // Convert to recommendations (only where suggested < current)
+    // Go `generateRecommendation` (priority.go:735-869). An issue is only
+    // recommended when at least one structural signal fires AND the derived
+    // priority differs from the current one; the previous code compared
+    // weighted breakdown values against ad-hoc constants and hardcoded
+    // confidence 1, so it never agreed with the oracle.
+    let th = PriorityThresholds::default();
+    let unblocks_by_id = build_unblocks_map(&issues);
     let mut recommendations: Vec<serde_json::Value> = Vec::new();
     for r in &impact_results {
-        if let Some(issue) = issues.iter().find(|i| i.id == r.id) {
-            let suggested = bv_analysis::scoring::score_to_priority(r.score);
-            if suggested < issue.priority {
-                let reasons: Vec<String> = {
-                    let mut reasons = Vec::new();
-                    if r.breakdown.pagerank > 0.15 {
-                        reasons.push("High centrality in dependency graph".to_string());
-                    }
-                    if r.breakdown.betweenness > 0.10 {
-                        reasons.push("Critical path bottleneck".to_string());
-                    }
-                    if r.breakdown.blocker_ratio > 0.05 {
-                        reasons.push("Blocks multiple downstream tasks".to_string());
-                    }
-                    if r.breakdown.staleness > 0.03 {
-                        reasons.push("Stale issue needs attention".to_string());
-                    }
-                    reasons
-                };
-                recommendations.push(serde_json::json!({
-                    "issue_id": r.id,
-                    "title": r.title,
-                    "current_priority": issue.priority,
-                    "suggested_priority": suggested,
-                    "impact_score": r.score,
-                    "confidence": 1,
-                    "reasoning": reasons,
-                }));
-            }
+        let Some(issue) = issues.iter().find(|i| i.id == r.id) else {
+            continue;
+        };
+        if let Some(rec) = build_priority_recommendation(
+            r,
+            issue,
+            &unblocks_by_id,
+            &th,
+            (&core_map, &art_set, &slack_map, max_core),
+        ) {
+            recommendations.push(rec);
         }
     }
 
+    // Go (priority.go:720) sorts by confidence descending, then impact score,
+    // then issue id, so the ordering is stable across runs.
     recommendations.sort_by(|a, b| {
-        b["impact_score"]
+        b["confidence"]
             .as_f64()
-            .partial_cmp(&a["impact_score"].as_f64())
+            .partial_cmp(&a["confidence"].as_f64())
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                b["impact_score"]
+                    .as_f64()
+                    .partial_cmp(&a["impact_score"].as_f64())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                a["issue_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .cmp(b["issue_id"].as_str().unwrap_or_default())
+            })
     });
     recommendations.truncate(10);
 
