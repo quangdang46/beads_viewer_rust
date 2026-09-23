@@ -228,6 +228,112 @@ impl OutputFormat {
     }
 }
 
+/// Whether the external `tru` encoder is usable.
+///
+/// Go's TOON path shells out to a separate `toon_rust` binary and degrades to
+/// JSON when it is absent (`vendor/.../toon-go/toon.go: findTruBinary`). This
+/// crate encodes in-process, so it does not need `tru` to produce bytes — but
+/// Go's *observable* contract is that `--format toon` without `tru` installed
+/// prints a warning and reports `output_format: "json"`. Matching that keeps
+/// the envelope honest: the marker must never claim `toon` over JSON bytes.
+pub fn tru_available() -> bool {
+    tru_path().is_some()
+}
+
+/// Resolve the `tru` binary using Go's lookup order: `TOON_TRU_BIN` then
+/// `TOON_BIN` (either a path or a command name), then `tru`/`toon` on PATH,
+/// then a short list of common install locations.
+fn tru_path() -> Option<std::path::PathBuf> {
+    for env in ["TOON_TRU_BIN", "TOON_BIN"] {
+        if let Ok(raw) = std::env::var(env) {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                continue;
+            }
+            // Go treats an explicitly configured but unusable value as a hard
+            // error rather than silently falling through to PATH.
+            return is_toon_rust_binary(&resolve_candidate(raw)).then(|| raw.into());
+        }
+    }
+    for name in ["tru", "toon"] {
+        if let Some(path) = look_path(name) {
+            if is_toon_rust_binary(&path) {
+                return Some(path);
+            }
+        }
+    }
+    for p in [
+        "/usr/local/bin/tru",
+        "/usr/bin/tru",
+        "/data/tmp/cargo-target/release/tru",
+        "/data/tmp/cargo-target/debug/tru",
+    ] {
+        let path = std::path::PathBuf::from(p);
+        if is_toon_rust_binary(&path) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn resolve_candidate(raw: &str) -> std::path::PathBuf {
+    let direct = std::path::PathBuf::from(raw);
+    if direct.is_file() {
+        return direct;
+    }
+    look_path(raw).unwrap_or(direct)
+}
+
+fn look_path(name: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Go `isToonRustBinary`: a binary qualifies if `--help` mentions the Rust
+/// reference implementation, or `--version` starts with `tru ` / `toon_rust `.
+/// Probing on every call would fork twice per invocation, so the answer is
+/// cached after the first lookup.
+fn is_toon_rust_binary(path: &std::path::Path) -> bool {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, bool>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Ok(map) = cache.lock() {
+        if let Some(hit) = map.get(path) {
+            return *hit;
+        }
+    }
+    let verdict = probe_toon_binary(path);
+    if let Ok(mut map) = cache.lock() {
+        map.insert(path.to_path_buf(), verdict);
+    }
+    verdict
+}
+
+fn probe_toon_binary(path: &std::path::Path) -> bool {
+    use std::process::Command;
+    if let Ok(out) = Command::new(path).arg("--help").output() {
+        let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
+        let text = format!("{text}{}", String::from_utf8_lossy(&out.stderr).to_lowercase());
+        if text.contains("reference implementation in rust") {
+            return true;
+        }
+    }
+    if let Ok(out) = Command::new(path).arg("--version").output() {
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_lowercase();
+        if text.starts_with("tru ") || text.starts_with("toon_rust ") {
+            return true;
+        }
+    }
+    false
+}
+
 /// Encode a robot payload. Golden-corpus finding (Phase 3b): for the captured
 /// command set, Go's TOON output is byte-identical to compact JSON apart from
 /// `output_format:"toon"` — i.e. the encoder emits compact JSON with the marker
