@@ -91,7 +91,7 @@ fn run_bvr(cwd: &Path, args: &[&str]) -> Option<String> {
         // velocity week buckets) are deterministic. Hardcoding the epoch here
         // let it drift out of step with a later recapture, which surfaced as
         // ~32-day "No activity in N days" divergences across the corpus.
-        .env("SOURCE_DATE_EPOCH", &golden_source_date_epoch())
+        .env("SOURCE_DATE_EPOCH", golden_source_date_epoch())
         .env("BV_ROBOT", "1")
         .env("BV_NO_CACHE", "1")
         .output()
