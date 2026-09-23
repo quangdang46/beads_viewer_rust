@@ -475,11 +475,39 @@ fn triage_schema() -> Value {
     })
 }
 
+/// Go `model.IssueActions` (pkg/model/types.go:66) — the live tracker route
+/// attached to a suggestion or a top pick.
+fn issue_actions_schema() -> Value {
+    let command = |desc: &str| {
+        json!({
+            "description": desc,
+            "type": "object",
+            "properties": {
+                "working_directory": {"type": "string", "minLength": 1},
+                "argv": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                "shell": {"type": "string", "minLength": 1},
+            },
+            "required": ["working_directory", "argv", "shell"],
+        })
+    };
+    json!({
+        "type": "object",
+        "properties": {
+            "working_directory": s("string"),
+            "local_id": s("string"),
+            "tracker": {"type": "string", "enum": ["br", "bd"]},
+            "show": command("Literal argv with an explicit working directory and equivalent POSIX shell command"),
+            "claim": command("Literal argv with an explicit working directory and equivalent POSIX shell command"),
+            "unavailable_reason": s("string"),
+        },
+    })
+}
+
 fn next_schema() -> Value {
     json!({
         "$schema": DRAFT,
         "title": "Robot Next Output",
-        "description": "Single top pick recommendation with claim command",
+        "description": "A verified live claim route when actionable, otherwise diagnostics without a claim command",
         "type": "object",
         "properties": {
             "generated_at": {"type": "string", "format": "date-time"},
@@ -491,8 +519,38 @@ fn next_schema() -> Value {
             "unblocks": s("integer"),
             "claim_command": s("string"),
             "show_command": s("string"),
+            // v0.25.0: a pick without a live tracker route is reported as a
+            // degradation rather than an actionable item, so the schema has to
+            // describe those fields too.
+            "actionable": {"type": "boolean"},
+            "phase2_ready": {"type": "boolean"},
+            "status": s("object"),
+            "message": s("string"),
+            "diagnostic_top_pick": s("object"),
+            "degraded": {"type": "array", "items": {"type": "object"}},
+            "actions": issue_actions_schema(),
         },
-        "required": ["generated_at", "data_hash", "id", "title", "score"],
+        "required": [
+            "generated_at", "data_hash", "actionable", "phase2_ready", "status",
+        ],
+        // The two shapes are mutually exclusive: an actionable pick must carry
+        // the live claim route, a degraded one must not.
+        "if": {"properties": {"actionable": {"const": true}}},
+        "then": {
+            "properties": {"actions": {"required": ["claim", "show"]}},
+            "required": [
+                "id", "title", "score", "claim_command", "show_command", "actions",
+            ],
+        },
+        "else": {
+            "properties": {
+                "actions": {"properties": {"claim": false}},
+                "claim_command": false,
+                "diagnostic_top_pick": {
+                    "properties": {"actions": {"properties": {"claim": false}}},
+                },
+            },
+        },
     })
 }
 
@@ -541,9 +599,9 @@ fn insights_schema() -> Value {
             "Hubs": {"type": "array"},
             "Authorities": {"type": "array"},
             "Orphans": {"type": "array"},
-            "Cores": s("object"),
+            "Cores": {"type": "array"},
             "Articulation": {"type": "array"},
-            "Slack": s("object"),
+            "Slack": {"type": "array"},
             "Velocity": s("object"),
             "status": s("object"),
             "advanced_insights": s("object"),
@@ -1510,6 +1568,31 @@ fn search_schema() -> Value {
             "data_hash": s("string"),
             "output_format": format_enum(),
             "version": s("string"),
+            // v0.25.0 records index/candidate/ranking provenance so a cached
+            // result can be tied back to exactly what was searched.
+            "index_data_hash": {
+                "description": "Hash of the complete indexed issue corpus before candidate filters",
+                "type": "string",
+            },
+            "candidate_hash": {
+                "description": "Hash of issues eligible for this search before score filtering",
+                "type": "string",
+            },
+            "ranking_hash": {
+                "description": "Hash of corpus, candidates, scope, query, and effective ranking configuration",
+                "type": "string",
+            },
+            "ranking_time": {
+                "description": "Pinned reference time used by hybrid recency scoring",
+                "type": "string",
+                "format": "date-time",
+            },
+            "min_score": {
+                "description": "Inclusive minimum raw text similarity, before lexical boost or hybrid ranking",
+                "type": "number",
+                "minimum": -1,
+                "maximum": 1,
+            },
             "query": s("string"),
             "provider": s("string"),
             "dim": s("integer"),
@@ -1539,7 +1622,12 @@ fn search_schema() -> Value {
                 "type": "array",
             },
         },
-        "required": ["generated_at", "data_hash", "output_format", "version", "query", "provider", "dim", "index_path", "index", "loaded", "limit", "mode", "results"],
+        "required": [
+            "generated_at", "data_hash", "output_format", "version",
+            "index_data_hash", "candidate_hash", "ranking_hash", "query",
+            "provider", "dim", "index_path", "index", "loaded", "limit", "mode",
+            "results",
+        ],
     })
 }
 
