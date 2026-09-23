@@ -1345,18 +1345,19 @@ fn capture_baseline(
             );
         }
     }
-    // Go keeps only the top 10 PageRank entries for drift comparison
-    // (robot_registry.go:1169, `buildMetricItems(stats.PageRank(), 10)`).
-    // Keeping every node made "entered top" fire for far more issues than
-    // the oracle reports.
-    let mut pr_map = std::collections::BTreeMap::new();
-    for (i, v) in bv_analysis::algorithms::pagerank::pagerank_default(&g)
+    // Go keeps the top 10 PageRank entries for drift comparison
+    // (main.go:5242 buildMetricItems): rank by value descending, then
+    // truncate. Ranking by graph iteration order instead selected a
+    // different set, so the "entered top" details disagreed with the
+    // oracle even at the same count.
+    let mut ranked: Vec<(String, f64)> = bv_analysis::algorithms::pagerank::pagerank_default(&g)
         .into_iter()
         .enumerate()
-        .take(10)
-    {
-        pr_map.insert(g.node_id(i).unwrap_or_default().to_string(), v);
-    }
+        .map(|(i, v)| (g.node_id(i).unwrap_or_default().to_string(), v))
+        .collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.truncate(10);
+    let pr_map: std::collections::BTreeMap<String, f64> = ranked.into_iter().collect();
     Ok((
         bv_analysis::drift::BaselineStats {
             node_count: p1.node_count,
@@ -3906,11 +3907,27 @@ fn run_robot_alerts() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let baseline_stats: bv_analysis::drift::BaselineStats = std::fs::read_to_string(BASELINE_PATH)
+    // Read the baseline from the same place Go does. Go's `baseline.Load`
+    // populates `TopMetrics.PageRank` from a top-level `top_metrics.pagerank`
+    // array of {id, value}; our baseline files predate that field, so Go sees
+    // an empty top-list and reports every current entry as "entered top".
+    // Reading `stats.pagerank` here instead made the two binaries disagree
+    // about the same file, so the comparison is anchored to Go's layout.
+    let baseline_doc: serde_json::Value = std::fs::read_to_string(BASELINE_PATH)
         .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .and_then(|doc| serde_json::from_value(doc.get("stats")?.clone()).ok())
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    let mut baseline_stats: bv_analysis::drift::BaselineStats = baseline_doc
+        .get("stats")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_else(|| current.clone());
+    // Go keys the top-list by `top_metrics.pagerank`; an absent key means an
+    // empty map, which is what makes every current entry count as "entered".
+    baseline_stats.pagerank = baseline_doc
+        .get("top_metrics")
+        .and_then(|tm| tm.get("pagerank"))
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
     let result = bv_analysis::drift::calculate(
         &baseline_stats,
         &current,
