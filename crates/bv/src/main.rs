@@ -200,6 +200,16 @@ fn main() -> ExitCode {
             eprintln!("Invalid --format \"{fmt_val}\" (expected json|toon)");
             return ExitCode::from(2);
         }
+        // Go (cmd/bv/main.go:2037-2038) warns and downgrades toon -> json when
+        // the external `tru` encoder is absent, doing it *before* the payload is
+        // built so `output_format` never claims "toon" over JSON bytes on
+        // stdout.
+        if fmt_val == "toon" && !bv_robot::envelope::tru_available() {
+            eprintln!("warning: tru not available; falling back to JSON");
+            set_output_format("json");
+        } else {
+            set_output_format(&fmt_val);
+        }
     }
 
     // Robot drift (Go: --robot-drift wraps --check-drift with JSON output).
@@ -589,10 +599,80 @@ fn extract_as_of() -> Option<String> {
 }
 
 /// Load issues from cwd, honoring workspace config if present (multi-repo).
+/// Source provenance for the v0.25.0 envelope (`source_path`, `source_kind`).
+/// Go derives these in `RobotContext`; we collect them at load time because our
+/// discovery chain returns only the issue vector.
+#[derive(Debug, Clone, Default)]
+struct SourceMeta {
+    path: String,
+    kind: String,
+    valid: usize,
+    errors: usize,
+    skipped: usize,
+}
+
+/// Build the Go `RobotSourceAuthority` for a single-source load
+/// (Go `newRobotSourceAuthority` over one `RobotSourceReport`).
+fn source_authority(meta: &SourceMeta, data_hash: &str) -> bv_robot::RobotSourceAuthority {
+    use bv_robot::{RobotSourceAuthority, RobotSourceReport};
+    let report = RobotSourceReport {
+        name: String::new(),
+        repo_path: String::new(),
+        source_path: meta.path.clone(),
+        source_kind: meta.kind.clone(),
+        status: "loaded".to_string(),
+        data_hash: data_hash.to_string(),
+        valid: meta.valid,
+        errors: meta.errors,
+        skipped: meta.skipped,
+        read_errors: 0,
+        visible: meta.valid,
+        tombstones: 0,
+        stale: false,
+        warning_count: 0,
+        warnings: Vec::new(),
+        error: String::new(),
+    };
+    let loaded = usize::from(!meta.path.is_empty());
+    RobotSourceAuthority {
+        state: "complete".to_string(),
+        claim_safe: meta.errors == 0,
+        readiness: "proven".to_string(),
+        loaded,
+        failed: 0,
+        disabled: 0,
+        valid: meta.valid,
+        errors: meta.errors,
+        skipped: meta.skipped,
+        read_errors: 0,
+        visible: meta.valid,
+        tombstones: 0,
+        warning_count: 0,
+        sources: vec![report],
+    }
+}
+
 fn load_issues_auto(
     cwd: &std::path::Path,
     as_of: Option<&str>,
 ) -> Result<(Vec<bv_core::model::Issue>, String, Option<String>), String> {
+    load_issues_auto_meta(cwd, as_of).map(|(i, h, c, _)| (i, h, c))
+}
+
+/// Go `RobotContext` loader — returns the issues, their hash, the resolved
+/// `--as-of` commit, and the source provenance the envelope reports.
+fn load_issues_auto_meta(
+    cwd: &std::path::Path,
+    as_of: Option<&str>,
+) -> Result<
+    (
+        Vec<bv_core::model::Issue>,
+        String,
+        Option<String>,
+        SourceMeta,
+    ),
+    String,
+> {
     // If --as-of is specified, use GitLoader for time-travel (Go parity).
     if let Some(revision) = as_of {
         let loader = bv_core::discovery::GitLoader::new(cwd);
@@ -607,7 +687,19 @@ fn load_issues_auto(
             &resolved[..resolved.len().min(7)]
         );
         let hash = bv_core::data_hash::compute_data_hash(&issues);
-        return Ok((issues, hash, Some(resolved)));
+        let valid = issues.len();
+        return Ok((
+            issues,
+            hash,
+            Some(resolved),
+            SourceMeta {
+                path: format!("@{revision}"),
+                kind: "git".to_string(),
+                valid,
+                errors: 0,
+                skipped: 0,
+            },
+        ));
     }
     if let Some(ws_path) = bv_core::workspace::find_workspace_config(cwd) {
         let ws_root = ws_path
@@ -620,14 +712,52 @@ fn load_issues_auto(
         {
             Ok((issues, _)) => {
                 let hash = bv_core::data_hash::compute_data_hash(&issues);
-                return Ok((issues, hash, None));
+                let valid = issues.len();
+                return Ok((
+                    issues,
+                    hash,
+                    None,
+                    SourceMeta {
+                        path: ws_path.to_string_lossy().to_string(),
+                        kind: "workspace".to_string(),
+                        valid,
+                        errors: 0,
+                        skipped: 0,
+                    },
+                ));
             }
             Err(e) => eprintln!("workspace load failed, falling back: {e}"),
         }
     }
-    let (issues, _) = bv_core::discovery::load_issues_from_repo(cwd).map_err(|e| e.to_string())?;
+    let beads_dir = bv_core::discovery::get_beads_dir(cwd).map_err(|e| e.to_string())?;
+    let jsonl = bv_core::discovery::find_jsonl_path_with_warnings(&beads_dir, |_| {})
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no beads JSONL found in {}", beads_dir.display()))?;
+    let (issues, stats) = {
+        let raw = std::fs::read_to_string(&jsonl)
+            .map_err(|e| format!("reading {}: {}", jsonl.display(), e))?;
+        let mut rdr = raw.as_bytes();
+        bv_core::loader::parse_issues_with_options(
+            &mut rdr,
+            &bv_core::loader::ParseOptions::default(),
+            |_| {},
+        )
+        .map_err(|e| e.to_string())?
+    };
     let hash = bv_core::data_hash::compute_data_hash(&issues);
-    Ok((issues, hash, None))
+    let valid = issues.len();
+    Ok((
+        issues,
+        hash,
+        None,
+        SourceMeta {
+            path: jsonl.to_string_lossy().to_string(),
+            kind: "jsonl_local".to_string(),
+            valid,
+            errors: stats.errors,
+            skipped: stats.skipped,
+        },
+    ))
 }
 
 /// Load issues from discovery chain and emit --robot-triage JSON.
@@ -637,7 +767,7 @@ fn load_issues_auto(
 fn run_robot_next() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
     let as_of = extract_as_of();
-    let (issues, hash, as_of_commit) = match load_issues_auto(&cwd, as_of.as_deref()) {
+    let (issues, hash, as_of_commit, source) = match load_issues_auto_meta(&cwd, as_of.as_deref()) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -645,7 +775,7 @@ fn run_robot_next() -> ExitCode {
         }
     };
 
-    let mut payload = full_envelope_json(&hash);
+    let mut payload = full_envelope_json_with_source(&hash, Some(&source), &issues);
     if let Some(ref a) = as_of {
         payload["as_of"] = serde_json::json!(a);
     }
@@ -798,11 +928,18 @@ fn run_robot_next() -> ExitCode {
             payload["title"] = top["title"].clone();
             payload["score"] = top["score"].clone();
             payload["reasons"] = top["reasons"].clone();
-            payload["unblocks"] = top["unblocks"].clone();
-            let id = top["id"].as_str().unwrap_or_default();
-            payload["claim_command"] =
-                serde_json::json!(format!("br update {id} --status=in_progress"));
-            payload["show_command"] = serde_json::json!(format!("br show {id}"));
+            let id = top["id"].as_str().unwrap_or_default().to_string();
+            // Go v0.25.0: live tracker route suggestions replace the flat
+            // claim_command/show_command strings.
+            let origin = bv_core::tracker::resolve_issue_origin(&source.path, &id);
+            let actions = bv_core::tracker::build_actions(&origin, true);
+            if let Some(cmd) = &actions.claim {
+                payload["claim_command"] = serde_json::json!(cmd.shell);
+            }
+            if let Some(cmd) = &actions.show {
+                payload["show_command"] = serde_json::json!(cmd.shell);
+            }
+            payload["actions"] = serde_json::to_value(&actions).unwrap_or(serde_json::Value::Null);
         }
         None => {
             payload["actionable"] = serde_json::json!(false);
@@ -1201,9 +1338,27 @@ fn capture_baseline(
 const BASELINE_PATH: &str = ".bv/baseline.json";
 
 /// Application version Go bv reports in robot envelopes (`pkg/version`
-/// fallback, pinned at parity commit 9ace029). Byte-parity with frozen
+/// fallback, pinned at parity commit 18afafa). Byte-parity with frozen
 /// goldens requires emitting Go's version string, not the Rust crate's.
-const GO_APP_VERSION: &str = "v0.20.0";
+const GO_APP_VERSION: &str = "v0.25.0";
+
+/// Output format for the current invocation, set from `--format`. Go tracks
+/// this in the package-level `robotOutputFormat` and stamps it into every
+/// `RobotEnvelope`; `emit_json` and `full_envelope_json` read it here.
+static OUTPUT_FORMAT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn set_output_format(fmt: &str) {
+    let v = if fmt == "toon" { 1 } else { 0 };
+    OUTPUT_FORMAT.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn output_format() -> &'static str {
+    if OUTPUT_FORMAT.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+        "toon"
+    } else {
+        "json"
+    }
+}
 
 fn run_save_baseline(desc: &str) -> ExitCode {
     match capture_baseline() {
@@ -1964,13 +2119,50 @@ fn envelope_json(data_hash: &str) -> serde_json::Value {
 /// Go `NewRobotEnvelope` parity: for handlers whose Go output embeds the
 /// full `RobotEnvelope` struct (alerts, next, history, …) the envelope also
 /// carries `output_format` and `version` — golden-verified.
+/// Build the v0.25.0 envelope prefix. Field order matches Go `RobotEnvelope`
+/// (cmd/bv/main.go:7215) because the serializer preserves insertion order.
 fn full_envelope_json(data_hash: &str) -> serde_json::Value {
-    serde_json::json!({
-        "generated_at": jiff_now(),
-        "data_hash": data_hash,
-        "output_format": "json",
-        "version": GO_APP_VERSION,
-    })
+    full_envelope_json_with_source(data_hash, None, &[])
+}
+
+/// Envelope with Go v0.25.0 source provenance + scope/authority hashes.
+fn full_envelope_json_with_source(
+    data_hash: &str,
+    source: Option<&SourceMeta>,
+    issues: &[bv_core::model::Issue],
+) -> serde_json::Value {
+    let mut env = serde_json::Map::new();
+    env.insert("generated_at".into(), serde_json::json!(jiff_now()));
+    env.insert("data_hash".into(), serde_json::json!(data_hash));
+    let fmt = output_format();
+    if !fmt.is_empty() {
+        env.insert("output_format".into(), serde_json::json!(fmt));
+    }
+    env.insert("version".into(), serde_json::json!(GO_APP_VERSION));
+    if let Some(meta) = source {
+        if !meta.path.is_empty() {
+            env.insert("source_path".into(), serde_json::json!(meta.path));
+        }
+        if !meta.kind.is_empty() {
+            env.insert("source_kind".into(), serde_json::json!(meta.kind));
+        }
+        let authority = source_authority(meta, data_hash);
+        let ahash = bv_robot::authority_hash(&authority);
+        env.insert(
+            "source_authority".into(),
+            serde_json::to_value(&authority).unwrap_or(serde_json::Value::Null),
+        );
+        if !ahash.is_empty() {
+            env.insert("authority_hash".into(), serde_json::json!(ahash));
+        }
+        let mut ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
+        ids.sort();
+        let shash = bv_robot::scope_hash("", "", "", data_hash, &ids);
+        if !shash.is_empty() {
+            env.insert("scope_hash".into(), serde_json::json!(shash));
+        }
+    }
+    serde_json::Value::Object(env)
 }
 
 fn emit_json(v: &serde_json::Value) -> ExitCode {
@@ -3872,7 +4064,7 @@ fn run_robot_recipes() -> ExitCode {
 
     let payload = serde_json::json!({
         "generated_at": jiff_now(),
-        "output_format": "json",
+        "output_format": output_format(),
         "version": GO_APP_VERSION,
         "recipes": recipes,
     });

@@ -12,5 +12,6 @@ pub mod discovery;
 pub mod fingerprint;
 pub mod loader;
 pub mod sqlite;
+pub mod tracker;
 
 pub mod workspace;
