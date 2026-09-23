@@ -4469,17 +4469,18 @@ fn run_robot_graph(args: &[String]) -> ExitCode {
         .filter(|dep| issue_ids.contains(dep.effective_depends_on()))
         .count();
 
-    let payload = serde_json::json!({
-        "format": "json",
-        "nodes": sorted_issues.len(),
-        "edges": edge_count,
-        "explanation": {
-            "what": "Dependency graph as JSON adjacency list",
-            "when_to_use": "When you need programmatic access to the graph structure",
-        },
-        "data_hash": hash,
-        "adjacency": {"nodes": adj_nodes, "edges": adj_edges},
+    // Go emits the v0.25.0 envelope first, then format/nodes/edges/
+    // explanation/adjacency. This branch hand-rolled its payload and put
+    // data_hash last, so it missed the envelope entirely.
+    let mut payload = full_envelope_for(&hash, &issues);
+    payload["format"] = serde_json::json!("json");
+    payload["nodes"] = serde_json::json!(sorted_issues.len());
+    payload["edges"] = serde_json::json!(edge_count);
+    payload["explanation"] = serde_json::json!({
+        "what": "Dependency graph as JSON adjacency list",
+        "when_to_use": "When you need programmatic access to the graph structure",
     });
+    payload["adjacency"] = serde_json::json!({"nodes": adj_nodes, "edges": adj_edges});
     emit_json(&payload)
 }
 
