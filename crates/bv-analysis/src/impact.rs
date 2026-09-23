@@ -219,22 +219,53 @@ fn compute_status_risk(issue: &Issue, now: &jiff::Timestamp) -> f64 {
     }
 }
 
+/// Go `computeCrossRepoRisk` (pkg/analysis/risk.go) — the share of an issue's
+/// *blocking* dependencies that point at a bead in a different repository.
+///
+/// Returns 0 when the issue has no `source_repo` or no dependencies at all, and
+/// 0 when none of its blocking deps resolve to a different repo. A previous
+/// stub returned a flat 0.2 for any non-empty `source_repo`, which inflated
+/// `composite_risk` (and therefore every score) by 0.04 on dependency-free
+/// issues — the single cause of a uniform +0.0034 score delta against Go.
+fn compute_cross_repo_risk(issue: &Issue, issues: &[Issue]) -> f64 {
+    if issue.source_repo.is_empty() || issue.dependencies.is_empty() {
+        return 0.0;
+    }
+    let this_repo = &issue.source_repo;
+    let mut cross_repo_count = 0usize;
+    let mut total_blocking = 0usize;
+    for dep in &issue.dependencies {
+        if !dep.r#type.is_blocking() {
+            continue;
+        }
+        total_blocking += 1;
+        let target = dep.effective_depends_on();
+        // Go looks the dependency up in the full issue map and only counts it
+        // when the target exists, has a repo, and differs from this one.
+        if let Some(dep_issue) = issues.iter().find(|i| i.id == target) {
+            if !dep_issue.source_repo.is_empty() && &dep_issue.source_repo != this_repo {
+                cross_repo_count += 1;
+            }
+        }
+    }
+    if total_blocking == 0 {
+        return 0.0;
+    }
+    cross_repo_count as f64 / total_blocking as f64
+}
+
 /// Simplified risk computation using graph-local signals.
 /// Full churn/cross-repo ports land with correlation integration; the
 /// weights and composition match Go DefaultRiskWeights exactly.
 pub fn compute_risk_signals(
     issue: &Issue,
     g: &DiGraph,
-    _idx: usize,
+    issues: &[Issue],
     now: &jiff::Timestamp,
 ) -> RiskSignals {
     let fan_variance = compute_fan_variance(issue, g);
     let churn = compute_activity_churn(issue, now);
-    let cross_repo = if issue.source_repo.is_empty() {
-        0.0
-    } else {
-        0.2
-    };
+    let cross_repo = compute_cross_repo_risk(issue, issues);
     let status_risk = compute_status_risk(issue, now);
     let composite = fan_variance * 0.30 + churn * 0.30 + cross_repo * 0.20 + status_risk * 0.20;
     RiskSignals {
@@ -353,7 +384,7 @@ pub fn compute_impact_scores(inputs: &ImpactInputs) -> Vec<IssueImpact> {
             .unwrap_or(0.0);
         let tti_norm = compute_time_to_impact(depth, issue.estimated_minutes, median_minutes);
         let urgency_norm = compute_urgency(&issue.labels, issue.created_at.as_deref(), &inputs.now);
-        let risk = compute_risk_signals(issue, inputs.g, idx, &inputs.now);
+        let risk = compute_risk_signals(issue, inputs.g, inputs.issues, &inputs.now);
 
         let b = Breakdown {
             pagerank: pr_norm * super::scoring::WEIGHT_PAGE_RANK,
@@ -527,6 +558,95 @@ pub fn compute_impact_scores(inputs: &ImpactInputs) -> Vec<IssueImpact> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn issue_with_repo(id: &str, repo: &str) -> Issue {
+        Issue {
+            id: id.to_string(),
+            content_hash: String::new(),
+            title: String::new(),
+            description: String::new(),
+            design: String::new(),
+            acceptance_criteria: String::new(),
+            notes: String::new(),
+            status: Status::Open,
+            priority: 2,
+            issue_type: "task".into(),
+            assignee: String::new(),
+            estimated_minutes: None,
+            created_at: None,
+            updated_at: None,
+            due_date: None,
+            closed_at: None,
+            external_ref: None,
+            compaction_level: 0,
+            compacted_at: None,
+            compacted_at_commit: None,
+            original_size: 0,
+            labels: vec![],
+            dependencies: vec![],
+            comments: vec![],
+            source_repo: repo.to_string(),
+        }
+    }
+
+    fn dep(
+        issue_id: &str,
+        target: &str,
+        ty: bv_core::model::DependencyType,
+    ) -> bv_core::model::Dependency {
+        bv_core::model::Dependency {
+            issue_id: issue_id.to_string(),
+            depends_on_id: target.to_string(),
+            depends_on_legacy: String::new(),
+            target_id_legacy: String::new(),
+            r#type: ty,
+            created_at: None,
+            created_by: String::new(),
+        }
+    }
+
+    #[test]
+    fn cross_repo_risk_is_zero_without_dependencies() {
+        // Regression: a stub returned a flat 0.2 for any non-empty
+        // `source_repo`, inflating composite_risk by 0.2*0.20 = 0.04 and
+        // every weighted score by 0.004 on dependency-free issues. Go
+        // (pkg/analysis/risk.go computeCrossRepoRisk) returns 0 as soon as
+        // `len(issue.Dependencies) == 0`.
+        use bv_core::model::DependencyType;
+        let issue = issue_with_repo("A", "beads_viewer_rust");
+        assert_eq!(compute_cross_repo_risk(&issue, &[]), 0.0);
+
+        // A non-blocking dependency is not counted in the denominator.
+        let mut with_related = issue.clone();
+        with_related
+            .dependencies
+            .push(dep("A", "B", DependencyType::Related));
+        assert_eq!(compute_cross_repo_risk(&with_related, &[]), 0.0);
+
+        // No `source_repo` short-circuits even with a blocking dep present.
+        let mut no_repo = issue_with_repo("A", "");
+        no_repo
+            .dependencies
+            .push(dep("A", "B", DependencyType::Blocks));
+        assert_eq!(compute_cross_repo_risk(&no_repo, &[]), 0.0);
+    }
+
+    #[test]
+    fn cross_repo_risk_is_ratio_of_cross_repo_blocking_deps() {
+        use bv_core::model::DependencyType;
+        let same = issue_with_repo("B", "repo-a");
+        let other = issue_with_repo("C", "repo-b");
+
+        let mut target = issue_with_repo("A", "repo-a");
+        target.dependencies = vec![
+            // blocking -> same repo: not cross
+            dep("A", "B", DependencyType::Blocks),
+            // blocking -> different repo: cross
+            dep("A", "C", DependencyType::Blocks),
+        ];
+        let all = vec![target.clone(), same, other];
+        assert_eq!(compute_cross_repo_risk(&target, &all), 0.5);
+    }
 
     #[test]
     fn staleness_caps_at_thirty_days() {
