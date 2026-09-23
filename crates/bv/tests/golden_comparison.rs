@@ -61,15 +61,37 @@ fn fixtures() -> Vec<(&'static str, PathBuf)> {
     out
 }
 
+/// The `SOURCE_DATE_EPOCH` the golden corpus was captured with, read from
+/// golden/METADATA.txt. Falls back to the original capture instant when the
+/// key is absent, so an older corpus still runs.
+fn golden_source_date_epoch() -> String {
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("repo root")
+        .join("golden")
+        .join("METADATA.txt");
+    std::fs::read_to_string(repo)
+        .ok()
+        .and_then(|txt| {
+            txt.lines()
+                .find_map(|l| l.strip_prefix("source_date_epoch:"))
+                .map(|v| v.trim().to_string())
+        })
+        .filter(|v| !v.is_empty() && v.parse::<i64>().is_ok())
+        .unwrap_or_else(|| "1787407612".to_string())
+}
+
 fn run_bvr(cwd: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new(env!("CARGO_BIN_EXE_bvr"))
         .args(args)
         .current_dir(cwd)
-        // Pin the clock to the golden capture instant (golden/METADATA.txt
-        // captured_at 2026-08-22T14:06:52Z) so time-dependent outputs
-        // (stale-day counts, velocity weekly buckets) are deterministic.
-        // Go `robotNow` honors SOURCE_DATE_EPOCH; Rust parity matches.
-        .env("SOURCE_DATE_EPOCH", "1787407612")
+        // Pin the clock to the instant the goldens were captured, read from
+        // golden/METADATA.txt, so time-dependent outputs (stale-day counts,
+        // velocity week buckets) are deterministic. Hardcoding the epoch here
+        // let it drift out of step with a later recapture, which surfaced as
+        // ~32-day "No activity in N days" divergences across the corpus.
+        .env("SOURCE_DATE_EPOCH", &golden_source_date_epoch())
         .env("BV_ROBOT", "1")
         .env("BV_NO_CACHE", "1")
         .output()

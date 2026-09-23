@@ -1,28 +1,4 @@
-captured_at: 2026-09-23T18:59:48Z
+captured_at: 2026-09-23T22:17:41Z
 go_commit: 18afafaefbcfd7fbb2ed4f55b49e7141da6513d2
-go_version: v0.25.0
-parity_target: v0.25.0
-previous_target: v0.20.0 (9ace029f1b141c4843a1fbd2c4a365888ef734a5)
-
-# NOT yet captured at v0.25.0 — these commands fail on the synthetic fixtures
-# because they are not git repositories ("not a git repository" from Go bv).
-# They still hold v0.20.0-era content and are known-stale, not golden.
-# The v0.20.0 --robot-history payload has 4 keys
-# (data_hash, generated_at, histories, stats); v0.25.0 emits 15, adding
-# source_path, source_kind, source_authority, authority_hash, scope_hash,
-# output_format, version, commit_index, git_range, window, latest_commit_sha.
-# Fix: capture these from inside a git worktree, or drop them from the corpus.
-#
-# These contribute 0 false failures today: golden_comparison skips them
-# because Rust also errors on a non-git fixture, so the comparison never runs.
-# They are stale but not actively misleading the differential count.
-stale_pending_recapture:
-  - small_chain____robot_history.json
-  - medium_tree____robot_history.json
-  - large_cyclic_600____robot_history.json
-  - xl_2500____robot_history.json
-  - large_cyclic_600____robot_label_attention.json
-
-# NOTE: the *_robot_schema.json goldens have no "version" key (Go's schema
-# payload carries "schema_version" instead) and are byte-identical between
-# v0.20.0 and v0.25.0 apart from generated_at. They are current, not stale.
+expected_commit: 9ace029f1b141c4843a1fbd2c4a365888ef734a5
+source_date_epoch: 1787407612
