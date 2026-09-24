@@ -871,6 +871,22 @@ impl ReverseDeps {
 /// Port of Go `ComputeLabelSubgraph` (`pkg/analysis/label_health.go:1351`).
 /// Membership expansion deliberately ignores dependency *type* (as Go does) —
 /// only the adjacency edges filter on `is_blocking`.
+/// The ids a `--label` scope selects, mirroring Go `scopeLoadedIssues`
+/// (cmd/bv/main.go:4870-4900): the label's own issues become the candidate
+/// set, and their direct neighbours stay in the analysis as context.
+///
+/// Returns `(candidate_ids, analysis_ids)`; the caller feeds the first to the
+/// scope hash and loads the second into the analyzer.
+pub fn label_scope_ids(label: &str, issues: &[Issue]) -> (Vec<String>, Vec<String>) {
+    if label.is_empty() {
+        let all: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
+        return (all.clone(), all);
+    }
+    let rev = ReverseDeps::build(issues);
+    let sg = compute_label_subgraph(label, issues, &rev);
+    (sg.core_issues, sg.all_issues)
+}
+
 fn compute_label_subgraph(label: &str, issues: &[Issue], rev: &ReverseDeps) -> LabelSubgraph {
     if label.is_empty() || issues.is_empty() {
         return LabelSubgraph {

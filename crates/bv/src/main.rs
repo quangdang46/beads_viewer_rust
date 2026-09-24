@@ -2575,19 +2575,33 @@ fn full_envelope_json_with_source(
         // Hashing empty strings here made scope_hash unreproducible and left
         // `scope` absent even when the caller was scoped.
         let (label, recipe, repo) = active_scope_flags();
-        let shash = bv_robot::scope_hash(&label, &recipe, &repo, data_hash, &ids);
+        // A --label scope narrows the candidate set to the label's own issues
+        // (their neighbours stay in the analysis as context) — see Go
+        // scopeLoadedIssues, main.go:4870-4900.
+        let (mut candidate_ids, _) =
+            bv_analysis::label_health::label_scope_ids(&label, issues);
+        candidate_ids.sort();
+        let shash =
+            bv_robot::scope_hash(&label, &recipe, &repo, data_hash, &candidate_ids);
         if !shash.is_empty() {
             env.insert("scope_hash".into(), serde_json::json!(shash));
         }
         if !label.is_empty() || !recipe.is_empty() || !repo.is_empty() {
-            env.insert(
-                "scope".into(),
-                serde_json::json!({
-                    "label": label,
-                    "recipe": recipe,
-                    "repo": repo,
-                }),
-            );
+            // Go's RobotScope fields are omitempty (robot_registry.go:262-266),
+            // so only the active modifiers appear. Emitting the empty ones both
+            // diverges from the oracle and feeds different values into the
+            // scope hash.
+            let mut scope = serde_json::Map::new();
+            if !label.is_empty() {
+                scope.insert("label".into(), serde_json::json!(label));
+            }
+            if !recipe.is_empty() {
+                scope.insert("recipe".into(), serde_json::json!(recipe));
+            }
+            if !repo.is_empty() {
+                scope.insert("repo".into(), serde_json::json!(repo));
+            }
+            env.insert("scope".into(), serde_json::Value::Object(scope));
         }
     }
     serde_json::Value::Object(env)
@@ -5527,6 +5541,13 @@ fn run_robot_search(args: &[String]) -> ExitCode {
 }
 
 /// Go `handleRobotCausality` — `--robot-causality <bead-id>`.
+/// Go `handleRobotCausality` — build the same correlation report
+/// `--robot-history` produces, but with the target's committed constraint
+/// observations retained, then render the causal chain and its insights.
+///
+/// The `data_hash` in the output is the report's own bead fingerprint, not the
+/// issue-corpus hash the loader computes: Go's `CausalityResult` carries
+/// `hr.DataHash` and `withEnvelope` lets it win over the envelope's own value.
 fn run_robot_causality(args: &[String]) -> ExitCode {
     let bead_id = args
         .iter()
@@ -5535,42 +5556,128 @@ fn run_robot_causality(args: &[String]) -> ExitCode {
         .cloned()
         .unwrap_or_default();
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (issues, hash, _as_of_commit) = match load_issues_auto(&cwd, None) {
+    if let Err(e) = validate_correlation_repository(&cwd) {
+        eprintln!("Error: {e}");
+        return ExitCode::from(1);
+    }
+    let (issues, _hash, _as_of_commit) = match load_issues_auto(&cwd, None) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
             return ExitCode::from(1);
         }
     };
-    if !issues.iter().any(|i| i.id == bead_id) {
+
+    // Go: CorrelatorOptions{Limit: 500, CausalityBeadID: <bead>} overridden by
+    // --history-limit, with --history-since bounding the window.
+    let mut opts = bv_correlation::history::HistoryOptions {
+        causality_bead_id: bead_id.clone(),
+        limit: 500,
+        ..Default::default()
+    };
+    if let Some(limit) = history_flag_value("history-limit") {
+        match limit.trim().parse::<i64>() {
+            Ok(v) => opts.limit = v,
+            Err(_) => {
+                eprintln!("Error: invalid --history-limit: {limit}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    if let Some(since) = history_flag_value("history-since") {
+        match parse_relative_time(&since) {
+            Ok(Some(ts)) => opts.since = Some(ts),
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("Error: parsing --history-since: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+
+    // Go builds BeadInfo from the loaded issues, in load order.
+    let beads: Vec<bv_correlation::history::BeadInfo> = issues
+        .iter()
+        .map(|i| bv_correlation::history::BeadInfo {
+            id: i.id.clone(),
+            title: i.title.clone(),
+            status: i.status.as_str().to_string(),
+        })
+        .collect();
+
+    // One frozen instant for both the chain's open end and the result stamp, so
+    // `end_time` and `generated_at` cannot disagree.
+    let now = jiff_now();
+    let report =
+        match bv_correlation::history::build_history_report(&cwd, &beads, &opts, None, now.clone())
+        {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Error: generating history report: {e}");
+                return ExitCode::from(1);
+            }
+        };
+
+    let Some(history) = report.histories.get(&bead_id) else {
         eprintln!("Bead not found: {bead_id}");
         return ExitCode::from(1);
-    }
-    let events = match bv_correlation::extract(
-        &cwd,
-        &bv_correlation::ExtractOptions {
-            limit: 1000,
-            ..Default::default()
-        },
-    ) {
-        Ok(e) => e,
-        Err(err) => {
-            eprintln!("Error: extraction failed: {err}");
-            return ExitCode::from(1);
-        }
     };
-    match bv_correlation::causality::build_causality_chain(&bead_id, &events) {
-        Some(result) => {
-            let mut payload = full_envelope_for(&hash, &issues);
-            payload["chain"] = serde_json::to_value(&result.chain).unwrap_or_default();
-            payload["insights"] = serde_json::to_value(&result.insights).unwrap_or_default();
-            emit_json(&payload)
-        }
-        None => {
-            eprintln!("No lifecycle events found for bead: {bead_id} (nothing to build a causal chain from)");
-            ExitCode::from(1)
+
+    let mut blocker_titles = std::collections::BTreeMap::new();
+    for issue in &issues {
+        blocker_titles.insert(issue.id.clone(), issue.title.clone());
+    }
+    let caus_opts = bv_correlation::causality::CausalityOptions {
+        include_commits: true,
+        blocker_titles,
+    };
+    let mut result = bv_correlation::causality::build_causality_chain_at(
+        history,
+        report.causal_history.as_ref(),
+        &caus_opts,
+        &now,
+    );
+    result.data_hash = report.data_hash.clone();
+
+    // Go builds the envelope from the loader's source authority (whose
+    // per-source data_hash is the full-file sha256) and only then substitutes
+    // the report's bead fingerprint at the top level, so `authority_hash` is
+    // computed over the file hash while `data_hash`/`scope_hash` use the
+    // report's. Same shape as --robot-history.
+    let file_hash = bv_core::data_hash::compute_data_hash(&issues);
+    let mut payload = full_envelope_for(&file_hash, &issues);
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("data_hash".into(), serde_json::json!(result.data_hash));
+        let mut ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
+        ids.sort();
+        let scope_hash = bv_robot::scope_hash("", "", "", &result.data_hash, &ids);
+        if !scope_hash.is_empty() {
+            obj.insert("scope_hash".into(), serde_json::json!(scope_hash));
         }
     }
+    payload["chain"] = serde_json::to_value(&result.chain).unwrap_or_default();
+    payload["insights"] = result.insights_value();
+
+    // Go's `withEnvelope` returns a `map[string]json.RawMessage`, and
+    // `encoding/json` emits map keys in sorted order. So --robot-causality is
+    // the one robot command whose TOP-LEVEL keys are alphabetical, while the
+    // nested chain/insights/authority objects keep their struct field order.
+    // Rebuilding the outer object in key order reproduces that exactly; the
+    // commands that embed the envelope as a struct keep insertion order and
+    // must not be sorted.
+    let sorted = match payload.as_object() {
+        Some(obj) => {
+            let mut keys: Vec<&String> = obj.keys().collect();
+            keys.sort();
+            let mut out = serde_json::Map::with_capacity(keys.len());
+            for k in keys {
+                out.insert(k.clone(), obj[k].clone());
+            }
+            serde_json::Value::Object(out)
+        }
+        None => payload.clone(),
+    };
+    emit_json(&sorted)
 }
 
 /// Go `handleRobotRelated` — `--robot-related <bead-id>`.
@@ -6547,9 +6654,27 @@ fn run_robot_label_attention() -> ExitCode {
     let result =
         bv_analysis::label_health::compute_label_attention_scores(&issues, &cfg, robot_now());
     let mut payload = full_envelope_for(&hash, &issues);
-    // Go's --attention-limit defaults to 5 (main.go:1494), and the payload
-    // reports that effective limit rather than the number of scores.
-    let effective_limit = result.labels.len().min(5);
+    // Go's --attention-limit defaults to 5 (main.go:1494). Read the flag when
+    // given and apply it to the emitted list, not just to the reported limit.
+    let attention_limit: usize = {
+        let args: Vec<String> = std::env::args().collect();
+        let mut found = None;
+        let mut i = 0;
+        while i < args.len() {
+            let a = &args[i];
+            if a == "--attention-limit" {
+                found = args.get(i + 1).and_then(|v| v.trim().parse::<usize>().ok());
+                break;
+            }
+            if let Some(v) = a.strip_prefix("--attention-limit=") {
+                found = v.trim().parse::<usize>().ok();
+                break;
+            }
+            i += 1;
+        }
+        found.unwrap_or(5)
+    };
+    let effective_limit = result.labels.len().min(attention_limit);
     payload["limit"] = serde_json::json!(effective_limit);
     payload["total_labels"] = serde_json::json!(result.total_labels);
     // Go builds labels from a separate struct with specific field order:
