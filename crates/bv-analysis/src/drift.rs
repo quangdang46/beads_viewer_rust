@@ -60,6 +60,10 @@ pub struct Alert {
     pub details: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub issue_id: String,
+    // Go carries the flagged issue's labels so `--alert-label` can filter on
+    // them (pkg/drift/drift.go:86, populated at :607/:702/:950/:996/:1090).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -313,6 +317,9 @@ fn check_staleness(
         result.push(Alert {
             alert_type: AlertType::StaleIssue,
             severity,
+            // Go drift.go:607 — the flagged issue's own labels, so
+            // `--alert-label` can filter on them.
+            labels: issue.labels.clone(),
             suggested_action:
                 "Update, close, or re-triage the issue; stale work hides real priorities".into(),
             message: format!("Issue {} inactive for {:.0} days", issue.id, inactive_days),
@@ -443,6 +450,7 @@ fn check_blocking_cascade(
         cascades.push(Alert {
             alert_type: AlertType::BlockingCascade,
             severity,
+            labels: issue.labels.clone(),
             suggested_action:
                 "Prioritize this issue: closing it releases the listed downstream items".into(),
             message: format!(
