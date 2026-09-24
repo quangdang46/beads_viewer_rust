@@ -680,6 +680,42 @@ fn active_scope_flags() -> (String, String, String) {
     )
 }
 
+/// Go's top-level `label_scope` / `label_context` payload keys.
+///
+/// Emitted by exactly three commands — `--robot-plan` (robot_registry.go:893),
+/// `--robot-priority` (:1009) and `--robot-insights` (:1985) — and by no
+/// others; triage, graph and next get their scoping only through the
+/// envelope's `scope.label`. Both keys are omitempty: `label_scope` is absent
+/// without `--label`, and `label_context` is absent when no label in the final
+/// analysis set matches, which is Go's unmatched-label case
+/// (cmd/bv/main.go:4922-4931). An unmatched label therefore yields no
+/// `label_context` key at all, not an empty object.
+fn insert_label_scope_keys(
+    payload: &mut serde_json::Value,
+    issues: &[bv_core::model::Issue],
+    now: jiff::Timestamp,
+) {
+    let (label, _, _) = active_scope_flags();
+    if label.is_empty() {
+        return;
+    }
+    let obj = payload.as_object_mut().expect("envelope is an object");
+    obj.insert("label_scope".into(), serde_json::json!(label));
+    // Health describes the final intersection, i.e. what the command actually
+    // analysed, so this runs against the caller's scoped issue set.
+    let health = bv_analysis::label_health::compute_all_label_health(
+        issues,
+        &bv_analysis::label_health::LabelHealthConfig::default(),
+        now,
+    );
+    if let Some(entry) = health.labels.into_iter().find(|l| l.label == label) {
+        obj.insert(
+            "label_context".into(),
+            serde_json::to_value(&entry).unwrap_or(serde_json::Value::Null),
+        );
+    }
+}
+
 /// Apply `--label` scoping the way Go's `scopeLoadedIssues` does
 /// (cmd/bv/main.go:4870-4900): the label's own issues plus their direct
 /// neighbours replace the issue set the command analyses, so the graph, the
@@ -2603,17 +2639,6 @@ fn full_envelope_json_with_source(
         if !meta.kind.is_empty() {
             env.insert("source_kind".into(), serde_json::json!(meta.kind));
         }
-        let authority = source_authority(meta, data_hash);
-        let ahash = bv_robot::authority_hash(&authority);
-        env.insert(
-            "source_authority".into(),
-            serde_json::to_value(&authority).unwrap_or(serde_json::Value::Null),
-        );
-        if !ahash.is_empty() {
-            env.insert("authority_hash".into(), serde_json::json!(ahash));
-        }
-        let mut ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
-        ids.sort();
         // Go derives the scope from the active --label/--recipe/--repo flags
         // (robot_registry.go:257-269) and emits the object alongside its hash.
         // Hashing empty strings here made scope_hash unreproducible and left
@@ -2624,26 +2649,39 @@ fn full_envelope_json_with_source(
         // scopeLoadedIssues, main.go:4870-4900.
         let (mut candidate_ids, _) = bv_analysis::label_health::label_scope_ids(&label, issues);
         candidate_ids.sort();
+        // Go emits `scope` between source_kind and source_authority, not after
+        // scope_hash (RobotEnvelope, cmd/bv/main.go:7213-7229). The wire order
+        // is the struct's declaration order, and both objects are emitted, so
+        // any other position is a byte diff on every scoped invocation.
+        if !label.is_empty() || !recipe.is_empty() || !repo.is_empty() {
+            // RobotScope's fields are all omitempty, so only the active
+            // modifiers appear. Emitting the empty ones both diverges from the
+            // oracle and feeds different values into the scope hash.
+            let scope = bv_robot::RobotScope {
+                label: label.clone(),
+                recipe: recipe.clone(),
+                repo: repo.clone(),
+                // Populated by the --as-of work; omitting it while empty is
+                // what Go does for every non-time-travelling run.
+                unsupported: Vec::new(),
+            };
+            env.insert(
+                "scope".into(),
+                serde_json::to_value(&scope).unwrap_or(serde_json::Value::Null),
+            );
+        }
+        let authority = source_authority(meta, data_hash);
+        let ahash = bv_robot::authority_hash(&authority);
+        env.insert(
+            "source_authority".into(),
+            serde_json::to_value(&authority).unwrap_or(serde_json::Value::Null),
+        );
+        if !ahash.is_empty() {
+            env.insert("authority_hash".into(), serde_json::json!(ahash));
+        }
         let shash = bv_robot::scope_hash(&label, &recipe, &repo, data_hash, &candidate_ids);
         if !shash.is_empty() {
             env.insert("scope_hash".into(), serde_json::json!(shash));
-        }
-        if !label.is_empty() || !recipe.is_empty() || !repo.is_empty() {
-            // Go's RobotScope fields are omitempty (robot_registry.go:262-266),
-            // so only the active modifiers appear. Emitting the empty ones both
-            // diverges from the oracle and feeds different values into the
-            // scope hash.
-            let mut scope = serde_json::Map::new();
-            if !label.is_empty() {
-                scope.insert("label".into(), serde_json::json!(label));
-            }
-            if !recipe.is_empty() {
-                scope.insert("recipe".into(), serde_json::json!(recipe));
-            }
-            if !repo.is_empty() {
-                scope.insert("repo".into(), serde_json::json!(repo));
-            }
-            env.insert("scope".into(), serde_json::Value::Object(scope));
         }
     }
     serde_json::Value::Object(env)
@@ -3036,6 +3074,9 @@ fn run_robot_insights() -> ExitCode {
         fixed_status.slack.reason.clear();
     }
     payload["status"] = fixed_status.to_json_map();
+    // Go declares LabelScope/LabelContext directly after Status
+    // (robot_registry.go:1970-1986).
+    insert_label_scope_keys(&mut payload, &issues, robot_now());
 
     // Go GenerateInsights(limit=50): value desc, ID asc tiebreak.
     const INSIGHTS_LIMIT: usize = 50;
@@ -3683,6 +3724,14 @@ fn generate_advanced_insights(
         .filter(|i| is_open(i))
         .map(|i| i.id.as_str())
         .collect();
+    // Every id the corpus knows about, as distinct from the open ones. Go's
+    // `ReadinessIndex.Blockers` counts a dependency as blocking when its
+    // target is *absent* as well as when it is present and open
+    // (`!exists || !closedForReadiness(other.Status)`), so a dangling
+    // reference still withholds readiness. Requiring the target to be a
+    // known-open issue — which this did — reads "blocked by something we
+    // cannot see" as "not blocked", inverting the meaning of a missing edge.
+    let known_set: std::collections::HashSet<&str> = issues.iter().map(|i| i.id.as_str()).collect();
     let mut blocker_of: std::collections::BTreeMap<&str, Vec<&str>> =
         std::collections::BTreeMap::new();
     let mut blocked_by: std::collections::BTreeMap<&str, Vec<&str>> =
@@ -3696,7 +3745,7 @@ fn generate_advanced_insights(
                 continue;
             }
             let b = dep.effective_depends_on();
-            if open_set.contains(b) {
+            if !known_set.contains(b) || open_set.contains(b) {
                 blocker_of.entry(b).or_default().push(issue.id.as_str());
                 blocked_by.entry(issue.id.as_str()).or_default().push(b);
             }
@@ -4142,6 +4191,10 @@ fn run_robot_plan() -> ExitCode {
     let mut payload = full_envelope_for(&hash, &issues);
     payload["analysis_config"] = plan_analysis_config(g.len());
     payload["status"] = plan_priority_status(&g);
+    // Go declares LabelScope/LabelContext between Status and Plan
+    // (robot_registry.go:881-895); serde preserves insertion order, so the call
+    // has to sit here to keep the byte order.
+    insert_label_scope_keys(&mut payload, &issues, robot_now());
     payload["plan"] = serde_json::json!({
         "tracks": tracks,
         "total_actionable": actionable.len(),
@@ -4682,12 +4735,19 @@ fn count_transitive_unblocks(
 fn compute_parallel_gain(issues: &[bv_core::model::Issue], limit: usize) -> serde_json::Value {
     const HOW_TO_USE: &str = "Independent work tracks gained by closing each actionable issue now (gain = tracks after - tracks now). Pick high-gain issues to widen parallel work; unblocks lists what opens up.";
     let is_open = |i: &bv_core::model::Issue| i.status.is_open();
+    // Go `ReadinessIndex.Blockers` (pkg/model/readiness.go:199-218) treats a
+    // blocking dependency as a blocker when its target is *absent* as well as
+    // when it is present and open: `!exists || !closedForReadiness(...)`.
+    // Requiring a known-open target instead reads "blocked by something we
+    // cannot see" as "not blocked" and inflates the parallel-track count.
+    let known_ids: std::collections::HashSet<&str> = issues.iter().map(|o| o.id.as_str()).collect();
     let has_open_blocker = |i: &bv_core::model::Issue| {
         i.dependencies.iter().any(|d| {
-            d.r#type.is_blocking()
-                && issues
-                    .iter()
-                    .any(|o| o.id == d.effective_depends_on() && is_open(o))
+            if !d.r#type.is_blocking() {
+                return false;
+            }
+            let target = d.effective_depends_on();
+            !known_ids.contains(target) || issues.iter().any(|o| o.id == target && is_open(o))
         })
     };
     let actionable: Vec<&bv_core::model::Issue> = issues
@@ -5014,6 +5074,9 @@ fn run_robot_priority(args: &[String]) -> ExitCode {
         s.to_json_map()
     };
     payload["status"] = priority_status;
+    // Go declares LabelScope/LabelContext directly after Status
+    // (robot_registry.go:985-1011).
+    insert_label_scope_keys(&mut payload, &issues, robot_now());
     payload["recommendations"] = serde_json::Value::Array(recommendations.clone());
     payload["field_descriptions"] = serde_json::json!({
         "status.capped": "Whether results were truncated to prevent overload",
