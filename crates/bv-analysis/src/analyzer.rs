@@ -214,11 +214,18 @@ pub struct GraphAnalysis {
 /// Edge direction matches wasm crate convention: issue -> its dependency
 /// (u depends on v => edge u -> v). Empty type counts as blocks (legacy).
 pub fn build_graph(issues: &[bv_core::model::Issue]) -> DiGraph {
-    let mut g = DiGraph::with_capacity(issues.len(), issues.len() * 2);
-    for i in issues {
+    // Go sorts the issue ids before assigning dense node indices
+    // (graph.go:1570-1585), and HITS sums over those indices, so the node
+    // order changes the floating-point result. Build in sorted-id order to
+    // match.
+    let mut sorted: Vec<&bv_core::model::Issue> = issues.iter().collect();
+    sorted.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let mut g = DiGraph::with_capacity(sorted.len(), sorted.len() * 2);
+    for i in &sorted {
         g.add_node(&i.id);
     }
-    for i in issues {
+    for i in &sorted {
         let from = match g.node_idx(&i.id) {
             Some(x) => x,
             None => continue,
@@ -250,9 +257,11 @@ pub fn analyze_phase1(g: &DiGraph) -> Phase1Stats {
         in_degree.insert(id, g.in_degree(idx));
     }
     let topo = topological_sort(g); // Kahn sorted-frontier; None when cyclic
-                                    // Go reverses gonum's topo.Sort output (dependencies-first canonical order).
-    let mut topo = topo.unwrap_or_else(|| (0..n).collect());
-    topo.reverse();
+    // gonum's topo.Sort returns the "from -> to" order, which for an edge
+    // u -> v (u depends on v) already puts dependencies first. Go then walks
+    // that slice backwards to emit dependents-first (graph.go:1952-1954), so
+    // reversing gonum's output here would undo Go's own reversal.
+    let topo = topo.unwrap_or_else(|| (0..n).collect());
     let topological_order: Vec<String> = topo
         .into_iter()
         .map(|idx| g.node_id(idx).unwrap_or_default().to_string())

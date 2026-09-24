@@ -62,56 +62,67 @@ pub fn hits(graph: &DiGraph, config: &HITSConfig) -> HITSResult {
         };
     }
 
-    // Initialize with uniform scores
-    let mut hubs = vec![1.0 / (n as f64); n];
-    let mut auth = vec![1.0 / (n as f64); n];
-
+    // gonum's network.HITS (vendor/.../network/hits.go): both vectors start
+    // at 1, each iteration normalizes authority then hub on their own, and
+    // the loop ends when the 2-norm of BOTH delta vectors falls below tol.
+    // It has no iteration cap; `max_iterations` is kept only as a safety
+    // bound for a graph that fails to converge.
+    let mut auth = vec![1.0_f64; n];
+    let mut hubs = vec![1.0_f64; n];
+    let mut delta_auth = vec![0.0_f64; n];
+    let mut delta_hub = vec![0.0_f64; n];
     let mut iterations = 0;
 
-    for iter in 0..config.max_iterations {
-        iterations = iter + 1;
+    loop {
+        iterations += 1;
 
-        let mut new_auth = vec![0.0; n];
-        let mut new_hubs = vec![0.0; n];
-
-        // Authority update: auth(v) = sum of hub(u) for all u → v
-        for (v, auth_score) in new_auth.iter_mut().enumerate() {
+        // auth(v) = sum over u -> v of hub(u), then normalize.
+        let mut norm = 0.0_f64;
+        for v in 0..n {
+            let mut a = 0.0_f64;
             for &u in graph.predecessors_slice(v) {
-                *auth_score += hubs[u];
+                a += hubs[u];
+            }
+            // gonum stores the previous value, then takes the difference
+            // AFTER normalizing (hits.go:63-70) — the delta is against the
+            // normalized vector, not the raw one.
+            delta_auth[v] = auth[v];
+            auth[v] = a;
+            norm += a * a;
+        }
+        norm = norm.sqrt();
+        if norm > 0.0 {
+            for v in 0..n {
+                auth[v] /= norm;
+                delta_auth[v] -= auth[v];
             }
         }
 
-        // Hub update: hub(u) = sum of auth(v) for all u → v
-        for (u, hub_score) in new_hubs.iter_mut().enumerate() {
+        // hub(u) = sum over u -> v of auth(v), then normalize.
+        let mut norm = 0.0_f64;
+        for u in 0..n {
+            let mut h = 0.0_f64;
             for &v in graph.successors_slice(u) {
-                *hub_score += new_auth[v];
+                h += auth[v];
+            }
+            delta_hub[u] = hubs[u];
+            hubs[u] = h;
+            norm += h * h;
+        }
+        norm = norm.sqrt();
+        if norm > 0.0 {
+            for u in 0..n {
+                hubs[u] /= norm;
+                delta_hub[u] -= hubs[u];
             }
         }
 
-        // Normalize both vectors (L2 norm for stability)
-        normalize_l2(&mut new_auth);
-        normalize_l2(&mut new_hubs);
-
-        // Check convergence using per-element max (absolute) — matches
-        // gonum's HITS which uses max change across all elements < tolerance.
-        let mut max_diff = 0.0_f64;
-        for (a, b) in auth.iter().zip(new_auth.iter()) {
-            let d = (a - b).abs();
-            if d > max_diff {
-                max_diff = d;
-            }
+        let auth_diff = l2_norm(&delta_auth);
+        let hub_diff = l2_norm(&delta_hub);
+        if auth_diff < config.tolerance && hub_diff < config.tolerance {
+            break;
         }
-        for (h, nh) in hubs.iter().zip(new_hubs.iter()) {
-            let d = (h - nh).abs();
-            if d > max_diff {
-                max_diff = d;
-            }
-        }
-
-        auth = new_auth;
-        hubs = new_hubs;
-
-        if max_diff < config.tolerance {
+        if iterations >= config.max_iterations {
             break;
         }
     }
@@ -123,12 +134,16 @@ pub fn hits(graph: &DiGraph, config: &HITSConfig) -> HITSResult {
     }
 }
 
+fn l2_norm(v: &[f64]) -> f64 {
+    v.iter().map(|x| x * x).sum::<f64>().sqrt()
+}
+
 /// Compute HITS with default parameters.
 ///
-/// FORT parity note (Phase 2a): tolerance aligned to 1e-3 to match Go's
-/// `network.HITS(g, 1e-3)` call (pkg/analysis/graph.go:1799). Convergence
-/// criterion differs subtly from gonum (sum-of-diffs vs per-vector norm);
-/// the robot-insights differential gate validates numerics on fixtures.
+/// Go calls `network.HITS(g, 1e-3)` (pkg/analysis/graph.go:1799), so the
+/// default tolerance matches gonum's call site. The iteration body now
+/// follows gonum exactly: start at 1, normalize authority and hub
+/// separately, and converge on the 2-norm of both delta vectors.
 pub fn hits_default(graph: &DiGraph) -> HITSResult {
     hits(graph, &HITSConfig::default())
 }

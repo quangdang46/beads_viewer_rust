@@ -3299,7 +3299,7 @@ fn generate_advanced_insights(
             used_sources.len() as i64,
         ),
         "paths": paths,
-        "how_to_use": "K-shortest critical paths. Focus on issues appearing in multiple paths.",
+        "how_to_use": "Representative longest critical paths. Focus on issues appearing in multiple paths.",
     });
 
     // ---- Parallel Cut (limit 5) — Go generateParallelCut ----
