@@ -394,6 +394,16 @@ fn is_claimable(issue: &Issue) -> bool {
         && issue.assignee.trim().is_empty()
 }
 
+/// Serialize a label list the way Go marshals a nil slice for a field declared
+/// without `omitempty`: `null` when empty, a JSON array otherwise.
+pub fn serialize_labels<S: serde::Serializer>(labels: &[String], s: S) -> Result<S::Ok, S::Error> {
+    if labels.is_empty() {
+        s.serialize_none()
+    } else {
+        s.collect_seq(labels)
+    }
+}
+
 /// Per-issue impact result matching golden `recommendations[]` breakdown.
 ///
 /// Field order mirrors Go `analysis.Recommendation` (triage.go:120): the
@@ -407,6 +417,9 @@ pub struct IssueImpact {
     pub issue_type: String,
     pub status: String,
     pub priority: i32,
+    /// Go `Recommendation.Labels` is a plain `[]string` with no omitempty, so
+    /// an issue with no labels serializes as `null` rather than `[]`.
+    #[serde(serialize_with = "crate::impact::serialize_labels")]
     pub labels: Vec<String>,
     pub score: f64,
     pub breakdown: Breakdown,

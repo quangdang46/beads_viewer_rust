@@ -1193,12 +1193,15 @@ fn run_robot_triage() -> ExitCode {
             .map(|(qw_score, r, unblocks_ids, reason)| {
                 // Go emits the quick-win score (impact/effort blend), not the
                 // raw impact score, and carries the issue status alongside.
-                serde_json::json!({
+                let mut qw = serde_json::json!({
                     "id": r.id, "title": r.title, "status": r.status,
                     "score": qw_score,
                     "reason": reason,
-                    "unblocks_ids": unblocks_ids,
-                })
+                });
+                if !unblocks_ids.is_empty() {
+                    qw["unblocks_ids"] = serde_json::json!(unblocks_ids);
+                }
+                qw
             })
             .collect()
     };
@@ -1243,9 +1246,11 @@ fn run_robot_triage() -> ExitCode {
                 "id": id,
                 "title": issue_index.get(id).map(|i| i.title.clone()).unwrap_or_default(),
                 "unblocks_count": unblocks_count,
-                "unblocks_ids": unblocks_ids,
                 "actionable": actionable,
             });
+            if !unblocks_ids.is_empty() {
+                item["unblocks_ids"] = serde_json::json!(unblocks_ids);
+            }
             if !actionable {
                 item["blocked_by"] =
                     serde_json::json!(bv_analysis::blocker_chain::open_blockers(&issue_index, id));
