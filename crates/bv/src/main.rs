@@ -3616,9 +3616,35 @@ fn generate_advanced_insights(
     {
         let by_id: std::collections::HashMap<&str, &Issue> =
             issues.iter().map(|i| (i.id.as_str(), i)).collect();
-        let mut remaining = candidates.clone();
         let k = 5usize;
         for _ in 0..k {
+            // Go re-derives `actionable` each step via
+            // getActionableIssuesAfterCompletions(completed) and picks only
+            // from that set (advanced_insights.go:492). Rust reused the static
+            // open-issue list, so a blocked high-fanout node could be selected
+            // ahead of its own prerequisite — which is exactly what "work these
+            // in order" must never do.
+            let blockers_resolved = |id: &str| -> bool {
+                issues
+                    .iter()
+                    .find(|i| i.id == id)
+                    .map(|i| {
+                        i.dependencies
+                            .iter()
+                            .filter(|d| d.r#type.is_blocking())
+                            .all(|d| {
+                                let t = d.effective_depends_on();
+                                completed.contains(t)
+                                    || !issues.iter().any(|x| x.id == t && is_open(x))
+                            })
+                    })
+                    .unwrap_or(false)
+            };
+            let mut remaining: Vec<String> = candidates
+                .iter()
+                .filter(|id| !completed.contains(*id) && blockers_resolved(id))
+                .cloned()
+                .collect();
             if remaining.is_empty() {
                 break;
             }
@@ -3629,7 +3655,14 @@ fn generate_advanced_insights(
                 // Go computeMarginalUnblocks: direct newly-actionable count.
                 let mut unblocks: Vec<String> = Vec::new();
                 for issue in issues {
-                    if !is_open(issue) || completed.contains(&issue.id) || issue.id == *cand {
+                    // Go excludes ids in `before` — the currently-actionable
+                    // set — since an already-ready issue is not a new unlock
+                    // (advanced_insights.go:582).
+                    if !is_open(issue)
+                        || completed.contains(&issue.id)
+                        || remaining.contains(&issue.id)
+                        || issue.id == *cand
+                    {
                         continue;
                     }
                     let mut has_this_blocker = false;
