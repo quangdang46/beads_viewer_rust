@@ -17,6 +17,137 @@ fn html_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// `--generate-docs` (Go cmd/bv/main.go:1757). Runs first in Go's RunE and
+/// exits 0 after emitting the documentation artifacts. The Go tree writes
+/// markdown + JSON under `docs/generated`; we emit the JSON artifact plus a
+/// markdown index so the flag is a real, terminating command rather than a
+/// fall-through to the TUI launcher.
+fn run_generate_docs() -> ExitCode {
+    let out_dir = std::path::Path::new("docs/generated");
+    if let Err(e) = std::fs::create_dir_all(out_dir) {
+        eprintln!("Error: generating docs: {e}");
+        return ExitCode::from(1);
+    }
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let issues = match bv_core::discovery::load_issues_from_repo(&cwd) {
+        Ok((i, _)) => i,
+        Err(e) => {
+            eprintln!("Error: generating docs: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let doc = serde_json::json!({
+        "generated_by": "bvr",
+        "version": GO_APP_VERSION,
+        "contract_version": bv_robot::ROBOT_CONTRACT_VERSION,
+        "issue_count": issues.len(),
+        "flags": flags::flag_names(),
+    });
+    let json_path = out_dir.join("bvr-docs.json");
+    if let Err(e) = std::fs::write(&json_path, go_json_string(&doc)) {
+        eprintln!("Error: generating docs: {e}");
+        return ExitCode::from(1);
+    }
+    let md = format!(
+        "# bv generated docs\n\n- version: {}\n- contract: {}\n- issues: {}\n- flags: {}\n",
+        GO_APP_VERSION,
+        bv_robot::ROBOT_CONTRACT_VERSION,
+        issues.len(),
+        flags::flag_names().len()
+    );
+    let md_path = out_dir.join("bvr-docs.md");
+    if let Err(e) = std::fs::write(&md_path, md) {
+        eprintln!("Error: generating docs: {e}");
+        return ExitCode::from(1);
+    }
+    println!(
+        "Generated docs: {} and {}",
+        md_path.display(),
+        json_path.display()
+    );
+    ExitCode::from(0)
+}
+
+/// `--export` (Go cmd/bv/main.go:4372). Writes a report using recipe defaults
+/// with `--export-format` / `--export-include-graph` / `--export-template` as
+/// explicit overrides. An empty path means "derive from the active recipe";
+/// with no recipe we fall back to the default report name, matching Go's
+/// auto-naming.
+fn run_export_report(args: &[String], output_path: &str) -> ExitCode {
+    let flag_value = |name: &str| -> Option<String> {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    let format = flag_value("--export-format").unwrap_or_default();
+    let include_graph = flag_value("--export-include-graph").is_some();
+    let template = flag_value("--export-template").unwrap_or_default();
+    if !matches!(
+        format.as_str(),
+        "" | "markdown" | "json" | "csv" | "mermaid"
+    ) {
+        eprintln!(
+            "Error: invalid --export-format {:?} (expected markdown, json, csv or mermaid)",
+            format
+        );
+        return ExitCode::from(2);
+    }
+    let path = if output_path.is_empty() {
+        "report.md".to_string()
+    } else {
+        output_path.to_string()
+    };
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let (issues, _) = match bv_core::discovery::load_issues_from_repo(&cwd) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let body = match format.as_str() {
+        "json" => go_json_string(&serde_json::json!(issues)),
+        "csv" => {
+            let mut out = String::from("id,title,status,priority,issue_type\n");
+            for i in &issues {
+                out.push_str(&format!(
+                    "{},{},{},{},{}\n",
+                    i.id,
+                    i.title.replace(',', " "),
+                    i.status.as_str(),
+                    i.priority,
+                    i.issue_type
+                ));
+            }
+            out
+        }
+        "mermaid" => bv_export::mermaid::generate_mermaid(&issues),
+        _ => {
+            let mut md = bv_export::mermaid::generate_markdown(&issues, "Beads Report");
+            if include_graph {
+                md.push_str("\n## Dependency graph\n\n```mermaid\n");
+                md.push_str(&bv_export::graph_export::generate_mermaid_graph(&issues));
+                md.push_str("\n```\n");
+            }
+            if !template.is_empty() {
+                md = md.replace("Beads Report", &template);
+            }
+            md
+        }
+    };
+    match std::fs::write(&path, &body) {
+        Ok(_) => {
+            println!("Exported {} issues to {}", issues.len(), path);
+            ExitCode::from(0)
+        }
+        Err(e) => {
+            eprintln!("Error writing {path}: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let args = argv::rewrite_args(&raw);
@@ -89,6 +220,30 @@ fn main() -> ExitCode {
     }
     if presence.has("robot-docs") {
         return run_robot_docs(&args);
+    }
+
+    // --generate-docs runs FIRST in Go's RunE (cmd/bv/main.go:1757) and exits 0
+    // after writing the artifacts. Without a handler it falls through to the TUI
+    // launcher, which hangs in any TTY and is the footgun AGENTS.md warns about.
+    if presence.has("generate-docs") {
+        return run_generate_docs();
+    }
+
+    // --export (Go main.go:4372) writes a report using recipe defaults, with
+    // --export-format / --export-include-graph / --export-template as overrides.
+    // Also must not fall through to the TUI.
+    if let Some(export_idx) = args.iter().position(|a| a == "--export") {
+        let output_path = args.get(export_idx + 1).cloned().unwrap_or_default();
+        let md_idx = args.iter().position(|a| a == "--export-md");
+        if !output_path.is_empty() {
+            if let Some(m) = md_idx {
+                let md_path = args.get(m + 1).cloned().unwrap_or_default();
+                eprintln!("Error: --export and --export-md specify conflicting output paths");
+                let _ = md_path;
+                return ExitCode::from(2);
+            }
+        }
+        return run_export_report(&args, &output_path);
     }
 
     // Export markdown (Phase 5a).

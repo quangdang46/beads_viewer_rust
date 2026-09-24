@@ -1233,6 +1233,14 @@ fn wrap(indent: usize, cols: usize, s: &str) -> String {
     r
 }
 
+/// Every long flag name the registry knows about, robot primaries first.
+/// Used by `--generate-docs` to record the accepted surface as an artifact.
+pub fn flag_names() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = ROBOT_PRIMARIES.iter().map(|f| f.name).collect();
+    names.extend(MODIFIER_FLAGS.iter().map(|f| f.name));
+    names
+}
+
 /// Port of pflag `FlagUsagesWrapped` (flag.go:707-778) for one section: the
 /// widest left column sets the description column for every row in it.
 fn flag_usages(rows: &[&HelpFlag]) -> String {
