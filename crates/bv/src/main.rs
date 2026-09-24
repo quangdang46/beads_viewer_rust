@@ -3935,15 +3935,31 @@ fn generate_advanced_insights(
         .filter(|id| blocked_by.get(*id).is_none_or(|v| v.is_empty()))
         .count();
     let mut pc_candidates: Vec<(String, i64, i64, Vec<String>)> = Vec::new();
-    for id in &open_set {
+    // Go iterates `actionable`, not every open issue (advanced_insights.go:983):
+    // the suggestion is "complete this to widen parallel work", which only
+    // makes sense for something that can be completed now. Iterating all open
+    // issues admits a candidate at every depth of the graph.
+    let actionable_ids: Vec<&str> = open_set
+        .iter()
+        .copied()
+        .filter(|id| blocked_by.get(*id).is_none_or(|v| v.is_empty()))
+        .collect();
+    for id in actionable_ids {
         let mut newly: Vec<String> = Vec::new();
         if let Some(dependents) = blocker_of.get(id) {
             for &dep_id in dependents {
                 let all_others_resolved = blocked_by
                     .get(dep_id)
-                    .map(|blockers| blockers.iter().all(|&b| b == *id || !open_set.contains(b)))
+                    .map(|blockers| blockers.iter().all(|b| **b == *id || !open_set.contains(b)))
                     .unwrap_or(true);
-                if all_others_resolved {
+                // Go requires `!before[id]` (advanced_insights.go:582): an issue
+                // that is already actionable is not a *new* unlock, so it must
+                // not raise the gain.
+                let already_actionable = blocked_by
+                    .get(dep_id)
+                    .map(|blockers| blockers.is_empty())
+                    .unwrap_or(true);
+                if all_others_resolved && !already_actionable {
                     newly.push(dep_id.to_string());
                 }
             }
@@ -5016,22 +5032,35 @@ fn compute_parallel_gain(issues: &[bv_core::model::Issue], limit: usize) -> serd
 
     let mut items: Vec<(String, String, usize, i64, f64, Vec<String>)> = Vec::new();
     for issue in &actionable {
-        let unblocks: Vec<String> = issues
-            .iter()
-            .filter(|o| is_open(o) && o.id != issue.id)
-            .filter(|o| {
-                o.dependencies
-                    .iter()
-                    .any(|d| d.r#type.is_blocking() && d.effective_depends_on() == issue.id)
-                    && !has_open_blocker(o)
-            })
-            .map(|o| o.id.clone())
-            .collect();
-        let mut after = active.clone();
-        after.remove(&issue.id);
-        after.extend(unblocks.iter().cloned());
-        let tracks_after = count_tracks(Some(&issue.id), &after);
-        let gain = tracks_after as i64 - tracks_now as i64;
+        // Go `generateParallelGain` (advanced_insights.go:985) uses the same
+        // marginal-unblocks rule as parallel_cut: the issues that become ready
+        // once this one is done, minus the completed node itself. Rust was
+        // measuring a track-count delta instead, which is a different
+        // quantity and admitted far more positive-gain candidates.
+        let mut unblocks: Vec<String> = Vec::new();
+        for o in issues.iter().filter(|o| is_open(o) && o.id != issue.id) {
+            let mut blocks_on_this = false;
+            let mut other_open_blocker = false;
+            for d in o.dependencies.iter().filter(|d| d.r#type.is_blocking()) {
+                let target = d.effective_depends_on();
+                if target == issue.id {
+                    blocks_on_this = true;
+                } else if issues.iter().any(|x| x.id == target && is_open(x)) {
+                    other_open_blocker = true;
+                    break;
+                }
+            }
+            // `other_open_blocker` already excludes issues that were ready
+            // before (Go's `!before[id]`); re-testing has_open_blocker here
+            // would also reject the very node being completed, since it is
+            // still open in the global view.
+            if blocks_on_this && !other_open_blocker {
+                unblocks.push(o.id.clone());
+            }
+        }
+        unblocks.sort();
+        let gain = unblocks.len() as i64 - 1;
+        let tracks_after = tracks_now as i64 + gain;
         if gain <= 0 {
             continue;
         }
@@ -5040,6 +5069,7 @@ fn compute_parallel_gain(issues: &[bv_core::model::Issue], limit: usize) -> serd
         } else {
             0.0
         };
+        let tracks_after = tracks_after as usize;
         items.push((
             issue.id.clone(),
             issue.title.clone(),
