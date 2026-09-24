@@ -640,9 +640,9 @@ impl App {
                 alert_type: bv_analysis::drift::AlertType::NewCycle,
                 severity: bv_analysis::drift::Severity::Critical,
                 message: "Dependency cycle detected in the issue graph".into(),
-                baseline_val: 0.0,
-                current_val: 0.0,
-                delta: 0.0,
+                baseline_val: None,
+                current_val: None,
+                delta: None,
                 ..Default::default()
             });
         }
@@ -666,9 +666,9 @@ impl App {
                                     "{} has been stale for {age} days ({:?})",
                                     i.id, i.status
                                 ),
-                                baseline_val: 0.0,
-                                current_val: age as f64,
-                                delta: 0.0,
+                                baseline_val: None,
+                                current_val: Some(age as f64),
+                                delta: None,
                                 ..Default::default()
                             });
                         }
