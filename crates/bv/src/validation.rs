@@ -6,8 +6,14 @@ use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum ValidationError {
-    #[error("flag --{modifier} requires --{required}")]
-    MissingRequirement { modifier: String, required: String },
+    /// Go renders the acceptable set as a comma list with a final " or"
+    /// (robot_registry.go:3797, joinRobotFlags at 3830).
+    #[error("{message}")]
+    MissingRequirement {
+        modifier: String,
+        required: String,
+        message: String,
+    },
     #[error("only one primary command allowed (found {count}: {found})")]
     ExclusivePrimaries { count: usize, found: String },
     /// Enum-value check happens at clap parse time (Phase 3c wiring).
@@ -38,14 +44,36 @@ impl Presence {
     }
 }
 
+/// Render a co-flag set the way Go's `joinRobotFlags` does: every flag
+/// prefixed with `--`, comma-separated, with a final " or" before the last
+/// (robot_registry.go:3830). A two-entry set reads "a or b"; a one-entry set
+/// has no conjunction at all.
+fn format_required(required: &[&str]) -> String {
+    let flags: Vec<String> = required.iter().map(|r| format!("--{r}")).collect();
+    match flags.len() {
+        0 => String::new(),
+        1 => flags[0].clone(),
+        _ => {
+            let head = flags[..flags.len() - 1].join(", ");
+            format!("{head} or {}", flags[flags.len() - 1])
+        }
+    }
+}
+
 /// Validate modifier-requires rules. Returns list of violations.
 pub fn validate_modifier_requires(present: &Presence) -> Vec<ValidationError> {
     let mut violations = Vec::new();
     for (modifier, required) in MODIFIER_REQUIRES {
         if present.has(modifier) && !required.iter().any(|r| present.has(r)) {
+            let rendered = format_required(required);
             violations.push(ValidationError::MissingRequirement {
                 modifier: (*modifier).to_string(),
-                required: (*required[0]).to_string(),
+                required: rendered.clone(),
+                message: if required.len() > 1 {
+                    format!("--{modifier} requires one of {rendered}")
+                } else {
+                    format!("--{modifier} requires {rendered}")
+                },
             });
         }
     }

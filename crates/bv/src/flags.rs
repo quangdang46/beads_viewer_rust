@@ -472,7 +472,10 @@ pub const MODIFIER_REQUIRES: &[(&str, &[&str])] = &[
     ("profile-json", &["profile-startup"]),
     ("robot-drift", &["check-drift"]),
     ("history-since", &["robot-history", "bead-history"]),
-    ("history-limit", &["robot-history", "bead-history"]),
+    (
+        "history-limit",
+        &["robot-history", "bead-history", "robot-causality"],
+    ),
     (
         "brief",
         &[
