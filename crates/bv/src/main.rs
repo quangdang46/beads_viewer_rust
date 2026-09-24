@@ -21,6 +21,15 @@ fn main() -> ExitCode {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let args = argv::rewrite_args(&raw);
 
+    // --help/-h short-circuits everything else (Go parity): cobra's help flag
+    // is consulted before the root command runs, so `--help` wins over
+    // `--version`, over modifier-requires violations, over exclusive-primary
+    // violations, and over any `--robot-*` dispatch. Exit code 0 either way.
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print!("{}", flags::render_help(flags::HELP_PROGRAM));
+        return ExitCode::from(0);
+    }
+
     // --version handled before validation (Go parity).
     if args.iter().any(|a| a == "--version") {
         println!(concat!("bvr ", env!("CARGO_PKG_VERSION")));
@@ -39,29 +48,6 @@ fn main() -> ExitCode {
         }
         eprintln!("Usage: bvr --robot-help  (full robot surface arrives with dispatch phase)");
         return ExitCode::from(1);
-    }
-
-    if args.iter().any(|a| a == "--help" || a == "-h")
-        && !args.iter().any(|a| a.starts_with("--robot"))
-    {
-        println!("bvr — Beads Viewer in Rust");
-        println!();
-        println!("USAGE:");
-        println!("  bvr                    Launch interactive TUI");
-        println!("  bvr --robot-triage     Unified triage (mega-command)");
-        println!("  bvr --robot-next       Single top pick + claim command");
-        println!("  bvr --robot-insights   Graph metrics + top-N lists");
-        println!("  bvr --robot-plan       Dependency-respecting execution plan");
-        println!("  bvr --robot-graph      Dependency graph as JSON/DOT/Mermaid");
-        println!("  bvr --robot-history    Bead-commit correlation from git log");
-        println!("  bvr --robot-orphans    Orphan commit detection");
-        println!("  bvr --robot-alerts     Drift + proactive warnings");
-        println!("  bvr --export-md FILE   Export markdown report");
-        println!("  bvr --save-baseline    Save current state as baseline");
-        println!("  bvr --check-drift      Check drift vs baseline (exit 0/1/2)");
-        println!("  bvr --version          Show version");
-        println!();
-        return ExitCode::from(0);
     }
 
     // Self-update (Go: --check-update / --update-dry-run / --update / --rollback).
@@ -4698,16 +4684,14 @@ fn run_robot_priority(args: &[String]) -> ExitCode {
         .and_then(|i| args.get(i + 1))
         .cloned();
 
-    let (mut issues, _hash, _p1, status, _g) = match load_and_analyze() {
+    let (issues, _hash, _p1, status, _g) = match load_and_analyze() {
         Ok(x) => x,
         Err(code) => return code,
     };
-    if let Some(label) = &by_label {
-        issues.retain(|i| i.labels.iter().any(|l| l == label));
-    }
-    if let Some(assignee) = &by_assignee {
-        issues.retain(|i| &i.assignee == assignee);
-    }
+    // Go scores the whole graph and filters the *recommendation list*
+    // afterwards (robot_registry.go:940-951). Filtering the issue set first
+    // shrank total_issues and stripped the graph context the surviving
+    // recommendations need, so the filter returned nothing.
     let hash = bv_core::data_hash::compute_data_hash(&issues);
     let g = bv_analysis::build_graph(&issues);
 
@@ -4793,6 +4777,29 @@ fn run_robot_priority(args: &[String]) -> ExitCode {
 
     // Go (priority.go:720) sorts by confidence descending, then impact score,
     // then issue id, so the ordering is stable across runs.
+    // Go filters the scored recommendations, not the issue set
+    // (robot_registry.go:940-951).
+    // The emitted recommendation carries no labels or assignee, so match against
+    // the source issue the recommendation names.
+    let rec_issue = |r: &serde_json::Value| -> Option<&bv_core::model::Issue> {
+        let id = r["issue_id"].as_str()?;
+        issues.iter().find(|i| i.id == id)
+    };
+    if let Some(label) = by_label.as_deref().filter(|v| !v.is_empty()) {
+        recommendations.retain(|r| {
+            rec_issue(r)
+                .map(|i| i.labels.iter().any(|l| l == label))
+                .unwrap_or(false)
+        });
+    }
+    if let Some(assignee) = by_assignee.as_deref().filter(|v| !v.is_empty()) {
+        recommendations.retain(|r| {
+            rec_issue(r)
+                .map(|i| i.assignee == assignee)
+                .unwrap_or(false)
+        });
+    }
+
     recommendations.sort_by(|a, b| {
         b["confidence"]
             .as_f64()
@@ -4856,7 +4863,16 @@ fn run_robot_priority(args: &[String]) -> ExitCode {
         "what_if.parallelization_gain": "Net change in parallel work capacity (direct_unblocks - 1); positive = more parallel work possible",
         "what_if.unblocks": "Number of issues directly waiting on this one",
     });
-    payload["filters"] = serde_json::json!({"max_results": 10});
+    // Go echoes the active scoping modifiers into `filters`
+    // (robot-priority handlers build it from by_label / by_assignee).
+    let mut filters = serde_json::json!({"max_results": 10});
+    if let Some(v) = by_label.as_deref().filter(|v| !v.is_empty()) {
+        filters["by_label"] = serde_json::json!(v);
+    }
+    if let Some(v) = by_assignee.as_deref().filter(|v| !v.is_empty()) {
+        filters["by_assignee"] = serde_json::json!(v);
+    }
+    payload["filters"] = filters;
     payload["summary"] = serde_json::json!({
         "total_issues": issues.len(),
         "recommendations": recommendations.len(),
