@@ -3075,12 +3075,18 @@ fn generate_advanced_insights(
             }
             completed.insert(best_id.clone());
             remaining.retain(|r| r != &best_id);
-            topk_items.push(serde_json::json!({
+            // Go's TopKSetItem.Unblocks is `omitempty`
+            // (advanced_insights.go:146), so an item that newly unblocks
+            // nothing omits the key rather than emitting an empty array.
+            let mut item = serde_json::json!({
                 "id": best_id,
                 "title": title_of(&best_id),
                 "marginal_gain": best_gain,
-                "unblocks": best_unblocks,
-            }));
+            });
+            if !best_unblocks.is_empty() {
+                item["unblocks"] = serde_json::json!(best_unblocks);
+            }
+            topk_items.push(item);
             marginal_gains.push(best_gain);
             total_gain += best_gain;
         }
@@ -3444,9 +3450,9 @@ fn generate_advanced_insights(
         "usage_hints": {
             "coverage_set": "Greedy dependency-edge coverage. Check coverage_ratio and capped before treating it as complete.",
             "cycle_break": "Structural fix suggestions. Apply BEFORE working on cycle members.",
-            "k_paths": "K-shortest critical paths. Focus on issues appearing in multiple paths.",
+            "k_paths": "Representative longest critical paths. Focus on issues appearing in multiple paths.",
             "parallel_cut": "Issues that enable parallel work. Complete to maximize team throughput.",
-            "parallel_gain": "Parallelization improvement from completing each issue.",
+            "parallel_gain": "Independent work tracks gained by closing each actionable issue now (gain = tracks after - tracks now). Pick high-gain issues to widen parallel work; unblocks lists what opens up.",
             "topk_set": "Best k issues to complete for max downstream unlock. Work these in order.",
         },
     })
