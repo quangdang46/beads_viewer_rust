@@ -5689,130 +5689,1297 @@ fn run_robot_recipes() -> ExitCode {
 type CorrelationReport =
     std::collections::BTreeMap<String, Vec<bv_correlation::correlator::CorrelatedCommit>>;
 
-/// Go `robotSearch` dispatch block (main.go — computes `searchDispatchContext.SearchOutput`
-/// then calls the `robot-search` handler). `--search QUERY` required
-/// (modifier-requires table), `--search-mode` (`text` default | `hybrid`),
-/// `--search-preset` (hybrid only, default `default`), `--search-limit`/
-/// `--robot-max-results` cap results (default 10).
+/// Read `--<name>` / `--<name>=<value>` out of the raw argv. Go's `flag`
+/// package accepts both spellings and several Rust handlers already rely on
+/// the `=` form (see `history_flag_value`).
+fn search_flag(args: &[String], name: &str) -> Option<String> {
+    let long = format!("--{name}");
+    let with_eq = format!("--{name}=");
+    for (i, a) in args.iter().enumerate() {
+        if let Some(v) = a.strip_prefix(&with_eq) {
+            return Some(v.to_string());
+        }
+        if a == &long {
+            return args.get(i + 1).cloned();
+        }
+    }
+    None
+}
+
+/// Go `search.EmbeddingConfigFromEnv` + `EmbeddingConfig.Normalized`
+/// (config.go:15, embedder.go:29). `BV_SEMANTIC_EMBEDDER` /
+/// `BV_SEMANTIC_MODEL` / `BV_SEMANTIC_DIM`; the provider falls back to
+/// `"hash"` when unset and a non-positive or unparseable dim becomes
+/// `DefaultEmbeddingDim` (384).
+struct SearchEmbedderConfig {
+    provider: String,
+    model: String,
+    dim: usize,
+}
+
+fn search_embedding_config_from_env() -> SearchEmbedderConfig {
+    let provider = std::env::var("BV_SEMANTIC_EMBEDDER")
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
+    let model = std::env::var("BV_SEMANTIC_MODEL")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    // Go calls `strconv.Atoi` without trimming: a padded value is a parse
+    // error, which leaves dim at 0 and therefore normalizes to 384 anyway.
+    let dim: i64 = std::env::var("BV_SEMANTIC_DIM")
+        .ok()
+        .and_then(|raw| raw.parse::<i64>().ok())
+        .unwrap_or(0);
+    SearchEmbedderConfig {
+        provider: if provider.is_empty() {
+            "hash".to_string()
+        } else {
+            provider
+        },
+        model,
+        dim: if dim <= 0 {
+            bv_search::embedder::DEFAULT_DIM
+        } else {
+            dim as usize
+        },
+    }
+}
+
+/// Go `search.NewEmbedderFromConfig` (config.go:34). The hash embedder is the
+/// only provider `bv-search` ships, so the two placeholder providers and the
+/// unknown-provider branch are reproduced verbatim as errors — an unimplemented
+/// provider must not silently fall back to a different ranking.
+fn search_embedder_dim(cfg: &SearchEmbedderConfig) -> Result<usize, String> {
+    match cfg.provider.as_str() {
+        "" | "hash" => Ok(cfg.dim),
+        "python-sentence-transformers" => Err(format!(
+            "semantic embedder {:?} not implemented (mvp placeholder); set BV_SEMANTIC_EMBEDDER={:?} for deterministic fallback",
+            cfg.provider, "hash"
+        )),
+        "openai" => Err(format!(
+            "semantic embedder {:?} not implemented (placeholder); set BV_SEMANTIC_EMBEDDER={:?} for deterministic fallback",
+            cfg.provider, "hash"
+        )),
+        other => Err(format!(
+            "unknown semantic embedder {other:?}; expected {:?}",
+            "hash"
+        )),
+    }
+}
+
+/// Go `parseSearchMinScore` (search_output.go:64). An empty string means "no
+/// threshold" (`nil`); a non-finite value or one outside `[-1, 1]` is rejected
+/// with Go's exact message, because the threshold is compared against raw
+/// cosine similarity and must never be able to reject the whole result set.
+fn search_parse_min_score(raw: &str) -> Result<Option<f64>, String> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let score: f64 = raw.parse().map_err(|_| search_min_score_error(raw))?;
+    if !score.is_finite() || !(-1.0..=1.0).contains(&score) {
+        return Err(search_min_score_error(raw));
+    }
+    Ok(Some(score))
+}
+
+fn search_min_score_error(raw: &str) -> String {
+    format!("invalid --search-min-score {raw:?} (expected a finite number from -1 to 1)")
+}
+
+/// Go `search.SearchConfig` (config.go:57). `Weights` starts at Go's zero
+/// value — `resolveSearchWeights` only consults it when `has_weights` is set.
+struct SearchConfig {
+    mode: String,
+    preset: String,
+    weights: bv_search::hybrid::Weights,
+    has_weights: bool,
+}
+
+const SEARCH_ZERO_WEIGHTS: bv_search::hybrid::Weights = bv_search::hybrid::Weights {
+    text_relevance: 0.0,
+    pagerank: 0.0,
+    status: 0.0,
+    impact: 0.0,
+    priority: 0.0,
+    recency: 0.0,
+};
+
+/// A `resolveSearchConfig` failure. Go reports every one of these through
+/// `resolveSearchConfig` and exits 1 (`go`); only an unknown
+/// `--search-preset` is reported as a usage error with exit 2, the one
+/// documented divergence (see `run_robot_search`).
+struct SearchConfigError {
+    message: String,
+    exit_code: u8,
+}
+
+impl SearchConfigError {
+    fn go(message: String) -> Self {
+        Self {
+            message,
+            exit_code: 1,
+        }
+    }
+
+    fn usage(message: String) -> Self {
+        Self {
+            message,
+            exit_code: 2,
+        }
+    }
+}
+
+/// Go `search.ParseSearchConfig` (config.go:70) — validate the values the
+/// environment supplied. A preset owns its implied mode: naming a hybrid
+/// preset with no explicit mode selects hybrid, `text-only` selects text, and
+/// an explicit text mode under a hybrid preset is an error rather than a
+/// silently ignored flag.
+fn search_parse_config(
+    mode_value: &str,
+    preset_value: &str,
+    weights_value: &str,
+) -> Result<SearchConfig, SearchConfigError> {
+    let mut cfg = SearchConfig {
+        mode: "text".to_string(),
+        preset: "default".to_string(),
+        weights: SEARCH_ZERO_WEIGHTS,
+        has_weights: false,
+    };
+
+    let mut mode_set = false;
+    let mode = mode_value.trim();
+    if !mode.is_empty() {
+        let lowered = mode.to_lowercase();
+        match lowered.as_str() {
+            "text" | "hybrid" => {
+                cfg.mode = lowered;
+                mode_set = true;
+            }
+            _ => {
+                return Err(SearchConfigError::go(format!(
+                    "invalid search mode: {mode:?} (expected text|hybrid)"
+                )))
+            }
+        }
+    }
+
+    let preset = preset_value.trim();
+    if !preset.is_empty() {
+        let name = preset.to_lowercase();
+        if bv_search::hybrid::get_preset(&name).is_none() {
+            return Err(SearchConfigError::go(format!("unknown preset {name:?}")));
+        }
+        cfg.preset = name.clone();
+        if name == "text-only" {
+            if !mode_set {
+                cfg.mode = "text".to_string();
+            }
+        } else if !mode_set {
+            cfg.mode = "hybrid".to_string();
+        } else if cfg.mode == "text" {
+            return Err(SearchConfigError::go(format!(
+                "search preset {preset:?} needs hybrid mode; use hybrid mode or the text-only preset"
+            )));
+        }
+    }
+
+    let weights = weights_value.trim();
+    if !weights.is_empty() {
+        cfg.weights = search_parse_weights_json(weights).map_err(SearchConfigError::go)?;
+        cfg.has_weights = true;
+    }
+
+    Ok(cfg)
+}
+
+/// Go `applySearchConfigOverrides` (search_output.go:100) — apply the flags on
+/// top of the parsed environment config. Unlike `ParseSearchConfig` the flag
+/// values are *not* trimmed here, because a padded mode or preset name is a
+/// typo worth reporting rather than quietly repairing.
+fn search_apply_config_overrides(
+    mut cfg: SearchConfig,
+    mode_flag: &str,
+    preset_flag: &str,
+    weights_flag: &str,
+) -> Result<SearchConfig, SearchConfigError> {
+    if !mode_flag.is_empty() {
+        let lowered = mode_flag.to_lowercase();
+        match lowered.as_str() {
+            "text" | "hybrid" => cfg.mode = lowered,
+            _ => {
+                return Err(SearchConfigError::go(format!(
+                    "invalid --search-mode: {mode_flag:?} (expected text|hybrid)"
+                )))
+            }
+        }
+    }
+
+    if !preset_flag.is_empty() {
+        let name = preset_flag.to_lowercase();
+        if bv_search::hybrid::get_preset(&name).is_none() {
+            // The one deliberate divergence from Go: Rust names the flag the
+            // user typed, lists the valid presets, and exits 2. Go exits 1
+            // with a bare `unknown preset %q`.
+            return Err(SearchConfigError::usage(format!(
+                "unknown --search-preset {preset_flag:?} (expected one of default, bug-hunting, sprint-planning, impact-first, text-only)"
+            )));
+        }
+        cfg.preset = name.clone();
+        if name == "text-only" {
+            if mode_flag.is_empty() {
+                cfg.mode = "text".to_string();
+            }
+        } else if mode_flag.is_empty() {
+            cfg.mode = "hybrid".to_string();
+        } else if cfg.mode == "text" {
+            return Err(SearchConfigError::go(format!(
+                "--search-preset {preset_flag:?} needs hybrid mode; drop --search-mode text or use --search-preset text-only"
+            )));
+        }
+    }
+
+    if !weights_flag.is_empty() {
+        cfg.weights = search_parse_weights_json(weights_flag).map_err(SearchConfigError::go)?;
+        cfg.has_weights = true;
+    }
+
+    Ok(cfg)
+}
+
+/// Go `resolveSearchConfig` (search_output.go:80). The environment supplies
+/// the defaults; naming a flag on a dimension suppresses the inherited value
+/// for that dimension only, so `--search-mode hybrid` still inherits
+/// `BV_SEARCH_PRESET` while `--search-preset` does not inherit
+/// `BV_SEARCH_MODE`.
+fn search_resolve_config(
+    mode_flag: &str,
+    preset_flag: &str,
+    weights_flag: &str,
+) -> Result<SearchConfig, SearchConfigError> {
+    let mut mode = std::env::var("BV_SEARCH_MODE").unwrap_or_default();
+    let mut preset = std::env::var("BV_SEARCH_PRESET").unwrap_or_default();
+    let mut weights = std::env::var("BV_SEARCH_WEIGHTS").unwrap_or_default();
+    // Validate only inherited values. A selected preset owns the implied
+    // mode, and explicit text mode makes an inherited hybrid preset irrelevant.
+    if !mode_flag.is_empty() || !preset_flag.is_empty() {
+        mode = String::new();
+    }
+    if !preset_flag.is_empty() || mode_flag.eq_ignore_ascii_case("text") {
+        preset = String::new();
+    }
+    if !weights_flag.is_empty() {
+        weights = String::new();
+    }
+    let cfg = search_parse_config(&mode, &preset, &weights)?;
+    search_apply_config_overrides(cfg, mode_flag, preset_flag, weights_flag)
+}
+
+/// Go `Weights.sum` (weights.go).
+fn search_weights_sum(w: &bv_search::hybrid::Weights) -> f64 {
+    w.text_relevance + w.pagerank + w.status + w.impact + w.priority + w.recency
+}
+
+/// Go `Weights.Normalize` (weights.go).
+fn search_weights_normalize(w: bv_search::hybrid::Weights) -> bv_search::hybrid::Weights {
+    let sum = search_weights_sum(&w);
+    if sum == 0.0 {
+        return w;
+    }
+    bv_search::hybrid::Weights {
+        text_relevance: w.text_relevance / sum,
+        pagerank: w.pagerank / sum,
+        status: w.status / sum,
+        impact: w.impact / sum,
+        priority: w.priority / sum,
+        recency: w.recency / sum,
+    }
+}
+
+/// Go `Weights.validateComponents` (weights.go) — finite and non-negative,
+/// checked before normalization can hide a negative behind a rescaled sum.
+fn search_weights_validate_components(w: &bv_search::hybrid::Weights) -> Result<(), String> {
+    for (name, value) in [
+        ("text", w.text_relevance),
+        ("pagerank", w.pagerank),
+        ("status", w.status),
+        ("impact", w.impact),
+        ("priority", w.priority),
+        ("recency", w.recency),
+    ] {
+        if !value.is_finite() {
+            return Err(format!("weight {name:?} must be finite"));
+        }
+        if value < 0.0 {
+            return Err("weights must be non-negative".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Go `Weights.Validate` (weights.go) — components, the low-text-relevance
+/// warning, then the 1.0 sum check with the 0.001 tolerance. Go logs the
+/// warning through `log.Printf`; stderr is not part of the robot contract, so
+/// it is emitted bare.
+fn search_weights_validate(w: &bv_search::hybrid::Weights) -> Result<(), String> {
+    search_weights_validate_components(w)?;
+    if w.text_relevance < 0.1 {
+        eprintln!(
+            "WARNING: text weight {:.2} is very low; results may not match query",
+            w.text_relevance
+        );
+    }
+    let sum = search_weights_sum(w);
+    if !sum.is_finite() {
+        return Err("weights sum must be finite".to_string());
+    }
+    if (sum - 1.0).abs() > 0.001 {
+        return Err(format!("weights must sum to 1.0, got {sum:.3}"));
+    }
+    Ok(())
+}
+
+/// Go `AdjustWeightsForQuery` (query_adjust.go) — floor a short query's text
+/// relevance at 0.55 so an unrelated high-impact issue cannot outrank a
+/// literal match, rescaling the graph weights into whatever is left.
 ///
-/// Scope cut vs Go (see plan doc §11): no persisted vector index /
-/// incremental sync (`index.Sync`, `syncStats`) — embeds every issue's
-/// title+description fresh on each invocation via the existing
-/// `hash_embed` primitive. `index`/`loaded` fields in the envelope are
-/// therefore omitted rather than fabricated.
-fn run_robot_search(args: &[String]) -> ExitCode {
-    let query = args
+/// Go ends its rescale path with `adjusted.Normalize()`. `bv-search`'s port
+/// returns the rescaled weights without that final normalize, and the two
+/// differ in the last ULP of every component (the rescaled sum is 1.0 only in
+/// exact arithmetic), which is enough to change both the emitted `weights`
+/// object and the `ranking_hash` that digests it. Re-applying `Normalize`
+/// under exactly Go's own condition — a short query whose text weight was
+/// below the floor — restores parity; every other Go path returns the input,
+/// which is already normalized by the caller.
+fn search_adjust_weights_for_query(
+    weights: bv_search::hybrid::Weights,
+    query: &str,
+) -> bv_search::hybrid::Weights {
+    let rescaled = bv_search::query::is_short_query(query)
+        && weights.text_relevance < bv_search::query::SHORT_QUERY_MIN_TEXT_WEIGHT;
+    let adjusted = bv_search::query::adjust_weights_for_query(weights, query);
+    if rescaled {
+        search_weights_normalize(adjusted)
+    } else {
+        adjusted
+    }
+}
+
+/// Go `search.ParseWeightsJSON` (config.go:126) — all six keys are required,
+/// no unknown keys, and the result must pass `Validate`. `bv-search`'s
+/// `Weights` has no `Deserialize` impl (its own `Serialize` uses Rust field
+/// names), so the payload is decoded here and the emitted object is assembled
+/// by hand in Go's struct order.
+fn search_parse_weights_json(raw: &str) -> Result<bv_search::hybrid::Weights, String> {
+    const REQUIRED: [&str; 6] = [
+        "text", "pagerank", "status", "impact", "priority", "recency",
+    ];
+    let payload: std::collections::BTreeMap<String, f64> =
+        serde_json::from_str(raw).map_err(|e| format!("invalid weights JSON: {e}"))?;
+    for key in REQUIRED {
+        if !payload.contains_key(key) {
+            return Err(format!("weights JSON missing {key:?}"));
+        }
+    }
+    for key in payload.keys() {
+        if !REQUIRED.contains(&key.as_str()) {
+            return Err(format!("weights JSON has unknown key {key:?}"));
+        }
+    }
+    let weights = bv_search::hybrid::Weights {
+        text_relevance: payload["text"],
+        pagerank: payload["pagerank"],
+        status: payload["status"],
+        impact: payload["impact"],
+        priority: payload["priority"],
+        recency: payload["recency"],
+    };
+    search_weights_validate(&weights)?;
+    Ok(weights)
+}
+
+/// Go `search.Weights` JSON shape (weights.go struct tags) — `text`,
+/// `pagerank`, `status`, `impact`, `priority`, `recency` in that order.
+fn search_weights_json(w: &bv_search::hybrid::Weights) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    m.insert("text".into(), serde_json::json!(w.text_relevance));
+    m.insert("pagerank".into(), serde_json::json!(w.pagerank));
+    m.insert("status".into(), serde_json::json!(w.status));
+    m.insert("impact".into(), serde_json::json!(w.impact));
+    m.insert("priority".into(), serde_json::json!(w.priority));
+    m.insert("recency".into(), serde_json::json!(w.recency));
+    serde_json::Value::Object(m)
+}
+
+/// Go `resolveSearchWeights` (search_output.go:144) — explicit weights report
+/// the synthetic preset name `custom` so a consumer can tell a hand-tuned
+/// ranking from a named one.
+fn search_resolve_weights(cfg: &SearchConfig) -> (bv_search::hybrid::Weights, String) {
+    if cfg.has_weights {
+        return (cfg.weights, "custom".to_string());
+    }
+    (
+        bv_search::hybrid::get_preset(&cfg.preset).unwrap_or(SEARCH_ZERO_WEIGHTS),
+        cfg.preset.clone(),
+    )
+}
+
+/// Go `search.NewHybridScorerAt`'s weight reconciliation
+/// (hybrid_scorer_impl.go): the incoming weights are re-validated and
+/// re-normalized, and anything that fails falls back to the `default` preset
+/// instead of scoring with nonsense weights.
+fn search_scorer_weights(w: bv_search::hybrid::Weights) -> bv_search::hybrid::Weights {
+    let default_weights =
+        bv_search::hybrid::get_preset("default").unwrap_or(bv_search::hybrid::Weights {
+            text_relevance: 1.0,
+            pagerank: 0.0,
+            status: 0.0,
+            impact: 0.0,
+            priority: 0.0,
+            recency: 0.0,
+        });
+    let mut normalized = default_weights;
+    if search_weights_validate_components(&w).is_ok() {
+        normalized = search_weights_normalize(w);
+    }
+    if search_weights_validate(&normalized).is_err() {
+        normalized = default_weights;
+    }
+    normalized
+}
+
+/// Go `search.VectorSearchOptions` (vector_index.go). `min_score` is an
+/// inclusive floor on the *raw* cosine similarity, applied before the lexical
+/// boost, so a prefix match cannot be discarded before ranking and an exact
+/// issue-ID query is filtered by the same threshold as everything else.
+struct SearchOptions<'a> {
+    /// `None` selects the whole index; an empty set selects nothing.
+    eligible: Option<&'a std::collections::BTreeSet<String>>,
+    exact_id: &'a str,
+    min_score: Option<f64>,
+    score_boosts: &'a std::collections::BTreeMap<String, f64>,
+}
+
+/// Go `search.SearchResult` plus the `ExactIDMatch` flag Go keeps off the wire
+/// (`json:"-"`), which lets the hybrid stage promote the winner without
+/// re-resolving a case-folded match from an already truncated list.
+#[derive(Clone)]
+struct ScoredHit {
+    issue_id: String,
+    score: f64,
+    exact_id_match: bool,
+}
+
+/// Go `VectorIndex.SearchTopKWithOptions` (vector_index.go).
+///
+/// Go collects into a bounded heap ordered by `(score desc, issue_id asc)`.
+/// Issue IDs are unique, so that comparator is a total order and a plain
+/// sort-and-truncate produces the identical list.
+fn search_top_k_with_options(
+    idx: &bv_search::vector_index::VectorIndex,
+    query: &[f32],
+    k: usize,
+    opts: &SearchOptions<'_>,
+) -> Result<Vec<ScoredHit>, String> {
+    let exact_id = opts.exact_id.trim();
+    if let Some(min) = opts.min_score {
+        if !min.is_finite() {
+            return Err("minimum score must be finite".to_string());
+        }
+    }
+    for (id, boost) in opts.score_boosts {
+        if !boost.is_finite() || *boost < 0.0 {
+            return Err(format!(
+                "score boost for {id:?} must be finite and nonnegative"
+            ));
+        }
+    }
+    if k == 0 {
+        return Ok(Vec::new());
+    }
+    if query.len() != idx.dim {
+        return Err(format!(
+            "query dim mismatch: {} != {}",
+            query.len(),
+            idx.dim
+        ));
+    }
+    search_validate_finite(query).map_err(|e| format!("invalid query: {e}"))?;
+
+    // Go clamps k to the index size, not to the eligible count.
+    let ids = idx.sorted_ids();
+    let k = k.min(ids.len());
+    if k == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut scored: Vec<ScoredHit> = Vec::new();
+    let mut exact_case: Option<ScoredHit> = None;
+    let mut folded: Option<ScoredHit> = None;
+    let mut folded_matches = 0usize;
+    for id in &ids {
+        if let Some(eligible) = opts.eligible {
+            if !eligible.contains(id) {
+                continue;
+            }
+        }
+        let Some(entry) = idx.get(id) else {
+            continue;
+        };
+        let mut score = search_dot_f32(query, &entry.vector);
+        if let Some(min) = opts.min_score {
+            if score < min {
+                continue;
+            }
+        }
+        score += opts.score_boosts.get(id).copied().unwrap_or(0.0);
+        let hit = ScoredHit {
+            issue_id: id.clone(),
+            score,
+            exact_id_match: false,
+        };
+        // Only a case-insensitive match needs a copy kept for the exact-match
+        // bookkeeping below; every other entry is just pushed.
+        let case_folds = !exact_id.is_empty() && id.eq_ignore_ascii_case(exact_id);
+        scored.push(hit);
+        if case_folds {
+            let recorded = scored.last().expect("just pushed").clone();
+            if id == exact_id {
+                exact_case = Some(recorded);
+            } else {
+                folded = Some(recorded);
+                folded_matches += 1;
+            }
+        }
+    }
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.issue_id.cmp(&b.issue_id))
+    });
+    scored.truncate(k);
+    let mut results = scored;
+
+    // An exact-case match always wins; a case-folded match is promoted only
+    // when it is unambiguous, because issue IDs are opaque and a query of
+    // `bv-1` must not pick a winner between `BV-1` and `bv-10`.
+    let exact = match exact_case {
+        Some(hit) => Some(hit),
+        None if folded_matches == 1 => folded,
+        None => None,
+    };
+    let Some(mut exact) = exact else {
+        return Ok(results);
+    };
+    exact.exact_id_match = true;
+    match results.iter().position(|r| r.issue_id == exact.issue_id) {
+        Some(0) => results[0] = exact,
+        Some(i) => {
+            results[0..=i].rotate_right(1);
+            results[0] = exact;
+        }
+        None => {
+            if results.len() < k {
+                results.push(exact);
+            } else {
+                let last = results.len() - 1;
+                results[last] = exact;
+            }
+        }
+    }
+    Ok(results)
+}
+
+/// Go `dotFloat32` (vector_index.go) — f64 accumulator over f32 operands.
+fn search_dot_f32(a: &[f32], b: &[f32]) -> f64 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| f64::from(*x) * f64::from(*y))
+        .sum()
+}
+
+/// Go `validateFiniteVector` (vector_index.go).
+fn search_validate_finite(vec: &[f32]) -> Result<(), String> {
+    for (i, v) in vec.iter().enumerate() {
+        if !v.is_finite() {
+            return Err(format!("vector component {i} must be finite"));
+        }
+    }
+    Ok(())
+}
+
+/// Go `search.IssueMetrics` (metrics_cache.go) — the graph-derived inputs the
+/// hybrid scorer mixes into the text score.
+struct SearchIssueMetrics {
+    pagerank: f64,
+    status: String,
+    priority: i32,
+    blocker_count: usize,
+    updated_at: Option<jiff::Timestamp>,
+}
+
+/// Go `defaultPageRank` (metrics_cache_impl.go) — the neutral PageRank for an
+/// issue the graph has no entry for (isolated after scoping).
+const SEARCH_DEFAULT_PAGERANK: f64 = 0.5;
+
+/// Go `metricsCache` after `Refresh` (metrics_cache_impl.go): one entry per
+/// indexed issue, PageRank defaulted when absent, and the corpus-wide maximum
+/// blocker count that `normalizeImpact` divides by.
+struct SearchMetricsCache {
+    metrics: std::collections::BTreeMap<String, SearchIssueMetrics>,
+    max_blocker_count: usize,
+}
+
+fn search_build_metrics_cache(issues: &[bv_core::model::Issue]) -> SearchMetricsCache {
+    let graph = std::sync::Arc::new(bv_analysis::build_graph(issues));
+    let phase1 = bv_analysis::analyze_phase1(&graph);
+    let budget = bv_analysis::AnalysisBudget {
+        density: phase1.density,
+        ..Default::default()
+    };
+    let (_status, phase2) = bv_analysis::analyze_phase2_blocking(graph, &budget);
+    let page_rank = phase2.page_rank.unwrap_or_default();
+
+    let mut metrics = std::collections::BTreeMap::new();
+    let mut max_blocker_count = 0usize;
+    for issue in issues {
+        let blocker_count = phase1.in_degree.get(&issue.id).copied().unwrap_or(0);
+        max_blocker_count = max_blocker_count.max(blocker_count);
+        metrics.insert(
+            issue.id.clone(),
+            SearchIssueMetrics {
+                pagerank: page_rank
+                    .get(&issue.id)
+                    .copied()
+                    .unwrap_or(SEARCH_DEFAULT_PAGERANK),
+                status: issue.status.as_str().to_string(),
+                priority: issue.priority,
+                blocker_count,
+                updated_at: issue
+                    .updated_at
+                    .as_deref()
+                    .and_then(|s| s.parse::<jiff::Timestamp>().ok()),
+            },
+        );
+    }
+    SearchMetricsCache {
+        metrics,
+        max_blocker_count,
+    }
+}
+
+/// Go `normalizeRecencyAt` (normalizers.go). A zero `updated_at` scores the
+/// neutral 0.5, a future timestamp scores 1.0, otherwise exponential decay
+/// with a 30-day constant measured against the scorer's pinned clock.
+fn search_normalize_recency_at(updated_at: Option<jiff::Timestamp>, now: jiff::Timestamp) -> f64 {
+    let Some(updated_at) = updated_at else {
+        return 0.5;
+    };
+    // Go: `now.Sub(updatedAt).Hours() / 24`, i.e. a fractional day count
+    // measured from the scorer's pinned clock rather than the wall clock.
+    let days = (now.as_nanosecond() - updated_at.as_nanosecond()) as f64 / 86_400_000_000_000.0;
+    if days < 0.0 {
+        return 1.0;
+    }
+    let score = (-days / 30.0).exp();
+    if score > 1.0 {
+        1.0
+    } else {
+        score
+    }
+}
+
+/// Go `search.HybridScore` (hybrid_scorer.go).
+struct SearchHybridRow {
+    issue_id: String,
+    final_score: f64,
+    text_score: f64,
+    /// `None` where Go leaves the map nil, which `omitempty` then drops.
+    components: Option<std::collections::BTreeMap<String, f64>>,
+}
+
+/// Go `hybridScorer.Score` (hybrid_scorer_impl.go). An issue the metrics cache
+/// does not know scores as pure text with no component breakdown, and Go skips
+/// normalizing any component whose weight is zero while still emitting its key
+/// — so a zeroed component reads 0.0 rather than the issue's real value.
+fn search_hybrid_score(
+    issue_id: &str,
+    text_score: f64,
+    weights: &bv_search::hybrid::Weights,
+    cache: &SearchMetricsCache,
+    reference_time: jiff::Timestamp,
+) -> Result<SearchHybridRow, String> {
+    if issue_id.is_empty() {
+        return Err("issueID is required".to_string());
+    }
+    let Some(metrics) = cache.metrics.get(issue_id) else {
+        return Ok(SearchHybridRow {
+            issue_id: issue_id.to_string(),
+            final_score: text_score,
+            text_score,
+            components: None,
+        });
+    };
+
+    let status = if weights.status > 0.0 {
+        bv_search::hybrid::ComponentScores::normalize_status(&metrics.status)
+    } else {
+        0.0
+    };
+    let priority = if weights.priority > 0.0 {
+        bv_search::hybrid::ComponentScores::normalize_priority(metrics.priority)
+    } else {
+        0.0
+    };
+    let impact = if weights.impact > 0.0 {
+        bv_search::hybrid::ComponentScores::normalize_impact(
+            metrics.blocker_count,
+            cache.max_blocker_count,
+        )
+    } else {
+        0.0
+    };
+    let recency = if weights.recency > 0.0 {
+        search_normalize_recency_at(metrics.updated_at, reference_time)
+    } else {
+        0.0
+    };
+
+    let components_struct = bv_search::hybrid::ComponentScores {
+        pagerank: metrics.pagerank,
+        status,
+        impact,
+        priority,
+        recency,
+    };
+    let final_score = bv_search::hybrid::hybrid_score(text_score, weights, &components_struct);
+    // Go's map marshals with sorted keys.
+    let mut components = std::collections::BTreeMap::new();
+    components.insert("impact".to_string(), impact);
+    components.insert("pagerank".to_string(), metrics.pagerank);
+    components.insert("priority".to_string(), priority);
+    components.insert("recency".to_string(), recency);
+    components.insert("status".to_string(), status);
+    Ok(SearchHybridRow {
+        issue_id: issue_id.to_string(),
+        final_score,
+        text_score,
+        components: Some(components),
+    })
+}
+
+/// Go `buildHybridScores` (search_output.go:156) — score every candidate, then
+/// sort by final score descending with the issue ID as the tiebreak.
+fn search_build_hybrid_scores(
+    results: &[ScoredHit],
+    weights: &bv_search::hybrid::Weights,
+    cache: &SearchMetricsCache,
+    reference_time: jiff::Timestamp,
+) -> Result<Vec<SearchHybridRow>, String> {
+    let mut out = Vec::with_capacity(results.len());
+    for hit in results {
+        out.push(search_hybrid_score(
+            &hit.issue_id,
+            hit.score,
+            weights,
+            cache,
+            reference_time,
+        )?);
+    }
+    out.sort_by(|a, b| {
+        b.final_score
+            .partial_cmp(&a.final_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.issue_id.cmp(&b.issue_id))
+    });
+    Ok(out)
+}
+
+/// Go `promoteExactHybridResult` (search_output.go:195) — hoist the row whose
+/// issue ID equals the promoted exact match verbatim, as
+/// `SearchTopKWithOptions` already did for the text list.
+fn search_promote_exact_hybrid(exact_id: &str, rows: &mut [SearchHybridRow]) {
+    if exact_id.is_empty() {
+        return;
+    }
+    if let Some(i) = rows.iter().position(|r| r.issue_id == exact_id) {
+        if i > 0 {
+            rows[0..=i].rotate_right(1);
+        }
+    }
+}
+
+/// Go's `time.Time` JSON encoding is RFC3339 with trailing zeros trimmed from
+/// the fractional part, and the whole part dropped when it is zero.
+fn search_go_rfc3339_nano(ts: jiff::Timestamp) -> String {
+    let rendered = ts.to_string();
+    let Some(dot) = rendered.find('.') else {
+        return rendered;
+    };
+    let (head, rest) = rendered.split_at(dot);
+    let digits = rest[1..].strip_suffix('Z').unwrap_or(&rest[1..]);
+    let trimmed = digits.trim_end_matches('0');
+    if trimmed.is_empty() {
+        format!("{head}Z")
+    } else {
+        format!("{head}.{trimmed}Z")
+    }
+}
+
+/// The retrieval configuration Go's `searchRankingHash` digests
+/// (search_output.go:48). It deliberately excludes volatile invocation state —
+/// `generated_at`, `loaded` and the per-result scores — so the same search
+/// over the same corpus and settings hashes identically across invocations.
+struct SearchRankingIdentity<'a> {
+    index_data_hash: &'a str,
+    candidate_hash: &'a str,
+    source_path: &'a str,
+    source_kind: &'a str,
+    as_of_commit: &'a str,
+    query: &'a str,
+    mode: &'a str,
+    preset: &'a str,
+    weights: Option<bv_search::hybrid::Weights>,
+    min_score: Option<f64>,
+    limit: usize,
+    provider: &'a str,
+    model: &'a str,
+    dim: usize,
+    ranking_time: Option<jiff::Timestamp>,
+    scope: &'a serde_json::Value,
+}
+
+/// Go `searchRankingHash` (search_output.go:48) — sha256 over the canonical
+/// identity of the retrieval configuration. Go marshals a `map[string]any`,
+/// which `encoding/json` emits with keys in sorted order, so the keys below
+/// are inserted alphabetically.
+fn search_ranking_hash(identity: &SearchRankingIdentity<'_>) -> String {
+    let mut m = serde_json::Map::new();
+    m.insert(
+        "as_of_commit".into(),
+        serde_json::json!(identity.as_of_commit),
+    );
+    m.insert(
+        "candidate_hash".into(),
+        serde_json::json!(identity.candidate_hash),
+    );
+    m.insert("dim".into(), serde_json::json!(identity.dim));
+    m.insert(
+        "index_data_hash".into(),
+        serde_json::json!(identity.index_data_hash),
+    );
+    m.insert("limit".into(), serde_json::json!(identity.limit));
+    m.insert(
+        "min_score".into(),
+        identity
+            .min_score
+            .map_or(serde_json::Value::Null, serde_json::Value::from),
+    );
+    m.insert("mode".into(), serde_json::json!(identity.mode));
+    m.insert("model".into(), serde_json::json!(identity.model));
+    m.insert("preset".into(), serde_json::json!(identity.preset));
+    m.insert("provider".into(), serde_json::json!(identity.provider));
+    m.insert("query".into(), serde_json::json!(identity.query));
+    m.insert(
+        "ranking_time".into(),
+        identity.ranking_time.map_or(serde_json::Value::Null, |ts| {
+            serde_json::json!(search_go_rfc3339_nano(ts))
+        }),
+    );
+    m.insert("scope".into(), identity.scope.clone());
+    m.insert(
+        "source_kind".into(),
+        serde_json::json!(identity.source_kind),
+    );
+    m.insert(
+        "source_path".into(),
+        serde_json::json!(identity.source_path),
+    );
+    m.insert(
+        "weights".into(),
+        identity
+            .weights
+            .map_or(serde_json::Value::Null, |w| search_weights_json(&w)),
+    );
+    let encoded = go_json_string(&serde_json::Value::Object(m));
+    bv_search::vector_index::compute_content_hash(&encoded)
         .iter()
-        .position(|a| a == "--search")
-        .and_then(|i| args.get(i + 1))
-        .cloned()
-        .unwrap_or_default();
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Go `--robot-search` (main.go:2814-3037 plus `cmd/bv/search_output.go`).
+///
+/// The handler drives the ported `bv-search` library the way Go drives
+/// `pkg/search`: `EmbeddingConfigFromEnv` → `NewEmbedderFromConfig` →
+/// `LoadOrNewVectorIndex` → `DocumentsFromIssues` → `SyncVectorIndex` →
+/// `SearchTopKWithOptions` → (hybrid only) `NewHybridScorerAt` → the
+/// `robotSearchOutput` struct in Go's field order. `--search QUERY` is
+/// required (modifier-requires table), `--search-limit` caps results at 10.
+///
+/// One deliberate deviation: an unknown `--search-preset` exits 2 and names the
+/// flag, where Go exits 1 with a bare preset name — the repo's exit-code
+/// contract puts usage errors at 2 and `crates/bv/tests/cli_behavior.rs` pins
+/// the Rust wording. Everything else in this function copies Go's text and
+/// behaviour.
+fn run_robot_search(args: &[String]) -> ExitCode {
+    let query = search_flag(args, "search").unwrap_or_default();
     if query.trim().is_empty() {
         eprintln!("Error: --search requires a non-empty query");
         return ExitCode::from(2);
     }
-    let mode = args
-        .iter()
-        .position(|a| a == "--search-mode")
-        .and_then(|i| args.get(i + 1))
-        .cloned()
-        .unwrap_or_else(|| "text".to_string());
-    let preset_name = args
-        .iter()
-        .position(|a| a == "--search-preset")
-        .and_then(|i| args.get(i + 1))
-        .cloned()
-        .unwrap_or_else(|| "default".to_string());
-    let limit: usize = args
-        .iter()
-        .position(|a| a == "--search-limit" || a == "--robot-max-results")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10);
 
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let (issues, hash, _as_of_commit) = match load_issues_auto(&cwd, None) {
-        Ok(x) => x,
+    // Go main.go:2817 — the threshold is parsed before the search config and
+    // is a usage error, not a runtime failure.
+    let min_score =
+        match search_parse_min_score(&search_flag(args, "search-min-score").unwrap_or_default()) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return ExitCode::from(2);
+            }
+        };
+
+    let mode_flag = search_flag(args, "search-mode").unwrap_or_default();
+    let preset_flag = search_flag(args, "search-preset").unwrap_or_default();
+    let weights_flag = search_flag(args, "search-weights").unwrap_or_default();
+    let cfg = match search_resolve_config(&mode_flag, &preset_flag, &weights_flag) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("Error: {}", e.message);
+            return ExitCode::from(e.exit_code);
+        }
+    };
+
+    let embed_cfg = search_embedding_config_from_env();
+    let dim = match search_embedder_dim(&embed_cfg) {
+        Ok(dim) => dim,
         Err(e) => {
             eprintln!("Error: {e}");
             return ExitCode::from(1);
         }
     };
 
-    let dim = bv_search::embedder::DEFAULT_DIM;
-    let query_vec = bv_search::embedder::hash_embed(&query, dim);
-    let now = robot_now();
-
-    let mut results: Vec<serde_json::Value> = Vec::new();
-    if mode == "hybrid" {
-        let Some(weights) = bv_search::hybrid::get_preset(&preset_name) else {
-            eprintln!("Error: unknown --search-preset {preset_name:?}");
-            return ExitCode::from(2);
+    // Go main.go:2838 — one `os.Getwd` feeds both the loader and the index
+    // path, so the two can never disagree.
+    let project_dir = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let as_of = search_flag(args, "as-of").filter(|s| !s.is_empty());
+    let (issues_for_search, hash, as_of_commit) =
+        match load_issues_auto(&project_dir, as_of.as_deref()) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return ExitCode::from(1);
+            }
         };
-        for issue in &issues {
-            let text = format!("{} {}", issue.title, issue.description);
-            let issue_vec = bv_search::embedder::hash_embed(&text, dim);
-            let text_score = bv_search::embedder::cosine_similarity(&query_vec, &issue_vec);
-            let days_since_update = issue
-                .updated_at
-                .as_deref()
-                .and_then(|s| s.parse::<jiff::Timestamp>().ok())
-                .map(|t| now.since(t).map(|d| d.get_days()).unwrap_or(0) as f64)
-                .unwrap_or(0.0);
-            let components = bv_search::hybrid::ComponentScores::new(
-                issue.status.as_str(),
-                issue.priority,
-                days_since_update,
-            );
-            let score = bv_search::hybrid::hybrid_score(text_score, &weights, &components);
-            results.push(serde_json::json!({
-                "issue_id": issue.id,
-                "score": score,
-                "text_score": text_score,
-                "title": issue.title,
-                "component_scores": components,
-            }));
-        }
-        results.sort_by(|a, b| {
-            b["score"]
-                .as_f64()
-                .partial_cmp(&a["score"].as_f64())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-    } else {
-        for issue in &issues {
-            let text = format!("{} {}", issue.title, issue.description);
-            let issue_vec = bv_search::embedder::hash_embed(&text, dim);
-            let score = bv_search::embedder::cosine_similarity(&query_vec, &issue_vec);
-            results.push(serde_json::json!({
-                "issue_id": issue.id,
-                "score": score,
-                "title": issue.title,
-            }));
-        }
-        results.sort_by(|a, b| {
-            b["score"]
-                .as_f64()
-                .partial_cmp(&a["score"].as_f64())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-    }
-    results.truncate(limit);
 
-    let mut payload = full_envelope_for(&hash, &issues);
-    payload["query"] = serde_json::json!(query);
-    payload["mode"] = serde_json::json!(mode);
-    if mode == "hybrid" {
-        payload["preset"] = serde_json::json!(preset_name);
+    // Go main.go:2770/2789 — the indexed corpus is the *unscoped* issue set
+    // while the ranked candidates are the scoped set's core issues, so a
+    // `--label` search indexes everything but only ranks the label.
+    let (label, _recipe, _repo) = active_scope_flags();
+    let scoped_issues = apply_label_scope(&issues_for_search);
+    let (candidate_ids, _all_ids) =
+        bv_analysis::label_health::label_scope_ids(&label, &issues_for_search);
+    let candidates: std::collections::BTreeSet<String> = candidate_ids.iter().cloned().collect();
+    let selected_issues: Vec<bv_core::model::Issue> = scoped_issues
+        .iter()
+        .filter(|i| candidates.contains(&i.id))
+        .cloned()
+        .collect();
+    let eligible: std::collections::BTreeSet<String> =
+        selected_issues.iter().map(|i| i.id.clone()).collect();
+
+    let mut index_path = bv_search::index_sync::default_index_path(&project_dir, dim);
+    if let Some(resolved) = as_of_commit.as_deref().filter(|s| !s.is_empty()) {
+        // Go main.go:2841 — a historical search gets its own index file so it
+        // cannot overwrite the live one.
+        let historical = index_path.parent().unwrap_or(&project_dir).join(format!(
+            "historical-{resolved}-{}",
+            index_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("index.bvvi")
+        ));
+        index_path = historical;
     }
-    payload["limit"] = serde_json::json!(limit);
-    payload["results"] = serde_json::Value::Array(results);
-    payload["usage_hints"] = serde_json::json!([
-        "This build embeds fresh on every call — no persisted vector index \
-         yet (see plan doc §11), so there is no 'index' sync-stats field.",
-        "jq '.results[] | {id: .issue_id, score: .score, title: .title}'",
-    ]);
-    emit_json(&payload)
+
+    let (mut idx, loaded) = bv_search::index_sync::load_or_new(&index_path, dim);
+    let mut docs = std::collections::BTreeMap::new();
+    for issue in &issues_for_search {
+        if issue.id.is_empty() {
+            continue;
+        }
+        docs.insert(
+            issue.id.clone(),
+            bv_search::query::issue_document(
+                &issue.id,
+                &issue.title,
+                &issue.labels,
+                &issue.description,
+            ),
+        );
+    }
+    let sync_stats =
+        match bv_search::index_sync::sync_index(&mut idx, &docs, |texts: &[String]| {
+            texts
+                .iter()
+                .map(|t| bv_search::embedder::hash_embed(t, dim))
+                .collect()
+        }) {
+            Ok(stats) => stats,
+            Err(e) => {
+                eprintln!("Error building semantic index: {e}");
+                return ExitCode::from(1);
+            }
+        };
+    if !loaded || sync_stats.changed() {
+        if let Err(e) = idx.save(&index_path) {
+            eprintln!("Error saving semantic index: {e}");
+            return ExitCode::from(1);
+        }
+    }
+
+    let query_vec = bv_search::embedder::hash_embed(&query, dim);
+
+    // Go main.go:2887 — `--search-limit` defaults to 10 and a non-positive
+    // value falls back to it. `--robot-max-results` is a Rust-side alias the
+    // help text advertises; Go applies it elsewhere, never to the search limit.
+    let limit = search_flag(args, "search-limit")
+        .or_else(|| search_flag(args, "robot-max-results"))
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(10) as usize;
+    let hybrid_mode = cfg.mode == "hybrid";
+    // Hybrid widens the candidate pool so the re-ranker has something to
+    // reorder; short queries widen it further (Go `HybridCandidateLimit`).
+    let fetch_limit = if hybrid_mode {
+        bv_search::query::hybrid_candidate_limit(limit, selected_issues.len(), &query)
+    } else {
+        limit
+    };
+
+    let mut score_boosts: std::collections::BTreeMap<String, f64> =
+        std::collections::BTreeMap::new();
+    if bv_search::query::is_short_query(&query) {
+        for (id, doc) in &docs {
+            if !eligible.contains(id) {
+                continue;
+            }
+            let boost = bv_search::query::short_query_lexical_boost(&query, doc);
+            if boost > 0.0 {
+                score_boosts.insert(id.clone(), boost);
+            }
+        }
+    }
+
+    let results = match search_top_k_with_options(
+        &idx,
+        &query_vec,
+        fetch_limit,
+        &SearchOptions {
+            eligible: Some(&eligible),
+            exact_id: &query,
+            min_score,
+            score_boosts: &score_boosts,
+        },
+    ) {
+        Ok(results) => results,
+        Err(e) => {
+            eprintln!("Error searching index: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let exact_id = results
+        .iter()
+        .find(|r| r.exact_id_match)
+        .map(|r| r.issue_id.clone())
+        .unwrap_or_default();
+
+    let mut title_by_id: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for issue in &issues_for_search {
+        title_by_id.insert(issue.id.clone(), issue.title.clone());
+    }
+
+    let mut ranking_time: Option<jiff::Timestamp> = None;
+    let mut resolved_preset = String::new();
+    let mut resolved_weights: Option<bv_search::hybrid::Weights> = None;
+    let mut hybrid_rows: Vec<SearchHybridRow> = Vec::new();
+    if hybrid_mode {
+        let (weights, preset) = search_resolve_weights(&cfg);
+        let weights = search_weights_normalize(weights);
+        let weights = search_adjust_weights_for_query(weights, &query);
+        resolved_preset = preset;
+        resolved_weights = Some(weights);
+
+        let cache = search_build_metrics_cache(&issues_for_search);
+        // The reference clock is pinned and published as `ranking_time` so a
+        // cached hybrid ranking does not drift as wall time advances.
+        let reference_time = robot_now();
+        ranking_time = Some(reference_time);
+        let scorer_weights = search_scorer_weights(weights);
+        match search_build_hybrid_scores(&results, &scorer_weights, &cache, reference_time) {
+            Ok(mut rows) => {
+                search_promote_exact_hybrid(&exact_id, &mut rows);
+                rows.truncate(limit);
+                hybrid_rows = rows;
+            }
+            Err(e) => {
+                eprintln!("Error scoring hybrid results: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+
+    let index_data_hash = bv_core::data_hash::compute_data_hash(&issues_for_search);
+    let candidate_hash = bv_core::data_hash::compute_data_hash(&selected_issues);
+    let mut payload = match full_envelope_for(&hash, &issues_for_search) {
+        serde_json::Value::Object(map) => map,
+        other => other.as_object().cloned().unwrap_or_default(),
+    };
+    let env_str = |key: &str| -> String {
+        payload
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let source_path = env_str("source_path");
+    let source_kind = env_str("source_kind");
+    let scope = payload
+        .get("scope")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+
+    let ranking_hash = search_ranking_hash(&SearchRankingIdentity {
+        index_data_hash: &index_data_hash,
+        candidate_hash: &candidate_hash,
+        source_path: &source_path,
+        source_kind: &source_kind,
+        as_of_commit: as_of_commit.as_deref().unwrap_or_default(),
+        query: &query,
+        mode: &cfg.mode,
+        preset: &resolved_preset,
+        weights: resolved_weights,
+        min_score,
+        limit,
+        provider: &embed_cfg.provider,
+        model: &embed_cfg.model,
+        dim,
+        ranking_time,
+        scope: &scope,
+    });
+
+    // Go `robotSearchResult` field order (search_output.go:18):
+    // issue_id, score, text_score (omitempty), title (omitempty),
+    // component_scores (omitempty).
+    let mut result_rows: Vec<serde_json::Value> = Vec::new();
+    if hybrid_mode {
+        for row in &hybrid_rows {
+            let mut m = serde_json::Map::new();
+            m.insert("issue_id".into(), serde_json::json!(row.issue_id));
+            m.insert("score".into(), serde_json::json!(row.final_score));
+            if row.text_score != 0.0 {
+                m.insert("text_score".into(), serde_json::json!(row.text_score));
+            }
+            let title = title_by_id.get(&row.issue_id).cloned().unwrap_or_default();
+            if !title.is_empty() {
+                m.insert("title".into(), serde_json::json!(title));
+            }
+            if let Some(components) = &row.components {
+                if !components.is_empty() {
+                    let mut cm = serde_json::Map::new();
+                    for (key, value) in components {
+                        cm.insert(key.clone(), serde_json::json!(value));
+                    }
+                    m.insert("component_scores".into(), serde_json::Value::Object(cm));
+                }
+            }
+            result_rows.push(serde_json::Value::Object(m));
+        }
+    } else {
+        for hit in &results {
+            let mut m = serde_json::Map::new();
+            m.insert("issue_id".into(), serde_json::json!(hit.issue_id));
+            m.insert("score".into(), serde_json::json!(hit.score));
+            let title = title_by_id.get(&hit.issue_id).cloned().unwrap_or_default();
+            if !title.is_empty() {
+                m.insert("title".into(), serde_json::json!(title));
+            }
+            result_rows.push(serde_json::Value::Object(m));
+        }
+    }
+
+    // Go `search.IndexSyncStats` field order (index_sync.go).
+    let mut index_stats = serde_json::Map::new();
+    index_stats.insert("total".into(), serde_json::json!(sync_stats.total));
+    index_stats.insert("added".into(), serde_json::json!(sync_stats.added));
+    index_stats.insert("updated".into(), serde_json::json!(sync_stats.updated));
+    index_stats.insert("removed".into(), serde_json::json!(sync_stats.removed));
+    index_stats.insert("skipped".into(), serde_json::json!(sync_stats.skipped));
+    index_stats.insert("embedded".into(), serde_json::json!(sync_stats.embedded));
+
+    // Go `robotSearchOutput` field order (search_output.go:26): the embedded
+    // envelope, then these. `ranking_time`, `min_score`, `model`, `preset` and
+    // `weights` are `omitempty` and appear only when the search produced them.
+    payload.insert("index_data_hash".into(), serde_json::json!(index_data_hash));
+    payload.insert("candidate_hash".into(), serde_json::json!(candidate_hash));
+    payload.insert("ranking_hash".into(), serde_json::json!(ranking_hash));
+    if let Some(ts) = ranking_time {
+        payload.insert(
+            "ranking_time".into(),
+            serde_json::json!(search_go_rfc3339_nano(ts)),
+        );
+    }
+    if let Some(v) = min_score {
+        payload.insert("min_score".into(), serde_json::json!(v));
+    }
+    payload.insert("query".into(), serde_json::json!(query));
+    payload.insert("provider".into(), serde_json::json!(embed_cfg.provider));
+    if !embed_cfg.model.is_empty() {
+        payload.insert("model".into(), serde_json::json!(embed_cfg.model));
+    }
+    payload.insert("dim".into(), serde_json::json!(dim));
+    payload.insert(
+        "index_path".into(),
+        serde_json::json!(index_path.to_string_lossy()),
+    );
+    payload.insert("index".into(), serde_json::Value::Object(index_stats));
+    payload.insert("loaded".into(), serde_json::json!(loaded));
+    payload.insert("limit".into(), serde_json::json!(limit));
+    payload.insert("mode".into(), serde_json::json!(cfg.mode));
+    if hybrid_mode {
+        payload.insert("preset".into(), serde_json::json!(resolved_preset));
+        if let Some(w) = resolved_weights {
+            payload.insert("weights".into(), search_weights_json(&w));
+        }
+    }
+    payload.insert("results".into(), serde_json::Value::Array(result_rows));
+    let usage_hints: &[&str] = if hybrid_mode {
+        &[
+            "jq '.results[] | {id: .issue_id, score: .score, text: .text_score}' - Extract scores",
+            "jq '.results[] | {id: .issue_id, components: .component_scores}' - Hybrid breakdown",
+            "jq '.index' - Index update stats (added/updated/removed/embedded)",
+        ]
+    } else {
+        &[
+            "jq '.results[] | {id: .issue_id, score: .score, title: .title}' - Extract results",
+            "jq '.index' - Index update stats (added/updated/removed/embedded)",
+        ]
+    };
+    payload.insert("usage_hints".into(), serde_json::json!(usage_hints));
+    emit_json(&serde_json::Value::Object(payload))
 }
 
 /// Go `handleRobotCausality` — `--robot-causality <bead-id>`.
