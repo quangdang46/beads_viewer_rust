@@ -6519,28 +6519,36 @@ fn run_robot_schema(args: &[String]) -> ExitCode {
 /// Reporting fabricated timing numbers would be worse than reporting none
 /// — this returns only what's actually true: process memory (best-effort,
 /// platform-dependent) and dataset size for the current working directory.
+/// Go `handleRobotMetrics` — `--robot-metrics`.
+///
+/// The metrics are *envelope fields*, not a payload of their own: Go returns a
+/// `RobotEnvelope` with `timing`, `cache` and `memory` added to it. This used
+/// to build a standalone object with a `tool`/`version`/`dataset` header and a
+/// `usage_hints` list, so a consumer reading `data_hash` or `source_authority`
+/// off this command found neither — and `version` reported the Rust crate's
+/// own `0.2.0` where every other robot command reports Go's `v0.25.0`.
 fn run_robot_metrics() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let t_load = bv_analysis::metrics::time(&bv_analysis::metrics::TIMING_GRAPH_LOAD);
-    let issue_count = bv_core::discovery::load_issues_from_repo(&cwd)
-        .map(|(issues, _)| issues.len())
-        .unwrap_or(0);
-    drop(t_load);
-    let mut payload = serde_json::json!({
-        "generated_at": jiff_now(),
-        "tool": "bvr",
-        "version": env!("CARGO_PKG_VERSION"),
-        "dataset": { "issue_count": issue_count },
-    });
+    // The graph load is timed, so the measurement the command reports includes
+    // the load that produced the issue set the envelope is built from.
+    let issues = {
+        let t_load = bv_analysis::metrics::time(&bv_analysis::metrics::TIMING_GRAPH_LOAD);
+        let loaded = bv_core::discovery::load_issues_from_repo(&cwd);
+        drop(t_load);
+        match loaded {
+            Ok((issues, _stats)) => issues,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    };
+    let hash = bv_core::data_hash::compute_data_hash(&issues);
+    let mut payload = full_envelope_for(&hash, &issues);
     let m = bv_analysis::metrics::get_all_metrics();
     payload["timing"] = m["timing"].clone();
     payload["cache"] = m["cache"].clone();
     payload["memory"] = m["memory"].clone();
-    payload["usage_hints"] = serde_json::json!([
-        "Set BV_METRICS=0 to disable collection entirely",
-        "jq '.timing[] | select(.count > 0)' - Only measured operations",
-        "jq '.cache[] | select(.total > 0) | {name, hit_rate}' - Cache efficiency",
-    ]);
     emit_json(&payload)
 }
 

@@ -283,6 +283,115 @@ fn robot_search_unknown_preset_exits_two() {
     assert!(stderr.contains("unknown --search-preset"), "{stderr}");
 }
 
+/// A minimal beads repo with one labelled issue, for the scoping tests below.
+/// Returns the directory; the caller must keep it alive for the process run.
+fn labelled_fixture_repo(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("bvr_cli_scope_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join(".beads")).unwrap();
+    std::fs::write(
+        dir.join(".beads").join("issues.jsonl"),
+        concat!(
+            r#"{"id":"L-1","title":"One","status":"open","priority":1,"issue_type":"task","#,
+            r#""labels":["cli"],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","dependencies":[]}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    dir
+}
+
+#[test]
+fn envelope_scope_sits_between_source_kind_and_source_authority() {
+    // Go's RobotEnvelope declares Scope between SourceKind/AsOfCommit and
+    // SourceAuthority (cmd/bv/main.go:7213-7229); serde preserves insertion
+    // order, so a wrong position is a byte diff on every scoped invocation.
+    let dir = labelled_fixture_repo("order");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_bvr"))
+        .args(["--robot-plan", "--label", "cli"])
+        .current_dir(&dir)
+        .output()
+        .expect("binary runs");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(out.status.code(), Some(0));
+    let parsed: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("valid json");
+    let keys: Vec<&str> = parsed
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let source_kind = keys
+        .iter()
+        .position(|k| *k == "source_kind")
+        .expect("present");
+    let scope = keys.iter().position(|k| *k == "scope").expect("present");
+    let source_authority = keys
+        .iter()
+        .position(|k| *k == "source_authority")
+        .expect("present");
+    assert!(
+        source_kind < scope && scope < source_authority,
+        "expected source_kind < scope < source_authority, got {keys:?}"
+    );
+}
+
+#[test]
+fn unscoped_run_omits_scope_and_label_scope_entirely() {
+    let dir = labelled_fixture_repo("unscoped");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_bvr"))
+        .args(["--robot-plan"])
+        .current_dir(&dir)
+        .output()
+        .expect("binary runs");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(out.status.code(), Some(0));
+    let parsed: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("valid json");
+    let obj = parsed.as_object().expect("object");
+    assert!(!obj.contains_key("scope"), "{obj:?}");
+    assert!(!obj.contains_key("label_scope"), "{obj:?}");
+    assert!(!obj.contains_key("label_context"), "{obj:?}");
+}
+
+#[test]
+fn label_scope_and_context_appear_on_plan_and_priority_but_not_next() {
+    // Go emits label_scope/label_context on exactly three commands
+    // (robot_registry.go:893, :1009, :1985): plan, priority, insights. Every
+    // other command — including next, which also accepts --label — gets its
+    // scoping only through the envelope's scope.label.
+    for cmd in ["--robot-plan", "--robot-priority"] {
+        let dir = labelled_fixture_repo("emits");
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_bvr"))
+            .args([cmd, "--label", "cli"])
+            .current_dir(&dir)
+            .output()
+            .expect("binary runs");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(out.status.code(), Some(0), "{cmd}");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("valid json");
+        assert_eq!(parsed["label_scope"], "cli", "{cmd}: {parsed}");
+        assert_eq!(parsed["label_context"]["label"], "cli", "{cmd}: {parsed}");
+        assert_eq!(parsed["label_context"]["issue_count"], 1, "{cmd}: {parsed}");
+    }
+
+    let dir = labelled_fixture_repo("next");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_bvr"))
+        .args(["--robot-next", "--label", "cli"])
+        .current_dir(&dir)
+        .output()
+        .expect("binary runs");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(out.status.code(), Some(0));
+    let parsed: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("valid json");
+    let obj = parsed.as_object().expect("object");
+    assert!(!obj.contains_key("label_scope"), "{obj:?}");
+    assert!(!obj.contains_key("label_context"), "{obj:?}");
+}
+
 #[test]
 fn robot_metrics_emits_timing_and_cache_entries() {
     let (code, stdout, _) = run(&["--robot-metrics"]);
