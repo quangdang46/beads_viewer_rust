@@ -3273,7 +3273,13 @@ fn generate_advanced_insights(
     let k_paths = serde_json::json!({
         // Go's KPathsResult.Limited is the number of representative sources
         // considered (advanced_insights.go:943), not the total path count.
-        "status": feature_status("available", "", paths.len() >= 5 && total_paths > 5, paths.len() as i64, total_paths.min(1) as i64),
+        "status": feature_status(
+            "available",
+            "",
+            paths.len() >= 5 && total_paths > 5,
+            paths.len() as i64,
+            used_sources.len() as i64,
+        ),
         "paths": paths,
         "how_to_use": "K-shortest critical paths. Focus on issues appearing in multiple paths.",
     });
