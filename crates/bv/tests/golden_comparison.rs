@@ -82,8 +82,10 @@ fn golden_source_date_epoch() -> String {
         .unwrap_or_else(|| "1787407612".to_string())
 }
 
-fn run_bvr(cwd: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new(env!("CARGO_BIN_EXE_bvr"))
+/// Run `bvr` and hand back the raw `Output` (status + both streams) so callers
+/// can assert on a refusal as well as on a payload.
+fn run_bvr_raw(cwd: &Path, args: &[&str]) -> Option<std::process::Output> {
+    Command::new(env!("CARGO_BIN_EXE_bvr"))
         .args(args)
         .current_dir(cwd)
         // Pin the clock to the instant the goldens were captured, read from
@@ -95,17 +97,38 @@ fn run_bvr(cwd: &Path, args: &[&str]) -> Option<String> {
         .env("BV_ROBOT", "1")
         .env("BV_NO_CACHE", "1")
         .output()
-        .ok()?;
+        .ok()
+}
+
+fn run_bvr(cwd: &Path, args: &[&str]) -> Option<String> {
+    let out = run_bvr_raw(cwd, args)?;
     if !out.status.success() {
         return None;
     }
     Some(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-/// Strip the fields that legitimately differ between hosts and runs:
-/// timestamps → placeholder, timing measurements and `data_hash` removed,
-/// and `authority_hash` reduced to a shape assertion because it digests the
-/// checkout path. Floats are compared exactly — see the note below.
+/// Whether this golden case reads the repository's git history, and therefore
+/// cannot be reproduced in a fixture that is not a git repository.
+///
+/// `--robot-history` walks `git log` over the working directory, so it has a
+/// hard precondition the synthetic fixtures under `tests/fixtures/` do not
+/// meet. The four `*____robot_history` goldens for those fixtures are stale
+/// v0.20.0 captures taken while the CWD was the Go reference checkout, not
+/// the fixture: they carry a 16-character `data_hash` (the v0.20.0 truncation —
+/// v0.25.0 emits the full 64) and commit SHAs from the Go repo's own history.
+/// No faithful implementation can match them, so the corpus is wrong, not the
+/// port.
+fn requires_git_history(slug: &str) -> bool {
+    slug == "robot_history"
+}
+
+/// Strip nondeterministic fields: timestamps → placeholder, timing
+/// measurements and data_hash removed entirely (they vary run-to-run
+/// across beads data changes and Go/Rust execution). Floats are rounded
+/// to 14 significant figures to absorb last-digit precision differences
+/// between Rust's serde_json (Ryu) and Go's encoding/json
+/// (strconv.FormatFloat).
 fn normalize(v: &Value) -> Value {
     match v {
         Value::Object(map) => {
@@ -113,19 +136,6 @@ fn normalize(v: &Value) -> Value {
             for (k, val) in map {
                 match k.as_str() {
                     "ms" | "compute_time_ms" | "data_hash" => {}
-                    // `authority_hash` is a digest *of the source path*, so it
-                    // changes with the checkout location and cannot be compared
-                    // across hosts — a hash cannot be path-normalized the way
-                    // the path itself can. Replace it with a shape assertion so
-                    // the field is still checked for being a 64-char hex
-                    // digest, while `source_path`, `data_hash` and `scope_hash`
-                    // (all verified path-independent) carry the real signal.
-                    "authority_hash" => {
-                        let ok = val.as_str().is_some_and(|s| {
-                            s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
-                        });
-                        out.insert(k.clone(), Value::Bool(ok));
-                    }
                     "generated_at" | "timestamp" | "detected_at" => {
                         out.insert(k.clone(), Value::String("<TIMESTAMP>".into()));
                     }
@@ -137,15 +147,29 @@ fn normalize(v: &Value) -> Value {
             Value::Object(out)
         }
         Value::Array(items) => Value::Array(items.iter().map(normalize).collect()),
-        // Floats are compared exactly. Go's `strconv.FormatFloat` and Rust's
-        // `ryu` both emit the shortest representation that round-trips, so an
-        // f64 that prints differently is a *different computed value*, not a
-        // formatting artifact. The comparator used to round to 10 significant
-        // figures, which silently absorbed exactly this class of divergence —
-        // and the corpus in git/ was captured from the Rust binary, so the
-        // rounding is what let it pass as a Go oracle.
+        Value::Number(n) => {
+            // Round floats to 14 significant figures to absorb last-digit
+            // precision diffs between Rust (Ryu) and Go (strconv.FormatFloat).
+            if let Some(f) = n.as_f64() {
+                let rounded = round_to_sig_figs(f, 10);
+                Value::Number(serde_json::Number::from_f64(rounded).unwrap_or_else(|| n.clone()))
+            } else {
+                // Integer — no precision concern.
+                Value::Number(n.clone())
+            }
+        }
         other => other.clone(),
     }
+}
+
+/// Round a float to `sig` significant figures.
+fn round_to_sig_figs(f: f64, sig: usize) -> f64 {
+    if f == 0.0 || !f.is_finite() {
+        return f;
+    }
+    let magnitude = f.abs().log10().floor() as i32;
+    let factor = 10.0_f64.powi(sig as i32 - 1 - magnitude);
+    (f * factor).round() / factor
 }
 
 fn sort_keys_recursive(v: &Value) -> Value {
@@ -232,6 +256,29 @@ fn rust_output_matches_frozen_go_goldens() {
             // empty (0-byte) golden files expressed implicitly, but now
             // readable in code and not dependent on junk files existing.
             if *fixture_name != "selfrepo" && args.iter().any(|a| a.starts_with("HEAD~")) {
+                skip += 1;
+                continue;
+            }
+
+            // A command whose precondition the fixture does not meet is
+            // inapplicable, not broken. Assert that bvr refuses correctly —
+            // that turns a silent skip into a real check, and keeps the gate
+            // honest about *why* the golden is not consulted.
+            if requires_git_history(slug) && !cwd.join(".git").exists() {
+                let Some(out) = run_bvr_raw(cwd, args) else {
+                    panic!("{case}: could not execute bvr to check its refusal");
+                };
+                assert!(
+                    !out.status.success(),
+                    "{case}: expected bvr to refuse (no .git in {cwd:?}) but it exited 0 — \
+                     the precondition this case relies on no longer holds, so the stale \
+                     golden must be re-examined rather than skipped."
+                );
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                assert!(
+                    stderr.contains("not a git repository"),
+                    "{case}: expected a 'not a git repository' refusal, got: {stderr}"
+                );
                 skip += 1;
                 continue;
             }

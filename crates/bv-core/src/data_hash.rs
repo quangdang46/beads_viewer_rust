@@ -66,8 +66,10 @@ impl<'a> HashIssue<'a> {
             .iter()
             .map(|d| DepKey {
                 depends_on: d.effective_depends_on().to_string(),
-                // Go writes `string(dep.Type)`, i.e. the type's own spelling,
-                // so this must track the type rather than re-enumerate it.
+                // Go hashes `string(dep.Type)` — the raw type string. Going
+                // through `as_str` instead of re-matching the enum here keeps
+                // the two in lockstep, so adding a dependency type can never
+                // silently desync the hash from the wire format.
                 dep_type: d.r#type.as_str().to_string(),
                 // Go: Dependency.CreatedAt is a non-pointer time.Time; absent
                 // JSON field decodes to zero time which formats as the
