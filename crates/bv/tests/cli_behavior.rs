@@ -17,9 +17,13 @@ fn run(args: &[&str]) -> (i32, String, String) {
 
 #[test]
 fn version_exits_zero() {
+    // Go prints `bv <version>` from `pkg/version` (fallback v0.25.0 at the
+    // parity commit), which is also what the robot envelope reports as
+    // `version`. The Rust crate's own name and version must not leak here —
+    // that would make `--version` contradict the binary's own output.
     let (code, stdout, _) = run(&["--version"]);
     assert_eq!(code, 0);
-    assert!(stdout.starts_with(concat!("bvr ", env!("CARGO_PKG_VERSION"))));
+    assert_eq!(stdout.trim(), "bv v0.25.0");
 }
 
 #[test]

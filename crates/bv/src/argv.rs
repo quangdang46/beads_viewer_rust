@@ -10,7 +10,17 @@
 const SHORT_ALIASES: &[(&str, &str)] = &[("-f", "--format"), ("-l", "--label"), ("-r", "--recipe")];
 
 /// Rewrite raw args into canonical form.
+///
+/// Go's `os.Args` includes the program name and every rewrite indexes from 1.
+/// `main` passes `args().skip(1)`, so that offset does not exist here — the
+/// tests pass a program name and production does not, which previously made
+/// the positional rewrites (the `upgrade` expansion and the auto-promote
+/// insert) behave differently in each: production inserted the promoted
+/// primary between `--format` and its value, and the `upgrade` expansion never
+/// matched at all. `arg_offset` is the single place that difference is
+/// resolved, so both callers get Go's indexing.
 pub fn rewrite_args(args: &[String]) -> Vec<String> {
+    let arg_offset = usize::from(args.first().is_some_and(|a| !a.starts_with('-')));
     let mut out = Vec::with_capacity(args.len());
     for arg in args {
         // Short-flag alias expansion first: `-f toon` -> `--format toon`,
@@ -135,11 +145,11 @@ pub fn rewrite_args(args: &[String]) -> Vec<String> {
     // alias rewriting so `upgrade` has already become `--update`. (Go rewriteUpgradeIntent parity):
     // `bvr upgrade [--check|--dry-run|--rollback] [--yes|-y]` maps onto the
     // self-update flags. Bare-word aliases accepted; unknown tokens pass through.
-    if out.get(1).map(|s| s.as_str()) == Some("--update") {
+    if out.get(arg_offset).map(|s| s.as_str()) == Some("--update") {
         let mut mode = "update";
         let mut yes = false;
         let mut passthrough: Vec<String> = Vec::new();
-        for arg in out.iter().skip(2) {
+        for arg in out.iter().skip(arg_offset + 1) {
             match arg.to_lowercase().trim() {
                 "check" | "--check" | "check-update" | "--check-update" => {
                     if mode == "update" {
@@ -169,52 +179,100 @@ pub fn rewrite_args(args: &[String]) -> Vec<String> {
             }
         };
         expanded.extend(passthrough);
-        let mut result = vec![out[0].clone()];
+        let mut result = out[..arg_offset].to_vec();
         result.extend(expanded);
         return result;
     }
 
+    // Whether an agent-intent output alias is present decides the auto-promote,
+    // and that question must be asked BEFORE the rewrite below consumes the
+    // alias. It cannot be asked afterwards: Go does not auto-promote on a bare
+    // `--format` (with one and no primary, `bv --format toon` drops into the
+    // TUI), so treating the post-rewrite `--format` as the trigger would
+    // promote invocations Go leaves alone.
+    let wants_structured_output = contains_structured_output_alias(&out);
+
+    // Structured-output aliases (Go `rewriteAgentIntentFlagAliases`,
+    // cmd/bv/main.go:885-895): `--json`, `--toon`, and `--output`/`-o` taking
+    // a format value all normalise to `--format <value>`. Without this the
+    // aliases only *triggered* the auto-promote and were then dropped, so
+    // `bvr --toon` silently produced JSON on every host.
+    out = rewrite_output_format_aliases(out);
+
     // Bare --json auto-promote: if no robot primary flag is present after alias
-    // rewriting, but the user passed a structured-output flag (--json, --toon,
-    // --output=json, -o=json, etc.), insert --robot-triage as the default
-    // primary command. This is the key agent ergonomic.
+    // rewriting, but the user passed a structured-output alias, insert
+    // --robot-triage as the default primary command. This is the key agent
+    // ergonomic.
     let has_robot_primary = out.iter().any(|arg| {
         let name = arg.split('=').next().unwrap_or(arg);
         let name = name.strip_prefix("--").unwrap_or(name);
         ROBOT_PRIMARY_NAMES.contains(&name)
     });
-    if !has_robot_primary && contains_structured_output_alias(&out) {
-        // Insert --robot-triage after the program name (index 0).
-        out.insert(1, "--robot-triage".to_string());
+    if !has_robot_primary && wants_structured_output {
+        // Insert at the head of the user args, after the program name when one
+        // is present — never between a value flag and its value.
+        out.insert(arg_offset, "--robot-triage".to_string());
     }
 
     out
 }
 
-/// Check whether args contain a structured-output alias.
+/// Go `rewriteAgentIntentFlagAliases`'s format cases. Runs after the alias
+/// tables so `-o=toon` has already become `--output=toon`.
+fn rewrite_output_format_aliases(args: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len() + 2);
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        match arg.as_str() {
+            "--json" => out.extend(["--format".to_string(), "json".to_string()]),
+            "--toon" => out.extend(["--format".to_string(), "toon".to_string()]),
+            // `--json=true` / `--toon=false`: Go's switch is on the exact
+            // token, so a `=value` form is not an alias and is left alone.
+            "--output" | "-o" => match args.get(i + 1).map(|v| v.to_lowercase()) {
+                Some(next) if next == "json" || next == "toon" => {
+                    out.extend(["--format".to_string(), next]);
+                    i += 1;
+                }
+                _ => out.push(arg.clone()),
+            },
+            _ => out.push(arg.clone()),
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Check whether args carry an agent-intent structured-output alias.
+///
+/// Deliberately does *not* count a bare : Go's auto-promote keys off
+/// the aliases, so  with no primary command drops into the
+/// TUI rather than defaulting to . Called before the alias
+/// rewrite, while the alias spellings are still present.
 fn contains_structured_output_alias(args: &[String]) -> bool {
     for (i, arg) in args.iter().enumerate() {
-        if arg == "--json"
-            || arg == "--json=true"
-            || arg == "--json=false"
-            || arg == "--toon"
-            || arg == "--toon=true"
-            || arg == "--toon=false"
-        {
+        let lower = arg.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "--json"
+                | "--json=true"
+                | "--json=false"
+                | "--toon"
+                | "--toon=true"
+                | "--toon=false"
+                | "--output=json"
+                | "--output=toon"
+                | "-o=json"
+                | "-o=toon"
+        ) {
             return true;
         }
-        if arg.eq_ignore_ascii_case("--output=json")
-            || arg.eq_ignore_ascii_case("-o=json")
-            || arg.eq_ignore_ascii_case("--output=toon")
-            || arg.eq_ignore_ascii_case("-o=toon")
+        if (arg == "--output" || arg == "-o")
+            && args
+                .get(i + 1)
+                .is_some_and(|next| matches!(next.to_ascii_lowercase().as_str(), "json" | "toon"))
         {
             return true;
-        }
-        if (arg == "--output" || arg == "-o") && i + 1 < args.len() {
-            let next = &args[i + 1];
-            if next == "json" || next == "toon" {
-                return true;
-            }
         }
     }
     false
@@ -457,7 +515,7 @@ mod tests {
     fn bare_json_auto_promotes_to_triage() {
         assert_eq!(
             rewrite_args(&s(&["bvr", "--json"])),
-            s(&["bvr", "--robot-triage", "--json"])
+            s(&["bvr", "--robot-triage", "--format", "json"])
         );
     }
 
@@ -465,7 +523,7 @@ mod tests {
     fn bare_toon_auto_promotes_to_triage() {
         assert_eq!(
             rewrite_args(&s(&["bvr", "--toon"])),
-            s(&["bvr", "--robot-triage", "--toon"])
+            s(&["bvr", "--robot-triage", "--format", "toon"])
         );
     }
 
@@ -488,8 +546,8 @@ mod tests {
     #[test]
     fn json_with_existing_primary_not_promoted() {
         assert_eq!(
-            rewrite_args(&s(&["bvr", "--robot-insights", "--json"])),
-            s(&["bvr", "--robot-insights", "--json"])
+            rewrite_args(&s(&["bvr", "--robot-insights", "--format", "json"])),
+            s(&["bvr", "--robot-insights", "--format", "json"])
         );
     }
 
@@ -497,7 +555,7 @@ mod tests {
     fn output_space_json_auto_promotes() {
         assert_eq!(
             rewrite_args(&s(&["bvr", "--output", "json"])),
-            s(&["bvr", "--robot-triage", "--output", "json"])
+            s(&["bvr", "--robot-triage", "--format", "json"])
         );
     }
 
@@ -590,6 +648,59 @@ mod tests {
         assert_eq!(
             rewrite_args(&s(&["bvr", "--version"])),
             s(&["bvr", "--version"])
+        );
+    }
+
+    #[test]
+    fn structured_output_aliases_normalise_to_format() {
+        // Go rewriteAgentIntentFlagAliases (cmd/bv/main.go:885-895). Without
+        // this the aliases only triggered the auto-promote and were then
+        // dropped, so `bvr --toon` emitted JSON.
+        assert_eq!(
+            rewrite_args(&s(&["bvr", "--toon"])),
+            s(&["bvr", "--robot-triage", "--format", "toon"])
+        );
+        assert_eq!(
+            rewrite_args(&s(&["bvr", "--json"])),
+            s(&["bvr", "--robot-triage", "--format", "json"])
+        );
+        assert_eq!(
+            rewrite_args(&s(&["bvr", "--output", "toon"])),
+            s(&["bvr", "--robot-triage", "--format", "toon"])
+        );
+        // Case is normalised on the --output value form.
+        assert_eq!(
+            rewrite_args(&s(&["bvr", "--output", "TOON"])),
+            s(&["bvr", "--robot-triage", "--format", "toon"])
+        );
+    }
+
+    #[test]
+    fn format_alias_rewrite_respects_an_explicit_primary() {
+        assert_eq!(
+            rewrite_args(&s(&["bvr", "--robot-next", "--toon"])),
+            s(&["bvr", "--robot-next", "--format", "toon"])
+        );
+    }
+
+    #[test]
+    fn output_without_a_format_value_is_not_an_alias() {
+        // Go only rewrites `--output` when the next token is a format; a file
+        // path (the export use) must pass through untouched.
+        assert_eq!(
+            rewrite_args(&s(&["bvr", "--robot-next", "--output", "report.md"])),
+            s(&["bvr", "--robot-next", "--output", "report.md"])
+        );
+    }
+
+    #[test]
+    fn a_bare_format_flag_does_not_auto_promote() {
+        // Verified against the oracle:  with no primary
+        // drops into the TUI in Go, it does not default to --robot-triage. The
+        // auto-promote keys off the agent-intent aliases only.
+        assert_eq!(
+            rewrite_args(&s(&["bvr", "--format", "toon"])),
+            s(&["bvr", "--format", "toon"])
         );
     }
 }
