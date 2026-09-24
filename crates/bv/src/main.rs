@@ -1067,7 +1067,6 @@ fn run_robot_triage() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let source = source_meta_for(&issues);
     if issues.is_empty() {
         println!(
             "{{\"generated_at\":\"{}\",\"data_hash\":\"empty\",\"triage\":{{}}}}",
