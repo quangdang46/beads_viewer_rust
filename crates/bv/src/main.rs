@@ -3806,6 +3806,8 @@ fn build_priority_recommendation(
     issue: &bv_core::model::Issue,
     unblocks_by_id: &std::collections::BTreeMap<String, usize>,
     th: &PriorityThresholds,
+    issues: &[bv_core::model::Issue],
+    cp_height: &std::collections::BTreeMap<String, f64>,
     structural: (
         &std::collections::BTreeMap<String, u32>,
         &std::collections::BTreeSet<String>,
@@ -3815,7 +3817,30 @@ fn build_priority_recommendation(
 ) -> Option<serde_json::Value> {
     let (core_map, art_set, slack_map, max_core) = structural;
     let b = &r.breakdown;
-    let unblocks_count = unblocks_by_id.get(&r.id).copied().unwrap_or(0);
+    let issue_by_id: std::collections::HashMap<&str, &bv_core::model::Issue> =
+        issues.iter().map(|i| (i.id.as_str(), i)).collect();
+    // Go's what-if names the issues this one directly unblocks, capped at 10
+    // in the output; the full list is needed for the days-saved estimate.
+    let unblocks_ids: Vec<String> = issues
+        .iter()
+        .filter(|o| {
+            o.dependencies
+                .iter()
+                .any(|d| d.r#type.is_blocking() && d.effective_depends_on() == r.id)
+        })
+        .map(|o| o.id.clone())
+        .collect();
+    let unblocks_count = unblocks_ids
+        .len()
+        .max(unblocks_by_id.get(&r.id).copied().unwrap_or(0));
+    // Go counts dependency-blocked work that becomes ready once this issue
+    // lands (priority.go:963-970). Without the transitive id set here, the
+    // direct unblock count is the available proxy; the transitive cascade is
+    // what count_transitive_unblocks computes separately.
+    let blocked_reduction = unblocks_count;
+    // Go scales the issue's critical-path height (priority.go:974-980), which
+    // is not the pagerank norm.
+    let depth_reduction = (cp_height.get(&r.id).copied().unwrap_or(0.0) / 10.0).min(1.0);
 
     let mut reasoning: Vec<String> = Vec::new();
     let mut signals = 0usize;
@@ -3951,12 +3976,24 @@ fn build_priority_recommendation(
         "confidence": confidence,
         "reasoning": reasoning,
         "direction": direction,
-        "what_if": what_if_delta(unblocks_count, slack),
+        "what_if": what_if_delta(
+            &unblocks_ids,
+            count_transitive_unblocks(&r.id, issues, &issue_by_id),
+            blocked_reduction,
+            depth_reduction,
+            issues,
+        ),
         // Go PriorityExplanation (whatif.go:9-21) nests the same what-if delta
         // plus an inline status block alongside the ranked reasons.
         "explanation": {
             "top_reasons": top_reasons(b),
-            "what_if": what_if_delta(unblocks_count, slack),
+            "what_if": what_if_delta(
+                &unblocks_ids,
+                count_transitive_unblocks(&r.id, issues, &issue_by_id),
+                blocked_reduction,
+                depth_reduction,
+                issues,
+            ),
             "status": {
                 "computed_at": jiff_now(),
                 "data_hash": "",
@@ -4057,22 +4094,176 @@ fn top_reasons(b: &bv_analysis::impact::Breakdown) -> Vec<serde_json::Value> {
 /// Go `WhatIfDelta` (priority.go:602-620). Reported from the unblocks count,
 /// which drives the parallelization term, and the slack-derived depth
 /// reduction.
-fn what_if_delta(direct_unblocks: usize, slack: f64) -> serde_json::Value {
-    let _ = slack;
-    let parallelization_gain = if direct_unblocks == 0 { -1 } else { 0 };
-    let explanation = if direct_unblocks == 0 {
-        "No immediate downstream impact"
+/// Go `WhatIfDelta` (priority.go:602-620, assembled at 1001-1010).
+/// `unblocks_ids` are the direct dependents, capped at MaxUnblockedIDsShown
+/// (10), exactly as Go does before populating the field.
+fn what_if_delta(
+    direct_unblocks: &[String],
+    transitive_unblocks: usize,
+    blocked_reduction: usize,
+    depth_reduction: f64,
+    issues: &[bv_core::model::Issue],
+) -> serde_json::Value {
+    let direct_count = direct_unblocks.len();
+    const MAX_UNBLOCKED_IDS_SHOWN: usize = 10;
+    let shown: Vec<String> = direct_unblocks
+        .iter()
+        .take(MAX_UNBLOCKED_IDS_SHOWN)
+        .cloned()
+        .collect();
+
+    // Go `estimateDaysSaved` (priority.go:1080): sum the estimates of the
+    // unblocked issues, falling back to the default estimate, and convert to
+    // days.
+    let mut total_minutes = 0.0f64;
+    let mut counted = 0usize;
+    for id in direct_unblocks {
+        if let Some(i) = issues.iter().find(|i| i.id == *id) {
+            match i.estimated_minutes {
+                Some(m) if m > 0 => {
+                    total_minutes += m as f64;
+                    counted += 1;
+                }
+                _ => {
+                    total_minutes += 60.0; // DefaultEstimatedMinutes
+                    counted += 1;
+                }
+            }
+        }
+    }
+    let estimated_days_saved = if counted == 0 {
+        0.0
     } else {
-        "Unblocks downstream work"
+        total_minutes / counted as f64 / 480.0
     };
-    serde_json::json!({
-        "direct_unblocks": direct_unblocks,
-        "transitive_unblocks": direct_unblocks,
-        "blocked_reduction": direct_unblocks,
-        "depth_reduction": 0.1,
-        "parallelization_gain": parallelization_gain,
-        "explanation": explanation,
-    })
+
+    let mut delta = serde_json::json!({
+        "direct_unblocks": direct_count,
+        "transitive_unblocks": transitive_unblocks,
+        "blocked_reduction": blocked_reduction,
+        "depth_reduction": depth_reduction,
+    });
+    if estimated_days_saved > 0.0 {
+        delta["estimated_days_saved"] = serde_json::json!(estimated_days_saved);
+    }
+    if !shown.is_empty() {
+        delta["unblocked_issue_ids"] = serde_json::json!(shown);
+    }
+    // Go's parallelization_gain is a pointer and is nil below the top-N; for
+    // the recommendations that carry a what-if it is always computed.
+    delta["parallelization_gain"] = serde_json::json!(direct_count as i64 - 1);
+    delta["explanation"] = serde_json::json!(what_if_explanation(
+        direct_count,
+        transitive_unblocks,
+        blocked_reduction,
+        estimated_days_saved
+    ));
+    delta
+}
+
+/// Go `generateWhatIfExplanation` (priority.go:1110-1133).
+fn what_if_explanation(
+    direct: usize,
+    transitive: usize,
+    blocked_reduction: usize,
+    days_saved: f64,
+) -> String {
+    if direct == 0 {
+        return "No immediate downstream impact".to_string();
+    }
+    let mut out = format!("Completing this directly unblocks {direct} item");
+    if direct != 1 {
+        out.push('s');
+    }
+    if transitive > direct {
+        out.push_str(&format!(" ({transitive} total including cascades)"));
+    }
+    if blocked_reduction > 0 {
+        out.push_str(&format!(", clears {blocked_reduction} blocked"));
+    }
+    if days_saved >= 0.5 {
+        out.push_str(&format!(", enabling ~{days_saved:.1} days of work"));
+    }
+    out
+}
+
+/// Go `countTransitiveUnblocks` (priority.go:1041-1076): BFS over the
+/// dependency cascade, counting issues that become actionable once the
+/// simulated set of completed issues grows. Existing ready work is skipped —
+/// it was not caused by this completion.
+fn count_transitive_unblocks(
+    issue_id: &str,
+    issues: &[bv_core::model::Issue],
+    by_id: &std::collections::HashMap<&str, &bv_core::model::Issue>,
+) -> usize {
+    let Some(issue) = by_id.get(issue_id) else {
+        return 0;
+    };
+    if matches!(
+        issue.status,
+        bv_core::model::Status::Closed | bv_core::model::Status::Tombstone
+    ) {
+        return 0;
+    }
+    let has_deps = issues.iter().any(|o| {
+        o.dependencies
+            .iter()
+            .any(|d| d.r#type.is_blocking() && d.effective_depends_on() == issue_id)
+    });
+    if !has_deps {
+        return 0;
+    }
+
+    // Direct dependents of a node, following blocking edges.
+    let dependents = |id: &str| -> Vec<String> {
+        issues
+            .iter()
+            .filter(|o| {
+                o.dependencies
+                    .iter()
+                    .any(|d| d.r#type.is_blocking() && d.effective_depends_on() == id)
+            })
+            .map(|o| o.id.clone())
+            .collect()
+    };
+
+    let actionable_with = |id: &str, closed: &std::collections::BTreeSet<String>| -> bool {
+        match by_id.get(id) {
+            Some(i) => {
+                i.status.is_open()
+                    && i.assignee.trim().is_empty()
+                    && !i.issue_type.eq_ignore_ascii_case("epic")
+                    && i.dependencies.iter().all(|d| {
+                        !d.r#type.is_blocking()
+                            || d.effective_depends_on().is_empty()
+                            || closed.contains(d.effective_depends_on())
+                    })
+            }
+            None => false,
+        }
+    };
+
+    let mut simulated_closed: std::collections::BTreeSet<String> = Default::default();
+    simulated_closed.insert(issue_id.to_string());
+    let mut queue: std::collections::VecDeque<String> = Default::default();
+    queue.push_back(issue_id.to_string());
+    let mut count = 0usize;
+
+    while let Some(curr) = queue.pop_front() {
+        for candidate in dependents(&curr) {
+            if simulated_closed.contains(&candidate)
+                || actionable_with(&candidate, &Default::default())
+            {
+                continue;
+            }
+            if actionable_with(&candidate, &simulated_closed) {
+                simulated_closed.insert(candidate.clone());
+                queue.push_back(candidate);
+                count += 1;
+            }
+        }
+    }
+    count
 }
 
 /// Go: `--robot-by-label`/`--robot-by-assignee` are modifiers of
@@ -4175,6 +4366,8 @@ fn run_robot_priority(args: &[String]) -> ExitCode {
             issue,
             &unblocks_by_id,
             &th,
+            &issues,
+            &cp_map,
             (&core_map, &art_set, &slack_map, max_core),
         ) {
             recommendations.push(rec);
