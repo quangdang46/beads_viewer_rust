@@ -3778,7 +3778,7 @@ fn generate_advanced_insights(
             "edges_covered": edges_covered,
             "total_edges": total_edges,
             "coverage_ratio": edges_covered as f64 / total_edges as f64,
-            "rationale": "Greedy vertex cover (2-approx): iteratively pick highest uncovered degree until edges are covered or cap is reached.",
+            "rationale": "Greedy vertex-cover heuristic: iteratively pick highest uncovered degree until edges are covered or cap is reached.",
             "how_to_use": "Greedy dependency-edge coverage. Check coverage_ratio and capped before treating it as complete.",
         })
     };
@@ -3955,13 +3955,37 @@ fn generate_advanced_insights(
         }
     }
     pc_candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let pc_total = pc_candidates.len();
     pc_candidates.truncate(5);
     let max_parallel = current_actionable as i64 + pc_candidates.first().map_or(0, |c| c.1);
-    let parallel_cut = serde_json::json!({
-        "status": {"state": "available"},
+    // Go emits the cut suggestions themselves (advanced_insights.go:186-199);
+    // Rust computed the candidates and then dropped them.
+    let pc_suggestions: Vec<serde_json::Value> = pc_candidates
+        .iter()
+        .map(|(id, gain, _, tracks)| {
+            serde_json::json!({
+                "id": id,
+                "title": title_of(id),
+                "parallel_gain": gain,
+                "enabled_tracks": tracks,
+            })
+        })
+        .collect();
+    // Go's FeatureStatus.Count/Limited are omitempty, so an empty cut emits a
+    // bare {"state":"available"} and omits `suggestions` entirely.
+    let mut pc_status = serde_json::json!({"state": "available"});
+    if !pc_suggestions.is_empty() {
+        pc_status["count"] = serde_json::json!(pc_suggestions.len());
+        pc_status["limited"] = serde_json::json!(pc_total);
+    }
+    let mut parallel_cut = serde_json::json!({
+        "status": pc_status,
         "max_parallel": max_parallel,
         "how_to_use": "Issues that enable parallel work. Complete to maximize team throughput.",
     });
+    if !pc_suggestions.is_empty() {
+        parallel_cut["suggestions"] = serde_json::json!(pc_suggestions);
+    }
 
     // ---- Parallel Gain — Go generateParallelGain (advanced_insights.go:1063) ----
     let parallel_gain = compute_parallel_gain(issues, 5);
@@ -5034,15 +5058,19 @@ fn compute_parallel_gain(issues: &[bv_core::model::Issue], limit: usize) -> serd
     });
     let total = items.len();
     items.truncate(limit);
+    // Go's FeatureStatus carries `count` (returned) and `limited` (original
+    // count before capping); both are omitempty and both feed the digest.
     let mut status = serde_json::json!({"state": "computed"});
     if total > 0 {
-        status["count"] = serde_json::json!(total);
+        status["count"] = serde_json::json!(items.len());
+        status["limited"] = serde_json::json!(total);
     }
     out["status"] = status;
     if items.is_empty() {
         return out;
     }
-    out["items"] = serde_json::json!(items
+    // Go's field is `metrics`, not `items` (advanced_insights.go:212).
+    out["metrics"] = serde_json::json!(items
         .into_iter()
         .map(|(id, title, potential, gain, pct, unblocks)| {
             serde_json::json!({
