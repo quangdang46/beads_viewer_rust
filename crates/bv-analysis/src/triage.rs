@@ -588,32 +588,76 @@ pub fn build_triage(issues: &[Issue], g: &DiGraph, now: jiff::Timestamp) -> Tria
     }
     let max_unblocks = unblocks_map.values().map(|v| v.len()).max().unwrap_or(0);
 
-    // 2. Compute blocker depths: how many open blocking deps each issue has.
+    /// Go `getBlockerDepthRecursive` (triage.go:1440-1470): the length of the
+    /// longest chain of open blockers above this issue. Returns -1 on a cycle, and
+    /// memoizes the result so a wide graph stays linear.
+    fn blocker_depth_recursive(
+        issue_id: &str,
+        issues: &[Issue],
+        visited: &mut std::collections::BTreeSet<String>,
+        memo: &mut BTreeMap<String, i64>,
+    ) -> i64 {
+        if let Some(val) = memo.get(issue_id) {
+            return *val;
+        }
+        if !visited.insert(issue_id.to_string()) {
+            return -1; // cycle
+        }
+        let open_blockers: Vec<String> = issues
+            .iter()
+            .find(|i| i.id == issue_id)
+            .map(|i| {
+                i.dependencies
+                    .iter()
+                    .filter(|d| d.r#type.is_blocking())
+                    .map(|d| d.effective_depends_on().to_string())
+                    .filter(|bid| {
+                        !bid.is_empty() && issues.iter().any(|o| o.id == *bid && o.status.is_open())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if open_blockers.is_empty() {
+            visited.remove(issue_id);
+            memo.insert(issue_id.to_string(), 0);
+            return 0;
+        }
+        let mut max_chain = 0i64;
+        for blocker_id in &open_blockers {
+            let depth = blocker_depth_recursive(blocker_id, issues, visited, memo);
+            if depth == -1 {
+                visited.remove(issue_id);
+                return -1;
+            }
+            max_chain = max_chain.max(depth);
+        }
+        visited.remove(issue_id);
+        memo.insert(issue_id.to_string(), max_chain + 1);
+        max_chain + 1
+    }
+
+    // 2. Compute blocker depths. Go `getBlockerDepthRecursive` (triage.go:1440)
+    //    walks the whole open-blocker CHAIN and returns its maximum length, not
+    //    the number of direct blockers. Counting direct open blockers gave every
+    //    mid-chain issue a depth of 1, so the quick-win boost (gated at
+    //    depth <= 2) fired far too often and every score past the first link
+    //    came out too high.
     let mut blocker_depths: BTreeMap<String, usize> = BTreeMap::new();
     for issue in issues {
         if !issue.status.is_open() {
             continue;
         }
-        let depth = issue
-            .dependencies
-            .iter()
-            .filter(|d| d.r#type.is_blocking())
-            .filter(|d| {
-                let bid = d.effective_depends_on();
-                if bid.is_empty() {
-                    return false;
-                }
-                // Count only open blockers
-                issues.iter().any(|i| i.id == bid && i.status.is_open())
-            })
-            .count();
-        blocker_depths.insert(issue.id.clone(), depth);
+        let mut visited: std::collections::BTreeSet<String> = Default::default();
+        let mut memo: BTreeMap<String, i64> = BTreeMap::new();
+        let depth = blocker_depth_recursive(&issue.id, issues, &mut visited, &mut memo);
+        if depth >= 0 {
+            blocker_depths.insert(issue.id.clone(), depth as usize);
+        }
     }
 
-    // 3. Apply triage scoring to each recommendation.
-    for rec in &mut recommendations {
-        let unblocks = unblocks_map.get(&rec.id).map(|v| v.len()).unwrap_or(0);
+    for rec in recommendations.iter_mut() {
         let blocker_depth = *blocker_depths.get(&rec.id).unwrap_or(&0);
+        let unblocks = unblocks_map.get(&rec.id).map(|v| v.len()).unwrap_or(0);
         let base_score = rec.score;
 
         // Unblock boost: normalized unblocks * weight
