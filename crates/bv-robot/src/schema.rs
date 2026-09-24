@@ -1081,6 +1081,119 @@ fn capabilities_schema() -> Value {
 // Detailed schemas for commands that previously used generic fallback
 // ──────────────────────────────────────────────────────────────────────
 
+/// A blocked interval. Shared by blocked_periods, dependency_wait_periods
+/// and explicit_blocked_periods, which Go gives the same shape.
+fn causality_blocked_period_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "blocker_id": s("string"),
+            "blocker_ids": {"type": ["array", "null"], "items": s("string")},
+            "start_time": {"type": "string", "format": "date-time"},
+            "end_time": {"type": "string", "format": "date-time"},
+            "duration": s("integer"),
+            "kind": {"type": "string", "enum": ["union", "explicit_status", "dependency"]},
+            "ongoing": {"type": "boolean"},
+            "start_observed": {"type": "boolean"},
+        },
+    })
+}
+
+/// Causality insights block. Lifted out of `causality_schema` because the
+/// inline nesting exceeds the json! macro's recursion limit.
+fn causality_insights_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+                "summary": s("string"),
+                // Every duration is nullable: the analysis reports what it
+                // could not attribute rather than guessing a zero.
+                "total_duration": {"type": ["integer", "null"]},
+                "active_duration": {"type": ["integer", "null"]},
+                "blocked_duration": {"type": ["integer", "null"]},
+                "blocked_percentage": {"type": ["number", "null"]},
+                "duration_known": {"type": "boolean"},
+                "blocked_duration_known": {"type": "boolean"},
+                "critical_path_duration_known": {"type": "boolean"},
+                "dependency_duration_known": {"type": "boolean"},
+                "explicit_duration_known": {"type": "boolean"},
+                "critical_path_duration": {"type": ["integer", "null"], "minimum": 0},
+                "dependency_wait_duration": {"type": ["integer", "null"]},
+                "explicit_blocked_duration": {"type": ["integer", "null"]},
+                "coverage": {
+                    "type": "string",
+                    "enum": ["complete", "partial", "inconsistent", "unavailable"],
+                },
+                "limitations": {"type": ["array", "null"], "items": s("string")},
+                "dependency_wait_periods": {
+                    "type": ["array", "null"],
+                    "items": causality_blocked_period_schema(),
+                },
+                "explicit_blocked_periods": {
+                    "type": ["array", "null"],
+                    "items": causality_blocked_period_schema(),
+                },
+                "blocked_periods": {
+                    "type": ["array", "null"],
+                    "items": causality_blocked_period_schema(),
+                },
+                "commit_count": s("integer"),
+                "longest_gap": {"type": ["integer", "null"]},
+                "longest_gap_desc": s("string"),
+                "avg_time_between": {"type": ["integer", "null"]},
+                "estimated_without": {"type": "null"},
+                "critical_path": {"type": ["array", "null"], "items": s("integer")},
+                "critical_path_desc": s("string"),
+                "recommendations": {"type": ["array", "null"], "items": s("string")},
+        },
+    })
+}
+
+/// One causal event. Split out of `causality_schema` because the inline
+/// `json!` nesting exceeded the macro's recursion limit once v0.25.0 added
+/// the before/after issue snapshots.
+fn causality_event_schema() -> Value {
+    let snapshot = || {
+        json!({
+            "type": ["object", "null"],
+            "properties": {
+                "id": s("string"),
+                "title": s("string"),
+                "status": s("string"),
+                "dependencies": {
+                    "type": ["array", "null"],
+                    "items": json!({
+                        "type": "object",
+                        "properties": {
+                            "depends_on_id": s("string"),
+                            "type": s("string"),
+                        },
+                    }),
+                },
+            },
+        })
+    };
+    json!({
+        "type": "object",
+        "properties": {
+            "id": s("integer"),
+            "type": s("string"),
+            "description": s("string"),
+            "timestamp": {"type": "string", "format": "date-time"},
+            "commit_sha": s("string"),
+            "blocker_id": s("string"),
+            "caused_by_id": s("integer"),
+            "duration_next": s("integer"),
+            "enables_ids": {"type": ["array", "null"], "items": s("integer")},
+            "committed_at": {"type": "string", "format": "date-time"},
+            "source_bead_id": s("string"),
+            "transition_observed": {"type": "boolean"},
+            "before": snapshot(),
+            "after": snapshot(),
+        },
+    })
+}
+
 fn causality_schema() -> Value {
     json!({
         "$schema": DRAFT,
@@ -1100,55 +1213,39 @@ fn causality_schema() -> Value {
                     "status": s("string"),
                     "start_time": {"type": "string", "format": "date-time"},
                     "end_time": {"type": "string", "format": "date-time"},
-                    "total_time": s("integer"),
+                    "total_time": {"type": ["integer", "null"]},
                     "edge_count": s("integer"),
                     "is_complete": s("boolean"),
-                    "events": array_of(json!({
-                        "type": "object",
-                        "properties": {
-                            "id": s("integer"),
-                            "type": s("string"),
-                            "description": s("string"),
-                            "timestamp": {"type": "string", "format": "date-time"},
-                            "commit_sha": s("string"),
-                            "blocker_id": s("string"),
-                            "caused_by_id": s("integer"),
-                            "duration_next": s("integer"),
-                            "enables_ids": {"type": ["array", "null"], "items": s("integer")},
-                        },
-                    })),
-                },
-            },
-            "insights": {
-                "type": "object",
-                "properties": {
-                    "summary": s("string"),
-                    "total_duration": s("integer"),
-                    "active_duration": s("integer"),
-                    "blocked_duration": s("integer"),
-                    "blocked_percentage": s("number"),
-                    "blocked_periods": {
+                    // v0.25.0 reports how much of the chain's timing is
+                    // actually known, and the evidence behind each link.
+                    "duration_known": {"type": "boolean"},
+                    "time_basis": s("string"),
+                    "related_commits": {"type": ["array", "null"], "items": s("object")},
+                    "links": {
                         "type": ["array", "null"],
                         "items": json!({
                             "type": "object",
                             "properties": {
-                                "blocker_id": s("string"),
-                                "start_time": {"type": "string", "format": "date-time"},
-                                "end_time": {"type": "string", "format": "date-time"},
-                                "duration": s("integer"),
+                                "from": s("integer"),
+                                "to": s("integer"),
+                                "duration": {"type": "integer", "minimum": 0},
+                                "kind": {
+                                    "type": "string",
+                                    "enum": [
+                                        "dependency_transition",
+                                        "observed_wait",
+                                        "ongoing_wait",
+                                    ],
+                                },
+                                "evidence": s("string"),
                             },
+                            "required": ["from", "to", "kind", "evidence", "duration"],
                         }),
                     },
-                    "commit_count": s("integer"),
-                    "longest_gap": s("integer"),
-                    "longest_gap_desc": s("string"),
-                    "avg_time_between": s("integer"),
-                    "estimated_without": s("integer"),
-                    "critical_path": {"type": ["array", "null"], "items": s("integer")},
-                    "critical_path_desc": s("string"),
-                    "recommendations": {"type": ["array", "null"], "items": s("string")},
+                    "events": array_of(causality_event_schema()),
                 },
             },
+            "insights": causality_insights_schema(),
         },
         "required": ["generated_at", "data_hash", "output_format", "version", "chain", "insights"],
     })
