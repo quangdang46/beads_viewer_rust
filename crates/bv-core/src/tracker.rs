@@ -298,7 +298,7 @@ pub fn installed_tracker_capabilities(tracker: &str) -> TrackerCapabilities {
             }
         }
     };
-    let executable = std::fs::canonicalize(&path).unwrap_or(path);
+    let executable = resolve_executable(&path);
     let out = std::process::Command::new(&executable)
         .args(["update", "--help"])
         .output();
@@ -325,8 +325,15 @@ pub fn installed_tracker_capabilities(tracker: &str) -> TrackerCapabilities {
     caps
 }
 
+/// Go `exec.LookPath` — resolve a bare command name against `PATH`.
+///
+/// On Windows this must honour `PATHEXT`. Go's `LookPath` tries each directory
+/// with each extension the environment declares (`.COM`, `.EXE`, …), so
+/// `br` resolves to `br.exe`; joining the bare name instead finds nothing, and
+/// the tracker then reports as unavailable even though it is installed. That
+/// silently blanks the `claim`/`show` argv on every recommendation.
 fn lookup_path(name: &str) -> Option<PathBuf> {
-    if name.contains('/') {
+    if name.contains('/') || name.contains('\\') {
         let p = Path::new(name);
         return if p.is_file() {
             Some(p.to_path_buf())
@@ -335,9 +342,63 @@ fn lookup_path(name: &str) -> Option<PathBuf> {
         };
     }
     let path_var = std::env::var_os("PATH")?;
-    std::env::split_paths(&path_var)
-        .map(|dir| dir.join(name))
-        .find(|p| p.is_file())
+    let extensions = executable_extensions(name);
+    for dir in std::env::split_paths(&path_var) {
+        for ext in &extensions {
+            let candidate = dir.join(format!("{name}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// The suffixes to try for a bare command name, most specific first.
+///
+/// A name that already carries an extension is used verbatim. Otherwise the
+/// bare name is tried first (correct on Unix, and on Windows for a
+/// extensionless binary), followed by each `PATHEXT` entry.
+fn executable_extensions(name: &str) -> Vec<String> {
+    if Path::new(name).extension().is_some() {
+        return vec![String::new()];
+    }
+    let mut out = vec![String::new()];
+    if cfg!(windows) {
+        let pathext =
+            std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+        for ext in pathext.split(';').map(str::trim).filter(|e| !e.is_empty()) {
+            out.push(ext.to_string());
+        }
+    }
+    out
+}
+
+/// Canonicalize a path for embedding in emitted argv, stripping the Windows
+/// verbatim prefix.
+///
+/// `std::fs::canonicalize` returns the extended-length form
+/// (`\\?\C:\Users\...`) on Windows. Go's `filepath.Abs` never produces that
+/// prefix, so leaving it in makes every `working_directory`, `BEADS_DIR` and
+/// tracker `argv` entry differ from Go's by three characters — and a shell
+/// command that works from Go's form can be handed a form no shell parses the
+/// same way. The prefix is only a Win32 API detail, so it is dropped here
+/// rather than at every call site.
+fn resolve_executable(path: &Path) -> PathBuf {
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let text = resolved.to_string_lossy();
+    #[cfg(windows)]
+    {
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            // Strip the verbatim marker. For a UNC target the remainder is
+            // `\server\share\...`, which is the form Go prints.
+            if !rest.starts_with("UNC\\") {
+                return PathBuf::from(rest);
+            }
+            return PathBuf::from(format!(r"\\{}", &rest[4..]));
+        }
+    }
+    resolved
 }
 
 /// Go `resolveIssueOrigin(sourcePath)` (pkg/loader/loader.go:157) — bind the
@@ -352,7 +413,7 @@ pub fn resolve_issue_origin(source_path: &str, local_id: &str) -> IssueOrigin {
         origin.clone()
     };
 
-    let path = std::fs::canonicalize(source_path).unwrap_or_else(|_| PathBuf::from(source_path));
+    let path = resolve_executable(&PathBuf::from(source_path));
     let Some(beads_dir) = path.parent() else {
         return refuse(
             &mut origin,
