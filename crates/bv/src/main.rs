@@ -1198,7 +1198,7 @@ fn run_robot_triage() -> ExitCode {
                             .any(|d| d.r#type.is_blocking() && d.effective_depends_on() == r.id)
                     })
                     .count();
-                let unblocks_ids: Vec<String> = issues
+                let mut unblocks_ids: Vec<String> = issues
                     .iter()
                     .filter(|o| {
                         o.dependencies
@@ -1207,6 +1207,11 @@ fn run_robot_triage() -> ExitCode {
                     })
                     .map(|o| o.id.clone())
                     .collect();
+                // Go reads `unblocksMap[id]`, whose values are sorted for
+                // determinism (triage.go:826-827), so the emitted
+                // `unblocks_ids` is lexicographically sorted — not in issue
+                // iteration order.
+                unblocks_ids.sort();
                 let unblock_impact = ((unblocks_count as f64) + 1.0).log2();
                 // Go compares BlockerRatioNorm (triage.go:988), not the
                 // weighted blocker_ratio. They differ by the 0.13 weight, so
