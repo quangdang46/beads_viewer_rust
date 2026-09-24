@@ -1,7 +1,9 @@
-//! Topological Sort using Kahn's algorithm.
+//! Topological sort: Kahn's algorithm plus a gonum-compatible variant.
 //!
-//! Orders nodes such that for every edge u→v, u comes before v.
-//! Essential for execution planning and critical path analysis.
+//! Both order nodes such that for every edge u→v, u comes before v.
+//! Kahn's serves execution planning and critical path analysis; the gonum
+//! variant reproduces `gonum topo.Sort` so `--robot-insights` can match the
+//! Go oracle byte-for-byte.
 
 use crate::graph::DiGraph;
 use std::cmp::Reverse;
@@ -64,6 +66,120 @@ pub fn topological_sort(graph: &DiGraph) -> Option<Vec<usize>> {
 /// A graph is a DAG if and only if it has a valid topological order.
 pub fn is_dag(graph: &DiGraph) -> bool {
     topological_sort(graph).is_some()
+}
+
+/// Strongly connected components in Tarjan completion order.
+///
+/// Mirrors `gonum topo.TarjanSCC` (vendor/gonum.org/v1/gonum/graph/topo/
+/// tarjan.go:89). That calls `tarjanSCCstabilized(g, nil)`, so the sort
+/// function is nil and nothing is reordered by the call: nodes are visited in
+/// graph-node order and each node's successors in the graph's own adjacency
+/// order. Components are appended as their root completes, i.e. in reverse
+/// topological order.
+fn tarjan_sccs(graph: &DiGraph) -> Vec<Vec<usize>> {
+    let n = graph.len();
+
+    // Go builds the analysis graph with `slices.Sort(blockingTargets)` before
+    // adding each edge (pkg/analysis/graph.go:1636), so the adjacency list
+    // gonum walks is already in ascending node-index order. Reproduce that
+    // here rather than trust `DiGraph::add_edge` insertion order.
+    let succs: Vec<Vec<usize>> = (0..n)
+        .map(|u| {
+            let mut out = graph.successors_slice(u).to_vec();
+            out.sort_unstable();
+            out.dedup();
+            out
+        })
+        .collect();
+
+    // index 0 means "unvisited", matching gonum's `indexTable[wID] == 0` test.
+    let mut index = 0usize;
+    let mut index_table = vec![0usize; n];
+    let mut low_link = vec![0usize; n];
+    let mut on_stack = vec![false; n];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut sccs: Vec<Vec<usize>> = Vec::new();
+
+    // (node, next successor cursor) replaces gonum's recursive strongconnect
+    // (tarjan.go:146) so a deep chain cannot overflow the stack. The visit
+    // order is identical: a successor is descended into before the next one is
+    // looked at, and the parent's low-link is folded in on the way back up.
+    let mut frames: Vec<(usize, usize)> = Vec::new();
+
+    for start in 0..n {
+        if index_table[start] != 0 {
+            continue;
+        }
+        index += 1;
+        index_table[start] = index;
+        low_link[start] = index;
+        stack.push(start);
+        on_stack[start] = true;
+        frames.push((start, 0));
+
+        while let Some(frame) = frames.last_mut() {
+            let v = frame.0;
+            if frame.1 < succs[v].len() {
+                let w = succs[v][frame.1];
+                frame.1 += 1;
+                if index_table[w] == 0 {
+                    index += 1;
+                    index_table[w] = index;
+                    low_link[w] = index;
+                    stack.push(w);
+                    on_stack[w] = true;
+                    frames.push((w, 0));
+                } else if on_stack[w] {
+                    low_link[v] = low_link[v].min(index_table[w]);
+                }
+                continue;
+            }
+
+            // v is done: emit its component if v is a root, then return.
+            if low_link[v] == index_table[v] {
+                let mut scc = Vec::new();
+                loop {
+                    let w = stack.pop().expect("tarjan stack holds v");
+                    on_stack[w] = false;
+                    scc.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                sccs.push(scc);
+            }
+            frames.pop();
+            if let Some(&(parent, _)) = frames.last() {
+                low_link[parent] = low_link[parent].min(low_link[v]);
+            }
+        }
+    }
+
+    sccs
+}
+
+/// Topological sort matching `gonum topo.Sort` exactly.
+///
+/// gonum's `Sort` is `TarjanSCC` followed by `sortedFrom(sccs, lexical)`
+/// (tarjan.go:40-42): each component contributes its single node, then
+/// `slices.Reverse` flips the whole list (tarjan.go:77), turning Tarjan's
+/// reverse-topological component order into a "from → to" ordering. Any
+/// multi-node component makes gonum return an `Unorderable` error, so this
+/// returns `None` for such graphs.
+///
+/// `lexical` is `order.ByID`, and callers build node indices in sorted-id
+/// order, so ascending index is exactly lexical order here.
+///
+/// Callers that need a different (or cheaper) valid order — critical path,
+/// slack, k-paths — should keep using [`topological_sort`].
+pub fn topological_sort_gonum(graph: &DiGraph) -> Option<Vec<usize>> {
+    let sccs = tarjan_sccs(graph);
+    if sccs.iter().any(|s| s.len() != 1) {
+        return None; // gonum: Unorderable
+    }
+    let mut sorted: Vec<usize> = sccs.iter().map(|s| s[0]).collect();
+    sorted.reverse(); // sortedFrom: slices.Reverse(sorted)
+    Some(sorted)
 }
 
 /// Compute topological sort with detailed result.
@@ -229,5 +345,116 @@ mod tests {
 
         assert_eq!(result1, result2);
         assert_eq!(result2, result3);
+    }
+
+    /// Diamond `a->b, a->c, b->d, c->d` (indices 0=a .. 3=d). Both sorts are
+    /// valid, and they disagree on the b/c tie: Kahn emits the lower index
+    /// first, Tarjan emits the one its DFS reached last. gonum's `topo.Sort`
+    /// on this graph is [a, c, b, d].
+    fn diamond() -> DiGraph {
+        let mut g = DiGraph::new();
+        for id in ["a", "b", "c", "d"] {
+            g.add_node(id);
+        }
+        g.add_edge(0, 1);
+        g.add_edge(0, 2);
+        g.add_edge(1, 3);
+        g.add_edge(2, 3);
+        g
+    }
+
+    #[test]
+    fn gonum_matches_tarjan_not_kahn_on_diamond() {
+        let g = diamond();
+        assert_eq!(topological_sort_gonum(&g), Some(vec![0, 2, 1, 3]));
+        // Same graph, same correctness, different tie-break: this is why the
+        // insights field cannot reuse the Kahn result.
+        assert_eq!(topological_sort(&g), Some(vec![0, 1, 2, 3]));
+    }
+
+    #[test]
+    fn gonum_is_independent_of_edge_insertion_order() {
+        let mut g = DiGraph::new();
+        for id in ["a", "b", "c", "d"] {
+            g.add_node(id);
+        }
+        // Same diamond, edges inserted in the opposite order.
+        g.add_edge(0, 2);
+        g.add_edge(0, 1);
+        g.add_edge(2, 3);
+        g.add_edge(1, 3);
+        assert_eq!(topological_sort_gonum(&g), Some(vec![0, 2, 1, 3]));
+    }
+
+    #[test]
+    fn gonum_orders_chain_from_to() {
+        // a -> b -> c -> d
+        let mut g = DiGraph::new();
+        for id in ["a", "b", "c", "d"] {
+            g.add_node(id);
+        }
+        g.add_edge(0, 1);
+        g.add_edge(1, 2);
+        g.add_edge(2, 3);
+        assert_eq!(topological_sort_gonum(&g), Some(vec![0, 1, 2, 3]));
+    }
+
+    #[test]
+    fn gonum_rejects_cycles() {
+        // a -> b -> c -> a
+        let mut g = DiGraph::new();
+        for id in ["a", "b", "c"] {
+            g.add_node(id);
+        }
+        g.add_edge(0, 1);
+        g.add_edge(1, 2);
+        g.add_edge(2, 0);
+        assert_eq!(topological_sort_gonum(&g), None);
+    }
+
+    #[test]
+    fn gonum_tolerates_self_loop() {
+        // A one-node component is still a valid singleton, so gonum returns
+        // an ordering where Kahn reports a cycle.
+        let mut g = DiGraph::new();
+        g.add_node("a");
+        g.add_node("b");
+        g.add_edge(0, 0);
+        g.add_edge(1, 0);
+        assert_eq!(topological_sort_gonum(&g), Some(vec![1, 0]));
+        assert_eq!(topological_sort(&g), None);
+    }
+
+    #[test]
+    fn gonum_empty_graph() {
+        assert_eq!(topological_sort_gonum(&DiGraph::new()), Some(vec![]));
+    }
+
+    #[test]
+    fn gonum_is_a_valid_topological_order() {
+        // Random-ish DAG: gonum may pick any valid order, but never an
+        // invalid one — every edge u->v keeps u before v.
+        let mut g = DiGraph::new();
+        for i in 0..40 {
+            g.add_node(&format!("n{i:02}"));
+        }
+        for u in 0..40 {
+            for v in (u + 1)..40 {
+                if (u * 7 + v * 3) % 5 == 0 {
+                    g.add_edge(u, v);
+                }
+            }
+        }
+        let order = topological_sort_gonum(&g).unwrap();
+        assert_eq!(order.len(), 40);
+        let mut pos = vec![usize::MAX; 40];
+        for (rank, &u) in order.iter().enumerate() {
+            pos[u] = rank;
+        }
+        for u in 0..40 {
+            for &v in g.successors_slice(u) {
+                assert!(pos[u] < pos[v], "{u} must precede {v}");
+            }
+        }
     }
 }

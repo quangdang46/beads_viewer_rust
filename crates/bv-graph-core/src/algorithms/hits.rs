@@ -148,16 +148,6 @@ pub fn hits_default(graph: &DiGraph) -> HITSResult {
     hits(graph, &HITSConfig::default())
 }
 
-/// Normalize vector to unit L2 norm.
-fn normalize_l2(vec: &mut [f64]) {
-    let norm: f64 = vec.iter().map(|v| v * v).sum::<f64>().sqrt();
-    if norm > 0.0 {
-        for v in vec.iter_mut() {
-            *v /= norm;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

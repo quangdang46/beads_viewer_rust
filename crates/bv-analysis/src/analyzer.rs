@@ -12,7 +12,7 @@ use crate::algorithms::{
     hits::hits_default,
     kcore::kcore,
     pagerank::pagerank_default,
-    topo::topological_sort,
+    topo::topological_sort_gonum,
 };
 use bv_graph_core::DiGraph;
 use serde::Serialize;
@@ -185,8 +185,10 @@ pub struct Phase1Stats {
     pub out_degree: BTreeMap<String, usize>,
     /// in-degree per node (issues depending on this one).
     pub in_degree: BTreeMap<String, usize>,
-    /// Topological order (Kahn with sorted frontier — gonum determinism).
-    pub topological_order: Vec<String>,
+    /// Topological order, gonum `topo.Sort` walked backwards like Go
+    /// (dependencies first). `None` when gonum reports a cyclic graph, which
+    /// is how Go leaves the field nil (serialized as JSON `null`).
+    pub topological_order: Option<Vec<String>>,
     pub density: f64,
     pub node_count: usize,
     pub edge_count: usize,
@@ -256,16 +258,18 @@ pub fn analyze_phase1(g: &DiGraph) -> Phase1Stats {
         out_degree.insert(id.clone(), g.out_degree(idx));
         in_degree.insert(id, g.in_degree(idx));
     }
-    let topo = topological_sort(g); // Kahn sorted-frontier; None when cyclic
-    // gonum's topo.Sort returns the "from -> to" order, which for an edge
-    // u -> v (u depends on v) already puts dependencies first. Go then walks
-    // that slice backwards to emit dependents-first (graph.go:1952-1954), so
-    // reversing gonum's output here would undo Go's own reversal.
-    let topo = topo.unwrap_or_else(|| (0..n).collect());
-    let topological_order: Vec<String> = topo
-        .into_iter()
-        .map(|idx| g.node_id(idx).unwrap_or_default().to_string())
-        .collect();
+    // Go: `sorted, err := topo.Sort(a.g)` then walks the slice backwards
+    // (graph.go:1950-1954). gonum's topo.Sort is Tarjan-SCC based, so a Kahn
+    // order here is valid but ordered differently; the insights field has to
+    // reproduce gonum exactly. On a cyclic graph gonum returns an Unorderable
+    // error and Go leaves the field nil, so `None` stays `None` here.
+    let topological_order = topological_sort_gonum(g).map(|order| {
+        order
+            .iter()
+            .rev()
+            .map(|&idx| g.node_id(idx).unwrap_or_default().to_string())
+            .collect()
+    });
     Phase1Stats {
         out_degree,
         in_degree,
@@ -550,6 +554,48 @@ mod tests {
         g
     }
 
+    fn issue_with_blocking_deps(id: &str, depends_on: &[&str]) -> bv_core::model::Issue {
+        use bv_core::model::{Dependency, DependencyType, Issue, Status};
+        Issue {
+            id: id.to_string(),
+            content_hash: String::new(),
+            title: id.to_string(),
+            description: String::new(),
+            design: String::new(),
+            acceptance_criteria: String::new(),
+            notes: String::new(),
+            status: Status::Open,
+            priority: 2,
+            issue_type: "task".into(),
+            assignee: String::new(),
+            estimated_minutes: None,
+            created_at: None,
+            updated_at: None,
+            due_date: None,
+            closed_at: None,
+            external_ref: None,
+            compaction_level: 0,
+            compacted_at: None,
+            compacted_at_commit: None,
+            original_size: 0,
+            labels: vec![],
+            dependencies: depends_on
+                .iter()
+                .map(|target| Dependency {
+                    issue_id: id.to_string(),
+                    depends_on_id: (*target).to_string(),
+                    depends_on_legacy: String::new(),
+                    target_id_legacy: String::new(),
+                    r#type: DependencyType::Blocks,
+                    created_at: None,
+                    created_by: String::new(),
+                })
+                .collect(),
+            comments: vec![],
+            source_repo: String::new(),
+        }
+    }
+
     #[test]
     fn phase1_degrees_and_density() {
         let g = chain(12);
@@ -559,8 +605,43 @@ mod tests {
         assert_eq!(p1.out_degree["FIX-1"], 1); // FIX-1 -> FIX-2
         assert_eq!(p1.in_degree["FIX-1"], 0); // first node unblocked
         assert_eq!(p1.in_degree["FIX-12"], 1); // edge FIX-11 -> FIX-12
-        assert_eq!(p1.topological_order.len(), 12);
-        assert_eq!(p1.topological_order[0], "FIX-12");
+        let order = p1.topological_order.as_deref().unwrap();
+        assert_eq!(order.len(), 12);
+        assert_eq!(order[0], "FIX-12");
+    }
+
+    #[test]
+    fn phase1_topological_order_matches_gonum() {
+        // Diamond over sorted ids: a->b, a->c, b->d, c->d. gonum's topo.Sort
+        // returns [a, c, b, d] and Go walks that slice backwards
+        // (graph.go:1952-1954), so the reported order is d, b, c, a. Feeding
+        // the Kahn order [a, b, c, d] through the same backwards walk would
+        // report d, c, b, a instead — the tie is what differs.
+        let issues = vec![
+            issue_with_blocking_deps("a", &["b", "c"]),
+            issue_with_blocking_deps("b", &["d"]),
+            issue_with_blocking_deps("c", &["d"]),
+            issue_with_blocking_deps("d", &[]),
+        ];
+        let g = build_graph(&issues);
+        let p1 = analyze_phase1(&g);
+        assert_eq!(
+            p1.topological_order,
+            Some(["d", "b", "c", "a"].map(String::from).to_vec())
+        );
+    }
+
+    #[test]
+    fn phase1_topological_order_empty_when_cyclic() {
+        // gonum returns Unorderable for a cyclic graph and Go leaves
+        // TopologicalOrder nil, i.e. JSON null (graph.go:1951-1954).
+        let issues = vec![
+            issue_with_blocking_deps("a", &["b"]),
+            issue_with_blocking_deps("b", &["a"]),
+        ];
+        let g = build_graph(&issues);
+        let p1 = analyze_phase1(&g);
+        assert_eq!(p1.topological_order, None);
     }
 
     #[test]

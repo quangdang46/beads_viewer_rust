@@ -3294,7 +3294,7 @@ fn generate_advanced_insights(
         }
         paths.push(p);
     }
-    let k_paths = serde_json::json!({
+    let mut k_paths = serde_json::json!({
         // Go's KPathsResult.Limited is the number of representative sources
         // considered (advanced_insights.go:943), not the total path count.
         "status": feature_status(
@@ -3304,9 +3304,13 @@ fn generate_advanced_insights(
             paths.len() as i64,
             used_sources.len() as i64,
         ),
-        "paths": paths,
         "how_to_use": "Representative longest critical paths. Focus on issues appearing in multiple paths.",
     });
+    // Go's KPathsResult.Paths is `omitempty` (advanced_insights.go:173), so a
+    // run that found no path omits the key rather than emitting [].
+    if !paths.is_empty() {
+        k_paths["paths"] = serde_json::json!(paths);
+    }
 
     // ---- Parallel Cut (limit 5) — Go generateParallelCut ----
     let open_set: std::collections::HashSet<&str> = issues
