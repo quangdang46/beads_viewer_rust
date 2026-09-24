@@ -386,9 +386,9 @@ fn executable_extensions(name: &str) -> Vec<String> {
 /// rather than at every call site.
 fn resolve_executable(path: &Path) -> PathBuf {
     let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let text = resolved.to_string_lossy();
     #[cfg(windows)]
     {
+        let text = resolved.to_string_lossy();
         if let Some(rest) = text.strip_prefix(r"\\?\") {
             // Strip the verbatim marker. For a UNC target the remainder is
             // `\server\share\...`, which is the form Go prints.
