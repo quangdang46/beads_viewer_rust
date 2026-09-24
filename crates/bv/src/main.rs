@@ -3342,11 +3342,8 @@ fn generate_advanced_insights(
         "how_to_use": "Issues that enable parallel work. Complete to maximize team throughput.",
     });
 
-    // ---- Parallel Gain — Go: pending (bv-129 not implemented upstream) ----
-    let parallel_gain = serde_json::json!({
-        "status": {"state": "pending", "reason": "Awaiting implementation (bv-129)"},
-        "how_to_use": "Parallelization improvement from completing each issue.",
-    });
+    // ---- Parallel Gain — Go generateParallelGain (advanced_insights.go:1063) ----
+    let parallel_gain = compute_parallel_gain(issues, 5);
 
     // ---- Cycle Break — Go generateCycleBreakSuggestions ----
     let cycle_break = if cycles.is_empty() {
@@ -4280,6 +4277,165 @@ fn count_transitive_unblocks(
         }
     }
     count
+}
+
+/// Go `generateParallelGain` (advanced_insights.go:1063-1230): report the
+/// current number of independent work tracks and, per actionable issue, how
+/// many more tracks completing it would open.
+///
+/// A "track" is a connected component of the open dependency graph that holds
+/// at least one actionable issue, so completing an issue is a gain only when it
+/// splits a component or joins its dependents into a new one.
+fn compute_parallel_gain(issues: &[bv_core::model::Issue], limit: usize) -> serde_json::Value {
+    const HOW_TO_USE: &str = "Independent work tracks gained by closing each actionable issue now (gain = tracks after - tracks now). Pick high-gain issues to widen parallel work; unblocks lists what opens up.";
+    let is_open = |i: &bv_core::model::Issue| i.status.is_open();
+    let has_open_blocker = |i: &bv_core::model::Issue| {
+        i.dependencies.iter().any(|d| {
+            d.r#type.is_blocking()
+                && issues
+                    .iter()
+                    .any(|o| o.id == d.effective_depends_on() && is_open(o))
+        })
+    };
+    let actionable: Vec<&bv_core::model::Issue> = issues
+        .iter()
+        .filter(|i| is_open(i) && !has_open_blocker(i))
+        .collect();
+    let active: std::collections::BTreeSet<String> =
+        actionable.iter().map(|i| i.id.clone()).collect();
+
+    // Union-find over the open graph (blocking and parent-child edges), counting
+    // components that still contain an actionable member.
+    let count_tracks =
+        |excluded: Option<&str>, active: &std::collections::BTreeSet<String>| -> usize {
+            let mut parent: std::collections::BTreeMap<String, String> =
+                std::collections::BTreeMap::new();
+            for i in issues.iter().filter(|i| is_open(i)) {
+                if Some(i.id.as_str()) != excluded {
+                    parent.insert(i.id.clone(), i.id.clone());
+                }
+            }
+            fn find(parent: &mut std::collections::BTreeMap<String, String>, x: &str) -> String {
+                let mut cur = x.to_string();
+                while let Some(next) = parent.get(&cur).cloned() {
+                    if next == cur {
+                        break;
+                    }
+                    cur = next;
+                }
+                cur
+            }
+            for i in issues.iter().filter(|i| is_open(i)) {
+                if Some(i.id.as_str()) == excluded {
+                    continue;
+                }
+                for d in &i.dependencies {
+                    if !(d.r#type.is_blocking()
+                        || d.r#type == bv_core::model::DependencyType::ParentChild)
+                    {
+                        continue;
+                    }
+                    let target = d.effective_depends_on().to_string();
+                    if Some(target.as_str()) == excluded || !parent.contains_key(&target) {
+                        continue;
+                    }
+                    let (pf, pt) = (find(&mut parent, &i.id), find(&mut parent, &target));
+                    if pf != pt {
+                        parent.insert(pt, pf);
+                    }
+                }
+            }
+            let mut roots: std::collections::BTreeSet<String> = Default::default();
+            for id in active {
+                if Some(id.as_str()) == excluded {
+                    continue;
+                }
+                if parent.contains_key(id) {
+                    roots.insert(find(&mut parent, id));
+                }
+            }
+            roots.len()
+        };
+
+    let tracks_now = count_tracks(None, &active);
+    let mut out = serde_json::json!({
+        "status": {"state": "computed"},
+        "current_parallel": tracks_now,
+        "how_to_use": HOW_TO_USE,
+    });
+    if actionable.is_empty() {
+        out["status"] =
+            serde_json::json!({"state": "computed", "count": 0, "reason": "No actionable issues"});
+        return out;
+    }
+
+    let mut items: Vec<(String, String, usize, i64, f64, Vec<String>)> = Vec::new();
+    for issue in &actionable {
+        let unblocks: Vec<String> = issues
+            .iter()
+            .filter(|o| is_open(o) && o.id != issue.id)
+            .filter(|o| {
+                o.dependencies
+                    .iter()
+                    .any(|d| d.r#type.is_blocking() && d.effective_depends_on() == issue.id)
+                    && !has_open_blocker(o)
+            })
+            .map(|o| o.id.clone())
+            .collect();
+        let mut after = active.clone();
+        after.remove(&issue.id);
+        after.extend(unblocks.iter().cloned());
+        let tracks_after = count_tracks(Some(&issue.id), &after);
+        let gain = tracks_after as i64 - tracks_now as i64;
+        if gain <= 0 {
+            continue;
+        }
+        let pct = if tracks_now > 0 {
+            gain as f64 / tracks_now as f64 * 100.0
+        } else {
+            0.0
+        };
+        items.push((
+            issue.id.clone(),
+            issue.title.clone(),
+            tracks_after,
+            gain,
+            pct,
+            unblocks,
+        ));
+    }
+
+    // Go's ordering: gain desc, then unblocks count desc, then id.
+    items.sort_by(|a, b| {
+        b.3.cmp(&a.3)
+            .then_with(|| b.5.len().cmp(&a.5.len()))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    let total = items.len();
+    items.truncate(limit);
+    let mut status = serde_json::json!({"state": "computed"});
+    if total > 0 {
+        status["count"] = serde_json::json!(total);
+    }
+    out["status"] = status;
+    if items.is_empty() {
+        return out;
+    }
+    out["items"] = serde_json::json!(items
+        .into_iter()
+        .map(|(id, title, potential, gain, pct, unblocks)| {
+            serde_json::json!({
+                "id": id,
+                "title": title,
+                "current_parallel": tracks_now,
+                "potential_parallel": potential,
+                "gain": gain,
+                "gain_percent": pct,
+                "unblocks": unblocks,
+            })
+        })
+        .collect::<Vec<_>>());
+    out
 }
 
 /// Go: `--robot-by-label`/`--robot-by-assignee` are modifiers of
