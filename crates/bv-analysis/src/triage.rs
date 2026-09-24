@@ -664,6 +664,13 @@ pub fn build_triage(issues: &[Issue], g: &DiGraph, now: jiff::Timestamp) -> Tria
     for rec in recommendations.iter_mut() {
         rec.unblocks_ids = unblocks_map.get(&rec.id).cloned().unwrap_or_default();
         rec.blocked_by = crate::blocker_chain::open_blockers(&issue_index, &rec.id);
+        // Go's claimable gate requires zero open blockers
+        // (isClaimableRecommendation, triage.go:1191). The impact scorer
+        // stamps a preliminary verdict before it can see the dependency graph,
+        // so refine it here where blocked_by is known.
+        if !rec.blocked_by.is_empty() {
+            rec.claimable = false;
+        }
         let blocker_depth = *blocker_depths.get(&rec.id).unwrap_or(&0);
         let unblocks = rec.unblocks_ids.len();
         let base_score = rec.score;
@@ -688,6 +695,13 @@ pub fn build_triage(issues: &[Issue], g: &DiGraph, now: jiff::Timestamp) -> Tria
         };
 
         rec.score = base_score * TRIAGE_BASE_WEIGHT + unblock_boost + quickwin_boost;
+        // Go marks a quick win by `QuickWinBoost > 0.05` (triage.go:1759) and
+        // rewrites the action hint for a genuinely startable bead
+        // (triage.go:1605-1622). The boost is only known here, so the hint is
+        // stamped in this layer rather than where the base action is derived.
+        if quickwin_boost > 0.05 && rec.blocked_by.is_empty() {
+            rec.action = "Quick win - start here for fast progress".to_string();
+        }
     }
 
     // Re-sort by triage score descending, ID ascending (Go tie-break).

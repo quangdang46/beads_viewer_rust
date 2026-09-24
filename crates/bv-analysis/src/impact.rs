@@ -682,6 +682,10 @@ pub fn compute_impact_scores(inputs: &ImpactInputs) -> Vec<IssueImpact> {
             reasons.push(format!("📅 Last updated {days_stale} days ago"));
         }
 
+        // Go sets this when the issue has open blockers (triage.go:1704);
+        // it takes precedence over the plain start-work hint.
+        let mut blocked_action_hint: Option<String> = None;
+
         // 4. Quick-win identification (unblock impact + not heavily blocked).
         //    Go parity: QuickWinBoost > 0.05 in triage factors.
         //    Simplified: unblocks > 0 and priority is high enough.
@@ -689,27 +693,26 @@ pub fn compute_impact_scores(inputs: &ImpactInputs) -> Vec<IssueImpact> {
             reasons.push("⚡ Low effort, high impact - good starting point".to_string());
         }
 
-        // 5b. Blocked-by reason (Go parity: BlockedByIDs in triage reasons).
-        //     Only for non-open issues (Go goldens: open issues never carry
-        //     this reason, even when blocked). Ancestor-epic parity (#2):
-        //     inherited parent-child blockers surface here too, via the
-        //     shared blocker_chain helper.
-        if !issue.status.is_open() {
-            let by_id_map: std::collections::HashMap<&str, &Issue> =
-                inputs.issues.iter().map(|i| (i.id.as_str(), i)).collect();
-            let blocker_ids: Vec<String> =
-                crate::blocker_chain::open_blockers(&by_id_map, &issue.id);
-            if blocker_ids.len() == 1 {
-                reasons.push(format!(
-                    "⏳ Blocked by {} - complete that first",
-                    blocker_ids[0]
-                ));
-            } else if blocker_ids.len() > 1 {
-                reasons.push(format!(
-                    "⏳ Blocked by {} items - need to clear dependencies",
-                    blocker_ids.len()
-                ));
-            }
+        // 5b. Blocked-by reason (Go triage.go:1696-1705). Go gates purely on
+        //     having open blockers, whatever the status; the earlier
+        //     `!is_open` guard dropped it for open-but-blocked issues, which
+        //     is most of a dependency chain. Ancestor-epic parity (#2):
+        //     inherited parent-child blockers surface via the shared helper.
+        let by_id_map: std::collections::HashMap<&str, &Issue> =
+            inputs.issues.iter().map(|i| (i.id.as_str(), i)).collect();
+        let blocker_ids: Vec<String> = crate::blocker_chain::open_blockers(&by_id_map, &issue.id);
+        if blocker_ids.len() == 1 {
+            reasons.push(format!(
+                "⏳ Blocked by {} - complete that first",
+                blocker_ids[0]
+            ));
+            blocked_action_hint = Some(format!("Work on {} first to unblock this", blocker_ids[0]));
+        } else if blocker_ids.len() > 1 {
+            reasons.push(format!(
+                "⏳ Blocked by {} items - need to clear dependencies",
+                blocker_ids.len()
+            ));
+            blocked_action_hint = Some(format!("Work on {} first to unblock this", blocker_ids[0]));
         }
 
         // 5. Claim status — Go parity: isOpenStatus guard.
@@ -740,7 +743,7 @@ pub fn compute_impact_scores(inputs: &ImpactInputs) -> Vec<IssueImpact> {
             labels: issue.labels.clone(),
             score,
             breakdown: b,
-            action: action_hint(issue),
+            action: blocked_action_hint.unwrap_or_else(|| action_hint(issue)),
             reasons,
             // Filled in by the triage layer, which owns the unblocks map;
             // the impact scorer has no dependency graph context.
