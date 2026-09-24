@@ -5691,22 +5691,16 @@ fn run_robot_label_flow() -> ExitCode {
     let mut flow_obj = serde_json::Map::new();
     flow_obj.insert("labels".into(), serde_json::json!(flow.labels));
     flow_obj.insert("flow_matrix".into(), serde_json::json!(flow.flow_matrix));
-    if flow.dependencies.is_empty() {
-        flow_obj.insert("dependencies".into(), serde_json::Value::Null);
-    } else {
+    {
         flow_obj.insert("dependencies".into(), serde_json::json!(flow.dependencies));
     }
-    if flow.critical_paths.is_empty() {
-        flow_obj.insert("critical_paths".into(), serde_json::Value::Null);
-    } else {
+    {
         flow_obj.insert(
             "critical_paths".into(),
             serde_json::json!(flow.critical_paths),
         );
     }
-    if flow.bottleneck_labels.is_empty() {
-        flow_obj.insert("bottleneck_labels".into(), serde_json::Value::Null);
-    } else {
+    {
         flow_obj.insert(
             "bottleneck_labels".into(),
             serde_json::json!(flow.bottleneck_labels),
