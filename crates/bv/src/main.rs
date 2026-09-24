@@ -17,6 +17,15 @@ fn html_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// Go `strconv.ParseBool` — the exact set `flag.Bool` accepts.
+fn parse_go_bool(value: &str) -> Option<bool> {
+    match value {
+        "1" | "t" | "T" | "TRUE" | "true" | "True" => Some(true),
+        "0" | "f" | "F" | "FALSE" | "false" | "False" => Some(false),
+        _ => None,
+    }
+}
+
 /// `--generate-docs` (Go cmd/bv/main.go:1757). Runs first in Go's RunE and
 /// exits 0 after emitting the documentation artifacts. The Go tree writes
 /// markdown + JSON under `docs/generated`; we emit the JSON artifact plus a
@@ -80,17 +89,38 @@ fn run_export_report(args: &[String], output_path: &str) -> ExitCode {
             .and_then(|i| args.get(i + 1))
             .cloned()
     };
-    let format = flag_value("--export-format").unwrap_or_default();
-    let include_graph = flag_value("--export-include-graph").is_some();
+    let format = match flag_value("--export-format") {
+        Some(value) => value,
+        // Go `ResolveReportOptions` seeds Format with "markdown" and only a
+        // recipe or an explicit override replaces it.
+        None => "markdown".to_string(),
+    };
     let template = flag_value("--export-template").unwrap_or_default();
-    if !matches!(
-        format.as_str(),
-        "" | "markdown" | "json" | "csv" | "mermaid"
-    ) {
-        eprintln!(
-            "Error: invalid --export-format {:?} (expected markdown, json, csv or mermaid)",
-            format
-        );
+    // Go's `flag.Bool` reads a bare `--export-include-graph` as true and only
+    // consumes a following token when that token is the value. `ResolveReportOptions`
+    // otherwise derives the default from the format, so markdown keeps its
+    // graph and csv never gets one.
+    let include_graph = match flag_value("--export-include-graph") {
+        None => format != "csv",
+        Some(value) if value.starts_with('-') => true,
+        Some(value) => match parse_go_bool(&value) {
+            Some(parsed) => parsed,
+            None => {
+                eprintln!("invalid boolean value {value:?} for -export-include-graph: parse error");
+                return ExitCode::from(2);
+            }
+        },
+    };
+    let options = bv_export::markdown::ReportOptions {
+        format: format.clone(),
+        template,
+        include_graph,
+        // Go stamps the report with `robotNow()`, which is UTC.
+        generated_at: Some(jiff::Timestamp::now()),
+        ..Default::default()
+    };
+    if let Err(e) = options.validate() {
+        eprintln!("Error: {e}");
         return ExitCode::from(2);
     }
     let path = if output_path.is_empty() {
@@ -99,14 +129,16 @@ fn run_export_report(args: &[String], output_path: &str) -> ExitCode {
         output_path.to_string()
     };
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (issues, _) = match bv_core::discovery::load_issues_from_repo(&cwd) {
+    let (issues, stats) = match bv_core::discovery::load_issues_from_repo(&cwd) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
             return ExitCode::from(1);
         }
     };
-    let body = match format.as_str() {
+    let mut options = options;
+    attach_report_origins(&mut options, &issues, &cwd, stats);
+    let body = match options.format.as_str() {
         "json" => go_json_string(&serde_json::json!(issues)),
         "csv" => {
             let mut out = String::from("id,title,status,priority,issue_type\n");
@@ -123,18 +155,12 @@ fn run_export_report(args: &[String], output_path: &str) -> ExitCode {
             out
         }
         "mermaid" => bv_export::mermaid::generate_mermaid(&issues),
-        _ => {
-            let mut md = bv_export::mermaid::generate_markdown(&issues, "Beads Report");
-            if include_graph {
-                md.push_str("\n## Dependency graph\n\n```mermaid\n");
-                md.push_str(&bv_export::graph_export::generate_mermaid_graph(&issues));
-                md.push_str("\n```\n");
-            }
-            if !template.is_empty() {
-                md = md.replace("Beads Report", &template);
-            }
-            md
-        }
+        // Go runs `renderReportTemplate` here when `--export-template` names a
+        // file (pkg/export/markdown.go:209): a Go `text/template` execution
+        // with its own field escaping and 1 MiB read / 16 MiB render caps.
+        // That interpreter is not ported yet, so a template path falls back to
+        // the default document rather than a half-rendered one.
+        _ => bv_export::markdown::generate_report(&issues, &issues, &options),
     };
     match std::fs::write(&path, &body) {
         Ok(_) => {
@@ -145,6 +171,40 @@ fn run_export_report(args: &[String], output_path: &str) -> ExitCode {
             eprintln!("Error writing {path}: {e}");
             ExitCode::from(1)
         }
+    }
+}
+
+/// Go attaches an `IssueOrigin` to every loaded issue (pkg/loader/loader.go:94
+/// `AttachIssueOrigins`), and `GenerateMarkdown` renders a Quick Actions block
+/// and a per-issue Commands block from it. Reproduce that binding here so the
+/// two blocks are not silently empty on a machine that does have a live
+/// tracker, and are still empty (Go's `Origin == nil` shape) on one that does
+/// not.
+fn attach_report_origins(
+    options: &mut bv_export::markdown::ReportOptions,
+    issues: &[bv_core::model::Issue],
+    cwd: &std::path::Path,
+    stats: bv_core::loader::ParseStats,
+) {
+    let source_path = match bv_core::discovery::find_jsonl_path_with_warnings(
+        &bv_core::discovery::get_beads_dir(cwd).unwrap_or_else(|_| cwd.to_path_buf()),
+        |_| {},
+    )
+    .ok()
+    .flatten()
+    {
+        Some(path) => path.to_string_lossy().into_owned(),
+        None => return,
+    };
+    // Go marks the whole source read-only when the load was not clean, so no
+    // issue in it may present a mutation command.
+    let complete = stats.errors == 0;
+    for issue in issues {
+        let mut origin = bv_core::tracker::resolve_issue_origin(&source_path, &issue.id);
+        if !complete && origin.read_only_reason.is_empty() {
+            origin.read_only_reason = "source authority is incomplete or stale".to_string();
+        }
+        options.origins.insert(issue.id.clone(), origin);
     }
 }
 
@@ -253,14 +313,22 @@ fn main() -> ExitCode {
             .cloned()
             .unwrap_or_else(|| "report.md".to_string());
         let cwd = std::env::current_dir().unwrap_or_default();
-        let (issues, _) = match bv_core::discovery::load_issues_from_repo(&cwd) {
+        let (issues, stats) = match bv_core::discovery::load_issues_from_repo(&cwd) {
             Ok(x) => x,
             Err(e) => {
                 eprintln!("Error: {e}");
                 return ExitCode::from(1);
             }
         };
-        let md = bv_export::mermaid::generate_markdown(&issues, "Beads Report");
+        let mut options = bv_export::markdown::ReportOptions {
+            // Go forces `overrides.Format = "markdown"` for `--export-md`,
+            // so the graph stays on (only `csv` turns it off).
+            format: "markdown".to_string(),
+            generated_at: Some(jiff::Timestamp::now()),
+            ..Default::default()
+        };
+        attach_report_origins(&mut options, &issues, &cwd, stats);
+        let md = bv_export::markdown::generate_report(&issues, &issues, &options);
         match std::fs::write(&output_path, &md) {
             Ok(_) => {
                 println!("Exported {} issues to {}", issues.len(), output_path);
