@@ -3,18 +3,19 @@
 //! `robot-label-flow`, `robot-label-attention`).
 //!
 //! Deliberate scope cut vs Go: the deep blockage-cascade tree
-//! (`ComputeBlockageCascade`), per-label subgraph PageRank/critical-path
-//! (`ComputeLabelSubgraph`/`ComputeLabelPageRank`/`ComputeLabelCriticalPath`),
-//! and multi-week historical velocity trends are not ported here — those
-//! back other, still-undispatched commands. Where `computeLabelAttention`
-//! needs a per-label PageRank sum, we sum the already-computed *global*
-//! PageRank over the label's issues rather than re-running PageRank on an
-//! extracted subgraph; this is a documented approximation, not a silent
-//! stub — attention ranking still reflects real graph centrality.
+//! (`ComputeBlockageCascade`), per-label subgraph critical-path
+//! (`ComputeLabelCriticalPath`), and multi-week historical velocity trends are
+//! not ported here — those back other, still-undispatched commands.
+//!
+//! Per-label subgraph PageRank (`ComputeLabelSubgraph`/`ComputeLabelPageRank`)
+//! *is* ported: `compute_label_attention` extracts the label's subgraph and
+//! runs PageRank on it, so `pagerank_sum` is the sum of the core-issue scores
+//! of a label-scoped graph — not a sum over the global graph's PageRank.
 
 use bv_core::model::{Issue, Status};
+use bv_graph_core::DiGraph;
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 fn is_closed_like(s: Status) -> bool {
     matches!(s, Status::Closed | Status::Tombstone)
@@ -810,6 +811,189 @@ pub fn compute_all_label_health(
 }
 
 // ---------------------------------------------------------------------
+// Label-scoped PageRank
+// ---------------------------------------------------------------------
+
+/// One label's extracted subgraph: the issues carrying `label` (core) plus
+/// their direct neighbours (blockers they depend on, and issues that depend on
+/// them), with the blocking edges among that set.
+///
+/// Port of Go `LabelSubgraph` (`pkg/analysis/label_health.go:1343`).
+struct LabelSubgraph {
+    /// Issues carrying `label`, sorted.
+    core_issues: Vec<String>,
+    /// `core_issues` plus the direct neighbours outside `label` (Go's
+    /// `CoreIssues` + `DependencyIssues`), sorted. Go keeps the dependency
+    /// list only for reporting; PageRank needs the union.
+    all_issues: Vec<String>,
+    /// blocker id -> sorted blocked ids; only blocking edges, both ends in the
+    /// subgraph. Empty-list entries are dropped, as in Go.
+    adjacency: BTreeMap<String, Vec<String>>,
+}
+
+/// Reverse dependency lookup over the whole issue set: blocker id -> the ids
+/// of the issues that declare a dependency on it (any dependency type, matching
+/// Go's untyped inner scan). Hoisted out of the per-label extraction so that
+/// building it costs one pass over the corpus instead of one pass per label.
+struct ReverseDeps {
+    /// Every known issue id — Go's `fullIssueMap` membership test.
+    known: BTreeSet<String>,
+    /// blocker id -> dependent issue ids, deduplicated.
+    dependents: BTreeMap<String, Vec<String>>,
+}
+
+impl ReverseDeps {
+    fn build(issues: &[Issue]) -> Self {
+        let mut known = BTreeSet::new();
+        let mut seen: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for iss in issues {
+            known.insert(iss.id.clone());
+            for dep in &iss.dependencies {
+                let blocker = dep.effective_depends_on();
+                if blocker.is_empty() {
+                    continue;
+                }
+                seen.entry(blocker.to_string())
+                    .or_default()
+                    .insert(iss.id.clone());
+            }
+        }
+        let dependents = seen
+            .into_iter()
+            .map(|(blocker, ids)| (blocker, ids.into_iter().collect()))
+            .collect();
+        ReverseDeps { known, dependents }
+    }
+}
+
+/// Extract the subgraph for `label`.
+///
+/// Port of Go `ComputeLabelSubgraph` (`pkg/analysis/label_health.go:1351`).
+/// Membership expansion deliberately ignores dependency *type* (as Go does) —
+/// only the adjacency edges filter on `is_blocking`.
+fn compute_label_subgraph(label: &str, issues: &[Issue], rev: &ReverseDeps) -> LabelSubgraph {
+    if label.is_empty() || issues.is_empty() {
+        return LabelSubgraph {
+            core_issues: Vec::new(),
+            all_issues: Vec::new(),
+            adjacency: BTreeMap::new(),
+        };
+    }
+
+    // Core issues: those carrying the label. BTreeSet iteration is already the
+    // sorted order Go reaches via `sort.Strings`.
+    let mut core: BTreeSet<&str> = BTreeSet::new();
+    for iss in issues {
+        if has_label(iss, label) {
+            core.insert(iss.id.as_str());
+        }
+    }
+
+    // Dependency issues: blockers a core issue depends on, plus issues that
+    // depend on a core issue — either side, excluding the core itself.
+    let mut deps: BTreeSet<&str> = BTreeSet::new();
+    for iss in issues {
+        if !core.contains(iss.id.as_str()) {
+            continue;
+        }
+        for dep in &iss.dependencies {
+            let blocker = dep.effective_depends_on();
+            if !core.contains(blocker) && rev.known.contains(blocker) {
+                deps.insert(blocker);
+            }
+        }
+        if let Some(dependents) = rev.dependents.get(iss.id.as_str()) {
+            for id in dependents {
+                if !core.contains(id.as_str()) {
+                    deps.insert(id.as_str());
+                }
+            }
+        }
+    }
+
+    let core_issues: Vec<String> = core.into_iter().map(str::to_string).collect();
+    let mut all_issues = core_issues.clone();
+    all_issues.extend(deps.into_iter().map(str::to_string));
+    all_issues.sort_unstable();
+
+    let in_subgraph: BTreeSet<&str> = all_issues.iter().map(String::as_str).collect();
+    let by_id: BTreeMap<&str, &Issue> = issues.iter().map(|i| (i.id.as_str(), i)).collect();
+
+    // Edges: blocker -> blocked, blocking types only, both ends in the subgraph.
+    let mut adjacency: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for id in &all_issues {
+        let Some(iss) = by_id.get(id.as_str()) else {
+            continue;
+        };
+        for dep in &iss.dependencies {
+            if !dep.r#type.is_blocking() {
+                continue;
+            }
+            let blocker = dep.effective_depends_on();
+            if !in_subgraph.contains(blocker) {
+                continue;
+            }
+            adjacency
+                .entry(blocker.to_string())
+                .or_default()
+                .push(id.clone());
+        }
+    }
+    for targets in adjacency.values_mut() {
+        targets.sort_unstable();
+    }
+
+    LabelSubgraph {
+        core_issues,
+        all_issues,
+        adjacency,
+    }
+}
+
+/// Sum of the PageRank scores restricted to the subgraph's core issues.
+///
+/// Port of Go `ComputeLabelPageRank` + the `CoreOnly` accumulation in
+/// `computeLabelAttention` (`pkg/analysis/label_health.go:1552`, `:2038`).
+/// Nodes are added in sorted id order so the power iteration visits them in
+/// the same order as Go's gonum ids, keeping the accumulation byte-identical.
+fn compute_label_pagerank_core_sum(sg: &LabelSubgraph) -> f64 {
+    if sg.all_issues.is_empty() {
+        return 0.0;
+    }
+    let mut g = DiGraph::with_capacity(sg.all_issues.len(), sg.all_issues.len() * 2);
+    for id in &sg.all_issues {
+        g.add_node(id);
+    }
+    for (blocker, targets) in &sg.adjacency {
+        let Some(from) = g.node_idx(blocker) else {
+            continue;
+        };
+        for target in targets {
+            let Some(to) = g.node_idx(target) else {
+                continue;
+            };
+            // Go's gonum `simple.DirectedGraph.SetEdge` panics on a self edge;
+            // dropping it keeps a malformed corpus from aborting the run.
+            if from == to {
+                continue;
+            }
+            g.add_edge(from, to);
+        }
+    }
+
+    let scores = bv_graph_core::algorithms::pagerank::pagerank_default(&g);
+    // Go accumulates over a Go map (random order); sorted ids give us the
+    // deterministic order, which is identical whenever Go's own result is.
+    let mut sum = 0.0;
+    for id in &sg.core_issues {
+        if let Some(idx) = g.node_idx(id) {
+            sum += scores.get(idx).copied().unwrap_or(0.0);
+        }
+    }
+    sum
+}
+
+// ---------------------------------------------------------------------
 // Attention scoring
 // ---------------------------------------------------------------------
 
@@ -844,9 +1028,9 @@ pub struct LabelAttentionResult {
 fn compute_label_attention(
     label: &str,
     issues: &[Issue],
+    rev: &ReverseDeps,
     cfg: &LabelHealthConfig,
     now: jiff::Timestamp,
-    stats: &GraphStats,
 ) -> LabelAttentionScore {
     let labeled: Vec<&Issue> = issues.iter().filter(|i| has_label(i, label)).collect();
     let mut score = LabelAttentionScore {
@@ -869,11 +1053,12 @@ fn compute_label_attention(
         if !is_closed_like(iss.status) {
             score.open_count += 1;
         }
-        // Documented approximation: sum global PageRank over this label's
-        // issues rather than re-running PageRank on an extracted subgraph
-        // (see module doc comment).
-        score.pagerank_sum += stats.pagerank.get(&iss.id).copied().unwrap_or(0.0);
     }
+
+    // PageRank over this label's own subgraph, summed over the core issues
+    // (Go: `ComputeLabelSubgraph` -> `ComputeLabelPageRank` -> `CoreOnly`).
+    let sg = compute_label_subgraph(label, issues, rev);
+    score.pagerank_sum = compute_label_pagerank_core_sum(&sg);
 
     let labeled_owned: Vec<Issue> = labeled.iter().map(|i| (*i).clone()).collect();
     let freshness = compute_freshness_metrics(&labeled_owned, now, cfg.stale_threshold_days);
@@ -926,12 +1111,12 @@ pub fn compute_label_attention_scores(
     if extraction.label_count == 0 {
         return result;
     }
-    let stats = compute_graph_stats(issues);
+    let rev = ReverseDeps::build(issues);
 
     let mut scores: Vec<LabelAttentionScore> = extraction
         .labels
         .iter()
-        .map(|label| compute_label_attention(label, issues, cfg, now, &stats))
+        .map(|label| compute_label_attention(label, issues, &rev, cfg, now))
         .collect();
 
     let (mut max_score, mut min_score) = (0.0, 0.0);
@@ -1142,5 +1327,139 @@ mod tests {
         );
         assert_eq!(result.total_labels, 0);
         assert!(result.labels.is_empty());
+    }
+
+    /// A 3-node chain `A-3 -> A-2 -> A-1` (blocker -> blocked) where `A-1` and
+    /// `A-2` carry `core` and `A-3` is pulled in only as a dependency, so the
+    /// label's subgraph splits 2 core / 1 dependency.
+    ///
+    /// PageRank over that 3-node subgraph (d=0.85, uniform start, dangling
+    /// mass of the sink `A-1` spread over all 3 nodes) has the closed form
+    ///     A-1 = 1029/2169, A-2 = 740/2169, A-3 = 400/2169  (sums to 1)
+    /// so the core-only sum the attention score uses is `1769/2169`.
+    const CHAIN_CORE_PAGERANK_SUM: f64 = 1769.0 / 2169.0;
+
+    fn core_chain_fixture() -> Vec<Issue> {
+        let mut a1 = issue("A-1", Status::Open, &["core"]);
+        a1.dependencies.push(blocks("A-1", "A-2"));
+        let mut a2 = issue("A-2", Status::Open, &["core"]);
+        a2.dependencies.push(blocks("A-2", "A-3"));
+        let a3 = issue("A-3", Status::Open, &[]);
+        vec![a1, a2, a3]
+    }
+
+    #[test]
+    fn label_subgraph_splits_core_from_dependencies() {
+        let issues = core_chain_fixture();
+        let rev = ReverseDeps::build(&issues);
+        let sg = compute_label_subgraph("core", &issues, &rev);
+
+        // `A-3` has no label but is a blocker of core `A-2`, so it joins the
+        // subgraph as a dependency without becoming a core issue.
+        assert_eq!(sg.core_issues, vec!["A-1".to_string(), "A-2".to_string()]);
+        let deps: Vec<&String> = sg
+            .all_issues
+            .iter()
+            .filter(|id| !sg.core_issues.contains(id))
+            .collect();
+        assert_eq!(deps, vec![&"A-3".to_string()]);
+        assert_eq!(
+            sg.all_issues,
+            vec!["A-1".to_string(), "A-2".to_string(), "A-3".to_string()]
+        );
+        // Blocking edges, blocker -> blocked.
+        let mut edges: Vec<(&str, Vec<&str>)> = sg
+            .adjacency
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.iter().map(String::as_str).collect()))
+            .collect();
+        edges.sort();
+        assert_eq!(
+            edges,
+            vec![("A-2", vec!["A-1"]), ("A-3", vec!["A-2"])],
+            "adjacency must be the two chain edges only"
+        );
+    }
+
+    #[test]
+    fn label_pagerank_sum_is_subgraph_scoped_not_global() {
+        let issues = core_chain_fixture();
+        let rev = ReverseDeps::build(&issues);
+        let sg = compute_label_subgraph("core", &issues, &rev);
+
+        let sum = compute_label_pagerank_core_sum(&sg);
+        assert!(
+            (sum - CHAIN_CORE_PAGERANK_SUM).abs() < 1e-5,
+            "subgraph-scoped PageRankSum was {sum}, want {CHAIN_CORE_PAGERANK_SUM}"
+        );
+        // This expectation is discriminating: dropping the edges entirely
+        // would give 2/3, and inverting them (blocked -> blocker) would give
+        // 1140/2169, so both a missing and a reversed adjacency fail here.
+        assert!(
+            (2.0 / 3.0 - CHAIN_CORE_PAGERANK_SUM).abs() > 1e-3
+                && (1140.0 / 2169.0 - CHAIN_CORE_PAGERANK_SUM).abs() > 1e-3,
+            "the expected value must not be reachable by a wrong edge set"
+        );
+
+        // The old approximation summed the *global* PageRank of the two core
+        // issues, which is a different (much smaller) number — assert we no
+        // longer take that path.
+        let stats = compute_graph_stats(&issues);
+        let global: f64 = ["A-1", "A-2"]
+            .iter()
+            .map(|id| stats.pagerank.get(*id).copied().unwrap_or(0.0))
+            .sum();
+        assert!(
+            (global - CHAIN_CORE_PAGERANK_SUM).abs() > 1e-3,
+            "fixture is degenerate: global PageRank sum {global} collides with the subgraph sum"
+        );
+
+        // End to end: the attention score carries the subgraph sum through.
+        let result = compute_label_attention_scores(
+            &issues,
+            &LabelHealthConfig::default(),
+            jiff::Timestamp::now(),
+        );
+        let core = result
+            .labels
+            .iter()
+            .find(|l| l.label == "core")
+            .expect("label `core` must be scored");
+        assert!(
+            (core.pagerank_sum - CHAIN_CORE_PAGERANK_SUM).abs() < 1e-5,
+            "attention pagerank_sum was {}, want {CHAIN_CORE_PAGERANK_SUM}",
+            core.pagerank_sum
+        );
+        // `open_count` counts label-carrying issues only (A-1, A-2) — the
+        // pulled-in dependency A-3 is in the graph, not in the label's count.
+        assert_eq!(core.open_count, 2);
+    }
+
+    #[test]
+    fn non_blocking_dependency_still_expands_subgraph_but_adds_no_edge() {
+        // Go expands the dependency set for every dependency type but only
+        // builds adjacency from blocking ones; this is the shape the real
+        // corpus has (a parent-child parent contributing no graph edge).
+        let mut a1 = issue("A-1", Status::Open, &["core"]);
+        a1.dependencies.push(Dependency {
+            issue_id: "A-1".to_string(),
+            depends_on_id: "A-2".to_string(),
+            depends_on_legacy: String::new(),
+            target_id_legacy: String::new(),
+            r#type: DependencyType::ParentChild,
+            created_at: None,
+            created_by: String::new(),
+        });
+        let issues = vec![a1, issue("A-2", Status::Open, &[])];
+
+        let rev = ReverseDeps::build(&issues);
+        let sg = compute_label_subgraph("core", &issues, &rev);
+        assert_eq!(sg.all_issues, vec!["A-1".to_string(), "A-2".to_string()]);
+        assert!(sg.adjacency.is_empty(), "parent-child is not a graph edge");
+
+        // Two edgeless nodes split their mass evenly, so the single core issue
+        // scores 0.5 — the value the Go oracle reports for the real corpus.
+        let sum = compute_label_pagerank_core_sum(&sg);
+        assert!((sum - 0.5).abs() < 1e-5, "got {sum}, want 0.5");
     }
 }

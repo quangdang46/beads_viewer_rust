@@ -6144,9 +6144,13 @@ fn run_robot_label_attention() -> ExitCode {
     // Go builds labels from a separate struct with specific field order:
     // rank, label, attention_score, normalized_score, reason, open_count,
     // blocked_count, stale_count, pagerank_sum, velocity_factor.
+    // Go truncates the ranked list to --attention-limit (robot_registry.go:1833)
+    // and reports the same bound as `limit`; without the truncation the array
+    // carried every scored label.
     let attention_labels: Vec<serde_json::Value> = result
         .labels
         .iter()
+        .take(effective_limit)
         .map(|s| {
             let reason = build_attention_reason(s);
             serde_json::json!({
