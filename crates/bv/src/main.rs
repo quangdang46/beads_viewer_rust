@@ -1022,6 +1022,17 @@ fn run_robot_next() -> ExitCode {
     payload["usage_hints"] = usage_hints;
     emit_json(&payload)
 }
+/// Go `opts.TopN` (default 10) applied to the scored recommendation list.
+/// Go builds recommendations against the full scored set and slices only the
+/// user-visible list, so top_picks and quick_wins are unaffected (issue #146).
+fn recommendations_top_n(recs: &[bv_analysis::impact::IssueImpact]) -> Vec<serde_json::Value> {
+    const TOP_N: usize = 10;
+    recs.iter()
+        .take(TOP_N)
+        .map(|r| serde_json::to_value(r).unwrap_or(serde_json::Value::Null))
+        .collect()
+}
+
 /// Go's claimability gate for a triage recommendation (triage.go:657).
 ///
 /// Shared by `top_picks` and `quick_wins`: Go derives both from the same
@@ -1328,7 +1339,10 @@ fn run_robot_triage() -> ExitCode {
                 "not_actionable_count": out.quick_ref.not_actionable_count,
                 "top_picks": top_picks,
             },
-            "recommendations": out.recommendations,
+            // Go slices the scored set to opts.TopN (triage.go:593 sets the
+            // default to 10) after building the full list, so top_picks
+            // still searches the unsliced set (issue #146).
+            "recommendations": recommendations_top_n(&out.recommendations),
             "quick_wins": quick_wins,
             "blockers_to_clear": blockers_to_clear,
             "project_health": project_health,
