@@ -3,6 +3,7 @@
 
 pub mod algorithms;
 pub mod graph;
+pub mod rand;
 pub mod reachability;
 pub mod whatif;
 
