@@ -168,12 +168,34 @@ impl RobotEnvelope {
     }
 }
 
+/// Go `encoding/json` HTML-escapes `<`, `>` and `&` by default;
+/// `serde_json::to_vec` escapes none of them. Any path or label containing
+/// one of those bytes therefore hashes to a different digest than Go's, even
+/// though the emitted envelope body is escaped correctly elsewhere.
+///
+/// `<`, `>` and `&` can only occur *inside* JSON string literals — never as
+/// JSON syntax — so rewriting the serialized bytes wholesale is exactly
+/// equivalent to escaping during serialization, and it cannot corrupt
+/// structure the way a naive pre-serialization replace of the input could.
+fn go_html_escape_json(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    for &b in raw {
+        match b {
+            b'<' => out.extend_from_slice(b"\\u003c"),
+            b'>' => out.extend_from_slice(b"\\u003e"),
+            b'&' => out.extend_from_slice(b"\\u0026"),
+            b => out.push(b),
+        }
+    }
+    out
+}
+
 /// Go `robotAuthorityHash` (cmd/bv/main.go:7393) — SHA-256 over the JSON
 /// encoding of the authority struct, lowercase hex. Field order must match the
 /// struct declaration for the digest to match.
 pub fn authority_hash(authority: &RobotSourceAuthority) -> String {
     match serde_json::to_vec(authority) {
-        Ok(raw) => sha256_hex(&raw),
+        Ok(raw) => sha256_hex(&go_html_escape_json(&raw)),
         Err(_) => String::new(),
     }
 }
@@ -197,7 +219,7 @@ pub fn scope_hash(
     });
     // serde_json::json! uses a Map; with preserve_order it keeps insertion order.
     match serde_json::to_vec(&value) {
-        Ok(raw) => sha256_hex(&raw),
+        Ok(raw) => sha256_hex(&go_html_escape_json(&raw)),
         Err(_) => String::new(),
     }
 }
@@ -417,5 +439,63 @@ mod tests {
         let v = serde_json::to_value(&stats).unwrap();
         assert_eq!(v["valid"], 10);
         assert_eq!(v["warnings"].as_array().unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod hash_escaping_tests {
+    use super::*;
+
+    /// The concrete divergence: any path or label containing `&` (or `<`/`>`)
+    /// hashed differently from Go before this fix, because Go's
+    /// `encoding/json` HTML-escapes those bytes and serde_json does not.
+    #[test]
+    fn scope_hash_escapes_ampersand_and_angle_brackets() {
+        let got = scope_hash("a&b<c>d", "", "", "h", &[]);
+        let want = sha256_hex(
+            br#"{"Label":"a\u0026b\u003cc\u003ed","Recipe":"","Repo":"","DataHash":"h","IDs":[]}"#,
+        );
+        assert_eq!(got, want, "scope_hash must hash Go-escaped bytes");
+    }
+
+    /// Same bytes, escaped vs not, must produce different digests — otherwise
+    /// the test above would pass even if escaping were a no-op.
+    #[test]
+    fn unescaped_and_escaped_differ() {
+        let escaped = scope_hash("a&b", "", "", "h", &[]);
+        let unescaped =
+            sha256_hex(br#"{"Label":"a&b","Recipe":"","Repo":"","DataHash":"h","IDs":[]}"#);
+        assert_ne!(escaped, unescaped);
+    }
+
+    /// A `&` inside an authority field must reach the digest escaped too.
+    #[test]
+    fn authority_hash_escapes_html_bytes() {
+        let a = RobotSourceAuthority {
+            state: "a&b".into(),
+            ..RobotSourceAuthority::default()
+        };
+        let raw = serde_json::to_vec(&a).expect("serializes");
+        assert!(
+            raw.windows(1).any(|w| w == b"&"),
+            "precondition: serde_json left the ampersand unescaped"
+        );
+        assert_eq!(authority_hash(&a), sha256_hex(&go_html_escape_json(&raw)));
+    }
+
+    /// Escaping must not alter anything when no HTML-escapable byte is present,
+    /// so ordinary digests are untouched by the fix.
+    #[test]
+    fn plain_values_are_unchanged_by_escaping() {
+        let raw = br#"{"Label":"tui","Recipe":"","Repo":"","DataHash":"abc","IDs":["A-1"]}"#;
+        assert_eq!(go_html_escape_json(raw), raw.to_vec());
+    }
+
+    /// The rewrite is only sound because these bytes cannot appear as JSON
+    /// syntax. Assert structure survives untouched.
+    #[test]
+    fn escaping_does_not_corrupt_json_structure() {
+        let raw = br#"{"a":[1,2],"b":"x"}"#;
+        assert_eq!(go_html_escape_json(raw), raw.to_vec());
     }
 }
