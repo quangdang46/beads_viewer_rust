@@ -699,8 +699,24 @@ pub fn build_triage(issues: &[Issue], g: &DiGraph, now: jiff::Timestamp) -> Tria
         // rewrites the action hint for a genuinely startable bead
         // (triage.go:1605-1622). The boost is only known here, so the hint is
         // stamped in this layer rather than where the base action is derived.
-        if quickwin_boost > 0.05 && rec.blocked_by.is_empty() {
-            rec.action = "Quick win - start here for fast progress".to_string();
+        if quickwin_boost > 0.05 {
+            // Go emits the quick-win reason immediately BEFORE the
+            // claim-status reason (triage.go:1605, then 1625) and rewrites
+            // the action hint from the same predicate, but only for a bead
+            // that is genuinely startable (no open blockers).
+            const QUICK_WIN_REASON: &str = "⚡ Low effort, high impact - good starting point";
+            if let Some(pos) = rec
+                .reasons
+                .iter()
+                .position(|r| r.starts_with("✅ Currently unclaimed"))
+            {
+                rec.reasons.insert(pos, QUICK_WIN_REASON.to_string());
+            } else {
+                rec.reasons.push(QUICK_WIN_REASON.to_string());
+            }
+            if rec.blocked_by.is_empty() {
+                rec.action = "Quick win - start here for fast progress".to_string();
+            }
         }
     }
 

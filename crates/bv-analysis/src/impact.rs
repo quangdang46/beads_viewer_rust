@@ -686,14 +686,27 @@ pub fn compute_impact_scores(inputs: &ImpactInputs) -> Vec<IssueImpact> {
         // it takes precedence over the plain start-work hint.
         let mut blocked_action_hint: Option<String> = None;
 
-        // 4. Quick-win identification (unblock impact + not heavily blocked).
-        //    Go parity: QuickWinBoost > 0.05 in triage factors.
-        //    Simplified: unblocks > 0 and priority is high enough.
-        if unblocks > 0 && prio_norm >= 0.5 {
-            reasons.push("⚡ Low effort, high impact - good starting point".to_string());
+        // 4. Quick-win identification. Go decides this from the triage
+        //    factor `QuickWinBoost > 0.05` (triage.go:1759), which is only
+        //    known in the triage layer; the old local approximation
+        //    (`unblocks > 0 && priority_norm >= 0.5`) fired for every
+        //    mid-chain issue. The triage layer appends the reason and the
+        //    action hint together, sharing one predicate.
+
+        // 5. Quick-win reason. Go emits it here, before the claim-status
+        //    reason (triage.go:1605 then 1625), so the ordering matters; the
+        //    predicate itself (QuickWinBoost > 0.05) lives in the triage layer
+        //    and is applied there, in position.
+        // 6. Claim status — Go parity: isOpenStatus guard.
+        //    Go inserts the quick-win reason just above this one
+        //    (triage.go:1605, then 1625), so the two are recorded in that
+        //    order; the quick-win predicate is applied in the triage layer,
+        //    which splices it in ahead of the claim-status entry.
+        if issue.status.is_open() && issue.assignee.is_empty() {
+            reasons.push("✅ Currently unclaimed - available for work".to_string());
         }
 
-        // 5b. Blocked-by reason (Go triage.go:1696-1705). Go gates purely on
+        // 7. Blocked-by reason (Go triage.go:1696-1705). Go gates purely on
         //     having open blockers, whatever the status; the earlier
         //     `!is_open` guard dropped it for open-but-blocked issues, which
         //     is most of a dependency chain. Ancestor-epic parity (#2):
@@ -713,13 +726,6 @@ pub fn compute_impact_scores(inputs: &ImpactInputs) -> Vec<IssueImpact> {
                 blocker_ids.len()
             ));
             blocked_action_hint = Some(format!("Work on {} first to unblock this", blocker_ids[0]));
-        }
-
-        // 5. Claim status — Go parity: isOpenStatus guard.
-        //    Go shows "Currently unclaimed" for all open unassigned items
-        //    in the robot-next actionable set.
-        if issue.status.is_open() && issue.assignee.is_empty() {
-            reasons.push("✅ Currently unclaimed - available for work".to_string());
         }
 
         // 6. Urgency label signal — Go parity: Priority <= 1 (P0/P1 only).
