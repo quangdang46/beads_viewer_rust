@@ -1,5 +1,6 @@
 //! Multi-repo workspace support — port of Go `pkg/workspace/types.go`.
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::Path;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -108,12 +109,44 @@ pub fn load_workspace(path: &Path) -> Result<WorkspaceConfig, String> {
 }
 
 /// Qualify an issue ID with the repo prefix (idempotent).
+///
+/// Go `QualifyID` (`pkg/workspace/types.go:296-304`): an empty local id or an
+/// empty prefix is returned untouched, an already-prefixed id is left alone, and
+/// otherwise the prefix is concatenated with no inserted separator. The
+/// already-prefixed test is a raw string prefix, not a `prefix + separator`
+/// match — so prefix `"a"` leaves `"apple"` alone. Prefixes are conventionally
+/// stored *with* their trailing separator, which is why `source_repo_key_from_prefix`
+/// strips it again for the `SourceRepo` field.
 pub fn qualify_id(prefix: &str, local_id: &str) -> String {
+    if local_id.is_empty() || prefix.is_empty() {
+        return local_id.to_string();
+    }
     if local_id.starts_with(prefix) {
         local_id.to_string()
     } else {
         format!("{prefix}{local_id}")
     }
+}
+
+/// Go `sourceRepoKeyFromPrefix` (`pkg/workspace/loader.go:557-561`): the
+/// `SourceRepo` value a namespaced issue carries. Trim whitespace, strip every
+/// trailing `-`, `:` and `_`, then lowercase. This is also the key
+/// `filterByRepo`'s `SourceRepo` fallback matches against, so it is stored
+/// separator-free on purpose.
+pub fn source_repo_key_from_prefix(prefix: &str) -> String {
+    prefix
+        .trim()
+        .trim_end_matches(['-', ':', '_'])
+        .to_lowercase()
+}
+
+/// Go `hasKnownPrefix` (`pkg/workspace/loader.go:604-612`): strictly longer than
+/// the prefix, raw prefix compare. Used to decide whether a cross-repo
+/// dependency reference is already qualified and must be left byte-identical.
+fn has_known_prefix(id: &str, known_prefixes: &HashSet<String>) -> bool {
+    known_prefixes
+        .iter()
+        .any(|prefix| id.len() > prefix.len() && id.starts_with(prefix.as_str()))
 }
 
 /// Result of loading one repo in a workspace.
@@ -236,19 +269,38 @@ pub fn load_all(
     let mut results = Vec::new();
     let mut failures = 0usize;
 
+    // Every enabled repo's prefix, used to recognise an already-qualified
+    // cross-repo dependency reference (Go `knownPrefixes`).
+    let known_prefixes: HashSet<String> = repos.iter().map(|r| r.get_prefix()).collect();
+
     for repo in &repos {
         let repo_path = root.join(&repo.path);
         let name = repo.get_name();
         match crate::discovery::load_issues_from_repo(&repo_path) {
             Ok((mut issues, _stats)) => {
                 let prefix = repo.get_prefix();
+                // Captured before any qualifying, so the membership test below
+                // sees this repo's own bare ids (Go `localIDs`).
+                let local_ids: HashSet<String> = issues.iter().map(|i| i.id.clone()).collect();
+                let source_repo = source_repo_key_from_prefix(&prefix);
                 for issue in &mut issues {
                     issue.id = qualify_id(&prefix, &issue.id);
-                    issue.source_repo = name.clone();
-                    // Rewrite dependency references into qualified IDs.
+                    issue.source_repo = source_repo.clone();
                     for dep in &mut issue.dependencies {
+                        // The owning issue is namespaced too, not just the target.
+                        dep.issue_id = qualify_id(&prefix, &dep.issue_id);
                         let target = dep.effective_depends_on().to_string();
-                        dep.depends_on_id = qualify_id(&prefix, &target);
+                        // A reference that already carries another repo's prefix
+                        // is external and stays byte-identical; everything else
+                        // is either local or assumed local.
+                        if !has_known_prefix(&target, &known_prefixes)
+                            || local_ids.contains(&target)
+                        {
+                            dep.depends_on_id = qualify_id(&prefix, &target);
+                        }
+                    }
+                    for comment in &mut issue.comments {
+                        comment.issue_id = qualify_id(&prefix, &comment.issue_id);
                     }
                 }
                 results.push(LoadResult {
@@ -285,6 +337,39 @@ mod tests {
     fn qualify_id_is_idempotent() {
         assert_eq!(qualify_id("api-", "AUTH-1"), "api-AUTH-1");
         assert_eq!(qualify_id("api-", "api-AUTH-1"), "api-AUTH-1");
+    }
+
+    #[test]
+    fn qualify_id_leaves_empty_sides_untouched() {
+        // Go QualifyID returns localID unchanged when either side is empty. The
+        // empty-local case is the one Rust got wrong by prefixing it: an empty
+        // id is a dangling reference, not an id that happens to need a prefix.
+        assert_eq!(qualify_id("api-", ""), "");
+        assert_eq!(qualify_id("", "AUTH-1"), "AUTH-1");
+        assert_eq!(qualify_id("", ""), "");
+    }
+
+    #[test]
+    fn source_repo_key_strips_every_trailing_separator() {
+        // Go TrimRight takes a cutset, so this strips a run, not one character.
+        assert_eq!(source_repo_key_from_prefix("api-"), "api");
+        assert_eq!(source_repo_key_from_prefix("api:"), "api");
+        assert_eq!(source_repo_key_from_prefix("api_"), "api");
+        assert_eq!(source_repo_key_from_prefix("api-:-_"), "api");
+        assert_eq!(source_repo_key_from_prefix("  API-  "), "api");
+        assert_eq!(source_repo_key_from_prefix("."), ".");
+    }
+
+    #[test]
+    fn known_prefix_detection_requires_strictly_longer() {
+        let known: HashSet<String> = ["api-".to_string(), "web-".to_string()].into();
+        assert!(has_known_prefix("web-9", &known));
+        assert!(has_known_prefix("api-deep", &known));
+        // Exactly the prefix is not "known" — it is a local bare id.
+        assert!(!has_known_prefix("api-", &known));
+        // A different separator is a different prefix, not a near miss.
+        assert!(!has_known_prefix("web:9", &known));
+        assert!(!has_known_prefix("other-1", &known));
     }
 
     #[test]
@@ -353,6 +438,82 @@ mod aggregate_tests {
             .any(|i| i.id == "web-1" && i.source_repo == "web"));
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|r| r.error.is_none()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_all_namespaces_dep_owner_comments_and_keeps_external_refs() {
+        let dir = std::env::temp_dir().join(format!("bvr_ws_ns_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for repo in ["api", "web"] {
+            let beads = dir.join(repo).join(".beads");
+            std::fs::create_dir_all(&beads).unwrap();
+        }
+        // One api issue that owns a local dependency, references another repo,
+        // and carries a comment. Every reference is deliberately left bare in
+        // the source so the namespacer has something to do to each of them.
+        std::fs::write(
+            dir.join("api").join(".beads").join("issues.jsonl"),
+            concat!(
+                r#"{"id":"A-1","title":"T1","status":"open","priority":1,"issue_type":"task","#,
+                r#""dependencies":["#,
+                r#"{"issue_id":"A-1","depends_on_id":"A-2","type":"blocks"},"#,
+                r#"{"issue_id":"A-1","depends_on_id":"web-7","type":"blocks"}],"#,
+                r#""comments":[{"issueId":"A-1","text":"note"}]}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("web").join(".beads").join("issues.jsonl"),
+            "{\"id\":\"W-1\",\"title\":\"T2\",\"status\":\"open\",\"priority\":1,\"issue_type\":\"task\",\"dependencies\":[]}\n",
+        )
+        .unwrap();
+
+        // A display name distinct from the prefix: source_repo must come from
+        // the prefix (separator-stripped, lowercased), not the repo name.
+        let config = WorkspaceConfig {
+            name: None,
+            repos: vec![
+                RepoConfig {
+                    name: Some("ApiService".into()),
+                    path: "api".into(),
+                    prefix: Some("api-".into()),
+                    beads_path: None,
+                    enabled: None,
+                },
+                RepoConfig {
+                    name: Some("WebApp".into()),
+                    path: "web".into(),
+                    prefix: Some("web-".into()),
+                    beads_path: None,
+                    enabled: None,
+                },
+            ],
+            discovery: None,
+            defaults: None,
+        };
+        let (issues, _) = load_all(&config, &dir).expect("load_all");
+        let a = issues
+            .iter()
+            .find(|i| i.id == "api-A-1")
+            .expect("namespaced issue");
+
+        assert_eq!(a.source_repo, "api", "from the prefix, not the name");
+        assert_eq!(a.dependencies.len(), 2);
+
+        // The owning issue is namespaced on the dependency too — this field
+        // feeds compute_data_hash, so leaving it bare changed the hash.
+        assert_eq!(a.dependencies[0].issue_id, "api-A-1");
+        // A local target is qualified.
+        assert_eq!(a.dependencies[0].depends_on_id, "api-A-2");
+        // A target already carrying another repo's known prefix is external and
+        // must stay byte-identical.
+        assert_eq!(a.dependencies[1].depends_on_id, "web-7");
+        assert_eq!(a.dependencies[1].issue_id, "api-A-1");
+
+        assert_eq!(a.comments.len(), 1);
+        assert_eq!(a.comments[0].issue_id, "api-A-1");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
