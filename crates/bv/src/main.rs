@@ -676,6 +676,28 @@ fn active_scope_flags() -> (String, String, String) {
     )
 }
 
+/// Apply `--label` scoping the way Go's `scopeLoadedIssues` does
+/// (cmd/bv/main.go:4870-4900): the label's own issues plus their direct
+/// neighbours replace the issue set the command analyses, so the graph, the
+/// counts and the drift all see the scoped subgraph rather than the whole repo.
+///
+/// Returns the analysis set. The candidate set (the label's own issues) is
+/// what the envelope's `scope`/`scope_hash` describe.
+fn apply_label_scope(issues: &[bv_core::model::Issue]) -> Vec<bv_core::model::Issue> {
+    let (label, _, _) = active_scope_flags();
+    if label.is_empty() {
+        return issues.to_vec();
+    }
+    let (_, analysis_ids) = bv_analysis::label_health::label_scope_ids(&label, issues);
+    let mut out = Vec::with_capacity(analysis_ids.len());
+    for id in &analysis_ids {
+        if let Some(issue) = issues.iter().find(|i| &i.id == id) {
+            out.push(issue.clone());
+        }
+    }
+    out
+}
+
 fn full_envelope_for(data_hash: &str, issues: &[bv_core::model::Issue]) -> serde_json::Value {
     let source = source_meta_for(issues);
     full_envelope_json_with_source(data_hash, Some(&source), issues)
@@ -1075,13 +1097,18 @@ fn triage_claimable(
 fn run_robot_triage() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
     let as_of = extract_as_of();
-    let (issues, _hash, as_of_commit) = match load_issues_auto(&cwd, as_of.as_deref()) {
+    let (loaded, _hash, as_of_commit) = match load_issues_auto(&cwd, as_of.as_deref()) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
             return ExitCode::from(1);
         }
     };
+    // --label narrows the analysis to the label's subgraph (Go
+    // scopeLoadedIssues, main.go:4870-4900), while the envelope keeps
+    // describing the loaded file.
+    let loaded_hash = _hash.clone();
+    let issues = apply_label_scope(&loaded);
     if issues.is_empty() {
         println!(
             "{{\"generated_at\":\"{}\",\"data_hash\":\"empty\",\"triage\":{{}}}}",
@@ -1089,14 +1116,18 @@ fn run_robot_triage() -> ExitCode {
         );
         return ExitCode::from(0);
     }
-    let data_hash = bv_core::data_hash::compute_data_hash(&issues);
+    // Go keeps the loader's data_hash: scopeLoadedIssues sets
+    // DataHashMatchesIssues=false so the payload still names the file it came
+    // from (main.go:4890-4900).
+    let data_hash = loaded_hash;
     let g = std::sync::Arc::new(bv_analysis::analyzer::build_graph(&issues));
     let mut out = bv_analysis::triage::build_triage(&issues, &g, robot_now());
     // Go stamps every recommendation with `issue.Actions(claimable)`
     // (triage.go:658). The tracker route needs the loaded source path, which
     // only the CLI layer has, so it is resolved here rather than in the
     // analysis layer.
-    let source = source_meta_for(&issues);
+    // Describe the loaded file, not the scoped analysis set.
+    let source = source_meta_for(&loaded);
     for rec in out.recommendations.iter_mut() {
         let origin = bv_core::tracker::resolve_issue_origin(&source.path, &rec.id);
         let actions = bv_core::tracker::build_actions(&origin, rec.claimable);
@@ -1390,7 +1421,7 @@ fn run_robot_triage() -> ExitCode {
     if triage_status.slack.state == "skipped" {
         triage_status.slack.reason.clear();
     }
-    let mut payload = full_envelope_for(&data_hash, &issues);
+    let mut payload = full_envelope_for(&data_hash, &loaded);
     payload["output_format"] = serde_json::json!(env.output_format);
     payload["version"] = serde_json::json!(GO_APP_VERSION);
     let triage_body = serde_json::json!({
@@ -1452,13 +1483,22 @@ fn run_robot_triage() -> ExitCode {
 
 fn capture_baseline(
 ) -> Result<(bv_analysis::drift::BaselineStats, Vec<Vec<String>>, String), String> {
-    use bv_analysis::algorithms::cycles::tarjan_scc;
     let cwd = std::env::current_dir().unwrap_or_default();
     let (issues, _hash, _as_of_commit) = load_issues_auto(&cwd, None)?;
-    let hash = bv_core::data_hash::compute_data_hash(&issues);
-    let g = bv_analysis::analyzer::build_graph(&issues);
+    capture_baseline_for(&issues)
+}
+
+/// `capture_baseline` over an already-loaded (and possibly `--label`-scoped)
+/// issue set, so a scoped command compares like with like instead of silently
+/// measuring the whole repo.
+fn capture_baseline_for(
+    issues: &[bv_core::model::Issue],
+) -> Result<(bv_analysis::drift::BaselineStats, Vec<Vec<String>>, String), String> {
+    use bv_analysis::algorithms::cycles::tarjan_scc;
+    let hash = bv_core::data_hash::compute_data_hash(issues);
+    let g = bv_analysis::analyzer::build_graph(issues);
     let p1 = bv_analysis::analyzer::analyze_phase1(&g);
-    let blocked = bv_analysis::triage::compute_blocked_set(&issues);
+    let blocked = bv_analysis::triage::compute_blocked_set(issues);
     let actionable = issues
         .iter()
         .filter(|i| i.status.is_open() && !blocked.contains(&i.id))
@@ -2578,11 +2618,9 @@ fn full_envelope_json_with_source(
         // A --label scope narrows the candidate set to the label's own issues
         // (their neighbours stay in the analysis as context) — see Go
         // scopeLoadedIssues, main.go:4870-4900.
-        let (mut candidate_ids, _) =
-            bv_analysis::label_health::label_scope_ids(&label, issues);
+        let (mut candidate_ids, _) = bv_analysis::label_health::label_scope_ids(&label, issues);
         candidate_ids.sort();
-        let shash =
-            bv_robot::scope_hash(&label, &recipe, &repo, data_hash, &candidate_ids);
+        let shash = bv_robot::scope_hash(&label, &recipe, &repo, data_hash, &candidate_ids);
         if !shash.is_empty() {
             env.insert("scope_hash".into(), serde_json::json!(shash));
         }
@@ -5126,19 +5164,24 @@ fn run_robot_alerts() -> ExitCode {
     let want_type = arg_value(&["--alert-type"]);
     let want_label = arg_value(&["--alert-label"]);
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (issues, hash, _as_of_commit) = match load_issues_auto(&cwd, None) {
+    let (loaded, hash, _as_of_commit) = match load_issues_auto(&cwd, None) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
             return ExitCode::from(1);
         }
     };
+    // --label narrows the analysis to the label's subgraph before the drift
+    // baseline is captured, as Go's scopeLoadedIssues does (main.go:4870-4900).
+    // The envelope keeps describing the *loaded* source, so source_authority and
+    // authority_hash still report the whole file.
+    let issues = apply_label_scope(&loaded);
     // Go (robot_registry.go:1158-1186) compares the live graph against the
     // saved baseline at `.bv/baseline.json`, falling back to comparing the
     // current stats against themselves when no baseline exists. Passing the
     // same stats for both sides — as this handler used to — made every
     // drift check trivially zero, so --robot-alerts always reported none.
-    let (current, cycles, _hash) = match capture_baseline() {
+    let (current, cycles, _hash) = match capture_baseline_for(&issues) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -5213,7 +5256,7 @@ fn run_robot_alerts() -> ExitCode {
             .filter(|a| a.get("severity").and_then(|v| v.as_str()) == Some(s))
             .count()
     };
-    let mut payload = full_envelope_for(&hash, &issues);
+    let mut payload = full_envelope_for(&hash, &loaded);
     payload["alerts"] = serde_json::to_value(&filtered_alerts).unwrap_or_default();
     payload["summary"] = serde_json::json!({
         "total": filtered_alerts.len(),

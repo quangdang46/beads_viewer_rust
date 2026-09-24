@@ -5,6 +5,12 @@ use bv_core::model::Issue;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Go's `omitempty` on a float64 field: a zero value is absent from the
+/// payload rather than serialised as 0 (pkg/drift/drift.go:75-77).
+fn is_zero_f64(v: &f64) -> bool {
+    *v == 0.0
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
@@ -39,14 +45,17 @@ pub struct Alert {
     /// previously dropped it, so alerts serialized without the field.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub suggested_action: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    // Go declares these as plain float64 with `omitempty`
+    // (pkg/drift/drift.go:75-77), so a zero value is absent from the payload
+    // rather than serialised as 0.
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
     #[serde(rename = "baseline_value")]
-    pub baseline_val: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_val: f64,
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
     #[serde(rename = "current_value")]
-    pub current_val: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub delta: Option<f64>,
+    pub current_val: f64,
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub delta: f64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub details: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -307,10 +316,10 @@ fn check_staleness(
             suggested_action:
                 "Update, close, or re-triage the issue; stale work hides real priorities".into(),
             message: format!("Issue {} inactive for {:.0} days", issue.id, inactive_days),
-            baseline_val: None,
+            baseline_val: 0.0,
             // Go leaves BaselineVal/CurrentVal unset (omitempty → absent).
-            current_val: None,
-            delta: None,
+            current_val: 0.0,
+            delta: 0.0,
             details: vec![
                 format!("status={status_str}"),
                 format!("last_update={last_active_raw}"),
@@ -440,9 +449,9 @@ fn check_blocking_cascade(
                 "Completing {} unblocks {} downstream item(s)",
                 issue.id, count
             ),
-            baseline_val: None,
-            current_val: None,
-            delta: None,
+            baseline_val: 0.0,
+            current_val: 0.0,
+            delta: 0.0,
             details: unblocked,
             issue_id: issue.id.clone(),
             label: String::new(),
@@ -514,9 +523,9 @@ pub fn calculate(
                     alert_type: AlertType::DensityGrowth,
                     severity: sev,
                     message: format!("Graph density increased by {pct:.1}%"),
-                    baseline_val: Some(baseline.density),
-                    current_val: Some(current.density),
-                    delta: Some(current.density - baseline.density),
+                    baseline_val: baseline.density,
+                    current_val: current.density,
+                    delta: current.density - baseline.density,
                     ..Default::default()
                 });
             }
@@ -536,9 +545,10 @@ pub fn calculate(
                 // Go drift.go:421 phrases this as a signed delta plus a
                 // percentage, not as "from X to Y".
                 message: format!("Node count changed by {delta:+} ({pct:.1}%)"),
-                baseline_val: Some(baseline.node_count as f64),
-                current_val: Some(current.node_count as f64),
-                delta: Some(delta as f64),
+                baseline_val: baseline.node_count as f64,
+                current_val: current.node_count as f64,
+                delta: delta as f64,
+                detected_at: Some(now.to_string()),
                 ..Default::default()
             });
         }
@@ -547,18 +557,26 @@ pub fn calculate(
     // Edge count change (info at threshold).
     if let Some(pct) = pct_change(baseline.edge_count as f64, current.edge_count as f64) {
         if pct.abs() >= cfg.edge_growth_info_pct {
-            r.push(Alert {
+            // Go drift.go:438-447 — a delta-and-percentage message, a
+            // suggested action, and a detected_at stamp. current_value is
+            // omitted when the count reaches zero, which is why the earlier
+            // "from 41 to 0" phrasing never matched the oracle.
+            let alert = Alert {
                 alert_type: AlertType::EdgeCountChange,
                 severity: Severity::Info,
+                suggested_action:
+                    "Review recently added or removed dependencies for accidental blockers"
+                        .to_string(),
                 message: format!(
-                    "Edge count changed from {} to {} ({pct:+.1}%)",
-                    baseline.edge_count, current.edge_count
+                    "Edge count changed by {delta} ({pct:.1}%)",
+                    delta = current.edge_count as i64 - baseline.edge_count as i64,
                 ),
-                baseline_val: Some(baseline.edge_count as f64),
-                current_val: Some(current.edge_count as f64),
-                delta: Some((current.edge_count as i64 - baseline.edge_count as i64) as f64),
+                baseline_val: baseline.edge_count as f64,
+                delta: (current.edge_count as i64 - baseline.edge_count as i64) as f64,
+                detected_at: Some(now.to_string()),
                 ..Default::default()
-            });
+            };
+            r.push(alert);
         }
     }
 
@@ -572,9 +590,9 @@ pub fn calculate(
                 "Blocked issues increased from {} to {} (+{blocked_delta})",
                 baseline.blocked, current.blocked
             ),
-            baseline_val: Some(baseline.blocked as f64),
-            current_val: Some(current.blocked as f64),
-            delta: Some(blocked_delta as f64),
+            baseline_val: baseline.blocked as f64,
+            current_val: current.blocked as f64,
+            delta: blocked_delta as f64,
             ..Default::default()
         });
     }
@@ -590,9 +608,9 @@ pub fn calculate(
                         "Actionable issues decreased from {} to {} ({pct:.1}%)",
                         baseline.actionable, current.actionable
                     ),
-                    baseline_val: Some(baseline.actionable as f64),
-                    current_val: Some(current.actionable as f64),
-                    delta: Some((current.actionable as i64 - baseline.actionable as i64) as f64),
+                    baseline_val: baseline.actionable as f64,
+                    current_val: current.actionable as f64,
+                    delta: (current.actionable as i64 - baseline.actionable as i64) as f64,
                     ..Default::default()
                 });
             } else if pct >= cfg.actionable_increase_info_pct {
@@ -603,9 +621,9 @@ pub fn calculate(
                         "Actionable issues increased from {} to {} (+{pct:.1}%)",
                         baseline.actionable, current.actionable
                     ),
-                    baseline_val: Some(baseline.actionable as f64),
-                    current_val: Some(current.actionable as f64),
-                    delta: Some((current.actionable as i64 - baseline.actionable as i64) as f64),
+                    baseline_val: baseline.actionable as f64,
+                    current_val: current.actionable as f64,
+                    delta: (current.actionable as i64 - baseline.actionable as i64) as f64,
                     ..Default::default()
                 });
             }
@@ -645,6 +663,7 @@ pub fn calculate(
                     "Re-check the priority of the issues whose structural importance moved".into(),
                 message: format!("{} PageRank changes detected", changes.len()),
                 details: changes,
+                detected_at: Some(now.to_string()),
                 ..Default::default()
             });
         }
