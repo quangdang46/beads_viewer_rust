@@ -1158,9 +1158,13 @@ fn run_robot_triage() -> ExitCode {
                     .map(|o| o.id.clone())
                     .collect();
                 let unblock_impact = ((unblocks_count as f64) + 1.0).log2();
-                let simplicity = if r.breakdown.blocker_ratio < 0.2 {
+                // Go compares BlockerRatioNorm (triage.go:988), not the
+                // weighted blocker_ratio. They differ by the 0.13 weight, so
+                // using the weighted value scored every low-blocker item as
+                // "simple" and doubled the quick-win score.
+                let simplicity = if r.breakdown.blocker_ratio_norm < 0.2 {
                     1.0
-                } else if r.breakdown.blocker_ratio < 0.4 {
+                } else if r.breakdown.blocker_ratio_norm < 0.4 {
                     0.5
                 } else {
                     0.0
@@ -1254,7 +1258,7 @@ fn run_robot_triage() -> ExitCode {
         "graph": {
             "node_count": out.counts.total,
             "edge_count": g.edge_count(),
-            "density": (graph_density * 10000.0).round() / 10000.0,
+            "density": graph_density,
             "has_cycles": false,
             "phase2_ready": true,
         },
@@ -1290,12 +1294,14 @@ fn run_robot_triage() -> ExitCode {
         bv_robot::OutputFormat::Json,
     );
     env.generated_at = jiff_now(); // Truncate to seconds (Go parity).
-                                   // Go emits history_status ("ok") only when the history prologue ran —
-                                   // i.e. the workspace is a valid git repo; otherwise the key is omitted.
+                                   // Go's HistoryStatus (triage.go:63-71) is omitempty, so an empty value
+                                   // omits the key — but when the optional git-history prologue is skipped Go
+                                   // sets it to the literal "skipped" rather than leaving it empty. Omitting
+                                   // it entirely, as this did, lost that distinction.
     let history_status = if cwd.join(".git").exists() {
-        Some("ok")
+        "ok"
     } else {
-        None
+        "skipped"
     };
     let mut meta = serde_json::json!({
         "version": bv_robot::ROBOT_CONTRACT_VERSION,
@@ -1304,8 +1310,8 @@ fn run_robot_triage() -> ExitCode {
         "issue_count": out.counts.total,
         "compute_time_ms": 0,
     });
-    if let Some(hs) = history_status {
-        meta["history_status"] = serde_json::json!(hs);
+    if !history_status.is_empty() {
+        meta["history_status"] = serde_json::json!(history_status);
     }
     // Go parity: clear reason on all skipped entries except betweenness.
     let mut triage_status = out.metric_status.clone();
