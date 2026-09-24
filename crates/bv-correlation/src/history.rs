@@ -232,6 +232,14 @@ impl WalkedCommit {
     pub fn touches_beads_dir(&self) -> bool {
         self.files.iter().any(|f| f.starts_with(".beads/"))
     }
+
+    /// Go `walkedCommit.beadsOnly` — every changed path lives under `.beads/`, so
+    /// the commit is tracker bookkeeping rather than a code commit. A commit with
+    /// no paths at all is *not* beads-only; it counts as a code commit whose
+    /// only defect is having no files.
+    pub fn beads_only(&self) -> bool {
+        !self.files.is_empty() && self.files.iter().all(|f| f.starts_with(".beads/"))
+    }
 }
 
 /// Go `appendHistoryFilters` — time/revision bounds and the commit cap.
@@ -354,7 +362,7 @@ const EXCLUDED_PATHS: &[&str] = &[
 
 /// Go `excludePathspecArgs` — exclude the noisy directories inside git itself
 /// so the line-stat pass never diffs the multi-MB beads blob.
-fn exclude_pathspec_args() -> Vec<String> {
+pub(crate) fn exclude_pathspec_args() -> Vec<String> {
     let mut args = vec!["--".to_string(), ".".to_string()];
     for prefix in EXCLUDED_PATHS {
         args.push(format!(
@@ -497,7 +505,7 @@ fn for_each_commit_chunk(out: &[u8]) -> Vec<(String, String)> {
 }
 
 /// Go `parseNameStatus`.
-fn parse_name_status(payload: &str) -> Vec<FileChange> {
+pub(crate) fn parse_name_status(payload: &str) -> Vec<FileChange> {
     let mut files = Vec::new();
     for line in payload.lines() {
         if line.is_empty() {
@@ -602,7 +610,7 @@ fn is_code_file(path: &str) -> bool {
 
 /// Go `isExcludedPath` — direct prefix, or a nested occurrence at a
 /// directory boundary.
-fn is_excluded_path(path: &str) -> bool {
+pub(crate) fn is_excluded_path(path: &str) -> bool {
     if EXCLUDED_PATHS.iter().any(|p| path.starts_with(p)) {
         return true;
     }
@@ -612,7 +620,7 @@ fn is_excluded_path(path: &str) -> bool {
         .any(|p| path.contains(&format!("/{p}")))
 }
 
-fn short_sha(sha: &str) -> String {
+pub(crate) fn short_sha(sha: &str) -> String {
     if sha.len() > 7 {
         sha[..7].to_string()
     } else {
@@ -921,7 +929,7 @@ pub struct TemporalCandidate {
     active_beads: usize,
 }
 
-fn parse_ts(s: &str) -> Option<jiff::Timestamp> {
+pub(crate) fn parse_ts(s: &str) -> Option<jiff::Timestamp> {
     s.parse::<jiff::Timestamp>().ok()
 }
 

@@ -2368,8 +2368,15 @@ fn run_robot_history() -> ExitCode {
     emit_json(&payload)
 }
 
+/// Go `handleRobotOrphans` — build the same correlation report `--robot-history`
+/// produces, hand it to the orphan detector (which scans exactly the window
+/// that index covered), then drop candidates below `--orphans-min-score`.
 fn run_robot_orphans() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
+    if let Err(e) = validate_correlation_repository(&cwd) {
+        eprintln!("Error: {e}");
+        return ExitCode::from(1);
+    }
     let (issues, _, _as_of_commit) = match load_issues_auto(&cwd, None) {
         Ok(x) => x,
         Err(e) => {
@@ -2377,40 +2384,112 @@ fn run_robot_orphans() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let data_hash = bv_core::data_hash::compute_data_hash(&issues);
-    let repo = std::env::current_dir().unwrap_or_default();
 
-    let min_score: i32 = std::env::var("BV_ORPHANS_MIN_SCORE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(30);
+    // Go: CorrelatorOptions{Limit: 500}, same default the history handler uses.
+    let mut opts = bv_correlation::history::HistoryOptions {
+        limit: 500,
+        ..Default::default()
+    };
+    if let Some(limit) = history_flag_value("history-limit") {
+        match limit.trim().parse::<i64>() {
+            Ok(v) => opts.limit = v,
+            Err(_) => {
+                eprintln!("Error: invalid --history-limit: {limit}");
+                return ExitCode::from(2);
+            }
+        }
+    }
 
-    let events = match bv_correlation::extract(&repo, &ExtractOptionsAlias::default()) {
-        Ok(e) => e,
-        Err(err) => {
-            eprintln!("Error: extraction failed: {err}");
+    let min_score: i32 = match history_flag_value("orphans-min-score") {
+        Some(v) => match v.trim().parse::<i32>() {
+            Ok(score) => score,
+            Err(_) => {
+                eprintln!("Error: invalid --orphans-min-score: {v}");
+                return ExitCode::from(2);
+            }
+        },
+        None => 30,
+    };
+
+    let beads: Vec<bv_correlation::history::BeadInfo> = issues
+        .iter()
+        .map(|i| bv_correlation::history::BeadInfo {
+            id: i.id.clone(),
+            title: i.title.clone(),
+            status: i.status.as_str().to_string(),
+        })
+        .collect();
+
+    let report = match bv_correlation::history::build_history_report(
+        &cwd,
+        &beads,
+        &opts,
+        None,
+        jiff_now(),
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error: generating history report: {e}");
             return ExitCode::from(1);
         }
     };
 
-    let candidates: Vec<serde_json::Value> =
-        bv_correlation::orphan::scan_orphan_candidates(&repo, &events, min_score)
-            .into_iter()
-            .map(|c| c.into_json())
-            .collect();
+    let now = robot_now();
+    let mut orphan_report =
+        match bv_correlation::orphan::detect_orphans(&cwd, &report, now, jiff_now()) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Error: detecting orphans: {e}");
+                return ExitCode::from(1);
+            }
+        };
+    bv_correlation::orphan::filter_by_min_score(&mut orphan_report, min_score);
 
-    let payload = serde_json::json!({
-        "generated_at": jiff_now(),
-        "data_hash": data_hash,
-        // output_format/version omitted for JSON (Go omitempty parity).
-        "candidates_count": candidates.len(),
-        "candidates": candidates,
-    });
-    println!("{payload}");
-    ExitCode::from(0)
+    // Go copies the report's fields onto a struct that embeds the envelope
+    // rather than the report, so the envelope's generated_at/data_hash lead and
+    // the report's own copies of those keys are dropped.
+    let file_hash = bv_core::data_hash::compute_data_hash(&issues);
+    let mut payload = full_envelope_for(&file_hash, &issues);
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert(
+            "data_hash".into(),
+            serde_json::json!(orphan_report.data_hash),
+        );
+        let mut ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
+        ids.sort();
+        let scope_hash = bv_robot::scope_hash("", "", "", &orphan_report.data_hash, &ids);
+        if !scope_hash.is_empty() {
+            obj.insert("scope_hash".into(), serde_json::json!(scope_hash));
+        }
+        obj.insert(
+            "git_range".into(),
+            serde_json::json!(orphan_report.git_range),
+        );
+        obj.insert(
+            "window".into(),
+            serde_json::to_value(&orphan_report.window).unwrap_or(serde_json::Value::Null),
+        );
+        obj.insert(
+            "stats".into(),
+            serde_json::to_value(&orphan_report.stats).unwrap_or(serde_json::Value::Null),
+        );
+        obj.insert(
+            "candidates".into(),
+            serde_json::to_value(&orphan_report.candidates).unwrap_or(serde_json::Value::Null),
+        );
+        if !orphan_report.by_bead.is_empty() {
+            obj.insert(
+                "by_bead".into(),
+                serde_json::to_value(&orphan_report.by_bead).unwrap_or(serde_json::Value::Null),
+            );
+        }
+        obj.insert(
+            "usage_hints".into(),
+            serde_json::to_value(&orphan_report.usage_hints).unwrap_or(serde_json::Value::Null),
+        );
+    }
+    emit_json(&payload)
 }
-
-type ExtractOptionsAlias = bv_correlation::ExtractOptions;
 
 type AnalysisTuple = (
     Vec<bv_core::model::Issue>,
@@ -2529,6 +2608,29 @@ fn go_json_string(v: &serde_json::Value) -> String {
     out
 }
 
+/// Quote a string the way Go's `encoding/json` does with its default HTML
+/// escaping: `<`, `>` and `&` become \u003c, \u003e and \u0026.
+fn go_escape_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '<' => out.push_str("\\u003c"),
+            '>' => out.push_str("\\u003e"),
+            '&' => out.push_str("\\u0026"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 fn write_go_json(v: &serde_json::Value, out: &mut String) {
     use serde_json::Value;
     match v {
@@ -2543,7 +2645,11 @@ fn write_go_json(v: &serde_json::Value, out: &mut String) {
             }
             out.push_str(&n.to_string());
         }
-        Value::String(s) => out.push_str(&serde_json::to_string(s).unwrap_or_default()),
+        // Go's encoding/json escapes <, > and & by default (SetEscapeHTML is
+        // on unless explicitly disabled), emitting \u003c, \u003e and \u0026.
+        // serde_json does not, so a commit message containing "<=" serialized
+        // differently from the oracle.
+        Value::String(s) => out.push_str(&go_escape_string(s)),
         Value::Array(items) => {
             out.push('[');
             for (i, item) in items.iter().enumerate() {
