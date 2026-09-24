@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::process::Command;
 
 /// Lifecycle event types (Go EventType).
@@ -78,16 +79,16 @@ pub struct BeadEvent {
 
 /// Minimal bead state snapshot parsed from +/- diff lines (Go beadSnapshot).
 #[derive(Debug, Clone)]
-struct BeadSnapshot {
-    id: String,
-    status: String,
-    title: String,
-    dependencies: Vec<HistoricalDependency>,
+pub struct BeadSnapshot {
+    pub id: String,
+    pub status: String,
+    pub title: String,
+    pub dependencies: Vec<HistoricalDependency>,
 }
 
 impl BeadSnapshot {
     /// Go `beadSnapshot.historicalState`.
-    fn historical_state(&self) -> HistoricalIssueState {
+    pub fn historical_state(&self) -> HistoricalIssueState {
         HistoricalIssueState {
             id: self.id.clone(),
             status: self.status.clone(),
@@ -174,7 +175,7 @@ pub fn append_history_filters(args: &mut Vec<String>, opts: &ExtractOptions) {
 
 pub const DEFAULT_BEADS_FILES: [&str; 3] = ["issues.jsonl", "beads.jsonl", "beads.base.jsonl"];
 
-fn resolve_beads_path(repo: &Path, requested: Option<&str>) -> String {
+pub fn resolve_beads_path(repo: &Path, requested: Option<&str>) -> String {
     if let Some(p) = requested {
         return p.to_string();
     }
@@ -187,8 +188,6 @@ fn resolve_beads_path(repo: &Path, requested: Option<&str>) -> String {
     }
     ".beads/issues.jsonl".to_string()
 }
-
-use std::path::Path;
 
 /// Extract bead lifecycle events from the repository's git history.
 ///
@@ -295,7 +294,7 @@ fn ignorable_metadata_line(line: &str) -> bool {
 /// event evidence needs are read; `dependencies` is deserialized through
 /// `bv_core::model::Dependency` so the legacy `depends_on` / `target_id`
 /// target spellings fold the same way they do everywhere else.
-fn parse_bead_json(json_str: &str) -> Option<BeadSnapshot> {
+pub fn parse_bead_json(json_str: &str) -> Option<BeadSnapshot> {
     #[derive(serde::Deserialize)]
     struct Partial {
         #[serde(default)]
@@ -332,7 +331,7 @@ fn parse_bead_json(json_str: &str) -> Option<BeadSnapshot> {
 }
 
 /// Go: `determineStatusEvent`.
-fn determine_status_event(old_status: &str, new_status: &str) -> EventType {
+pub fn determine_status_event(old_status: &str, new_status: &str) -> EventType {
     let old_s = old_status.trim().to_lowercase();
     let new_s = new_status.trim().to_lowercase();
     let was_closed = old_s == "closed" || old_s == "tombstone";

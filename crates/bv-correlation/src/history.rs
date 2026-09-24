@@ -160,8 +160,9 @@ pub struct HistoryStats {
 /// Go `CommitIndex` — SHA -> sorted bead IDs.
 pub type CommitIndex = BTreeMap<String, Vec<String>>;
 
-/// Go `HistoryReport` (minus the causal-history field, which is only produced
-/// for an explicitly requested `--robot-causality` target).
+/// Go `HistoryReport` (`causal_history` is present only for an explicitly
+/// requested `--robot-causality` target, so it is omitted from every other
+/// report).
 #[derive(Debug, Clone, Serialize)]
 pub struct HistoryReport {
     pub generated_at: String,
@@ -173,6 +174,8 @@ pub struct HistoryReport {
     pub stats: HistoryStats,
     pub histories: BTreeMap<String, BeadHistory>,
     pub commit_index: CommitIndex,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub causal_history: Option<crate::causality::CausalHistory>,
 }
 
 /// The minimal bead fields the report embeds (Go `BeadInfo`).
@@ -196,6 +199,11 @@ pub struct HistoryOptions {
     pub until: Option<String>,
     /// Max commits to process (0 = no limit).
     pub limit: i64,
+    /// Go `CorrelatorOptions.CausalityBeadID` — retain committed constraint
+    /// snapshots for this one bead. Empty for every other report: the retained
+    /// history is the expensive half of `--robot-causality` and nothing else
+    /// consumes it.
+    pub causality_bead_id: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -1359,6 +1367,9 @@ pub struct HistoryArtifact {
     pub temporal: Vec<TemporalCandidate>,
     pub walked_commits: i64,
     pub strategies: Vec<StrategyRun>,
+    /// Go `extractCausalHistory` output, retained only when a causality target
+    /// was requested.
+    pub causal_history: Option<crate::causality::CausalHistory>,
 }
 
 /// Go `durationMS` — microsecond precision, so a strategy's reported cost has
@@ -1425,6 +1436,27 @@ pub fn extract_history_artifact(
         duration_ms: duration_ms(start),
         candidates: art.temporal.len() as i64,
     });
+
+    // Go `Correlator.GenerateReport` runs the causal walk only for an
+    // explicitly requested target. It is deliberately a *separate* walk from
+    // the one above: it must see records that did not change the target.
+    if !opts.causality_bead_id.is_empty() {
+        // The target's own `-G` filter must not apply here.
+        let causal_opts = ExtractOptions {
+            bead_id: None,
+            ..extract_opts.clone()
+        };
+        let beads_rel = crate::extractor::resolve_beads_path(repo, beads_file);
+        art.causal_history = Some(
+            crate::extractor_snapshot::extract_causal_history(
+                repo,
+                &opts.causality_bead_id,
+                &causal_opts,
+                &beads_rel,
+            )
+            .map_err(|e| format!("extracting causal history: {e}"))?,
+        );
+    }
 
     Ok(art)
 }
@@ -1764,6 +1796,7 @@ pub fn assemble_report(
         stats,
         histories,
         commit_index,
+        causal_history: art.causal_history,
     }
 }
 

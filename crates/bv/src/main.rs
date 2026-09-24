@@ -5674,12 +5674,21 @@ fn run_robot_causality(args: &[String]) -> ExitCode {
         include_commits: true,
         blocker_titles,
     };
-    let mut result = bv_correlation::causality::build_causality_chain_at(
+    // Go's `robotNow()` is the reference instant, so the chain's open end and
+    // the result stamp cannot disagree.
+    let Ok(now) = bv_correlation::causality::GoTime::parse(&now) else {
+        eprintln!("Error: invalid reference instant");
+        return ExitCode::from(1);
+    };
+    let Some(mut result) = bv_correlation::causality::build_causality_chain_at(
         history,
         report.causal_history.as_ref(),
         &caus_opts,
         &now,
-    );
+    ) else {
+        eprintln!("Bead not found: {bead_id}");
+        return ExitCode::from(1);
+    };
     result.data_hash = report.data_hash.clone();
 
     // Go builds the envelope from the loader's source authority (whose

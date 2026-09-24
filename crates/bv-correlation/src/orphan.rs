@@ -1070,6 +1070,7 @@ mod tests {
             },
             histories,
             commit_index,
+            causal_history: None,
         }
     }
 

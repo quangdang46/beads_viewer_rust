@@ -15,8 +15,16 @@
 //! cannot see that difference, which is why Go routes large blobs here and why
 //! `extract` dispatches on blob size (see `SNAPSHOT_BLOB_SIZE_THRESHOLD`).
 
-use crate::extractor::{parse_diff_text, BeadEvent, CommitHeader, ExtractOptions};
-use std::collections::HashMap;
+use crate::causality::{is_closed_lifecycle_status, normalize_status};
+use crate::extractor::{
+    determine_status_event, parse_bead_json, parse_diff_text, BeadEvent, BeadSnapshot,
+    CommitHeader, EventType, ExtractOptions,
+};
+use crate::readiness::{
+    dep_type_is_blocking, dep_type_is_valid, DependencyState, ReadinessIndex, ReadinessIssue,
+    DEP_PARENT_CHILD,
+};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -54,6 +62,9 @@ struct SnapshotCommit {
     header: CommitHeader,
     old_sha: String,
     new_sha: String,
+    /// The committer date (`%cI`). Only the causal walk requests it; the event
+    /// walk leaves it empty because nothing downstream reads it there.
+    committed_at: String,
 }
 
 /// Go `snapshotCommits` + `parseSnapshotLog` + `parseRawDiffLines`: one
@@ -103,6 +114,7 @@ fn parse_snapshot_log(out: &[u8]) -> Vec<SnapshotCommit> {
             header,
             old_sha: String::new(),
             new_sha: String::new(),
+            committed_at: String::new(),
         };
         if parse_raw_diff_lines(&chunk[nl + 1..], &mut sc) {
             commits.push(sc);
@@ -245,6 +257,14 @@ impl BlobReader {
     }
 
     fn read_blob(&mut self, sha: &str) -> Result<Vec<u8>, String> {
+        Ok(self.read_blob_opt(sha)?.unwrap_or_default())
+    }
+
+    /// `None` for a blob git does not have. Go's `read` maps a missing blob to
+    /// `nil`, and the causal path treats that differently from a genuinely
+    /// empty blob: missing means the state is *unknown*, empty means the file
+    /// existed with no records.
+    fn read_blob_opt(&mut self, sha: &str) -> Result<Option<Vec<u8>>, String> {
         writeln!(self.stdin, "{sha}").map_err(|e| e.to_string())?;
         self.stdin.flush().map_err(|e| e.to_string())?;
         let mut header = String::new();
@@ -255,7 +275,7 @@ impl BlobReader {
         if fields.len() < 3 {
             // "<oid> missing" — an absent blob reads as empty, like Go's
             // readBlobs mapping it to nil.
-            return Ok(Vec::new());
+            return Ok(None);
         }
         let size: usize = fields[2]
             .parse()
@@ -267,7 +287,7 @@ impl BlobReader {
         // cat-file terminates each object with a newline.
         let mut nl = [0u8; 1];
         let _ = self.stdout.read_exact(&mut nl);
-        Ok(buf)
+        Ok(Some(buf))
     }
 }
 
@@ -350,6 +370,361 @@ fn load_set(
     let set = build_record_line_set(&blob);
     live.insert(sha.to_string(), set.clone());
     Ok(set)
+}
+
+// ---------------------------------------------------------------------------
+// Causal history (Go `extractCausalHistory` + `causalSnapshotState`)
+// ---------------------------------------------------------------------------
+
+/// Go `extractCausalHistory` — follow one first-parent history for `target`,
+/// retaining the full source while evaluating each target state.
+///
+/// Two deliberate differences from `extract_via_snapshots`:
+///
+/// * it does **not** apply the target's `-G` filter. An unchanged target can
+///   become unblocked because *another* record changed, so filtering to commits
+///   that touch the target would drop the release event.
+/// * it parses whole records rather than diffing record-line multisets, because
+///   a dependency edge inside an unchanged record is still evidence.
+///
+/// Only two parsed snapshots are resident at a time; the retained artifact
+/// holds compact target observations, not every issue in every commit.
+pub fn extract_causal_history(
+    repo: &Path,
+    target: &str,
+    opts: &ExtractOptions,
+    beads_rel: &str,
+) -> Result<crate::causality::CausalHistory, String> {
+    let mut args: Vec<String> = vec![
+        "log".into(),
+        "--first-parent".into(),
+        "--diff-merges=first-parent".into(),
+        "--raw".into(),
+        "--no-abbrev".into(),
+        "--follow".into(),
+        "--no-color".into(),
+        format!(
+            "--format={}%x00%cI",
+            crate::extractor::GIT_LOG_HEADER_FORMAT
+        ),
+    ];
+    crate::extractor::append_history_filters(&mut args, opts);
+    args.push("--".to_string());
+    args.push(beads_rel.to_string());
+
+    let out = Command::new("git")
+        .args(&args)
+        .current_dir(repo)
+        .output()
+        .map_err(|e| format!("spawning causal git log: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "causal git log: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+
+    let commits = parse_causal_log(&out.stdout);
+    let mut result = crate::causality::CausalHistory {
+        bead_id: target.to_string(),
+        observations: Vec::new(),
+        until: None,
+        revision: String::new(),
+        reference_time: None,
+        reference_committed_at: None,
+    };
+
+    if !opts.revision.is_empty() {
+        // The revision may not itself change the beads file. Its own clocks —
+        // not the last file change, and not today's clock — bound an ongoing
+        // wait.
+        let out = Command::new("git")
+            .args(["show", "-s", "--format=%aI%x00%cI", &opts.revision])
+            .current_dir(repo)
+            .output()
+            .map_err(|e| format!("spawning causal reference commit: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "causal reference commit: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut parts = text.trim().split('\0');
+        let (Some(authored), Some(committed)) = (parts.next(), parts.next()) else {
+            return Err("incomplete causal reference timestamps".to_string());
+        };
+        result.reference_time = Some(parse_go_time(
+            authored,
+            "causal reference author timestamp",
+        )?);
+        result.reference_committed_at = Some(parse_go_time(
+            committed,
+            "causal reference committer timestamp",
+        )?);
+        result.revision = opts.revision.clone();
+    }
+
+    if let Some(until) = &opts.until {
+        result.until = Some(parse_go_time(until, "causal cutoff")?);
+    }
+
+    let mut reader = BlobReader::open(repo)?;
+    // Go caches the previous commit's snapshot and reuses it when the current
+    // commit's parent blob is that same blob, so consecutive commits in a
+    // followed chain parse the boundary file once.
+    let mut previous: Option<(String, bool, BTreeMap<String, BeadSnapshot>)> = None;
+
+    // git log emits newest-first; Go walks the slice backwards, so the
+    // observations end up in chronological order.
+    for c in commits.iter().rev() {
+        let (before, valid_before) = match &previous {
+            Some((sha, valid, records)) if *sha == c.old_sha => (records.clone(), *valid),
+            _ => {
+                let (records, valid) = read_records(&mut reader, &c.old_sha)?;
+                (records, valid)
+            }
+        };
+        let (after, valid_after) = read_records(&mut reader, &c.new_sha)?;
+
+        let (old_state, mut old_relevant) = causal_snapshot_state(&before, valid_before, target);
+        let (new_state, new_relevant) = causal_snapshot_state(&after, valid_after, target);
+        for (id, _) in new_relevant {
+            old_relevant.insert(id, ());
+        }
+        let mut ids: Vec<&String> = old_relevant.keys().collect();
+        ids.sort();
+
+        let mut changes: Vec<BeadEvent> = Vec::new();
+        for id in ids {
+            let old = before.get(id);
+            let current = after.get(id);
+            if old.is_some() == current.is_some()
+                && match (old, current) {
+                    (Some(a), Some(b)) => equal_historical_record(a, b),
+                    _ => true,
+                }
+            {
+                continue;
+            }
+            let event_type = match (old, current) {
+                (None, _) => EventType::Created,
+                (_, None) => EventType::Deleted,
+                (Some(a), Some(b)) if a.status != b.status => {
+                    determine_status_event(&a.status, &b.status)
+                }
+                _ => EventType::Modified,
+            };
+            changes.push(BeadEvent {
+                bead_id: id.clone(),
+                commit_sha: c.header.sha.clone(),
+                timestamp: c.header.timestamp.clone(),
+                commit_msg: c.header.message.clone(),
+                author: c.header.author.clone(),
+                author_email: c.header.author_email.clone(),
+                event_type,
+                before: old.map(BeadSnapshot::historical_state),
+                after: current.map(BeadSnapshot::historical_state),
+                transition_observed: valid_before && valid_after,
+            });
+        }
+
+        result
+            .observations
+            .push(crate::causality::CausalObservation {
+                commit_sha: c.header.sha.clone(),
+                timestamp: parse_go_time(&c.header.timestamp, "causal commit timestamp")?,
+                committed_at: parse_go_time(&c.committed_at, "causal committer timestamp")?,
+                before: old_state,
+                after: new_state,
+                changes,
+            });
+        previous = Some((c.new_sha.clone(), valid_after, after));
+    }
+
+    Ok(result)
+}
+
+fn parse_go_time(raw: &str, what: &str) -> Result<crate::causality::GoTime, String> {
+    crate::causality::GoTime::parse(raw).map_err(|e| format!("{what}: {e}"))
+}
+
+/// Go's `read` closure — parse one blob into records, and report whether every
+/// record in it was well formed and unique. A malformed or duplicated record
+/// does not abort the walk; it makes the state *unknown*, which withholds the
+/// conclusions that would otherwise follow.
+fn read_records(
+    reader: &mut BlobReader,
+    sha: &str,
+) -> Result<(BTreeMap<String, BeadSnapshot>, bool), String> {
+    if sha.is_empty() {
+        // No parent blob: the file did not exist yet, which is a known-empty
+        // state rather than a missing one.
+        return Ok((BTreeMap::new(), true));
+    }
+    let Some(data) = reader.read_blob_opt(sha)? else {
+        return Ok((BTreeMap::new(), false));
+    };
+    let mut records = BTreeMap::new();
+    let mut valid = true;
+    for line in data.split(|b| *b == b'\n') {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let Some(record) = parse_bead_json(&String::from_utf8_lossy(line)) else {
+            valid = false;
+            continue;
+        };
+        let id = record.id.clone();
+        if records.insert(id, record).is_some() {
+            // A repeated id means the file cannot be read as one record per
+            // bead, so nothing derived from it is trustworthy.
+            valid = false;
+        }
+    }
+    Ok((records, valid))
+}
+
+/// Go `equalHistoricalRecord` — identity by the fields causality reasons about.
+fn equal_historical_record(a: &BeadSnapshot, b: &BeadSnapshot) -> bool {
+    a.id == b.id && a.title == b.title && a.status == b.status && a.dependencies == b.dependencies
+}
+
+/// Go `causalSnapshotState` — the target's constraint set in one committed
+/// snapshot, plus every record id that snapshot makes relevant.
+///
+/// A blocker is a dependency that resolves to a live issue, or to no issue at
+/// all. A `parent-child` edge instead *transitively* withholds readiness, so
+/// it is walked rather than counted, and cycles terminate on the visited set
+/// rather than recursing forever.
+fn causal_snapshot_state(
+    records: &BTreeMap<String, BeadSnapshot>,
+    valid: bool,
+    target: &str,
+) -> (crate::causality::CausalState, BTreeMap<String, ()>) {
+    let mut state = crate::causality::CausalState {
+        issue: None,
+        known: valid,
+        dependency_state: DependencyState::Unknown,
+        blockers: Vec::new(),
+        reason: String::new(),
+    };
+    let mut relevant: BTreeMap<String, ()> = BTreeMap::new();
+    relevant.insert(target.to_string(), ());
+
+    let mut issues: Vec<ReadinessIssue> = Vec::with_capacity(records.len());
+    for record in records.values() {
+        let status = normalize_status(&record.status);
+        if status.trim().is_empty() {
+            // Go `Status.IsValid` accepts any nonblank status, so a blank one
+            // is the only invalid case.
+            state.known = false;
+        }
+        for dep in &record.dependencies {
+            if !dep_type_is_valid(&dep.dep_type) || dep.depends_on_id.is_empty() {
+                state.known = false;
+            }
+        }
+        issues.push(ReadinessIssue {
+            id: record.id.clone(),
+            status: status.clone(),
+            dependencies: record
+                .dependencies
+                .iter()
+                .map(|d| (d.depends_on_id.clone(), d.dep_type.clone()))
+                .collect(),
+        });
+    }
+
+    if let Some(record) = records.get(target) {
+        state.issue = Some(record.historical_state());
+        state.dependency_state = ReadinessIndex::new(&issues).dependency_state(target);
+    }
+
+    let mut blockers: BTreeSet<String> = BTreeSet::new();
+    let mut visited: BTreeSet<String> = BTreeSet::new();
+    visit_parents(target, records, &mut visited, &mut relevant, &mut blockers);
+    state.blockers = blockers.into_iter().collect();
+
+    if !state.known {
+        state.reason = "malformed, duplicate, or invalid historical records".to_string();
+    } else if state.issue.is_some() && state.dependency_state == DependencyState::Unknown {
+        state.reason = "missing dependency or unresolved parent cycle".to_string();
+    }
+    (state, relevant)
+}
+
+/// Go's inner `visit` closure — walk `parent-child` edges transitively,
+/// collecting direct blockers on the way.
+fn visit_parents(
+    id: &str,
+    records: &BTreeMap<String, BeadSnapshot>,
+    visited: &mut BTreeSet<String>,
+    relevant: &mut BTreeMap<String, ()>,
+    blockers: &mut BTreeSet<String>,
+) {
+    if !visited.insert(id.to_string()) {
+        return;
+    }
+    let Some(record) = records.get(id) else {
+        return;
+    };
+    if is_closed_lifecycle_status(&normalize_status(&record.status)) {
+        return;
+    }
+    for dep in &record.dependencies {
+        let blocking = dep_type_is_blocking(&dep.dep_type);
+        if !blocking && dep.dep_type != DEP_PARENT_CHILD {
+            continue;
+        }
+        relevant.insert(dep.depends_on_id.clone(), ());
+        let Some(other) = records.get(&dep.depends_on_id) else {
+            // An unresolvable edge blocks, and the missing id is itself worth
+            // reporting.
+            blockers.insert(dep.depends_on_id.clone());
+            continue;
+        };
+        if is_closed_lifecycle_status(&normalize_status(&other.status)) {
+            continue;
+        }
+        if blocking {
+            blockers.insert(dep.depends_on_id.clone());
+        } else {
+            visit_parents(&dep.depends_on_id, records, visited, relevant, blockers);
+        }
+    }
+}
+
+/// Go's `parseSnapshotLog` for the causal walk: the header carries a sixth
+/// NUL-separated field, the committer date, which the event path does not need.
+fn parse_causal_log(out: &[u8]) -> Vec<SnapshotCommit> {
+    let mut commits = Vec::new();
+    for chunk in commit_chunks(out) {
+        let Some(nl) = chunk.iter().position(|b| *b == b'\n') else {
+            continue;
+        };
+        // The committer date is the field after the last NUL, so the header
+        // proper is everything before it.
+        let Some(last) = chunk[..nl].iter().rposition(|b| *b == 0) else {
+            continue;
+        };
+        let Some(header) = CommitHeader::parse(&chunk[..last]) else {
+            continue;
+        };
+        let Ok(committed_at) = String::from_utf8(chunk[last + 1..nl].to_vec()) else {
+            continue;
+        };
+        let mut sc = SnapshotCommit {
+            header,
+            old_sha: String::new(),
+            new_sha: String::new(),
+            committed_at,
+        };
+        if parse_raw_diff_lines(&chunk[nl + 1..], &mut sc) {
+            commits.push(sc);
+        }
+    }
+    commits
 }
 
 #[cfg(test)]
@@ -442,6 +817,7 @@ mod tests {
             },
             old_sha: String::new(),
             new_sha: String::new(),
+            committed_at: String::new(),
         };
         let payload = b"\n:100644 100644 aaa bbb M\t.beads/issues.jsonl\n";
         assert!(parse_raw_diff_lines(payload, &mut sc));
@@ -452,6 +828,7 @@ mod tests {
             header: sc.header.clone(),
             old_sha: String::new(),
             new_sha: String::new(),
+            committed_at: String::new(),
         };
         let del_payload =
             b":100644 000000 aaa 0000000000000000000000000000000000000000 D\t.beads/issues.jsonl\n";
@@ -470,6 +847,7 @@ mod tests {
             },
             old_sha: String::new(),
             new_sha: String::new(),
+            committed_at: String::new(),
         };
         let payload =
             b":000000 100644 0000000000000000000000000000000000000000 bbb A\t.beads/issues.jsonl\n";

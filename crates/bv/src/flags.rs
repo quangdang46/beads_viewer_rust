@@ -1710,7 +1710,10 @@ pub const MODIFIER_REQUIRES: &[(&str, &[&str])] = &[
     ("alert-label", &["robot-alerts"]),
     ("profile-json", &["profile-startup"]),
     ("robot-drift", &["check-drift"]),
-    ("history-since", &["robot-history", "bead-history"]),
+    (
+        "history-since",
+        &["robot-history", "bead-history", "robot-causality"],
+    ),
     (
         "history-limit",
         &["robot-history", "bead-history", "robot-causality"],

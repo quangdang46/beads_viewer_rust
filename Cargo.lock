@@ -213,6 +213,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -243,6 +244,7 @@ dependencies = [
  "jiff",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

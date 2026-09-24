@@ -22,6 +22,11 @@ dist/
 # Upstream reference clone (local only — do not publish Go source in Rust repo)
 beads_viewer/
 
+# Go oracle binary built by scripts/capture_goldens.sh for differential runs.
+# A ~60 MB local build artifact; never commit it.
+scripts/.bv-go
+scripts/.bv-go.exe
+
 # OS / editor
 .DS_Store
 *.swp

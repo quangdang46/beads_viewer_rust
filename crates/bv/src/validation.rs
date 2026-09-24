@@ -140,6 +140,22 @@ mod tests {
     }
 
     #[test]
+    fn history_window_modifiers_accept_robot_causality() {
+        // Go main.go:1811-1812 — both history-since and history-limit list
+        // robot-causality alongside the two history commands.
+        for modifier in ["--history-since", "--history-limit"] {
+            assert!(
+                check(&["bvr", "--robot-causality", "A-1", modifier, "30d"]).is_empty(),
+                "{modifier} must be allowed with --robot-causality"
+            );
+            assert!(
+                !check(&["bvr", "--robot-triage", modifier, "30d"]).is_empty(),
+                "{modifier} must still be rejected without a history command"
+            );
+        }
+    }
+
+    #[test]
     fn two_triage_family_flags_conflict() {
         let v = check(&["bvr", "--robot-triage", "--robot-next"]);
         assert!(matches!(
