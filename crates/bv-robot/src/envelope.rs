@@ -499,3 +499,254 @@ mod hash_escaping_tests {
         assert_eq!(go_html_escape_json(raw), raw.to_vec());
     }
 }
+
+/// Go `boundedSourceMessage` (cmd/bv/main.go:7273) — cap at 1024 *runes*
+/// (not bytes) and append an ellipsis. The rune count matters: a multi-byte
+/// path or warning truncates at the same character index Go would pick.
+pub fn bounded_source_message(message: &str) -> String {
+    const MAX_RUNES: usize = 1024;
+    if message.chars().count() <= MAX_RUNES {
+        return message.to_string();
+    }
+    let cut: String = message.chars().take(MAX_RUNES).collect();
+    format!("{cut}…")
+}
+
+/// Go `newRobotSourceAuthority` (cmd/bv/main.go:7282) — the authority reducer.
+///
+/// This is behaviour, not formatting: `claim_safe` is the field an agent reads
+/// before claiming work, and it is false in more cases than "there were
+/// errors". In particular a source whose `status` is neither `loaded` nor
+/// `disabled` marks the whole authority unsafe on its own, and a *disabled*
+/// source contributes nothing to any counter. Both are easy to drop when
+/// porting by hand, so the branches are spelled out here.
+///
+/// Mirrors, in order:
+/// - `source_kind == ""` becomes `"unknown"`
+/// - warnings truncate to 10 entries, then each entry is rune-bounded
+/// - `error` is rune-bounded
+/// - accumulate counters, skipping `disabled` entirely
+/// - `Loaded == 0` forces `state: "unknown"` and clears `claim_safe`
+pub fn new_source_authority(mut sources: Vec<RobotSourceReport>) -> RobotSourceAuthority {
+    let mut authority = RobotSourceAuthority {
+        state: "complete".to_string(),
+        claim_safe: true,
+        readiness: "proven".to_string(),
+        sources: Vec::new(),
+        ..Default::default()
+    };
+
+    for mut source in sources.drain(..) {
+        if source.source_kind.is_empty() {
+            source.source_kind = "unknown".to_string();
+        }
+        if source.warnings.len() > MAX_SOURCE_WARNINGS {
+            source.warnings.truncate(MAX_SOURCE_WARNINGS);
+        }
+        for warning in &mut source.warnings {
+            *warning = bounded_source_message(warning);
+        }
+        source.error = bounded_source_message(&source.error);
+
+        match source.status.as_str() {
+            // A disabled source is not evidence about the workspace: it adds
+            // nothing to any counter and cannot make the authority unsafe.
+            "disabled" => {
+                authority.disabled += 1;
+                continue;
+            }
+            "loaded" => authority.loaded += 1,
+            // Anything else is a failed source, and one is enough to make the
+            // whole authority unsafe regardless of its error count.
+            _ => {
+                authority.failed += 1;
+                authority.claim_safe = false;
+            }
+        }
+
+        authority.valid += source.valid;
+        authority.errors += source.errors;
+        authority.skipped += source.skipped;
+        authority.read_errors += source.read_errors;
+        authority.visible += source.visible;
+        authority.tombstones += source.tombstones;
+        authority.warning_count += source.warning_count;
+        if source.errors > 0 || source.read_errors > 0 || source.stale {
+            authority.claim_safe = false;
+        }
+        authority.sources.push(source);
+    }
+
+    // Go sorts before hashing, so the digest does not depend on the order the
+    // loader happened to discover sources in. `sort.SliceStable` keeps
+    // discovery order among equal keys.
+    authority.sources.sort_by(|a, b| {
+        a.repo_path
+            .cmp(&b.repo_path)
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.source_path.cmp(&b.source_path))
+    });
+
+    if authority.loaded == 0 {
+        authority.state = "unknown".to_string();
+        authority.claim_safe = false;
+    } else if !authority.claim_safe {
+        authority.state = "partial".to_string();
+    }
+    if !authority.claim_safe {
+        authority.readiness = "provisional".to_string();
+    }
+    authority
+}
+
+/// Go truncates a source's warning list to 10 before the authority hashes it
+/// (cmd/bv/main.go:7291), so the cap is part of the digest, not just display.
+const MAX_SOURCE_WARNINGS: usize = 10;
+
+#[cfg(test)]
+mod source_authority_tests {
+    use super::*;
+
+    fn report(status: &str) -> RobotSourceReport {
+        RobotSourceReport {
+            source_kind: "jsonl".into(),
+            status: status.into(),
+            valid: 3,
+            visible: 3,
+            ..Default::default()
+        }
+    }
+
+    /// The branch that is easiest to miss: a source that is neither `loaded`
+    /// nor `disabled` makes the authority unsafe even with zero errors.
+    #[test]
+    fn failed_status_makes_authority_unsafe_without_any_errors() {
+        // A lone failed source leaves Loaded == 0, so Go's first branch wins
+        // and the state is "unknown" — "partial" requires a loaded source too.
+        let only_failed = new_source_authority(vec![report("failed")]);
+        assert!(!only_failed.claim_safe);
+        assert_eq!(only_failed.failed, 1);
+        assert_eq!(only_failed.state, "unknown");
+        assert_eq!(only_failed.readiness, "provisional");
+
+        let mixed = new_source_authority(vec![report("loaded"), report("failed")]);
+        assert!(!mixed.claim_safe);
+        assert_eq!(mixed.loaded, 1);
+        assert_eq!(mixed.failed, 1);
+        assert_eq!(mixed.state, "partial");
+        assert_eq!(mixed.readiness, "provisional");
+    }
+
+    /// A disabled source contributes to `Disabled` and to nothing else, and
+    /// cannot make the authority unsafe.
+    #[test]
+    fn disabled_source_contributes_no_counters() {
+        let mut s = report("disabled");
+        s.valid = 99;
+        s.errors = 0;
+        s.read_errors = 0;
+        s.stale = true;
+        let a = new_source_authority(vec![s]);
+        assert_eq!(a.disabled, 1);
+        assert_eq!(a.valid, 0, "disabled must not accumulate valid");
+        assert_eq!(a.tombstones, 0);
+        // Loaded == 0 forces the override, so claim_safe is false regardless.
+        assert_eq!(a.state, "unknown");
+        assert!(!a.claim_safe);
+    }
+
+    #[test]
+    fn stale_read_errors_and_errors_each_clear_claim_safe() {
+        for mutate in [
+            (|s: &mut RobotSourceReport| s.errors = 1) as fn(&mut RobotSourceReport),
+            |s: &mut RobotSourceReport| s.read_errors = 1,
+            |s: &mut RobotSourceReport| s.stale = true,
+        ] {
+            let mut s = report("loaded");
+            mutate(&mut s);
+            let a = new_source_authority(vec![s]);
+            assert!(!a.claim_safe, "expected unsafe for {mutate:?}");
+            assert_eq!(a.state, "partial");
+        }
+    }
+
+    #[test]
+    fn clean_loaded_source_is_proven() {
+        let a = new_source_authority(vec![report("loaded")]);
+        assert!(a.claim_safe);
+        assert_eq!(a.state, "complete");
+        assert_eq!(a.readiness, "proven");
+        assert_eq!(a.loaded, 1);
+    }
+
+    /// `Loaded == 0` overwrites claim_safe even when every source is disabled.
+    #[test]
+    fn zero_loaded_forces_unknown_even_with_all_disabled() {
+        let a = new_source_authority(vec![report("disabled"), report("disabled")]);
+        assert_eq!(a.loaded, 0);
+        assert_eq!(a.disabled, 2);
+        assert_eq!(a.state, "unknown");
+        assert!(!a.claim_safe);
+        assert_eq!(a.readiness, "provisional");
+    }
+
+    #[test]
+    fn empty_source_kind_becomes_unknown() {
+        let mut s = report("loaded");
+        s.source_kind = String::new();
+        let a = new_source_authority(vec![s]);
+        assert_eq!(a.sources[0].source_kind, "unknown");
+    }
+
+    #[test]
+    fn warnings_truncate_to_ten_and_are_rune_bounded() {
+        let mut s = report("loaded");
+        s.warnings = (0..25).map(|i| format!("w{i}")).collect();
+        let a = new_source_authority(vec![s]);
+        assert_eq!(a.sources[0].warnings.len(), MAX_SOURCE_WARNINGS);
+        assert_eq!(a.sources[0].warnings[0], "w0");
+        assert_eq!(a.sources[0].warnings[9], "w9");
+    }
+
+    #[test]
+    fn bounded_source_message_counts_runes_not_bytes() {
+        assert_eq!(bounded_source_message("short"), "short");
+        let long = "é".repeat(2000);
+        let out = bounded_source_message(&long);
+        assert_eq!(out.chars().count(), 1025, "1024 runes plus the ellipsis");
+        assert!(out.ends_with('…'));
+    }
+
+    /// The sort is part of the digest contract: discovery order must not leak
+    /// into `authority_hash`.
+    #[test]
+    fn sources_sort_by_repo_path_name_source_path() {
+        let mk = |repo: &str, name: &str, path: &str| RobotSourceReport {
+            repo_path: repo.into(),
+            name: name.into(),
+            source_path: path.into(),
+            status: "loaded".into(),
+            ..Default::default()
+        };
+        let a = new_source_authority(vec![
+            mk("b", "x", "2"),
+            mk("a", "z", "1"),
+            mk("a", "a", "3"),
+        ]);
+        let keys: Vec<_> = a
+            .sources
+            .iter()
+            .map(|s| {
+                (
+                    s.repo_path.as_str(),
+                    s.name.as_str(),
+                    s.source_path.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec![("a", "a", "3"), ("a", "z", "1"), ("b", "x", "2")]
+        );
+    }
+}
