@@ -84,10 +84,28 @@ pub struct Suggestion {
     #[serde(rename = "action_command")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action_command: Option<String>,
+    /// Go `Suggestion.Action` (suggestions.go:80-82): the source-bound argv and
+    /// working directory behind `action_command`, never parsed from it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<serde_json::Value>,
     #[serde(rename = "generated_at")]
     pub generated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+}
+
+/// Rebuild a JSON object with its keys sorted, matching how Go's
+/// `encoding/json` marshals a `map[string]interface{}`.
+fn sorted_object(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let mut out = serde_json::Map::new();
+    let mut keys: Vec<&String> = obj.keys().collect();
+    keys.sort();
+    for k in keys {
+        out.insert(k.clone(), obj[k].clone());
+    }
+    Some(out)
 }
 
 impl Suggestion {
@@ -106,6 +124,7 @@ impl Suggestion {
             reason: reason.to_string(),
             confidence,
             action_command: None,
+            action: None,
             generated_at: now_rfc3339(),
             metadata: None,
         }
@@ -121,6 +140,12 @@ impl Suggestion {
         self
     }
 
+    /// Attach the structured form alongside the rendered shell command.
+    fn with_structured_action(mut self, cmd: &bv_core::tracker::IssueCommand) -> Self {
+        self.action = Some(serde_json::to_value(cmd).unwrap_or(serde_json::Value::Null));
+        self
+    }
+
     /// Go `Suggestion.withMutationAction` (suggestions.go:200-207): build the
     /// command from the issue's live tracker route, and record why it is
     /// unavailable when the route cannot be resolved.
@@ -130,21 +155,29 @@ impl Suggestion {
         from_id: &str,
         peer_id: &str,
         kind: bv_core::tracker::MutationKind,
+        value: &str,
     ) -> Self {
         let origin = bv_core::tracker::resolve_issue_origin(source_path, from_id);
         let peer_origin = bv_core::tracker::resolve_issue_origin(source_path, peer_id);
-        match bv_core::tracker::mutation_action(&origin, kind, Some(&peer_origin), "") {
-            Ok(cmd) => self.with_action(&cmd),
+        match bv_core::tracker::mutation_action(&origin, kind, Some(&peer_origin), value) {
+            Ok(cmd) => self.with_structured_action(&cmd).with_action(&cmd.shell),
             Err(reason) => {
                 self.with_metadata("action_unavailable_reason", serde_json::json!(reason))
             }
         }
     }
 
+    /// Go's `WithMetadata` copies into a `map[string]interface{}` and
+    /// `encoding/json` sorts map keys on marshal, so the serialized order is
+    /// alphabetical regardless of insertion order. serde_json's Map here
+    /// preserves insertion order, so sort the keys after each insert.
     fn with_metadata(mut self, key: &str, value: serde_json::Value) -> Self {
         let m = self.metadata.get_or_insert_with(|| serde_json::json!({}));
         if let Some(obj) = m.as_object_mut() {
             obj.insert(key.to_string(), value);
+            if let Some(sorted) = sorted_object(obj) {
+                *obj = sorted;
+            }
         }
         self
     }
@@ -450,10 +483,13 @@ fn extract_keywords(title: &str, description: &str) -> Vec<String> {
     let text = format!("{} {}", title, description).to_lowercase();
 
     // Remove common markdown/code artifacts (non-word chars → space).
+    // Go replaces `[^\w\s]` (duplicates.go:15). `\w` includes underscore, so
+    // `agent_prompt_modal` stays a single token; is_alphanumeric() would split
+    // it into three and surface spurious keywords like "agent".
     let cleaned: String = text
         .chars()
         .map(|c| {
-            if c.is_alphanumeric() || c.is_whitespace() {
+            if c.is_alphanumeric() || c == '_' || c.is_whitespace() {
                 c
             } else {
                 ' '
@@ -680,6 +716,7 @@ fn detect_duplicates_with_source(
                     &pair.issue1,
                     &pair.issue2,
                     bv_core::tracker::MutationKind::Relate,
+                    "",
                 );
             }
 
@@ -917,6 +954,7 @@ fn detect_missing_dependencies_with_source(
                     &m.from,
                     &m.to,
                     bv_core::tracker::MutationKind::AddDependency,
+                    "",
                 );
             } else {
                 sug = sug
@@ -1034,6 +1072,16 @@ struct LabelMatch {
 /// Analyze issues for potential label suggestions.
 /// Matches Go `SuggestLabels` exactly.
 pub fn suggest_labels(issues: &[Issue], config: &LabelSuggestionConfig) -> Vec<Suggestion> {
+    suggest_labels_with_source(issues, config, "")
+}
+
+/// Variant that can build tracker-backed mutation commands; see
+/// `detect_duplicates_with_source`.
+fn suggest_labels_with_source(
+    issues: &[Issue],
+    config: &LabelSuggestionConfig,
+    source_path: &str,
+) -> Vec<Suggestion> {
     if issues.is_empty() {
         return Vec::new();
     }
@@ -1071,7 +1119,17 @@ pub fn suggest_labels(issues: &[Issue], config: &LabelSuggestionConfig) -> Vec<S
 
         // Extract keywords.
         let keywords = extract_keywords(&issue.title, &issue.description);
-        let keyword_set: HashSet<&str> = keywords.iter().map(|s| s.as_str()).collect();
+        // Go preserves keyword order when accumulating the float bonuses
+        // (label_suggest.go:161-162): iterating a keyword map randomized the
+        // addition order and could change confidence by an ulp. A HashSet
+        // iterates in arbitrary order, so keep a de-duplicated ordered list.
+        let mut keyword_set: Vec<&str> = Vec::new();
+        for k in &keywords {
+            let k = k.as_str();
+            if !keyword_set.contains(&k) {
+                keyword_set.push(k);
+            }
+        }
 
         // Score potential labels.
         let mut label_scores: HashMap<String, f64> = HashMap::new();
@@ -1079,7 +1137,7 @@ pub fn suggest_labels(issues: &[Issue], config: &LabelSuggestionConfig) -> Vec<S
 
         // Check builtin mappings.
         if config.builtin_mappings {
-            for &keyword in &keyword_set {
+            for &keyword in keyword_set.iter() {
                 if let Some(labels) = builtin.get(keyword) {
                     for &label in labels {
                         if !existing_labels.contains_key(label) && all_labels.contains(label) {
@@ -1096,7 +1154,7 @@ pub fn suggest_labels(issues: &[Issue], config: &LabelSuggestionConfig) -> Vec<S
 
         // Check learned mappings.
         if config.learn_from_existing {
-            for &keyword in &keyword_set {
+            for &keyword in keyword_set.iter() {
                 if let Some(label_counts) = learned_mappings.get(keyword) {
                     for (label, count) in label_counts {
                         if !existing_labels.contains_key(label.as_str())
@@ -1167,9 +1225,15 @@ pub fn suggest_labels(issues: &[Issue], config: &LabelSuggestionConfig) -> Vec<S
                 &m.reason,
                 m.confidence,
             )
-            .with_action(&format!("br update {} --add-label={}", m.issue_id, m.label))
             .with_metadata("suggested_label", serde_json::json!(m.label))
             .with_metadata("matched_keywords", serde_json::json!(m.matched_words))
+            .with_mutation_action(
+                source_path,
+                &m.issue_id,
+                &m.issue_id,
+                bv_core::tracker::MutationKind::AddLabel,
+                &m.label,
+            )
         })
         .collect()
 }
@@ -1442,7 +1506,7 @@ pub fn generate_all_suggestions(
         && (config.filter_type.is_none()
             || config.filter_type.as_deref() == Some(SuggestionType::LabelSuggestion.as_str()))
     {
-        let labels = suggest_labels(issues, &config.labels);
+        let labels = suggest_labels_with_source(issues, &config.labels, source_path);
         all_suggestions.extend(labels);
     }
 

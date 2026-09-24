@@ -78,7 +78,7 @@ pub fn mutation_action(
     kind: MutationKind,
     peer: Option<&IssueOrigin>,
     value: &str,
-) -> Result<String, String> {
+) -> Result<IssueCommand, String> {
     // Go (types.go:120-145) returns the command, or a reason string. Its
     // wording for an absent route is its own, not whatever the origin
     // recorded, so return it explicitly rather than reusing
@@ -104,8 +104,7 @@ pub fn mutation_action(
                     "--",
                     &origin.local_id,
                 ],
-            )
-            .shell)
+            ))
         }
         MutationKind::AddDependency => {
             let peer =
@@ -113,18 +112,16 @@ pub fn mutation_action(
             if !peer.route_available() {
                 return Err("related issue has no verified live tracker route".to_string());
             }
-            Ok(build_command(
-                origin,
-                true,
-                &["dep", "add", &peer.local_id, "--", &origin.local_id],
-            )
-            .shell)
-        }
-        MutationKind::Relate => {
-            let peer =
-                peer.ok_or_else(|| "related issue has no verified live tracker route".to_string())?;
-            if !peer.route_available() {
-                return Err("related issue has no verified live tracker route".to_string());
+            if origin.tracker != peer.tracker
+                || origin.database != peer.database
+                || origin.working_directory != peer.working_directory
+                || origin.tracker_directory != peer.tracker_directory
+                || origin.executable != peer.executable
+            {
+                return Err("related issues belong to different trackers".to_string());
+            }
+            if origin.local_id == peer.local_id {
+                return Err("dependency action refers to the same local issue".to_string());
             }
             Ok(build_command(
                 origin,
@@ -132,13 +129,44 @@ pub fn mutation_action(
                 &[
                     "dep",
                     "add",
-                    &peer.local_id,
-                    "--type=related",
+                    "--json",
                     "--",
                     &origin.local_id,
+                    &peer.local_id,
                 ],
-            )
-            .shell)
+            ))
+        }
+        MutationKind::Relate => {
+            let peer =
+                peer.ok_or_else(|| "related issue has no verified live tracker route".to_string())?;
+            if !peer.route_available() {
+                return Err("related issue has no verified live tracker route".to_string());
+            }
+            if origin.tracker != peer.tracker
+                || origin.database != peer.database
+                || origin.working_directory != peer.working_directory
+                || origin.tracker_directory != peer.tracker_directory
+                || origin.executable != peer.executable
+            {
+                return Err("related issues belong to different trackers".to_string());
+            }
+            if origin.local_id == peer.local_id {
+                return Err("dependency action refers to the same local issue".to_string());
+            }
+            Ok(build_command(
+                origin,
+                true,
+                &[
+                    "dep",
+                    "add",
+                    "--json",
+                    "--type",
+                    "related",
+                    "--",
+                    &origin.local_id,
+                    &peer.local_id,
+                ],
+            ))
         }
         MutationKind::RemoveDependency => {
             let peer =
@@ -146,12 +174,29 @@ pub fn mutation_action(
             if !peer.route_available() {
                 return Err("related issue has no verified live tracker route".to_string());
             }
+            if origin.tracker != peer.tracker
+                || origin.database != peer.database
+                || origin.working_directory != peer.working_directory
+                || origin.tracker_directory != peer.tracker_directory
+                || origin.executable != peer.executable
+            {
+                return Err("related issues belong to different trackers".to_string());
+            }
+            if origin.local_id == peer.local_id {
+                return Err("dependency action refers to the same local issue".to_string());
+            }
             Ok(build_command(
                 origin,
                 true,
-                &["dep", "remove", &peer.local_id, "--", &origin.local_id],
-            )
-            .shell)
+                &[
+                    "dep",
+                    "remove",
+                    "--json",
+                    "--",
+                    &origin.local_id,
+                    &peer.local_id,
+                ],
+            ))
         }
     }
 }
