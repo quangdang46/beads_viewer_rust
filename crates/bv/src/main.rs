@@ -1204,35 +1204,53 @@ fn run_robot_triage() -> ExitCode {
     };
 
     // Build blockers_to_clear: high betweenness blocking issues.
-    let blockers_to_clear: Vec<serde_json::Value> = out
+    // Go `buildBlockersToClearWithContext` (triage.go:1100-1148) builds this
+    // from the triage unblocks map, not from blocker_ratio/betweenness: an item
+    // qualifies when it is a non-closed candidate that unblocks something, and
+    // the list is sorted by unblocks count desc then id asc.
+    let issue_index: std::collections::HashMap<&str, &bv_core::model::Issue> =
+        issues.iter().map(|i| (i.id.as_str(), i)).collect();
+    let mut blockers: Vec<(&str, usize, Vec<String>)> = out
         .recommendations
         .iter()
-        .filter(|r| r.breakdown.blocker_ratio > 0.0 || r.breakdown.betweenness > 0.01)
+        .filter_map(|r| {
+            if r.blocked_by.is_empty() && r.unblocks_ids.is_empty() {
+                return None;
+            }
+            let issue = issue_index.get(r.id.as_str())?;
+            if matches!(
+                issue.status,
+                bv_core::model::Status::Closed | bv_core::model::Status::Tombstone
+            ) {
+                return None;
+            }
+            Some((r.id.as_str(), r.unblocks_ids.len(), r.unblocks_ids.clone()))
+        })
+        .filter(|(_, n, _)| *n > 0)
+        .collect();
+    blockers.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    let blockers_to_clear: Vec<serde_json::Value> = blockers
+        .into_iter()
         .take(5)
-        .map(|r| {
-            let unblocks_count = issues
+        .map(|(id, unblocks_count, unblocks_ids)| {
+            let actionable = !out
+                .recommendations
                 .iter()
-                .filter(|o| {
-                    o.dependencies
-                        .iter()
-                        .any(|d| d.r#type.is_blocking() && d.effective_depends_on() == r.id)
-                })
-                .count();
-            let unblocks_ids: Vec<String> = issues
-                .iter()
-                .filter(|o| {
-                    o.dependencies
-                        .iter()
-                        .any(|d| d.r#type.is_blocking() && d.effective_depends_on() == r.id)
-                })
-                .map(|o| o.id.clone())
-                .collect();
-            serde_json::json!({
-                "id": r.id, "title": r.title,
+                .find(|r| r.id == id)
+                .map(|r| !r.blocked_by.is_empty())
+                .unwrap_or(true);
+            let mut item = serde_json::json!({
+                "id": id,
+                "title": issue_index.get(id).map(|i| i.title.clone()).unwrap_or_default(),
                 "unblocks_count": unblocks_count,
                 "unblocks_ids": unblocks_ids,
-                "actionable": r.status == "open",
-            })
+                "actionable": actionable,
+            });
+            if !actionable {
+                item["blocked_by"] =
+                    serde_json::json!(bv_analysis::blocker_chain::open_blockers(&issue_index, id));
+            }
+            item
         })
         .collect();
 

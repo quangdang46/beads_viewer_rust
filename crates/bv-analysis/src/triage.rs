@@ -448,13 +448,18 @@ pub fn compute_project_velocity(
         }
     }
 
-    Some(serde_json::json!({
+    // Go's `Estimated` is omitempty (triage.go:235), so a false value is
+    // absent rather than present-as-false.
+    let mut vel = serde_json::json!({
         "closed_last_7_days": closed_last_7,
         "closed_last_30_days": closed_last_30,
         "avg_days_to_close": avg_days,
         "weekly": weekly,
-        "estimated": estimated,
-    }))
+    });
+    if estimated {
+        vel["estimated"] = serde_json::json!(true);
+    }
+    Some(vel)
 }
 
 /// Days since the Unix epoch for the Monday that starts the given ISO week.
