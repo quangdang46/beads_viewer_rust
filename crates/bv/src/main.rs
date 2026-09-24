@@ -1316,10 +1316,23 @@ fn run_robot_triage() -> ExitCode {
                                    // omits the key — but when the optional git-history prologue is skipped Go
                                    // sets it to the literal "skipped" rather than leaving it empty. Omitting
                                    // it entirely, as this did, lost that distinction.
-    let history_status = if cwd.join(".git").exists() {
+                                   // Go's HistoryStatus (triage.go:63-71) is omitempty. robot_registry.go:2155
+                                   // decides the value: with open work AND SOURCE_DATE_EPOCH set
+                                   // (main.go:1174), the history prologue is skipped outright and the status is
+                                   // the literal "skipped" — a pinned clock would otherwise make history
+                                   // output drift between runs. Only the unpinned path builds a real report
+                                   // and reports "ok".
+    let has_open_issues = issues.iter().any(|i| !i.status.is_closed());
+    let source_date_epoch_active = std::env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .map(|v| v.trim().parse::<i64>().is_ok())
+        .unwrap_or(false);
+    let history_status = if has_open_issues && source_date_epoch_active {
+        "skipped"
+    } else if has_open_issues {
         "ok"
     } else {
-        "skipped"
+        ""
     };
     let mut meta = serde_json::json!({
         "version": bv_robot::ROBOT_CONTRACT_VERSION,
