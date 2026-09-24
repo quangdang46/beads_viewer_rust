@@ -655,9 +655,17 @@ pub fn build_triage(issues: &[Issue], g: &DiGraph, now: jiff::Timestamp) -> Tria
         }
     }
 
+    // Go builds the recommendation's graph context here: `UnblocksIDs` from the
+    // unblocks map (triage.go:947) and `BlockedBy` from the context's open
+    // blockers, set only when non-empty (triage.go:949). Both are omitted
+    // when empty, so the field order is reasons, unblocks_ids, blocked_by.
+    let issue_index: std::collections::HashMap<&str, &Issue> =
+        issues.iter().map(|i| (i.id.as_str(), i)).collect();
     for rec in recommendations.iter_mut() {
+        rec.unblocks_ids = unblocks_map.get(&rec.id).cloned().unwrap_or_default();
+        rec.blocked_by = crate::blocker_chain::open_blockers(&issue_index, &rec.id);
         let blocker_depth = *blocker_depths.get(&rec.id).unwrap_or(&0);
-        let unblocks = unblocks_map.get(&rec.id).map(|v| v.len()).unwrap_or(0);
+        let unblocks = rec.unblocks_ids.len();
         let base_score = rec.score;
 
         // Unblock boost: normalized unblocks * weight

@@ -415,6 +415,14 @@ pub struct IssueImpact {
     pub action: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasons: Vec<String>,
+    /// Go `Recommendation.UnblocksIDs` (triage.go:947) — issues this one is
+    /// the sole open blocker of, from the triage unblocks map.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unblocks_ids: Vec<String>,
+    /// Go `Recommendation.BlockedBy` (triage.go:949) — this issue's open
+    /// blockers; omitted when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_by: Vec<String>,
     /// Go `model.IssueActions` — the live tracker route for this issue.
     /// `None` when no tracker origin could be resolved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -734,6 +742,10 @@ pub fn compute_impact_scores(inputs: &ImpactInputs) -> Vec<IssueImpact> {
             breakdown: b,
             action: action_hint(issue),
             reasons,
+            // Filled in by the triage layer, which owns the unblocks map;
+            // the impact scorer has no dependency graph context.
+            unblocks_ids: Vec::new(),
+            blocked_by: Vec::new(),
             // Tracker route is resolved by the CLI layer, which owns the
             // source path; the analysis layer has no origin to build it from.
             actions: None,

@@ -1077,7 +1077,17 @@ fn run_robot_triage() -> ExitCode {
     }
     let data_hash = bv_core::data_hash::compute_data_hash(&issues);
     let g = std::sync::Arc::new(bv_analysis::analyzer::build_graph(&issues));
-    let out = bv_analysis::triage::build_triage(&issues, &g, robot_now());
+    let mut out = bv_analysis::triage::build_triage(&issues, &g, robot_now());
+    // Go stamps every recommendation with `issue.Actions(claimable)`
+    // (triage.go:658). The tracker route needs the loaded source path, which
+    // only the CLI layer has, so it is resolved here rather than in the
+    // analysis layer.
+    let source = source_meta_for(&issues);
+    for rec in out.recommendations.iter_mut() {
+        let origin = bv_core::tracker::resolve_issue_origin(&source.path, &rec.id);
+        let actions = bv_core::tracker::build_actions(&origin, rec.claimable);
+        rec.actions = Some(serde_json::to_value(&actions).unwrap_or(serde_json::Value::Null));
+    }
 
     // Build top_picks: Go `buildTopPicks` — only claimable recommendations
     // (open, not epic, unassigned, no open blockers, not a parent with open
