@@ -1022,6 +1022,29 @@ fn run_robot_next() -> ExitCode {
     payload["usage_hints"] = usage_hints;
     emit_json(&payload)
 }
+/// Go's claimability gate for a triage recommendation (triage.go:657).
+///
+/// Shared by `top_picks` and `quick_wins`: Go derives both from the same
+/// `claimableIDs` set, so a deferred/draft/blocked bead must never appear in
+/// either (issue #199). Checking only `status == "open"` is not enough.
+fn triage_claimable(
+    r: &bv_analysis::impact::IssueImpact,
+    issue_by_id: &std::collections::HashMap<&str, &bv_core::model::Issue>,
+) -> bool {
+    if r.status != "open" || r.issue_type == "epic" {
+        return false;
+    }
+    if let Some(issue) = issue_by_id.get(r.id.as_str()) {
+        if !issue.assignee.trim().is_empty() {
+            return false;
+        }
+        // Ancestor-epic parity (#2): shared blocker_chain helper.
+        if !bv_analysis::open_blockers(issue_by_id, &issue.id).is_empty() {
+            return false;
+        }
+    }
+    true
+}
 
 fn run_robot_triage() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
@@ -1095,7 +1118,7 @@ fn run_robot_triage() -> ExitCode {
         let mut candidates: Vec<_> = out
             .recommendations
             .iter()
-            .filter(|r| r.status == "open")
+            .filter(|r| triage_claimable(r, &issue_by_id))
             .map(|r| {
                 let unblocks_count = issues
                     .iter()
@@ -1143,9 +1166,12 @@ fn run_robot_triage() -> ExitCode {
         candidates
             .into_iter()
             .take(5)
-            .map(|(_, r, unblocks_ids, reason)| {
+            .map(|(qw_score, r, unblocks_ids, reason)| {
+                // Go emits the quick-win score (impact/effort blend), not the
+                // raw impact score, and carries the issue status alongside.
                 serde_json::json!({
-                    "id": r.id, "title": r.title, "score": r.score,
+                    "id": r.id, "title": r.title, "status": r.status,
+                    "score": qw_score,
                     "reason": reason,
                     "unblocks_ids": unblocks_ids,
                 })
