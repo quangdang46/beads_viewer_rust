@@ -323,6 +323,14 @@ pub struct Issue {
     pub updated_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub due_date: Option<String>,
+    /// Scheduler deferral: hidden from ready/actionable until this instant
+    /// passes. Go `Issue.DeferUntil` (pkg/model/types.go:30).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_go_time"
+    )]
+    pub defer_until: Option<String>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -527,6 +535,7 @@ mod tests {
             created_at: Some("2026-01-01T00:00:00Z".into()),
             updated_at: Some("2026-01-02T00:00:00Z".into()),
             due_date: None,
+            defer_until: None,
             closed_at: None,
             external_ref: None,
             compaction_level: 0,
@@ -574,6 +583,7 @@ mod tests {
             created_at: None,
             updated_at: None,
             due_date: None,
+            defer_until: None,
             closed_at: None,
             external_ref: None,
             compaction_level: 0,

@@ -165,9 +165,7 @@ fn compute_issue_content_hash(w: &mut FingerprintWriter, issue: &Issue) -> Strin
     w.write_time_hash(issue.created_at.as_deref());
     w.write_time_hash(issue.updated_at.as_deref());
     w.write_time_ptr_hash(issue.due_date.as_deref());
-    // Go hashes issue.DeferUntil (a *time.Time). The Rust model has no
-    // defer_until field — the loader never populates it — so it is always nil.
-    w.write_time_ptr_hash(None);
+    w.write_time_ptr_hash(issue.defer_until.as_deref());
     w.write_time_ptr_hash(issue.closed_at.as_deref());
 
     w.write_int_hash(issue.compaction_level);
@@ -423,6 +421,7 @@ mod tests {
             created_at: Some("2026-01-01T00:00:00Z".into()),
             updated_at: Some("2026-01-01T01:00:00Z".into()),
             due_date: None,
+            defer_until: None,
             closed_at: None,
             external_ref: None,
             compaction_level: 0,
