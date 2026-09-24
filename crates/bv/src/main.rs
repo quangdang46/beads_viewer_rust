@@ -4984,6 +4984,27 @@ fn run_robot_suggest(args: &[String]) -> ExitCode {
 }
 
 fn run_robot_alerts() -> ExitCode {
+    let arg_value = |names: &[&str]| -> Option<String> {
+        let args: Vec<String> = std::env::args().collect();
+        let mut i = 0;
+        while i < args.len() {
+            let a = &args[i];
+            for n in names {
+                if a == n {
+                    let v = args.get(i + 1).cloned().unwrap_or_default();
+                    return (!v.trim().is_empty()).then_some(v);
+                }
+                if let Some(v) = a.strip_prefix(&format!("{n}=")) {
+                    return (!v.trim().is_empty()).then(|| v.to_string());
+                }
+            }
+            i += 1;
+        }
+        None
+    };
+    let want_severity = arg_value(&["--severity"]);
+    let want_type = arg_value(&["--alert-type"]);
+    let want_label = arg_value(&["--alert-label"]);
     let cwd = std::env::current_dir().unwrap_or_default();
     let (issues, hash, _as_of_commit) = match load_issues_auto(&cwd, None) {
         Ok(x) => x,
@@ -5036,13 +5057,49 @@ fn run_robot_alerts() -> ExitCode {
 
     // Go robot-alerts embeds the full RobotEnvelope (output_format+version)
     // and provides non-empty usage hints.
+    // Go robot-alerts embeds the full RobotEnvelope and filters the computed
+    // alerts before emitting them (robot_registry.go:1190-1215): exact match on
+    // severity and type, then a case-insensitive label match against the
+    // alert's label and its detail substrings.
+    let filtered_alerts: Vec<serde_json::Value> = result
+        .alerts
+        .iter()
+        .filter(|a| {
+            want_severity
+                .as_deref()
+                .map(|w| format!("{:?}", a.severity).to_lowercase() == w.to_lowercase())
+                .unwrap_or(true)
+        })
+        .filter(|a| {
+            want_type
+                .as_deref()
+                .map(|w| format!("{:?}", a.alert_type).to_lowercase() == w.to_lowercase())
+                .unwrap_or(true)
+        })
+        .filter(|a| match want_label.as_deref() {
+            None => true,
+            Some(want) => {
+                let want = want.to_lowercase();
+                let is_label = !a.label.is_empty() && a.label.to_lowercase() == want;
+                let in_details = a.details.iter().any(|d| d.to_lowercase().contains(&want));
+                is_label || in_details
+            }
+        })
+        .map(|a| serde_json::to_value(a).unwrap_or_default())
+        .collect();
+    let count_sev = |s: &str| {
+        filtered_alerts
+            .iter()
+            .filter(|a| a.get("severity").and_then(|v| v.as_str()) == Some(s))
+            .count()
+    };
     let mut payload = full_envelope_for(&hash, &issues);
-    payload["alerts"] = serde_json::to_value(&result.alerts).unwrap_or_default();
+    payload["alerts"] = serde_json::to_value(&filtered_alerts).unwrap_or_default();
     payload["summary"] = serde_json::json!({
-        "total": result.alerts.len(),
-        "critical": result.critical_count,
-        "warning": result.warning_count,
-        "info": result.info_count,
+        "total": filtered_alerts.len(),
+        "critical": count_sev("critical"),
+        "warning": count_sev("warning"),
+        "info": count_sev("info"),
     });
     // Go robot_registry.go:1240-1248 — the full seven-hint list, including the
     // proactive and drift-vs-baseline filter combinations.
@@ -6460,6 +6517,12 @@ fn run_robot_impact(args: &[String]) -> ExitCode {
 }
 
 /// Go handleRobotDiff — git snapshot comparison.
+///
+/// Go builds two `analysis.Snapshot`s (one per revision) and diffs the graphs
+/// between them (cmd/bv/robot_registry.go:1614-1647, main.go:4336-4340), so
+/// the output carries `resolved_revision`, `from_data_hash`, `to_data_hash`
+/// and the full `SnapshotDiff` — not the flat issue-list diff this handler
+/// used to emit.
 fn run_robot_diff(args: &[String]) -> ExitCode {
     let diff_ref = args
         .iter()
@@ -6481,19 +6544,38 @@ fn run_robot_diff(args: &[String]) -> ExitCode {
     // Shared plumbing with the TUI Time-Travel view (TUI_UX_PARITY_PLAN.md
     // Q4): revision resolution + `git show` + tolerant JSONL parse live in
     // `bv_core::discovery::GitLoader` (the same loader `--as-of` uses), so
-    // the diff algorithm is built once and reused, not duplicated. Failure
-    // message kept byte-identical to the previous inline implementation
-    // (golden-covered CLI surface: same text, same exit code).
-    let previous = match bv_core::discovery::GitLoader::new(&cwd).load_at(&ref_str) {
+    // the diff algorithm is built once and reused, not duplicated.
+    let git = bv_core::discovery::GitLoader::new(&cwd);
+    let previous = match git.load_at(&ref_str) {
         Ok(prev) => prev,
         Err(_) => {
             eprintln!("Error: could not read issues at ref {ref_str}");
             return ExitCode::from(1);
         }
     };
-    let result = bv_analysis::diff::diff_issues(&current, &previous, &ref_str);
-    let mut payload = full_envelope_for(&hash, &[]);
-    payload["diff"] = serde_json::to_value(&result).unwrap_or_default();
+    // Go falls back to the raw ref when resolution fails (main.go:4330-4333).
+    let revision = git
+        .resolve_revision(&ref_str)
+        .unwrap_or_else(|_| ref_str.clone());
+
+    // Go: NewSnapshotAt(historical, time.Time{}, revision) and
+    // NewSnapshot(issues), then the handler stamps ToTimestamp with
+    // robotNow() so SOURCE_DATE_EPOCH pins the output.
+    let from = bv_analysis::snapshot_diff::Snapshot::new(
+        previous.clone(),
+        bv_analysis::snapshot_diff::GO_ZERO_TIME.to_string(),
+        revision.clone(),
+    );
+    let to = bv_analysis::snapshot_diff::Snapshot::new(current.clone(), jiff_now(), String::new());
+    let diff = bv_analysis::snapshot_diff::compare_snapshots(&from, &to);
+
+    // The envelope is built from the live issues (Go's ctx.Issues), not from
+    // the historical ones, so `scope_hash` agrees with every other command.
+    let mut payload = full_envelope_for(&hash, &current);
+    payload["resolved_revision"] = serde_json::json!(revision);
+    payload["from_data_hash"] = serde_json::json!(bv_core::data_hash::compute_data_hash(&previous));
+    payload["to_data_hash"] = serde_json::json!(hash);
+    payload["diff"] = serde_json::to_value(&diff).unwrap_or_default();
     emit_json(&payload)
 }
 
