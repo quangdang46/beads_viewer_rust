@@ -2674,11 +2674,7 @@ fn run_robot_insights() -> ExitCode {
 
     // Cycles: Go emits null when none detected.
     let cycles_from_phase2 = phase2.cycles.clone().unwrap_or_default();
-    if cycles_from_phase2.is_empty() {
-        payload["Cycles"] = serde_json::Value::Null;
-    } else {
-        payload["Cycles"] = serde_json::json!(cycles_from_phase2);
-    }
+    payload["Cycles"] = serde_json::json!(cycles_from_phase2);
     payload["ClusterDensity"] = serde_json::json!(density);
 
     // Velocity snapshot — Go VelocitySnapshot: weekly as plain ints (newest
@@ -2740,7 +2736,7 @@ fn run_robot_insights() -> ExitCode {
 
     payload["usage_hints"] = serde_json::json!([
         "jq '.Bottlenecks[:5] | map(.ID)' - Top 5 bottleneck IDs",
-        "jq '.CriticalPath[:3]' - Top 3 critical path items",
+        "jq '.Keystones[:3]' - Top 3 critical path scores",
         "jq '.top_what_ifs[] | select(.delta.direct_unblocks > 2)' - High-impact items",
         "jq '.full_stats.pagerank | to_entries | sort_by(-.value)[:5]' - Top PageRank",
         "jq '.full_stats.core_number | to_entries | sort_by(-.value)[:5]' - Strongly embedded nodes (k-core)",
@@ -2852,12 +2848,24 @@ fn compute_top_what_if_deltas(
         if direct == 0 && transitive == 0 {
             continue;
         }
+        // Go counts unblocked issues whose dependency state is not satisfied
+        // (priority.go:963-970). Checking `status == blocked` counted only
+        // issues parked in that status; an open issue still held up by an open
+        // blocker also counts, which is the common case on a chain.
         let blocked_reduction = direct_list
             .iter()
             .filter(|id| {
-                issues
-                    .iter()
-                    .any(|i| i.id == **id && i.status == Status::Blocked)
+                issues.iter().any(|i| {
+                    i.id == **id
+                        && i.dependencies.iter().any(|d| {
+                            d.r#type.is_blocking()
+                                && !d.effective_depends_on().is_empty()
+                                && issues.iter().any(|o| {
+                                    o.id == d.effective_depends_on()
+                                        && !matches!(o.status, Status::Closed | Status::Tombstone)
+                                })
+                        })
+                })
             })
             .count() as i64;
         let cp_node = g.node_idx(issue.id.as_str()).unwrap_or(usize::MAX);
@@ -3102,7 +3110,7 @@ fn generate_advanced_insights(
             "total_edges": 0,
             "coverage_ratio": 1.0,
             "rationale": "Graph has no blocking dependencies.",
-            "how_to_use": "Small vertex cover touching all dependency edges. Use for breadth coverage.",
+            "how_to_use": "Greedy dependency-edge coverage. Check coverage_ratio and capped before treating it as complete.",
         })
     } else {
         let mut uncovered: Vec<(String, String)> = edges.clone();
@@ -3154,7 +3162,7 @@ fn generate_advanced_insights(
             "total_edges": total_edges,
             "coverage_ratio": edges_covered as f64 / total_edges as f64,
             "rationale": "Greedy vertex cover (2-approx): iteratively pick highest uncovered degree until edges are covered or cap is reached.",
-            "how_to_use": "Small vertex cover touching all dependency edges. Use for breadth coverage.",
+            "how_to_use": "Greedy dependency-edge coverage. Check coverage_ratio and capped before treating it as complete.",
         })
     };
 
@@ -3263,7 +3271,9 @@ fn generate_advanced_insights(
         paths.push(p);
     }
     let k_paths = serde_json::json!({
-        "status": feature_status("available", "", paths.len() >= 5 && total_paths > 5, paths.len() as i64, total_paths),
+        // Go's KPathsResult.Limited is the number of representative sources
+        // considered (advanced_insights.go:943), not the total path count.
+        "status": feature_status("available", "", paths.len() >= 5 && total_paths > 5, paths.len() as i64, total_paths.min(1) as i64),
         "paths": paths,
         "how_to_use": "K-shortest critical paths. Focus on issues appearing in multiple paths.",
     });
@@ -3407,11 +3417,11 @@ fn generate_advanced_insights(
             "k_paths_limit": 5,
             "path_length_cap": 50,
             "cycle_break_limit": 5,
-            "parallel_cut_limit": 5,
+            "parallel_cut_limit": 5, "parallel_gain_limit": 5,
         },
         // Go map keys serialize sorted alphabetically.
         "usage_hints": {
-            "coverage_set": "Small vertex cover touching all dependency edges. Use for breadth coverage.",
+            "coverage_set": "Greedy dependency-edge coverage. Check coverage_ratio and capped before treating it as complete.",
             "cycle_break": "Structural fix suggestions. Apply BEFORE working on cycle members.",
             "k_paths": "K-shortest critical paths. Focus on issues appearing in multiple paths.",
             "parallel_cut": "Issues that enable parallel work. Complete to maximize team throughput.",
