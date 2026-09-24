@@ -279,6 +279,7 @@ pub fn build_actions(origin: &IssueOrigin, claimable: bool) -> IssueActions {
 
 /// Go `installedTrackerCapabilities` (pkg/loader/loader.go:47) — probe the
 /// tracker for the flags the explicit-database route depends on.
+#[derive(Debug, Clone)]
 pub struct TrackerCapabilities {
     pub executable: String,
     pub claim: bool,
@@ -287,6 +288,10 @@ pub struct TrackerCapabilities {
 
 /// Resolve the `br` executable and detect atomic-claim support. Runs only
 /// `update --help`, never a command that opens or mutates a tracker.
+///
+/// Go bounds the probe with a 2s context and caches on the executable's
+/// identity (`path:size:mtime`) so a long-running TUI neither re-spawns the
+/// tracker on every payload nor keeps a stale answer after it is replaced.
 pub fn installed_tracker_capabilities(tracker: &str) -> TrackerCapabilities {
     let path = match lookup_path(tracker) {
         Some(p) => p,
@@ -299,18 +304,83 @@ pub fn installed_tracker_capabilities(tracker: &str) -> TrackerCapabilities {
         }
     };
     let executable = resolve_executable(&path);
-    let out = std::process::Command::new(&executable)
+    // Go `os.Stat` is part of capability identity: replacing the installed
+    // binary must invalidate the cached answer.
+    let meta = match std::fs::metadata(&executable) {
+        Ok(m) => m,
+        Err(_) => {
+            return TrackerCapabilities {
+                executable: String::new(),
+                claim: false,
+                error: "cannot inspect tracker executable".to_string(),
+            }
+        }
+    };
+    let key = format!(
+        "{}:{}:{}",
+        executable.to_string_lossy(),
+        meta.len(),
+        meta_modtime_nanos(&meta)
+    );
+    if let Some(hit) = capability_cache_get(&key) {
+        return hit;
+    }
+    let caps = probe_tracker(&executable, tracker);
+    capability_cache_put(key, &caps);
+    caps
+}
+
+/// Go's 2s bound on the help probe. Without it a wedged tracker hangs the
+/// whole `bv` invocation, which is the failure this gate is meant to survive.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn probe_tracker(executable: &Path, tracker: &str) -> TrackerCapabilities {
+    let child = std::process::Command::new(executable)
         .args(["update", "--help"])
-        .output();
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+    let mut out: Option<(std::process::ExitStatus, Vec<u8>)> = None;
+    if let Ok(mut c) = child {
+        // Poll for the deadline rather than blocking on `wait`, so a tracker
+        // that never exits is killed instead of hanging bv.
+        let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
+        loop {
+            match c.try_wait() {
+                Ok(Some(status)) => {
+                    let mut buf = Vec::new();
+                    use std::io::Read;
+                    if let Some(mut o) = c.stdout.take() {
+                        let _ = o.read_to_end(&mut buf);
+                    }
+                    out = Some((status, buf));
+                    break;
+                }
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+    }
     let mut caps = TrackerCapabilities {
         executable: executable.to_string_lossy().to_string(),
         claim: false,
         error: String::new(),
     };
     match out {
-        Ok(o) if o.status.success() => {
-            let help = String::from_utf8_lossy(&o.stdout);
-            let has = |flag: &str| help.split_whitespace().any(|f| f == flag);
+        Some((status, buf)) if status.success() => {
+            // Trackers may honor inherited forced-color settings even when
+            // help is piped, so styling must not change token recognition
+            // (Go applies ansi.Strip for the same reason).
+            let help = String::from_utf8_lossy(&buf);
+            let stripped = strip_ansi(&help);
+            let has = |flag: &str| stripped.split_whitespace().any(|f| f == flag);
             if !has("--db")
                 || !has("--json")
                 || (tracker == "br" && (!has("--no-auto-import") || !has("--no-auto-flush")))
@@ -320,9 +390,82 @@ pub fn installed_tracker_capabilities(tracker: &str) -> TrackerCapabilities {
             }
             caps.claim = has("--claim");
         }
-        _ => caps.error = "cannot establish installed tracker capabilities".to_string(),
+        Some(_) => caps.error = "cannot establish installed tracker capabilities".to_string(),
+        None => caps.error = "cannot establish installed tracker capabilities".to_string(),
     }
     caps
+}
+
+/// Modification time as Unix nanoseconds, for the capability cache key.
+/// Go uses `info.ModTime().UnixNano()`.
+fn meta_modtime_nanos(meta: &std::fs::Metadata) -> u128 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+/// Remove ANSI SGR/CSI sequences so forced-color output does not hide a
+/// capability token. Mirrors what Go's `ansi.Strip` does to the help text.
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            // CSI sequence: ESC '[' params(0x30-0x3f) intermediates(0x20-0x2f) final
+            Some('[') => {
+                chars.next();
+                for c in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            // OSC: ESC ']' ... BEL or ESC '\'
+            Some(']') => {
+                chars.next();
+                while let Some(c) = chars.next() {
+                    if c == '\u{7}' {
+                        break;
+                    }
+                    if c == '\u{1b}' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            _ => {
+                chars.next();
+            }
+        }
+    }
+    out
+}
+
+/// Go's `trackerCapabilityCache` (a `sync.Map` keyed by executable identity).
+static CAPABILITY_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, TrackerCapabilities>>,
+> = std::sync::OnceLock::new();
+
+fn capability_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, TrackerCapabilities>> {
+    CAPABILITY_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn capability_cache_get(key: &str) -> Option<TrackerCapabilities> {
+    let map = capability_cache().lock().ok()?;
+    map.get(key).cloned()
+}
+
+fn capability_cache_put(key: String, caps: &TrackerCapabilities) {
+    if let Ok(mut map) = capability_cache().lock() {
+        map.insert(key, caps.clone());
+    }
 }
 
 /// Go `exec.LookPath` — resolve a bare command name against `PATH`.
@@ -582,5 +725,55 @@ mod tests {
             "no claim command for an unroutable origin"
         );
         assert!(!a.unavailable_reason.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+
+    /// A tracker that colorizes its help must still be recognized: Go strips
+    /// ANSI before matching tokens, and we must too or `--claim` is missed
+    /// whenever the environment forces color.
+    #[test]
+    fn ansi_strip_removes_sgr_and_csi() {
+        let colored = "\u{1b}[1m--db\u{1b}[0m \u{1b}[32m--json\u{1b}[0m";
+        assert_eq!(strip_ansi(colored), "--db --json");
+    }
+
+    #[test]
+    fn ansi_strip_handles_osc_and_keeps_plain_text() {
+        assert_eq!(strip_ansi("\u{1b}]0;title\u{7}--claim"), "--claim");
+        assert_eq!(strip_ansi("plain --db text"), "plain --db text");
+    }
+
+    #[test]
+    fn colorized_help_still_matches_capability_tokens() {
+        // The exact shape a forced-color tracker emits around a flag.
+        let help = "\u{1b}[36m  --db\u{1b}[0m <path>\n  --json\n  --claim\n";
+        let stripped = strip_ansi(help);
+        let has = |f: &str| stripped.split_whitespace().any(|x| x == f);
+        assert!(has("--db") && has("--json") && has("--claim"));
+    }
+
+    #[test]
+    fn capability_cache_roundtrips() {
+        let caps = TrackerCapabilities {
+            executable: "/usr/local/bin/br".into(),
+            claim: true,
+            error: String::new(),
+        };
+        let key = "test-key".to_string();
+        capability_cache_put(key.clone(), &caps);
+        let got = capability_cache_get(&key).expect("cached");
+        assert!(got.claim);
+        assert_eq!(got.executable, "/usr/local/bin/br");
+    }
+
+    #[test]
+    fn missing_executable_reports_unavailable() {
+        let caps = installed_tracker_capabilities("definitely-not-a-real-tracker-xyz");
+        assert!(!caps.executable.is_empty() || !caps.error.is_empty());
+        assert!(caps.error.contains("unavailable"), "{}", caps.error);
     }
 }
