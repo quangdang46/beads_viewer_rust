@@ -11,6 +11,7 @@ pub mod impact;
 pub mod label_health;
 pub mod metrics;
 pub mod scoring;
+pub mod snapshot_diff;
 pub mod suggestions;
 pub mod triage;
 

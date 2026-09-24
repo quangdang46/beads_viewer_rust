@@ -7,6 +7,40 @@
 
 use serde::{Deserialize, Serialize};
 
+// /// Serialize a timestamp the way Go marshals a `time.Time`: UTC, RFC3339 with
+/// trailing zeros trimmed from the fractional part. The loader stores the raw
+/// source text, so values like `...206355500Z` would otherwise pass through
+/// where Go emits `...2063555Z`.
+pub fn serialize_go_time<S: serde::Serializer>(
+    v: &Option<String>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    match v {
+        None => s.serialize_none(),
+        Some(raw) => match raw.parse::<jiff::Timestamp>() {
+            Ok(ts) => {
+                let text = ts.to_string();
+                // jiff already appends the "Z"; only the fractional part
+                // needs Go's trailing-zero trim.
+                let out = match text.find('.') {
+                    Some(dot) => {
+                        let frac = text[dot + 1..].trim_end_matches('0');
+                        if frac.is_empty() {
+                            text[..dot].to_string()
+                        } else {
+                            format!("{}.{}", &text[..dot], frac)
+                        }
+                    }
+                    None => text,
+                };
+                s.serialize_str(&out)
+            }
+            // Unparseable input is passed through rather than dropped, so a
+            // malformed record stays visible instead of vanishing.
+            Err(_) => s.serialize_str(raw),
+        },
+    }
+}
 /// Issue status. Exactly the 10 values Go recognizes (`model.Status.IsValid`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Status {
@@ -156,14 +190,22 @@ pub struct Dependency {
     #[serde(default, rename = "depends_on_id")]
     pub depends_on_id: String,
     /// Legacy field name; folded into `depends_on_id` when canonical absent.
-    #[serde(default, rename = "depends_on")]
+    #[serde(
+        default,
+        rename = "depends_on",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub depends_on_legacy: String,
     /// Legacy field name; folded into `depends_on_id` when others absent.
-    #[serde(default, rename = "target_id")]
+    #[serde(
+        default,
+        rename = "target_id",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub target_id_legacy: String,
     #[serde(default)]
     pub r#type: DependencyType,
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_go_time")]
     pub created_at: Option<String>,
     #[serde(default)]
     pub created_by: String,
@@ -257,13 +299,17 @@ pub struct Issue {
     pub assignee: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_minutes: Option<i64>,
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_go_time")]
     pub created_at: Option<String>,
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_go_time")]
     pub updated_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub due_date: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_go_time"
+    )]
     pub closed_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_ref: Option<String>,
@@ -326,9 +372,9 @@ pub struct Sprint {
     pub bead_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub velocity_target: Option<f64>,
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_go_time")]
     pub created_at: Option<String>,
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_go_time")]
     pub updated_at: Option<String>,
 }
 
@@ -357,7 +403,7 @@ pub struct Forecast {
     pub confidence: f64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub factors: Vec<String>,
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_go_time")]
     pub created_at: Option<String>,
 }
 
