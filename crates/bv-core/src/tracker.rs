@@ -468,7 +468,12 @@ pub fn resolve_issue_origin(source_path: &str, local_id: &str) -> IssueOrigin {
 
     let caps = installed_tracker_capabilities("br");
     if !caps.error.is_empty() {
-        origin.read_only_reason = caps.error;
+        // Go returns `refuse(caps.Error)` immediately (pkg/loader/loader.go:168-170),
+        // leaving `Executable` empty so `routeAvailable()` is false and the
+        // payload carries no show/claim command. Setting only the reason and
+        // still assigning the executable would emit live commands against a
+        // tracker that just failed its capability probe.
+        return refuse(&mut origin, &caps.error);
     }
     origin.executable = caps.executable;
     origin.supports_claim = caps.claim;
@@ -558,5 +563,24 @@ mod tests {
         let a = build_actions(&o, true);
         assert!(a.show.is_none());
         assert_eq!(a.unavailable_reason, "live tracker route is incomplete");
+    }
+
+    /// A tracker that fails its capability probe must not yield executable
+    /// show/claim commands. Go returns early on `caps.Error`
+    /// (pkg/loader/loader.go:168-170), leaving `Executable` empty.
+    #[test]
+    fn failed_capability_probe_blocks_commands() {
+        let mut o = origin();
+        o.executable = String::new();
+        o.read_only_reason =
+            "installed tracker cannot bind the required explicit database route".to_string();
+        assert!(!o.route_available(), "failed probe must not be routable");
+        let a = build_actions(&o, true);
+        assert!(a.show.is_none(), "no show command for an unroutable origin");
+        assert!(
+            a.claim.is_none(),
+            "no claim command for an unroutable origin"
+        );
+        assert!(!a.unavailable_reason.is_empty());
     }
 }
