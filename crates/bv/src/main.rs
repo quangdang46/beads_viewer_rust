@@ -30,9 +30,13 @@ fn main() -> ExitCode {
         return ExitCode::from(0);
     }
 
-    // --version handled before validation (Go parity).
+    // --version handled before validation (Go parity). Go prints
+    // "bv <version>" from `pkg/version`, whose fallback at the parity commit
+    // is v0.25.0 — the same string the envelope already carries. Printing the
+    // Rust crate's own name and version here would make `--version` the one
+    // place the binary contradicts its own output.
     if args.iter().any(|a| a == "--version") {
-        println!(concat!("bvr ", env!("CARGO_PKG_VERSION")));
+        println!("{} {}", flags::HELP_PROGRAM, GO_APP_VERSION);
         return ExitCode::from(0);
     }
 
