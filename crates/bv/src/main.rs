@@ -661,6 +661,35 @@ fn load_issues_auto(
 
 /// Envelope for a command that already loaded `issues` — derives the source
 /// provenance from the current directory so callers do not thread `cwd`.
+/// The active `--label` / `--recipe` / `--repo` scoping flags, read straight
+/// from argv so the envelope can publish them. Go threads these through the
+/// RobotContext (robot_registry.go:261-268); the envelope helper has no
+/// context, so it reads the process arguments.
+fn active_scope_flags() -> (String, String, String) {
+    let args: Vec<String> = std::env::args().collect();
+    let value_of = |names: &[&str]| -> String {
+        let mut i = 0;
+        while i < args.len() {
+            let a = &args[i];
+            for n in names {
+                if a == n {
+                    return args.get(i + 1).cloned().unwrap_or_default();
+                }
+                if let Some(v) = a.strip_prefix(&format!("{n}=")) {
+                    return v.to_string();
+                }
+            }
+            i += 1;
+        }
+        String::new()
+    };
+    (
+        value_of(&["--label"]),
+        value_of(&["--recipe"]),
+        value_of(&["--repo"]),
+    )
+}
+
 fn full_envelope_for(data_hash: &str, issues: &[bv_core::model::Issue]) -> serde_json::Value {
     let source = source_meta_for(issues);
     full_envelope_json_with_source(data_hash, Some(&source), issues)
@@ -2303,9 +2332,24 @@ fn full_envelope_json_with_source(
         }
         let mut ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
         ids.sort();
-        let shash = bv_robot::scope_hash("", "", "", data_hash, &ids);
+        // Go derives the scope from the active --label/--recipe/--repo flags
+        // (robot_registry.go:257-269) and emits the object alongside its hash.
+        // Hashing empty strings here made scope_hash unreproducible and left
+        // `scope` absent even when the caller was scoped.
+        let (label, recipe, repo) = active_scope_flags();
+        let shash = bv_robot::scope_hash(&label, &recipe, &repo, data_hash, &ids);
         if !shash.is_empty() {
             env.insert("scope_hash".into(), serde_json::json!(shash));
+        }
+        if !label.is_empty() || !recipe.is_empty() || !repo.is_empty() {
+            env.insert(
+                "scope".into(),
+                serde_json::json!({
+                    "label": label,
+                    "recipe": recipe,
+                    "repo": repo,
+                }),
+            );
         }
     }
     serde_json::Value::Object(env)
