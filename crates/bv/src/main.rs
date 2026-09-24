@@ -1384,7 +1384,7 @@ fn run_robot_triage() -> ExitCode {
             }
             true
         })
-        .take(5)
+        .take(3)
         .map(|r| {
             let unblocks: usize = issues
                 .iter()
