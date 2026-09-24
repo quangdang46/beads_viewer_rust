@@ -2154,8 +2154,117 @@ fn run_robot_drift() -> ExitCode {
     ExitCode::from(result.exit_code())
 }
 
+/// Go `correlation.ValidateRepository` — a `.git` directory plus at least one
+/// of the known beads file names under `.beads/`.
+fn validate_correlation_repository(repo: &std::path::Path) -> Result<(), String> {
+    if !repo.join(".git").exists() {
+        return Err(format!("not a git repository: {}", repo.to_string_lossy()));
+    }
+    let found = bv_correlation::extractor::DEFAULT_BEADS_FILES
+        .iter()
+        .any(|name| repo.join(".beads").join(name).exists());
+    if !found {
+        return Err(format!(
+            "no beads file found in {}/.beads/",
+            repo.to_string_lossy()
+        ));
+    }
+    Ok(())
+}
+
+/// Read a string flag from the process argv, accepting both `--flag=value` and
+/// `--flag value`. `rewrite_args` only rewrites bare boolean flags, so the raw
+/// argv still carries every valued flag verbatim.
+fn history_flag_value(name: &str) -> Option<String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let with_eq = format!("--{name}=");
+    for (i, a) in args.iter().enumerate() {
+        if let Some(v) = a.strip_prefix(&with_eq) {
+            return Some(v.to_string());
+        }
+        if a == &format!("--{name}") {
+            return args.get(i + 1).cloned();
+        }
+    }
+    None
+}
+
+/// The zone Go's `now.Location()` has for the current run: a frozen
+/// `SOURCE_DATE_EPOCH` instant is UTC, an unfrozen `time.Now()` is Local.
+fn robot_now_zone() -> jiff::tz::TimeZone {
+    if let Ok(v) = std::env::var("SOURCE_DATE_EPOCH") {
+        if v.trim().parse::<i64>().is_ok() {
+            return jiff::tz::TimeZone::UTC;
+        }
+    }
+    jiff::tz::TimeZone::try_system().unwrap_or(jiff::tz::TimeZone::UTC)
+}
+
+/// Go `recipe.ParseRelativeTime` — `7d` / `3w` / `6m` / `1y` counted back from
+/// now, else RFC3339, else `YYYY-MM-DDTHH:MM:SS`, else `YYYY-MM-DD`.
+///
+/// The reference "now" is `robot_now()` (SOURCE_DATE_EPOCH-aware), not the wall
+/// clock: Go resolves relative times against the same instant it stamps
+/// `generated_at` with, so a frozen-clock run stays frozen here too. An explicit
+/// RFC3339 input keeps its own offset — Go's `time.Parse` retains the parsed
+/// location, and the `window`/`git_range` fields echo that offset back.
+fn parse_relative_time(raw: &str) -> Result<Option<String>, String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return Ok(None);
+    }
+    // Relative form: a digit run followed by one of d/w/m/y.
+    let lower = s.to_lowercase();
+    if lower.len() >= 2 {
+        let (digits, unit) = lower.split_at(lower.len() - 1);
+        if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+            let n: i64 = digits
+                .parse()
+                .map_err(|_| format!("could not parse time \"{raw}\""))?;
+            let span = match unit {
+                "d" => jiff::Span::new().days(-n),
+                "w" => jiff::Span::new().days(-n * 7),
+                "m" => jiff::Span::new().months(-n),
+                "y" => jiff::Span::new().years(-n),
+                _ => jiff::Span::new().days(0),
+            };
+            if !span.is_zero() {
+                let shifted = robot_now()
+                    .to_zoned(robot_now_zone())
+                    .checked_add(span)
+                    .map_err(|e| e.to_string())?;
+                return Ok(Some(shifted.timestamp().to_string()));
+            }
+        }
+    }
+    // An explicit instant is already in the shape the report echoes back.
+    if s.parse::<jiff::Timestamp>().is_ok() {
+        return Ok(Some(s.to_string()));
+    }
+    // Naive layouts, read in the reference zone like Go's ParseInLocation.
+    let tz = robot_now_zone();
+    for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"] {
+        if let Ok(dt) = jiff::civil::DateTime::strptime(fmt, s) {
+            if let Ok(zoned) = dt.to_zoned(tz.clone()) {
+                return Ok(Some(zoned.timestamp().to_string()));
+            }
+        }
+    }
+    if let Ok(date) = jiff::civil::Date::strptime("%Y-%m-%d", s) {
+        let dt = date.to_datetime(jiff::civil::Time::midnight());
+        if let Ok(zoned) = dt.to_zoned(tz) {
+            return Ok(Some(zoned.timestamp().to_string()));
+        }
+    }
+    Err(format!("could not parse time \"{raw}\""))
+}
+
 fn run_robot_history() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
+    if let Err(e) = validate_correlation_repository(&cwd) {
+        eprintln!("Error: {e}");
+        return ExitCode::from(1);
+    }
     let (issues, _, _as_of_commit) = match load_issues_auto(&cwd, None) {
         Ok(x) => x,
         Err(e) => {
@@ -2163,50 +2272,114 @@ fn run_robot_history() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let data_hash = bv_core::data_hash::compute_data_hash(&issues);
-    let repo = std::env::current_dir().unwrap_or_default();
 
-    let limit = 500; // Go --history-limit default
-    let events = match bv_correlation::extract(
-        &repo,
-        &bv_correlation::ExtractOptions {
-            limit,
-            ..Default::default()
-        },
+    // Go: CorrelatorOptions{Limit: 500} overridden by --history-limit, with
+    // --bead-history narrowing to one bead and --history-since bounding the
+    // window (a parse failure is fatal, as in Go's handleRobotHistory).
+    let mut opts = bv_correlation::history::HistoryOptions {
+        limit: 500,
+        ..Default::default()
+    };
+    if let Some(bead) = history_flag_value("bead-history") {
+        opts.bead_id = bead.trim().to_string();
+    }
+    if let Some(limit) = history_flag_value("history-limit") {
+        match limit.trim().parse::<i64>() {
+            Ok(v) => opts.limit = v,
+            Err(_) => {
+                eprintln!("Error: invalid --history-limit: {limit}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    if let Some(since) = history_flag_value("history-since") {
+        match parse_relative_time(&since) {
+            Ok(Some(ts)) => opts.since = Some(ts),
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("Error: parsing --history-since: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+
+    // Go builds BeadInfo from the loaded issues, in load order.
+    let beads: Vec<bv_correlation::history::BeadInfo> = issues
+        .iter()
+        .map(|i| bv_correlation::history::BeadInfo {
+            id: i.id.clone(),
+            title: i.title.clone(),
+            status: i.status.as_str().to_string(),
+        })
+        .collect();
+
+    let mut report = match bv_correlation::history::build_history_report(
+        &cwd,
+        &beads,
+        &opts,
+        None,
+        jiff_now(),
     ) {
-        Ok(e) => e,
-        Err(err) => {
-            eprintln!("Error: extraction failed: {err}");
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error: generating history report: {e}");
             return ExitCode::from(1);
         }
     };
 
-    // Group events by bead.
-    let mut by_bead: std::collections::BTreeMap<String, Vec<&bv_correlation::BeadEvent>> =
-        std::collections::BTreeMap::new();
-    for e in &events {
-        by_bead.entry(e.bead_id.clone()).or_default().push(e);
+    // Go: --min-confidence filters the assembled histories, then re-derives the
+    // commit index and the beads_with_commits count.
+    if let Some(min) = history_flag_value("min-confidence") {
+        if let Ok(floor) = min.trim().parse::<f64>() {
+            bv_correlation::history::filter_histories_by_confidence(&mut report, floor);
+        }
     }
 
-    // Method distribution: all events from this path are explicit-message
-    // correlations in the legacy extractor (Go method_distribution parity).
-    let payload = serde_json::json!({
-        "generated_at": jiff_now(),
-        "data_hash": data_hash,
-        // output_format/version omitted for JSON (Go omitempty parity).
-        "stats": {
-            "total_events": events.len(),
-            "beads_with_commits": by_bead.len(),
-        },
-        "histories": by_bead.iter().map(|(id, evs)| {
-            serde_json::json!({
-                "bead_id": id,
-                "events": evs,
-            })
-        }).collect::<Vec<_>>(),
-    });
-    println!("{payload}");
-    ExitCode::from(0)
+    // Same top-level keys as the report plus the shared envelope. The envelope
+    // carries generated_at/data_hash (Go's output struct embeds the envelope
+    // and copies the report's remaining fields rather than embedding it, so the
+    // colliding keys would have been dropped).
+    //
+    // Go builds the envelope from the *loader's* source authority (whose
+    // per-source data_hash is the full-file sha256) and only then overrides the
+    // top-level data_hash with the report's own bead fingerprint — so
+    // authority_hash is computed over the file hash while scope_hash is
+    // computed over the report hash. Build with the file hash, then substitute.
+    let file_hash = bv_core::data_hash::compute_data_hash(&issues);
+    let mut payload = full_envelope_for(&file_hash, &issues);
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("data_hash".into(), serde_json::json!(report.data_hash));
+        let mut ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
+        ids.sort();
+        let scope_hash = bv_robot::scope_hash("", "", "", &report.data_hash, &ids);
+        if !scope_hash.is_empty() {
+            obj.insert("scope_hash".into(), serde_json::json!(scope_hash));
+        }
+        obj.insert("git_range".into(), serde_json::json!(report.git_range));
+        if !report.latest_commit_sha.is_empty() {
+            obj.insert(
+                "latest_commit_sha".into(),
+                serde_json::json!(report.latest_commit_sha),
+            );
+        }
+        obj.insert(
+            "window".into(),
+            serde_json::to_value(&report.window).unwrap_or(serde_json::Value::Null),
+        );
+        obj.insert(
+            "stats".into(),
+            serde_json::to_value(&report.stats).unwrap_or(serde_json::Value::Null),
+        );
+        obj.insert(
+            "histories".into(),
+            serde_json::to_value(&report.histories).unwrap_or(serde_json::Value::Null),
+        );
+        obj.insert(
+            "commit_index".into(),
+            serde_json::to_value(&report.commit_index).unwrap_or(serde_json::Value::Null),
+        );
+    }
+    emit_json(&payload)
 }
 
 fn run_robot_orphans() -> ExitCode {

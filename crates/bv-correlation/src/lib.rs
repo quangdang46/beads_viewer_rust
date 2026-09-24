@@ -2,6 +2,7 @@
 //! Phase 4a slice: event extraction from git log (legacy patch path).
 
 pub mod extractor;
+pub mod extractor_snapshot;
 
 pub use extractor::{extract, parse_log_output, BeadEvent, EventType, ExtractOptions};
 
@@ -13,5 +14,6 @@ pub mod temporal;
 pub mod causality;
 pub mod cocommit;
 pub mod correlator;
+pub mod history;
 pub mod network;
 pub mod orphan;

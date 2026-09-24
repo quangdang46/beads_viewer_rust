@@ -135,6 +135,9 @@ mod tests {
             commit_msg: msg.to_string(),
             author: "alice".to_string(),
             author_email: String::new(),
+            before: None,
+            after: None,
+            transition_observed: true,
         }
     }
 

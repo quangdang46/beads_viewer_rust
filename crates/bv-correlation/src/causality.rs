@@ -70,6 +70,7 @@ fn event_label(t: EventType) -> &'static str {
         EventType::Closed => "closed",
         EventType::Reopened => "reopened",
         EventType::Modified => "modified",
+        EventType::Deleted => "deleted",
     }
 }
 
@@ -209,6 +210,9 @@ mod tests {
             commit_msg: String::new(),
             author: "alice".to_string(),
             author_email: String::new(),
+            before: None,
+            after: None,
+            transition_observed: true,
         }
     }
 
