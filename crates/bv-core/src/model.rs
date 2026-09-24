@@ -121,6 +121,10 @@ impl Status {
 pub enum DependencyType {
     #[default]
     Blocks,
+    /// Go `DepConditionalBlocks` — blocking.
+    ConditionalBlocks,
+    /// Go `DepWaitsFor` — blocking.
+    WaitsFor,
     Related,
     ParentChild,
     DiscoveredFrom,
@@ -130,39 +134,42 @@ impl DependencyType {
     pub fn as_str(self) -> &'static str {
         match self {
             DependencyType::Blocks => "blocks",
+            DependencyType::ConditionalBlocks => "conditional-blocks",
+            DependencyType::WaitsFor => "waits-for",
             DependencyType::Related => "related",
             DependencyType::ParentChild => "parent-child",
             DependencyType::DiscoveredFrom => "discovered-from",
         }
     }
 
-    /// Go: `IsBlocking` — only `blocks` blocks among recognized values.
-    /// (The legacy EMPTY string maps to `Blocks` in `parse`, so it blocks too.)
+    /// Go `DependencyType.IsBlocking` — `""`, `blocks`, `conditional-blocks`,
+    /// and `waits-for` block. Everything else (including a type br invented
+    /// after this build) does not, so an unrecognized type is informational
+    /// rather than an error.
     pub fn is_blocking(self) -> bool {
-        self == DependencyType::Blocks
+        matches!(
+            self,
+            DependencyType::Blocks | DependencyType::ConditionalBlocks | DependencyType::WaitsFor
+        )
     }
 
     /// Parse from raw JSONL string; "" maps to Blocks (legacy default).
     pub fn parse(raw: &str) -> Self {
         match raw {
             "" | "blocks" => DependencyType::Blocks,
+            "conditional-blocks" => DependencyType::ConditionalBlocks,
+            "waits-for" => DependencyType::WaitsFor,
             "related" => DependencyType::Related,
             "parent-child" => DependencyType::ParentChild,
             "discovered-from" => DependencyType::DiscoveredFrom,
-            // Unknown types fall back to Blocks to preserve Go's IsBlocking()
-            // behavior on unrecognized strings? No — Go IsValid() rejects them
-            // at validation; loader keeps them but they don't block. We model
-            // unknowns as Related (non-blocking) and record validity separately.
+            // Go does not validate the type here: it interns whatever string
+            // the record carried, and `IsBlocking` returns false for a name it
+            // does not recognize. Modelling an unknown name as `related`
+            // reproduces that readiness decision (non-blocking) without
+            // rejecting the record. It is still lossy for the *string* — Go
+            // round-trips the original, this does not.
             _ => DependencyType::Related,
         }
-    }
-
-    /// True when the raw string is one of the four recognized values or empty.
-    pub fn raw_is_valid(raw: &str) -> bool {
-        matches!(
-            raw,
-            "" | "blocks" | "related" | "parent-child" | "discovered-from"
-        )
     }
 }
 

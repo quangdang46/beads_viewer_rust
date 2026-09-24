@@ -102,12 +102,10 @@ fn run_bvr(cwd: &Path, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-/// Strip nondeterministic fields: timestamps → placeholder, timing
-/// measurements and data_hash removed entirely (they vary run-to-run
-/// across beads data changes and Go/Rust execution). Floats are rounded
-/// to 14 significant figures to absorb last-digit precision differences
-/// between Rust's serde_json (Ryu) and Go's encoding/json
-/// (strconv.FormatFloat).
+/// Strip the fields that legitimately differ between hosts and runs:
+/// timestamps → placeholder, timing measurements and `data_hash` removed,
+/// and `authority_hash` reduced to a shape assertion because it digests the
+/// checkout path. Floats are compared exactly — see the note below.
 fn normalize(v: &Value) -> Value {
     match v {
         Value::Object(map) => {
@@ -115,6 +113,19 @@ fn normalize(v: &Value) -> Value {
             for (k, val) in map {
                 match k.as_str() {
                     "ms" | "compute_time_ms" | "data_hash" => {}
+                    // `authority_hash` is a digest *of the source path*, so it
+                    // changes with the checkout location and cannot be compared
+                    // across hosts — a hash cannot be path-normalized the way
+                    // the path itself can. Replace it with a shape assertion so
+                    // the field is still checked for being a 64-char hex
+                    // digest, while `source_path`, `data_hash` and `scope_hash`
+                    // (all verified path-independent) carry the real signal.
+                    "authority_hash" => {
+                        let ok = val.as_str().is_some_and(|s| {
+                            s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+                        });
+                        out.insert(k.clone(), Value::Bool(ok));
+                    }
                     "generated_at" | "timestamp" | "detected_at" => {
                         out.insert(k.clone(), Value::String("<TIMESTAMP>".into()));
                     }
@@ -126,29 +137,15 @@ fn normalize(v: &Value) -> Value {
             Value::Object(out)
         }
         Value::Array(items) => Value::Array(items.iter().map(normalize).collect()),
-        Value::Number(n) => {
-            // Round floats to 14 significant figures to absorb last-digit
-            // precision diffs between Rust (Ryu) and Go (strconv.FormatFloat).
-            if let Some(f) = n.as_f64() {
-                let rounded = round_to_sig_figs(f, 10);
-                Value::Number(serde_json::Number::from_f64(rounded).unwrap_or_else(|| n.clone()))
-            } else {
-                // Integer — no precision concern.
-                Value::Number(n.clone())
-            }
-        }
+        // Floats are compared exactly. Go's `strconv.FormatFloat` and Rust's
+        // `ryu` both emit the shortest representation that round-trips, so an
+        // f64 that prints differently is a *different computed value*, not a
+        // formatting artifact. The comparator used to round to 10 significant
+        // figures, which silently absorbed exactly this class of divergence —
+        // and the corpus in git/ was captured from the Rust binary, so the
+        // rounding is what let it pass as a Go oracle.
         other => other.clone(),
     }
-}
-
-/// Round a float to `sig` significant figures.
-fn round_to_sig_figs(f: f64, sig: usize) -> f64 {
-    if f == 0.0 || !f.is_finite() {
-        return f;
-    }
-    let magnitude = f.abs().log10().floor() as i32;
-    let factor = 10.0_f64.powi(sig as i32 - 1 - magnitude);
-    (f * factor).round() / factor
 }
 
 fn sort_keys_recursive(v: &Value) -> Value {

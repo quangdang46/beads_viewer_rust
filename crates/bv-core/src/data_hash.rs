@@ -66,12 +66,9 @@ impl<'a> HashIssue<'a> {
             .iter()
             .map(|d| DepKey {
                 depends_on: d.effective_depends_on().to_string(),
-                dep_type: match d.r#type {
-                    crate::model::DependencyType::Blocks => "blocks".into(),
-                    crate::model::DependencyType::Related => "related".into(),
-                    crate::model::DependencyType::ParentChild => "parent-child".into(),
-                    crate::model::DependencyType::DiscoveredFrom => "discovered-from".into(),
-                },
+                // Go writes `string(dep.Type)`, i.e. the type's own spelling,
+                // so this must track the type rather than re-enumerate it.
+                dep_type: d.r#type.as_str().to_string(),
                 // Go: Dependency.CreatedAt is a non-pointer time.Time; absent
                 // JSON field decodes to zero time which formats as the
                 // constant below (verified via instrumented upstream).

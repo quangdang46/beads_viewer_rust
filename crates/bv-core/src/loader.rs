@@ -293,11 +293,12 @@ impl RawIssue {
         if self.title.is_empty() {
             return Err(ValidationError::MissingField("title"));
         }
-        for d in &self.dependencies {
-            if !DependencyType::raw_is_valid(&d.r#type) {
-                return Err(ValidationError::InvalidDependencyType);
-            }
-        }
+        // Go's loader validates no dependency type: `pkg/loader/loader.go:1859`
+        // only interns the string. Rejecting a record here would drop the whole
+        // bead whenever br wrote a type this build does not recognise — and
+        // `waits-for` and `conditional-blocks` are real Go blocking constants,
+        // not typos. `DependencyType::is_blocking` is where a type earns the
+        // right to gate readiness.
         if let (Some(c), Some(u)) = (&self.created_at, &self.updated_at) {
             if let (Ok(c), Ok(u)) = (c.parse::<jiff::Timestamp>(), u.parse::<jiff::Timestamp>()) {
                 if u < c {

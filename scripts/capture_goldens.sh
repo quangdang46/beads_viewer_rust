@@ -1,11 +1,23 @@
 #!/usr/bin/env bash
 # Capture frozen Go-oracle goldens from the reference clone.
 # Usage: scripts/capture_goldens.sh [output_dir=golden]
+#
+# The captured corpus IS the project's parity oracle, so a run that silently
+# captures from the wrong build is worse than no run at all: it re-bakes false
+# provenance and the gate keeps passing or failing for reasons that have
+# nothing to do with the port. Every guard below exists because that happened.
 set -euo pipefail
 
 OUT="${1:-golden}"
-UPSTREAM="beads_viewer"
-COMMIT="9ace029f1b141c4843a1fbd2c4a365888ef734a5"
+# The Go clone is a SIBLING of this repo, not a child. Resolve it from the
+# script's own location so the script works from any working directory —
+# `cd`-relative resolution silently tripped the existence guard when run from
+# the repo root.
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$HERE/.." && pwd)"
+UPSTREAM="${BEADS_VIEWER_CLONE:-$REPO/../beads_viewer}"
+# Upstream is frozen for the parity phase. v0.25.0.
+COMMIT="18afafaefbcfd7fbb2ed4f55b49e7141da6513d2"
 
 # Pin the clock for capture. Go honors SOURCE_DATE_EPOCH (main.go:1165), so
 # time-dependent output (staleness day counts, velocity week buckets) is
@@ -15,17 +27,29 @@ COMMIT="9ace029f1b141c4843a1fbd2c4a365888ef734a5"
 # Override with: SOURCE_DATE_EPOCH=<unix-seconds> scripts/capture_goldens.sh
 export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-1787407612}"
 
-[ -d "$UPSTREAM" ] || { echo "ERROR: $UPSTREAM/ clone not found"; exit 1; }
+[ -d "$UPSTREAM/.git" ] || {
+  echo "ERROR: Go reference clone not found at $UPSTREAM" >&2
+  echo "       Set BEADS_VIEWER_CLONE=/path/to/beads_viewer" >&2
+  exit 1
+}
 
-cd "$UPSTREAM"
-current=$(git rev-parse HEAD)
-[ "$current" = "$COMMIT" ] || echo "WARN: upstream at $current, expected $COMMIT (proceeding — goldens record actual SHA)"
+current=$(git -C "$UPSTREAM" rev-parse HEAD)
+if [ "$current" != "$COMMIT" ]; then
+  # Hard failure, not a warning. The previous corpus in git/ was labelled with
+  # a Go commit it was never built from (commit 4513446 recaptured all 75 files
+  # from the *Rust* binary; 26c0b03 then claimed a v0.25.0 rebaseline without
+  # recapturing), and a soft warning is what let that happen twice.
+  echo "ERROR: Go clone is at $current, expected $COMMIT." >&2
+  echo "       The parity target is frozen; check out $COMMIT or point" >&2
+  echo "       BEADS_VIEWER_CLONE at a clone that is." >&2
+  exit 1
+fi
 
-echo "Building Go bv..."
-go build -o ../scripts/.bv-go ./cmd/bv
-cd ..
+echo "Building Go bv from $current..."
+( cd "$UPSTREAM" && go build -o "$REPO/scripts/.bv-go" ./cmd/bv )
 
-BV=scripts/.bv-go
+BV="$REPO/scripts/.bv-go"
+cd "$REPO"
 
 # Fixture classes: real repo + synthetic fixtures
 declare -a FIXTURES=(
@@ -55,6 +79,7 @@ declare -a COMMANDS=(
 )
 
 mkdir -p "$OUT"
+captured=0
 
 for fixture in "${FIXTURES[@]}"; do
     name=$(basename "$fixture")
@@ -74,12 +99,12 @@ for fixture in "${FIXTURES[@]}"; do
         # rather than aborting the whole run before the status is inspected.
         if [ "$fixture" != "." ]; then
             set +e
-            (cd "$fixture" && BV_NO_CACHE=1 BV_TEST_MODE=1 "$OLDPWD/$BV" $cmd > "$OLDPWD/$tmp" 2>/dev/null)
+            (cd "$fixture" && BV_NO_CACHE=1 BV_TEST_MODE=1 "$BV" $cmd > "$REPO/$tmp" 2>/dev/null)
             cmd_status=$?
             set -e
         else
             set +e
-            (BV_NO_CACHE=1 BV_TEST_MODE=1 $BV $cmd > "$tmp" 2>/dev/null)
+            (BV_NO_CACHE=1 BV_TEST_MODE=1 "$BV" $cmd > "$tmp" 2>/dev/null)
             cmd_status=$?
             set -e
         fi
@@ -88,6 +113,7 @@ for fixture in "${FIXTURES[@]}"; do
             rm -f "$tmp"
         else
             mv "$tmp" "$f"
+            captured=$((captured + 1))
         fi
     done
 done
@@ -96,18 +122,36 @@ done
 mkdir -p "$OUT/toon"
 for cmd in "--robot-triage" "--robot-next" "--robot-plan" "--robot-insights" "--robot-graph" "--robot-history"; do
     slug=$(echo "$cmd" | tr ' -' '__')
-    (BV_NO_CACHE=1 BV_TEST_MODE=1 $BV $cmd --format toon > "$OUT/toon/selfrepo${slug}.toon" 2>/dev/null) || echo "SKIP toon: $cmd"
+    (BV_NO_CACHE=1 BV_TEST_MODE=1 "$BV" $cmd --format toon > "$OUT/toon/selfrepo${slug}.toon" 2>/dev/null) || echo "SKIP toon: $cmd"
 done
 
-# Record provenance of the run. `source_date_epoch` is the instant the
-# capture was pinned to; golden_comparison reads it so the test clock can
-# never drift from the corpus.
+rm -f "$BV"
+
+# Write provenance only if something was actually captured, and only after the
+# oracle's own commit has been re-checked. The previous script stamped
+# METADATA unconditionally, so a run that captured nothing — or captured from
+# the wrong build — still produced a file asserting a Go commit, which is how
+# a corpus built from the Rust binary came to be labelled `18afafa`.
+if [ "$captured" -eq 0 ]; then
+    echo "ERROR: nothing was captured; refusing to write METADATA.txt" >&2
+    exit 1
+fi
+
+built_from=$(git -C "$UPSTREAM" rev-parse HEAD)
+if [ "$built_from" != "$COMMIT" ]; then
+    echo "ERROR: Go clone moved to $built_from during the run; refusing to write METADATA.txt" >&2
+    exit 1
+fi
+
+# `source_date_epoch` is the instant the capture was pinned to; golden_comparison
+# reads it so the test clock can never drift from the corpus.
 {
     echo "captured_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    echo "go_commit: $current"
+    echo "producer: go-bv-oracle"
+    echo "go_commit: $built_from"
     echo "expected_commit: $COMMIT"
     echo "source_date_epoch: $SOURCE_DATE_EPOCH"
+    echo "captured_files: $captured"
 } > "$OUT/METADATA.txt"
 
-rm -f scripts/.bv-go
-echo "Goldens written to $OUT/"
+echo "Captured $captured files from Go $built_from into $OUT/"

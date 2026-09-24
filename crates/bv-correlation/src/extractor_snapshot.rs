@@ -621,7 +621,14 @@ fn causal_snapshot_state(
             state.known = false;
         }
         for dep in &record.dependencies {
-            if !dep_type_is_valid(&dep.dep_type) || dep.depends_on_id.is_empty() {
+            // Go: `(dep.Type != "" && !model.DependencyType(dep.Type).IsValid())
+            // || dep.DependsOnID == ""`. The empty type is exempt — it is the
+            // legacy blocking default, not malformed data. Only a *blank but
+            // non-empty* type (e.g. "   ") invalidates the snapshot, because
+            // `IsValid` is a nonblank test.
+            if (!dep.dep_type.is_empty() && !dep_type_is_valid(&dep.dep_type))
+                || dep.depends_on_id.is_empty()
+            {
                 state.known = false;
             }
         }

@@ -34,10 +34,37 @@ use std::collections::BTreeMap;
 /// identity string. Keeping the original text therefore reproduces Go's output
 /// byte for byte, which re-formatting a UTC-normalized `jiff::Timestamp` would
 /// not: Go preserves the commit's own offset rather than converting to UTC.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// Ordering deliberately compares `ts` and not `raw`. Go's `time.Time`
+/// operators compare instants, and a commit's author offset varies per
+/// repository: `2026-01-02T10:00:00+09:00` is 01:00Z and therefore *earlier*
+/// than `2026-01-02T02:00:00Z`, even though its text sorts later. Deriving
+/// `Ord` here would compare the text and silently invert every ordering and
+/// equality check in this module for such a repository.
+#[derive(Debug, Clone)]
 pub struct GoTime {
     raw: String,
     ts: jiff::Timestamp,
+}
+
+impl PartialEq for GoTime {
+    fn eq(&self, other: &Self) -> bool {
+        self.ts == other.ts
+    }
+}
+
+impl Eq for GoTime {}
+
+impl PartialOrd for GoTime {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for GoTime {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.ts.cmp(&other.ts)
+    }
 }
 
 impl GoTime {
@@ -684,7 +711,9 @@ fn build_chronology_chain(
         // Only a recorded creation bounds a duration; a chain that merely
         // mentions a commit has no known start.
         chain.duration_known = chain.events[0].event_type == CausalEventType::Created;
-        chain.total_time = Some(total);
+        // Go's MarshalJSON nulls this unless DurationKnown, so the chain must
+        // not claim a span it cannot vouch for.
+        chain.total_time = chain.duration_known.then_some(total);
     }
 
     chain.edge_count = chain.events.iter().map(|e| e.enables_ids.len()).sum();
@@ -986,7 +1015,7 @@ fn build_recorded_causality(
                 }
                 link(
                     &mut chain,
-                    cause,
+                    cause as isize,
                     boundaries[i],
                     "dependency_transition",
                     "This committed dependency-state change accompanies the target gate transition; simultaneous changes are joint evidence, not isolated causal estimates.",
@@ -1072,15 +1101,19 @@ fn build_recorded_causality(
 #[allow(clippy::too_many_arguments)]
 fn link(
     chain: &mut CausalChain,
-    from: usize,
+    from: isize,
     to: isize,
     kind: &str,
     evidence: &str,
     duration: i64,
 ) {
-    if to < 0 || to as usize <= from {
+    // Both endpoints are event ids that may be absent (-1). A link needs a
+    // real source and a strictly later target; anything else is not an edge.
+    // Taking `isize` for both keeps a missing id from wrapping to usize::MAX.
+    if from < 0 || to < 0 || to <= from {
         return;
     }
+    let from = from as usize;
     let to = to as usize;
     if let Some(links) = chain.links.as_mut() {
         links.push(CausalLink {
@@ -1230,7 +1263,7 @@ fn measure_recorded(
                 let start = wait_start.expect("set whenever wait_start_id is");
                 link(
                     chain,
-                    wait_start_id as usize,
+                    wait_start_id,
                     boundaries[i],
                     "observed_wait",
                     "Recorded blocked interval ended at this observed state transition.",
@@ -1320,7 +1353,7 @@ fn measure_recorded(
         chain.events[id].source_bead_id = history.bead_id.clone();
         link(
             chain,
-            wait_start_id as usize,
+            wait_start_id,
             id as isize,
             "ongoing_wait",
             "The last known blocked state remains observed through the caller's reference instant.",
@@ -1330,16 +1363,23 @@ fn measure_recorded(
 
     if clocks_valid {
         let total = chain.end_time.sub_nanos(&chain.start_time);
-        chain.total_time = Some(total);
+        // Go's chain MarshalJSON gates `total_time` on DurationKnown alone.
+        chain.total_time = insights.duration_known.then_some(total);
         if insights.duration_known {
             insights.total_duration = Some(total);
         }
-        if insights.duration_known && insights.blocked_duration_known {
+        if insights.blocked_duration_known {
             insights.blocked_duration = Some(blocked_duration);
+        }
+        if insights.duration_known && insights.blocked_duration_known {
             insights.active_duration = Some(total - blocked_duration);
-            if total > 0 {
-                insights.blocked_percentage = Some(blocked_duration as f64 / total as f64 * 100.0);
-            }
+            // Go skips the division when the total is zero but still emits the
+            // field, so a zero-length window reports 0%, not null.
+            insights.blocked_percentage = Some(if total > 0 {
+                blocked_duration as f64 / total as f64 * 100.0
+            } else {
+                0.0
+            });
         }
         if insights.explicit_duration_known {
             insights.explicit_blocked_duration = Some(explicit_duration);
@@ -1845,6 +1885,97 @@ mod tests {
         assert_eq!(r.insights.blocked_duration, Some(86_400_000_000_000));
         let pct = r.insights.blocked_percentage.expect("known");
         assert!((pct - 50.0).abs() < 1e-9, "{pct}");
+    }
+
+    #[test]
+    fn go_time_orders_by_instant_not_by_text() {
+        // The corpus this port was written against is entirely +07:00, which
+        // hides this. A repository whose commits carry mixed offsets breaks any
+        // comparison that reads the timestamp as text: 10:00+09:00 is 01:00Z
+        // and therefore EARLIER than 02:00Z, while its text sorts later.
+        let early = t("2026-01-02T10:00:00+09:00"); // 01:00Z
+        let late = t("2026-01-02T02:00:00Z");
+        assert!(early.before(&late), "instant ordering");
+        assert!(early < late, "Ord must agree with before()");
+        assert!(late > early);
+        assert_ne!(early, late);
+        // Same instant written two ways must compare equal, as Go's Equal does.
+        assert_eq!(early, t("2026-01-02T01:00:00Z"));
+        // And the duration is the true elapsed time, not a text difference.
+        assert_eq!(late.sub_nanos(&early), 3_600_000_000_000);
+        // Serialization still preserves each commit's own offset.
+        assert_eq!(early.raw(), "2026-01-02T10:00:00+09:00");
+    }
+
+    #[test]
+    fn gaps_survive_a_mixed_offset_repository() {
+        // The same trap reached through the public entry point: events ordered
+        // by instant, not by text, so gap measurement still happens.
+        let mut h = history("closed");
+        h.events = vec![
+            event("A-1", EventType::Created, "2026-01-02T10:00:00+09:00"),
+            event("A-1", EventType::Claimed, "2026-01-02T02:00:00Z"),
+            event("A-1", EventType::Closed, "2026-01-02T04:00:00Z"),
+        ];
+        let r = build_causality_chain_at(
+            &h,
+            None,
+            &CausalityOptions::default(),
+            &t("2026-01-03T00:00:00Z"),
+        )
+        .expect("history exists");
+        assert_eq!(r.chain.events.len(), 3);
+        // Instant order puts 01:00Z (the +09:00 creation) first, so the gaps
+        // are one hour then two. Ordering by text would have produced none.
+        let gaps: Vec<Option<i64>> = r.chain.events.iter().map(|e| e.duration_next).collect();
+        assert_eq!(
+            gaps,
+            vec![Some(3_600_000_000_000), Some(7_200_000_000_000), None],
+            "gap measurement must survive mixed offsets"
+        );
+        assert_eq!(r.insights.longest_gap, Some(7_200_000_000_000));
+    }
+
+    #[test]
+    fn chain_total_time_is_null_when_the_duration_is_unknown() {
+        // A chain whose first event is not a recorded creation has no known
+        // start, so Go's MarshalJSON emits null. Printing the elapsed span
+        // anyway would assert a number the evidence does not support.
+        let mut h = history("open");
+        h.events = vec![event("A-1", EventType::Modified, "2026-01-01T00:00:00Z")];
+        let r = build_causality_chain_at(
+            &h,
+            None,
+            &CausalityOptions::default(),
+            &t("2026-06-01T00:00:00Z"),
+        )
+        .expect("history exists");
+        assert!(!r.chain.duration_known);
+        assert!(r.chain.total_time.is_none(), "{:?}", r.chain.total_time);
+    }
+
+    #[test]
+    fn a_zero_length_window_reports_zero_percent_not_null() {
+        // Created and closed in the same commit: the total is 0, so Go skips
+        // the division but still emits the field, because its presence is gated
+        // on the two "known" flags rather than on a non-zero total.
+        let obs = vec![observation(
+            "s1",
+            "2026-01-01T00:00:00Z",
+            absent(true),
+            state("closed", true, DependencyState::Satisfied),
+        )];
+        let h = history("closed");
+        let r = build_causality_chain_at(
+            &h,
+            Some(&history_of(obs)),
+            &CausalityOptions::default(),
+            &t("2026-06-01T00:00:00Z"),
+        )
+        .expect("history exists");
+        assert_eq!(r.chain.end_time.raw(), "2026-01-01T00:00:00Z");
+        assert_eq!(r.chain.total_time, Some(0));
+        assert_eq!(r.insights.blocked_percentage, Some(0.0));
     }
 
     #[test]
