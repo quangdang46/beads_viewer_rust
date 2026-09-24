@@ -546,6 +546,41 @@ fn resolve_executable(path: &Path) -> PathBuf {
 
 /// Go `resolveIssueOrigin(sourcePath)` (pkg/loader/loader.go:157) — bind the
 /// loaded JSONL to a real tracker route, or explain why it cannot.
+/// Go `IsBDWorkspace` (pkg/loader/loader.go:106) — a bd (Dolt) workspace, not
+/// a br one. bd keeps its data under `.beads/dolt/` (server mode) or
+/// `.beads/embeddeddolt/` (embedded, the bd 1.1+ default), and may also say
+/// so in `metadata.json`.
+pub fn is_bd_workspace(beads_dir: &Path) -> bool {
+    if beads_dir.as_os_str().is_empty() {
+        return false;
+    }
+    for dir in ["dolt", "embeddeddolt"] {
+        if let Ok(info) = std::fs::metadata(beads_dir.join(dir)) {
+            if info.is_dir() {
+                return true;
+            }
+        }
+    }
+    let Ok(data) = std::fs::read_to_string(beads_dir.join("metadata.json")) else {
+        return false;
+    };
+    let Ok(meta) = serde_json::from_str::<serde_json::Value>(&data) else {
+        return false;
+    };
+    meta.get("backend")
+        .and_then(|b| b.as_str())
+        .unwrap_or("")
+        .trim()
+        .eq_ignore_ascii_case("dolt")
+}
+
+/// Go `resolveIssueOrigin(sourcePath)` (pkg/loader/loader.go:157) — bind the
+/// loaded JSONL to a real tracker route, or explain why it cannot.
+///
+/// The binding is deliberately strict: the source path must be the database or
+/// the export **the tracker metadata itself declares**. An arbitrary `--db`
+/// JSONL/SQLite input stays readable but may not borrow a nearby tracker just
+/// by containing matching IDs (Go `AttachIssueOrigins`, loader.go:89).
 pub fn resolve_issue_origin(source_path: &str, local_id: &str) -> IssueOrigin {
     let mut origin = IssueOrigin {
         local_id: local_id.to_string(),
@@ -584,22 +619,20 @@ pub fn resolve_issue_origin(source_path: &str, local_id: &str) -> IssueOrigin {
         );
     }
 
-    let resolve_name = |name: &str| -> PathBuf {
+    // Go `filepath.EvalSymlinks` on a metadata-declared name, resolved against
+    // the beads directory.
+    let resolve_name = |name: &str| -> Option<PathBuf> {
         if name.is_empty() {
-            return beads_dir.to_path_buf();
+            return None;
         }
         let p = Path::new(name);
-        if p.is_absolute() {
+        let joined = if p.is_absolute() {
             p.to_path_buf()
         } else {
             beads_dir.join(p)
-        }
+        };
+        std::fs::canonicalize(&joined).ok()
     };
-    let database = resolve_name(
-        meta.get("database")
-            .and_then(|d| d.as_str())
-            .unwrap_or("beads.db"),
-    );
 
     origin.tracker_directory = beads_dir.to_string_lossy().to_string();
     origin.working_directory = beads_dir
@@ -607,9 +640,51 @@ pub fn resolve_issue_origin(source_path: &str, local_id: &str) -> IssueOrigin {
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
     origin.tracker = "br".to_string();
-    origin.database = database.to_string_lossy().to_string();
 
-    let caps = installed_tracker_capabilities("br");
+    if is_bd_workspace(beads_dir) {
+        origin.tracker = "bd".to_string();
+        // The bd bridge specifically exports issues.jsonl from its Dolt
+        // directory; an unrelated sidecar file is not that live source.
+        if path.file_name().and_then(|n| n.to_str()) != Some("issues.jsonl") {
+            return refuse(
+                &mut origin,
+                "source is not the live bd compatibility export",
+            );
+        }
+        origin.database = beads_dir.to_string_lossy().to_string();
+    } else {
+        let Some(database) =
+            resolve_name(meta.get("database").and_then(|d| d.as_str()).unwrap_or(""))
+        else {
+            return refuse(
+                &mut origin,
+                "metadata does not resolve to an existing tracker database",
+            );
+        };
+        let is_regular = std::fs::metadata(&database)
+            .map(|m| m.is_file())
+            .unwrap_or(false);
+        if !is_regular {
+            return refuse(&mut origin, "metadata database is not a regular file");
+        }
+        // Anti-hijack: the loaded file must be the declared database or its
+        // declared JSONL export. Otherwise any JSONL next to a live tracker
+        // could be presented as that tracker's data.
+        let export = resolve_name(
+            meta.get("jsonl_export")
+                .and_then(|d| d.as_str())
+                .unwrap_or(""),
+        );
+        if path != database && Some(&path) != export.as_ref() {
+            return refuse(
+                &mut origin,
+                "source is not the metadata-declared live database or export",
+            );
+        }
+        origin.database = database.to_string_lossy().to_string();
+    }
+
+    let caps = installed_tracker_capabilities(&origin.tracker);
     if !caps.error.is_empty() {
         // Go returns `refuse(caps.Error)` immediately (pkg/loader/loader.go:168-170),
         // leaving `Executable` empty so `routeAvailable()` is false and the
@@ -775,5 +850,132 @@ mod probe_tests {
         let caps = installed_tracker_capabilities("definitely-not-a-real-tracker-xyz");
         assert!(!caps.executable.is_empty() || !caps.error.is_empty());
         assert!(caps.error.contains("unavailable"), "{}", caps.error);
+    }
+}
+
+#[cfg(test)]
+mod resolution_tests {
+    use super::*;
+
+    fn write_workspace(dir: &Path, meta: &str, files: &[&str]) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("metadata.json"), meta).unwrap();
+        for f in files {
+            std::fs::write(dir.join(f), "x").unwrap();
+        }
+    }
+
+    /// A JSONL that is neither the declared database nor the declared export
+    /// must not borrow the nearby tracker — Go refuses it
+    /// (pkg/loader/loader.go:161) so an arbitrary `--db` input cannot be
+    /// presented as that tracker's live data.
+    #[test]
+    fn foreign_source_is_refused() {
+        let root = std::env::temp_dir().join("bv-tracker-foreign");
+        let beads = root.join(".beads");
+        let _ = std::fs::remove_dir_all(&root);
+        write_workspace(
+            &beads,
+            r#"{"database":"beads.db","jsonl_export":"issues.jsonl"}"#,
+            &["beads.db", "issues.jsonl", "somebody-elses.jsonl"],
+        );
+        let o = resolve_issue_origin(beads.join("somebody-elses.jsonl").to_str().unwrap(), "X-1");
+        assert!(
+            o.read_only_reason.contains("not the metadata-declared"),
+            "{}",
+            o.read_only_reason
+        );
+        assert!(!o.route_available());
+    }
+
+    /// The declared export itself is the live source and must resolve.
+    #[test]
+    fn declared_export_is_accepted() {
+        let root = std::env::temp_dir().join("bv-tracker-export");
+        let _ = std::fs::remove_dir_all(&root);
+        let beads = root.join(".beads");
+        write_workspace(
+            &beads,
+            r#"{"database":"beads.db","jsonl_export":"issues.jsonl"}"#,
+            &["beads.db", "issues.jsonl"],
+        );
+        let o = resolve_issue_origin(beads.join("issues.jsonl").to_str().unwrap(), "X-1");
+        // No refusal about the source binding; only the tracker probe may fail
+        // here, because the test machine has no `br` on PATH.
+        assert!(
+            !o.read_only_reason.contains("metadata-declared"),
+            "{}",
+            o.read_only_reason
+        );
+        assert_eq!(o.tracker, "br");
+    }
+
+    /// A missing database is refused rather than silently binding the dir.
+    #[test]
+    fn missing_database_is_refused() {
+        let root = std::env::temp_dir().join("bv-tracker-nodb");
+        let _ = std::fs::remove_dir_all(&root);
+        let beads = root.join(".beads");
+        write_workspace(
+            &beads,
+            r#"{"database":"absent.db","jsonl_export":"issues.jsonl"}"#,
+            &["issues.jsonl"],
+        );
+        let o = resolve_issue_origin(beads.join("issues.jsonl").to_str().unwrap(), "X-1");
+        assert!(
+            o.read_only_reason.contains("does not resolve")
+                || o.read_only_reason.contains("regular file"),
+            "{}",
+            o.read_only_reason
+        );
+    }
+
+    #[test]
+    fn bd_workspace_detected_from_dolt_dir() {
+        let root = std::env::temp_dir().join("bv-tracker-bd");
+        let _ = std::fs::remove_dir_all(&root);
+        let beads = root.join(".beads");
+        std::fs::create_dir_all(beads.join("dolt")).unwrap();
+        std::fs::write(beads.join("metadata.json"), r#"{"backend":"dolt"}"#).unwrap();
+        std::fs::write(beads.join("issues.jsonl"), "x").unwrap();
+        assert!(is_bd_workspace(&beads));
+        let o = resolve_issue_origin(beads.join("issues.jsonl").to_str().unwrap(), "X-1");
+        assert_eq!(o.tracker, "bd");
+        // `beads` comes from a temp path that may be a symlink (macOS
+        // /var -> /private/var); the origin records the resolved directory.
+        let expected = std::fs::canonicalize(&beads).unwrap_or(beads.clone());
+        assert_eq!(o.database, expected.to_string_lossy());
+    }
+
+    /// bd exports issues.jsonl specifically; any other file is not its live
+    /// source even inside a bd workspace.
+    #[test]
+    fn bd_rejects_non_export_file() {
+        let root = std::env::temp_dir().join("bv-tracker-bd2");
+        let _ = std::fs::remove_dir_all(&root);
+        let beads = root.join(".beads");
+        std::fs::create_dir_all(beads.join("dolt")).unwrap();
+        std::fs::write(beads.join("metadata.json"), r#"{"backend":"dolt"}"#).unwrap();
+        std::fs::write(beads.join("other.jsonl"), "x").unwrap();
+        let o = resolve_issue_origin(beads.join("other.jsonl").to_str().unwrap(), "X-1");
+        assert!(
+            o.read_only_reason.contains("bd compatibility export"),
+            "{}",
+            o.read_only_reason
+        );
+    }
+
+    #[test]
+    fn unsupported_backend_refused() {
+        let root = std::env::temp_dir().join("bv-tracker-bad");
+        let _ = std::fs::remove_dir_all(&root);
+        let beads = root.join(".beads");
+        write_workspace(&beads, r#"{"backend":"postgres"}"#, &["issues.jsonl"]);
+        let o = resolve_issue_origin(beads.join("issues.jsonl").to_str().unwrap(), "X-1");
+        assert!(
+            o.read_only_reason.contains("unsupported tracker backend"),
+            "{}",
+            o.read_only_reason
+        );
     }
 }
