@@ -5581,6 +5581,29 @@ fn run_robot_alerts() -> ExitCode {
     };
     let mut payload = full_envelope_for(&hash, &loaded);
     payload["alerts"] = serde_json::to_value(&filtered_alerts).unwrap_or_default();
+    // Go emits `skipped_checks` alongside the alerts so a check that did not
+    // run is never read as one that found nothing. Derived directly from Go's
+    // `expensiveCheckAllowed` rule rather than by re-running the analysis.
+    {
+        let limit = bv_analysis::drift::DriftConfig::default().proactive_max_issues;
+        if limit > 0 && loaded.len() > limit {
+            let skipped: Vec<bv_analysis::drift::SkippedCheck> =
+                ["potential_duplicate", "priority_mismatch"]
+                    .iter()
+                    .map(|t| bv_analysis::drift::SkippedCheck {
+                        check_type: (*t).to_string(),
+                        reason: format!(
+                            "{} issues exceed proactive_max_issues={}",
+                            loaded.len(),
+                            limit
+                        ),
+                    })
+                    .collect();
+            if !skipped.is_empty() {
+                payload["skipped_checks"] = serde_json::to_value(&skipped).unwrap_or_default();
+            }
+        }
+    }
     payload["summary"] = serde_json::json!({
         "total": filtered_alerts.len(),
         "critical": count_sev("critical"),
