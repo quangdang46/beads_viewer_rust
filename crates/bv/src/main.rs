@@ -3277,7 +3277,24 @@ fn run_robot_insights() -> ExitCode {
     let (issues, hash, p1, status, g, phase2) = all;
 
     let pr_obj = to_id_map(&g, &bv_graph_core::pagerank_default(&g));
-    let bw_raw = bv_graph_core::betweenness(&g);
+    // Go's betweenness here is the config-driven Phase 2 result, not a
+    // direct exact call: `ConfigForSize` switches to approximate sampling above
+    // the density/size thresholds (config.go:158-190). Computing exact
+    // unconditionally gave `large_cyclic_600` max 184 / 337 non-zero where Go
+    // reports 210 / 176, and `xl_2500` max 12 / 124 where Go reports
+    // 37.5 / 15.
+    let bw_nodes = g.len();
+    let (use_approx, skip_bw) =
+        bv_analysis::analyzer::AnalysisBudget::default().betweenness_mode(bw_nodes);
+    let bw_sample =
+        bv_analysis::analyzer::AnalysisBudget::default().recommend_sample_size(bw_nodes, 0);
+    let bw_raw: Vec<f64> = if skip_bw {
+        Vec::new()
+    } else if use_approx {
+        bv_graph_core::betweenness_approx(&g, bw_sample, Some(1))
+    } else {
+        bv_graph_core::betweenness(&g)
+    };
     let mut bw_obj = to_id_map(&g, &bw_raw);
     // gonum Betweenness omits zero-score nodes (endpoints of a DAG chain).
     bw_obj.retain(|_, v| v.as_f64() != Some(0.0));
