@@ -1,8 +1,30 @@
-//! Cycle Detection algorithms.
+//! Cycle Detection algorithms — **not** the canonical copy.
 //!
 //! Provides:
 //! - Tarjan's SCC algorithm for fast cycle presence check
 //! - Johnson's algorithm for full cycle enumeration
+//!
+//! # Which file is canonical
+//!
+//! `crates/bv-graph-core/src/algorithms/cycles.rs` is canonical. It is the only
+//! one on the parity path: `bv-analysis` calls its `enumerate_cycles`, which
+//! routes to `find_cycles_safe` — Go's `findCyclesSafe`
+//! (`pkg/analysis/graph_cycles.go:20-68`), one representative cycle per Tarjan
+//! SCC, not one per elementary circuit. Every `Cycles` list, `cycle_break` and
+//! `cycle_warning` field the `bv` CLI emits comes from there.
+//!
+//! This file is a **deliberate near-duplicate**, not an oversight. The two
+//! crates share no dependency edge — `bv-graph-wasm` does not depend on
+//! `bv-graph-core` and has its own `DiGraph` in `crate::graph` — and no
+//! workspace crate depends on `bv-graph-wasm` either. It exists only to feed
+//! the browser bundle in `crates/bv-graph-wasm/src/graph.rs`.
+//!
+//! The trap this comment exists to defuse: the two crates both export a
+//! function called `enumerate_cycles`, and here it is Johnson's all-elementary
+//! enumeration, which is the OPPOSITE of the Go oracle's one-per-SCC
+//! contract. `cycle_break_suggestions` here is likewise the browser viewer's
+//! own scorer and has no Go counterpart. Do not "port" Go's `findCyclesSafe`
+//! over this file, and do not make the two agree by editing the canonical one.
 
 use crate::graph::DiGraph;
 use serde::Serialize;
