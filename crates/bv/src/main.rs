@@ -3286,7 +3286,18 @@ fn run_robot_insights() -> ExitCode {
     let hits_result = bv_graph_core::hits_default(&g);
     let hub_obj = to_id_map(&g, &hits_result.hubs);
     let auth_obj = to_id_map(&g, &hits_result.authorities);
-    let cp_heights = bv_graph_core::critical_path_heights(&g);
+    // Go computes critical-path heights only when Phase 1's topological sort
+    // covered every node (graph.go:2161-2163) — i.e. the graph is acyclic. A
+    // height DP needs a valid order; on a cyclic graph gonum returns an
+    // Unorderable error, Go skips the metric and leaves the map empty.
+    // large_cyclic_600 is cyclic: Go emits `{}` there, Rust emitted 200
+    // entries of invented scores.
+    let cp_heights: Vec<f64> =
+        if bv_graph_core::algorithms::topo::topological_sort_gonum(&g).is_some() {
+            bv_graph_core::critical_path_heights(&g)
+        } else {
+            Vec::new()
+        };
     let cp_obj = to_id_map(&g, &cp_heights);
     let cores = bv_graph_core::kcore(&g);
     let core_obj = to_id_map(&g, &cores.iter().map(|&v| v as f64).collect::<Vec<_>>());
