@@ -46,6 +46,15 @@ pub struct HITSResult {
 /// 3. Normalize both vectors
 /// 4. Repeat until convergence
 ///
+/// Byte-compatibility with `gonum/graph/network.HITS` rests on two details
+/// that a reader would otherwise "clean up":
+///
+/// * **The two normalization norms are fused multiply-adds.** See the
+///   `mul_add` comments in the loop body; a plain `norm += a * a` puts every
+///   score 1 ULP away from Go's.
+/// * **`l2_norm` is gonum's scaled `dnrm2`, not a naive sum of squares.**
+///   See its own doc comment.
+///
 /// # Arguments
 /// * `graph` - The directed graph
 /// * `config` - HITS configuration parameters
@@ -88,9 +97,22 @@ pub fn hits(graph: &DiGraph, config: &HITSConfig) -> HITSResult {
             // normalized vector, not the raw one.
             delta_auth[v] = auth[v];
             auth[v] = a;
-            norm += a * a;
+            // FUSED, deliberately: `norm += a * a` in Go compiles to a single
+            // FMADDD on arm64 (`1f410020 FMADDD F1, F0, F1, F0` attributed to
+            // hits.go:68 in the shipped bv binary), so Go rounds `a*a + norm`
+            // ONCE. A plain `norm += a * a` rounds twice and drifts the
+            // normalization by 1 ULP, which propagates into every hub and
+            // authority score. Do not "simplify" this back — see the note on
+            // this function's doc comment.
+            norm = a.mul_add(a, norm);
         }
         norm = norm.sqrt();
+        // gonum divides unconditionally (hits.go:73-76). The `norm > 0.0`
+        // guard is a deliberate deviation: Go's only caller gates on
+        // `Edges().Len() > 0` (pkg/analysis/graph.go:2118), which makes
+        // `norm == 0` unreachable there, whereas Rust's `analyzer.rs:867`
+        // path has no such gate. Dividing by zero here would emit NaN
+        // scores instead of zeros, so the guard is kept.
         if norm > 0.0 {
             for v in 0..n {
                 auth[v] /= norm;
@@ -107,7 +129,9 @@ pub fn hits(graph: &DiGraph, config: &HITSConfig) -> HITSResult {
             }
             delta_hub[u] = hubs[u];
             hubs[u] = h;
-            norm += h * h;
+            // Fused for the same reason as the authority norm above; Go
+            // compiles hits.go:85 to `1f410020 FMADDD F1, F0, F1, F0`.
+            norm = h.mul_add(h, norm);
         }
         norm = norm.sqrt();
         if norm > 0.0 {
@@ -134,8 +158,48 @@ pub fn hits(graph: &DiGraph, config: &HITSConfig) -> HITSResult {
     }
 }
 
-fn l2_norm(v: &[f64]) -> f64 {
-    v.iter().map(|x| x * x).sum::<f64>().sqrt()
+/// L2 norm, matching gonum's `floats.Norm(s, 2)`.
+///
+/// `floats.Norm` special-cases `L == 2` to `f64.L2NormUnitary`
+/// (gonum v0.17.0 floats/floats.go:604-605). On the build platforms bv
+/// targets, `L2NormUnitary` is the pure-Go BLAS `dnrm2` in
+/// `internal/asm/f64/l2norm_noasm.go:13-35` — the amd64 assembly is gated
+/// behind `!amd64 || noasm || gccgo || safe` and is not used on darwin/arm64.
+/// It accumulates a running `scale` (= max |x|) with a rescaled `sumSquares`
+/// seeded at 1.0, which is what keeps the sum from overflowing or flushing to
+/// zero where a naive `sqrt(sum(x*x))` would.
+///
+/// This value only ever feeds the `< tol` convergence test — it is never fed
+/// back into the scores — so on the frozen goldens it changes no byte. It is
+/// kept faithful because the two forms are not equal: on the last iteration
+/// of `large_cyclic_600` gonum's scaled form yields
+/// 0.00083638227391777039948 where the naive form yields
+/// 0.00083638227391776964054. They are both far below the 1e-3 tolerance, so
+/// the iteration count is the same.
+fn l2_norm(x: &[f64]) -> f64 {
+    let mut scale = 0.0_f64;
+    let mut sum_squares = 1.0_f64;
+    for &v in x {
+        if v == 0.0 {
+            continue;
+        }
+        let absxi = v.abs();
+        if absxi.is_nan() {
+            return f64::NAN;
+        }
+        if scale < absxi {
+            let s = scale / absxi;
+            sum_squares = 1.0 + sum_squares * s * s;
+            scale = absxi;
+        } else {
+            let s = absxi / scale;
+            sum_squares += s * s;
+        }
+    }
+    if scale == f64::INFINITY {
+        return f64::INFINITY;
+    }
+    scale * sum_squares.sqrt()
 }
 
 /// Compute HITS with default parameters.
@@ -349,5 +413,159 @@ mod tests {
             avg_hub_hub > avg_auth_hub,
             "Hub nodes should have higher hub scores"
         );
+    }
+
+    /// Fills `v` with a deterministic pseudo-random spread of magnitudes in
+    /// (0, 1) — a stand-in for one `delta` vector of a converged HITS run.
+    fn pseudo_delta(seed: u64, n: usize) -> Vec<f64> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let bits = (s >> 11) as f64 / (1u64 << 53) as f64;
+                0.25 + 0.75 * bits
+            })
+            .collect()
+    }
+
+    /// The normalization norm is a fused multiply-add, matching the FMADDD the
+    /// Go toolchain emits for `norm += a * a` (gonum network/hits.go:68 and
+    /// :85). Dropping the fusion shifts the result by 1 ULP — on the frozen
+    /// `large_cyclic_600` corpus that moved 47/50 hub scores and 24/50
+    /// authority scores off the golden, and flipped two adjacent pairs in
+    /// the emitted order. This test fails if anyone "simplifies" the mul_add.
+    #[test]
+    fn test_hits_norm_accumulation_is_fused() {
+        // A hub/hub graph with uneven degrees so the per-node sums differ in
+        // magnitude and the two rounding modes visibly disagree.
+        let mut graph = DiGraph::new();
+        for i in 0..24 {
+            graph.add_node(&format!("n{}", i));
+        }
+        // Sources 0..6 fan out to sinks 12..24 with a ragged pattern.
+        for i in 0..7 {
+            for j in 12..24 {
+                if (i * 7 + j * 3) % 5 != 0 {
+                    graph.add_edge(i, j);
+                }
+            }
+        }
+        // One mid chain so authorities feed back into hubs.
+        for j in 12..18 {
+            graph.add_edge(7, j);
+        }
+        for i in 18..24 {
+            graph.add_edge(i, 8);
+        }
+
+        let fused = hits_default(&graph);
+
+        // Reference: the same loop with the naive (twice-rounded) norm, which
+        // is what the port looked like before the mul_add was restored.
+        let mut auth = [1.0_f64; 24];
+        let mut hubs = [1.0_f64; 24];
+        let mut delta_auth = [0.0_f64; 24];
+        let mut delta_hub = [0.0_f64; 24];
+        let mut iterations = 0;
+        loop {
+            iterations += 1;
+            let mut norm = 0.0_f64;
+            for v in 0..24 {
+                let mut a = 0.0_f64;
+                for &u in graph.predecessors_slice(v) {
+                    a += hubs[u];
+                }
+                delta_auth[v] = auth[v];
+                auth[v] = a;
+                norm += a * a; // NOT fused — deliberately the old form
+            }
+            norm = norm.sqrt();
+            if norm > 0.0 {
+                for v in 0..24 {
+                    auth[v] /= norm;
+                    delta_auth[v] -= auth[v];
+                }
+            }
+            let mut norm = 0.0_f64;
+            for u in 0..24 {
+                let mut h = 0.0_f64;
+                for &v in graph.successors_slice(u) {
+                    h += auth[v];
+                }
+                delta_hub[u] = hubs[u];
+                hubs[u] = h;
+                norm += h * h; // NOT fused — deliberately the old form
+            }
+            norm = norm.sqrt();
+            if norm > 0.0 {
+                for u in 0..24 {
+                    hubs[u] /= norm;
+                    delta_hub[u] -= hubs[u];
+                }
+            }
+            if l2_norm(&delta_auth) < 1e-3 && l2_norm(&delta_hub) < 1e-3 {
+                break;
+            }
+            if iterations >= 100 {
+                break;
+            }
+        }
+
+        assert_eq!(
+            fused.iterations, iterations,
+            "fused and unfused runs must take the same number of iterations \
+             (the norm choice only gates the convergence test)"
+        );
+
+        let differs = fused
+            .hubs
+            .iter()
+            .zip(&hubs)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_ne!(
+            differs, 0,
+            "fused and unfused norm accumulation produced bit-identical \
+             scores on this graph, so the test no longer proves the mul_add \
+             is load-bearing — pick a graph where the two disagree"
+        );
+    }
+
+    /// `l2_norm` is gonum's scaled dnrm2: a running `scale` with a rescaled
+    /// `sumSquares` seeded at 1.0. It must agree with the naive form to
+    /// within a few ULP on well-conditioned input, and it must not overflow
+    /// or underflow where the naive form would.
+    #[test]
+    fn test_l2_norm_matches_naive_within_ulp() {
+        let v = pseudo_delta(0x5eed_1234, 512);
+        let naive = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let scaled = l2_norm(&v);
+        assert!(
+            (naive - scaled).abs() <= 4.0 * scaled * f64::EPSILON,
+            "scaled {scaled:e} vs naive {naive:e} drift by more than a few ULP"
+        );
+    }
+
+    #[test]
+    fn test_l2_norm_specials() {
+        assert_eq!(l2_norm(&[]), 0.0, "empty vector: scale=0, 0*sqrt(1)=0");
+        assert_eq!(l2_norm(&[0.0, 0.0]), 0.0);
+        assert_eq!(l2_norm(&[3.0, 4.0]), 5.0);
+        assert_eq!(l2_norm(&[-3.0, 4.0]), 5.0);
+        assert!(l2_norm(&[f64::NAN, 1.0]).is_nan());
+        assert_eq!(l2_norm(&[f64::INFINITY, 1.0]), f64::INFINITY);
+    }
+
+    /// The naive `sqrt(sum(x*x))` overflows to infinity once `sum(x*x)`
+    /// exceeds f64::MAX; the scaled form does not. (It is a convergence-test
+    /// input, so this cannot corrupt scores — it proves the port is the
+    /// overflow-safe routine gonum actually uses.)
+    #[test]
+    fn test_l2_norm_does_not_overflow() {
+        let v = vec![1e200_f64; 4];
+        assert!(v.iter().map(|x| x * x).sum::<f64>().is_infinite());
+        assert_eq!(l2_norm(&v), 2e200_f64);
     }
 }

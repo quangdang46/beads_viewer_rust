@@ -2,11 +2,23 @@
 //!
 //! Provides:
 //! - Tarjan's SCC algorithm for fast cycle presence check
-//! - Johnson's algorithm for full cycle enumeration
+//! - `find_cycles_safe`: the Go oracle's cycle enumeration — one representative
+//!   per strongly connected component, not every elementary cycle
+//! - Johnson's algorithm for full elementary-cycle enumeration (wasm viewer only)
+//!
+//! Parity note: `pkg/analysis/graph_cycles.go:16-20` states the contract in one
+//! line — "extracts one cycle per component ... The result retains the
+//! pre-limit representative count so callers can report truncation without
+//! implying that every simple cycle in an SCC was enumerated." Every
+//! `Cycles` list and `cycle_warning` suggestion in the robot surface derives
+//! from that function, so it is the entry point for byte-exactness.
+//! `enumerate_elementary_cycles` is the Johnson implementation that only
+//! `cycle_break_suggestions` here — the browser viewer's scorer, not Go's —
+//! consumes; Go has no counterpart for it and it is NOT on the parity path.
 
 use crate::graph::DiGraph;
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Result of Strongly Connected Components analysis.
 #[derive(Serialize, Clone)]
@@ -108,10 +120,183 @@ pub fn has_cycles(graph: &DiGraph) -> bool {
     tarjan_scc(graph).has_cycles
 }
 
+// ============================================================================
+// Cycle detection — the Go oracle's algorithm
+// ============================================================================
+
+/// Go `cycleDetectionResult` (`pkg/analysis/graph_cycles.go:10-14`).
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct CycleEnumerationResult {
+    /// Stored cycle representatives: one per cyclic component, sorted and then
+    /// truncated to `limit`.
+    pub cycles: Vec<Vec<usize>>,
+    /// Go `truncated`: the representative count exceeded `limit`. Recorded
+    /// BEFORE truncation, so it never claims a cap that was not reached.
+    pub truncated: bool,
+    /// Go `total`: representatives found before truncation. Consumers use it to
+    /// report "truncated to N of M" without implying M is every simple cycle.
+    pub count: usize,
+}
+
+/// Go `findCyclesSafe` (`pkg/analysis/graph_cycles.go:20-68`).
+///
+/// Tarjan's SCC first, then one representative per component: a singleton SCC
+/// yields `[n, n]` when `n` has a self-edge, and every larger SCC yields the
+/// single cycle `find_one_cycle_in_scc` extracts. The output order is Go's
+/// `sort.Slice` at :46-59 — length ascending, then lexicographic on node
+/// indices — and it is observable in `--robot-insights` `Cycles`, in
+/// `advanced_insights.cycle_break` `in_cycles` indices, and in the order
+/// `cycle_warning` suggestions are generated.
+///
+/// Node indices are assigned in sorted issue-ID order by the analyzer
+/// (`analyzer.rs:650-694`), so "lexicographic on indices" is exactly Go's
+/// numeric comparison of the compact int64 node IDs, and "lexicographic on
+/// indices" is likewise exactly Go's comparison of the issue-ID strings those
+/// indices stand for.
+pub fn find_cycles_safe(graph: &DiGraph, limit: usize) -> CycleEnumerationResult {
+    if limit == 0 {
+        return CycleEnumerationResult::default();
+    }
+
+    let sccs = tarjan_scc(graph);
+    let mut cycles: Vec<Vec<usize>> = Vec::new();
+
+    for scc in &sccs.components {
+        if scc.len() == 1 {
+            // Self-loop check (graph_cycles.go:28-35). `add_edge` deduplicates
+            // adjacency, so membership is the same predicate as Go's
+            // `HasEdgeFromTo`.
+            let n = scc[0];
+            if graph.successors_slice(n).contains(&n) {
+                cycles.push(vec![n, n]);
+            }
+            continue;
+        }
+        if let Some(cycle) = find_one_cycle_in_scc(graph, scc) {
+            cycles.push(cycle);
+        }
+    }
+
+    // graph_cycles.go:46-59. `Vec<usize>`'s `Ord` is the elementwise
+    // comparison Go writes out by hand.
+    cycles.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+
+    let total = cycles.len();
+    let truncated = total > limit;
+    if truncated {
+        cycles.truncate(limit);
+    }
+    CycleEnumerationResult {
+        cycles,
+        truncated,
+        count: total,
+    }
+}
+
+/// Go `findOneCycleInSCC` (`pkg/analysis/graph_cycles.go:71-155`).
+///
+/// Iterative DFS inside one component, seeded at its lowest-index member, with
+/// neighbours pre-filtered to the component and sorted. The first edge onto a
+/// node still on the stack closes the cycle, which is why a component with many
+/// elementary cycles still reports exactly one.
+fn find_one_cycle_in_scc(graph: &DiGraph, scc: &[usize]) -> Option<Vec<usize>> {
+    // Sort SCC nodes for a deterministic DFS starting point (:73-75).
+    let mut scc_sorted = scc.to_vec();
+    scc_sorted.sort_unstable();
+
+    let in_scc: HashSet<usize> = scc_sorted.iter().copied().collect();
+
+    // Pre-compute and sort adjacency lists for nodes in SCC (:85-99). The
+    // analyzer already inserts edges in sorted order, so the sort is a no-op
+    // there; it is kept because Go performs it and other DiGraph producers do
+    // not.
+    let mut adj: HashMap<usize, Vec<usize>> = HashMap::with_capacity(scc_sorted.len());
+    for &u in &scc_sorted {
+        let mut neighbors: Vec<usize> = graph
+            .successors_slice(u)
+            .iter()
+            .copied()
+            .filter(|n| in_scc.contains(n))
+            .collect();
+        neighbors.sort_unstable();
+        adj.insert(u, neighbors);
+    }
+
+    let mut visited: HashSet<usize> = HashSet::new();
+    let mut on_stack: HashSet<usize> = HashSet::new();
+    let mut stack_pos: HashMap<usize, usize> = HashMap::new();
+    let mut neighbor_index: HashMap<usize, usize> = HashMap::new();
+    let mut stack: Vec<usize> = Vec::new();
+
+    if let Some(&first) = scc_sorted.first() {
+        stack_pos.insert(first, 0);
+        stack.push(first);
+    }
+
+    while let Some(&u) = stack.last() {
+        if visited.insert(u) {
+            on_stack.insert(u);
+        }
+
+        let idx = *neighbor_index.get(&u).unwrap_or(&0);
+        let empty: [usize; 0] = [];
+        let neighbors: &[usize] = adj.get(&u).map_or(&empty, |v| v.as_slice());
+
+        if idx < neighbors.len() {
+            let v = neighbors[idx];
+            neighbor_index.insert(u, idx + 1);
+
+            if on_stack.contains(&v) {
+                // Cycle found: reconstruct v..u, then close with v (:132-140).
+                if let Some(&stack_idx) = stack_pos.get(&v) {
+                    let mut cycle = stack[stack_idx..].to_vec();
+                    cycle.push(v);
+                    return Some(cycle);
+                }
+            }
+
+            if !visited.contains(&v) {
+                stack_pos.insert(v, stack.len());
+                stack.push(v);
+            }
+        } else {
+            // All neighbours visited: backtrack (:146-152).
+            on_stack.remove(&u);
+            stack_pos.remove(&u);
+            stack.pop();
+            neighbor_index.remove(&u);
+        }
+    }
+
+    None
+}
+
+/// Cycles as stored by the Go oracle: one representative per cyclic component,
+/// length-then-lexicographic sorted, capped at `max_cycles`.
+pub fn enumerate_cycles(graph: &DiGraph, max_cycles: usize) -> Vec<Vec<usize>> {
+    find_cycles_safe(graph, max_cycles).cycles
+}
+
+/// Go `cycleDetectionResult` under Rust's existing name, with Go's semantics:
+/// `count` is the pre-truncation total and `truncated` means the cap bit.
+pub fn enumerate_cycles_with_info(graph: &DiGraph, max_cycles: usize) -> CycleEnumerationResult {
+    find_cycles_safe(graph, max_cycles)
+}
+
+// ============================================================================
+// Elementary cycle enumeration (Johnson) — wasm viewer, no Go counterpart
+// ============================================================================
+
 /// Enumerate elementary cycles using Johnson's algorithm.
 ///
 /// Reference: Donald B. Johnson, "Finding All the Elementary Circuits of a Directed Graph"
 /// SIAM J. Computing, Vol. 4, No. 1, March 1975
+///
+/// Not the Go oracle's algorithm: Go extracts one cycle per SCC, and every
+/// `Cycles` / `cycle_break` / `cycle_warning` field in the robot surface is
+/// built on that. This is kept only because the browser viewer's cycle-break
+/// ranking scores an edge by how many distinct circuits it participates in, a
+/// question the oracle never asks.
 ///
 /// # Arguments
 /// * `graph` - The directed graph
@@ -119,7 +304,7 @@ pub fn has_cycles(graph: &DiGraph) -> bool {
 ///
 /// # Returns
 /// Vector of cycles, each cycle is a vector of node indices in order
-pub fn enumerate_cycles(graph: &DiGraph, max_cycles: usize) -> Vec<Vec<usize>> {
+pub fn enumerate_elementary_cycles(graph: &DiGraph, max_cycles: usize) -> Vec<Vec<usize>> {
     let n = graph.len();
     if n == 0 || max_cycles == 0 {
         return Vec::new();
@@ -230,22 +415,25 @@ impl CircuitState<'_> {
     }
 }
 
-/// Result of cycle enumeration with metadata.
-#[derive(Serialize)]
-pub struct CycleEnumerationResult {
-    /// List of cycles found
+/// Elementary-cycle enumeration with truncation metadata (Johnson).
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct ElementaryCycleResult {
+    /// Elementary circuits found, capped at `max_cycles`.
     pub cycles: Vec<Vec<usize>>,
-    /// Whether max_cycles limit was reached
+    /// Whether the cap was reached.
     pub truncated: bool,
-    /// Number of cycles found
+    /// Number of circuits stored.
     pub count: usize,
 }
 
-/// Enumerate cycles with metadata about truncation.
-pub fn enumerate_cycles_with_info(graph: &DiGraph, max_cycles: usize) -> CycleEnumerationResult {
-    let cycles = enumerate_cycles(graph, max_cycles);
+/// Enumerate every elementary cycle with metadata about truncation.
+pub fn enumerate_elementary_cycles_with_info(
+    graph: &DiGraph,
+    max_cycles: usize,
+) -> ElementaryCycleResult {
+    let cycles = enumerate_elementary_cycles(graph, max_cycles);
     let count = cycles.len();
-    CycleEnumerationResult {
+    ElementaryCycleResult {
         cycles,
         truncated: count >= max_cycles,
         count,
@@ -293,6 +481,12 @@ pub struct CycleBreakResult {
 /// Suggestions are sorted by: cycles_broken desc, then collateral asc
 /// (prefer edges that break many cycles with minimal disruption)
 ///
+/// Browser-viewer scorer, not a port of Go's `cycle_break`: it scores edges
+/// by every elementary circuit, where Go scores them by the per-SCC
+/// representatives `findCyclesSafe` returns. See the note on the enumeration
+/// call below. The CLI's parity path for `cycle_break` lives in
+/// `crates/bv/src/main.rs`.
+///
 /// # Arguments
 /// * `graph` - The directed graph
 /// * `limit` - Maximum suggestions to return
@@ -311,8 +505,18 @@ pub fn cycle_break_suggestions(
         };
     }
 
-    // Enumerate actual cycles to count edge participation
-    let cycle_info = enumerate_cycles_with_info(graph, max_cycles_to_enumerate);
+    // Enumerate actual cycles to count edge participation.
+    //
+    // This is the browser viewer's own scorer, NOT Go's
+    // `generateCycleBreakSuggestionsFromStats` (advanced_insights.go:296-372).
+    // Go ranks edges by how many of `stats.Cycles()` contain them, and
+    // `stats.Cycles()` holds one representative per SCC — the oracle's
+    // `findCyclesSafe` output. This function instead counts every elementary
+    // circuit, so it ranks an edge higher when the component is densely
+    // cyclic. The CLI's `advanced_insights.cycle_break` is computed in
+    // `crates/bv/src/main.rs:5081`, which does follow Go; only
+    // `bv-graph-wasm`'s JS view consumes this one.
+    let cycle_info = enumerate_elementary_cycles_with_info(graph, max_cycles_to_enumerate);
     let cycles = &cycle_info.cycles;
 
     // Build a map of edge -> cycles it appears in
@@ -542,8 +746,8 @@ mod tests {
         graph.add_edge(c, a);
 
         let cycles = enumerate_cycles(&graph, 100);
-        assert_eq!(cycles.len(), 1);
-        assert_eq!(cycles[0].len(), 3);
+        // Go stores closed paths (A,B,C,A) — graph_cycles.go:138 appends v.
+        assert_eq!(cycles, vec![vec![a, b, c, a]]);
     }
 
     #[test]
@@ -556,31 +760,26 @@ mod tests {
         graph.add_edge(b, a);
 
         let cycles = enumerate_cycles(&graph, 100);
-        assert_eq!(cycles.len(), 1);
-        assert_eq!(cycles[0].len(), 2);
+        assert_eq!(cycles, vec![vec![a, b, a]]);
     }
 
     #[test]
     fn test_enumerate_max_limit() {
-        // Create graph with multiple cycles
-        // a <-> b <-> c <-> d with interconnections
+        // Three disjoint two-node components, so three representatives.
         let mut graph = DiGraph::new();
-        let a = graph.add_node("a");
-        let b = graph.add_node("b");
-        let c = graph.add_node("c");
-        let d = graph.add_node("d");
-        graph.add_edge(a, b);
-        graph.add_edge(b, a);
-        graph.add_edge(b, c);
-        graph.add_edge(c, b);
-        graph.add_edge(c, d);
-        graph.add_edge(d, c);
-        graph.add_edge(d, a);
-        graph.add_edge(a, d);
+        for pair in [("a", "b"), ("c", "d"), ("e", "f")] {
+            let x = graph.add_node(pair.0);
+            let y = graph.add_node(pair.1);
+            graph.add_edge(x, y);
+            graph.add_edge(y, x);
+        }
 
-        // Limit to 2 cycles
-        let cycles = enumerate_cycles(&graph, 2);
-        assert_eq!(cycles.len(), 2);
+        // graph_cycles.go:61-65 — the total is recorded before truncation, so
+        // the cap keeps the first two and reports the pre-truncation count.
+        let result = enumerate_cycles_with_info(&graph, 2);
+        assert_eq!(result.cycles.len(), 2);
+        assert_eq!(result.count, 3);
+        assert!(result.truncated);
     }
 
     #[test]
@@ -601,9 +800,10 @@ mod tests {
         graph.add_edge(c, d);
         graph.add_edge(d, a);
 
+        // All four nodes are one SCC, so Go reports ONE representative, not
+        // the two elementary circuits (a->b->d->a, a->c->d->a) Johnson finds.
         let cycles = enumerate_cycles(&graph, 100);
-        // Two cycles: a->b->d->a and a->c->d->a
-        assert_eq!(cycles.len(), 2);
+        assert_eq!(cycles, vec![vec![a, b, d, a]]);
     }
 
     #[test]
@@ -619,12 +819,12 @@ mod tests {
         assert_eq!(result.count, 1);
         assert!(!result.truncated);
 
-        // With limit of 1, we should get exactly 1 cycle and not be truncated
-        // (since there's only 1 cycle to find)
+        // A limit of exactly the representative count is NOT truncation: Go
+        // sets `truncated` from the pre-limit total (graph_cycles.go:61-64).
         let result_one = enumerate_cycles_with_info(&graph, 1);
         assert_eq!(result_one.count, 1);
-        // Truncated because we hit the limit (count >= max)
-        assert!(result_one.truncated);
+        assert_eq!(result_one.cycles, vec![vec![a, b, a]]);
+        assert!(!result_one.truncated);
     }
 
     #[test]
@@ -661,8 +861,139 @@ mod tests {
         let scc = tarjan_scc(&graph);
         assert!(scc.has_cycles);
 
+        // The two circuits share node 2, so the whole graph is one SCC and Go
+        // reports a single representative.
         let cycles = enumerate_cycles(&graph, 100);
-        assert!(cycles.len() >= 2);
+        assert_eq!(cycles, vec![vec![0, 1, 2, 0]]);
+    }
+
+    // ========================================================================
+    // Go `findCyclesSafe` contract
+    // ========================================================================
+
+    /// graph_cycles.go:28-35 — a singleton SCC with a self-edge is `[n, n]`,
+    /// the doubled node included. The self-loop sorts first: it is the
+    /// shortest possible record (length 2 counting the closing node).
+    #[test]
+    fn test_self_loop_is_a_doubled_record() {
+        let mut graph = DiGraph::new();
+        let a = graph.add_node("a");
+        let b = graph.add_node("b");
+        let c = graph.add_node("c");
+        graph.add_edge(c, c); // self-loop on the highest-index node
+        graph.add_edge(a, b);
+        graph.add_edge(b, a);
+
+        let cycles = enumerate_cycles(&graph, 100);
+        assert_eq!(cycles, vec![vec![c, c], vec![a, b, a]]);
+    }
+
+    /// graph_cycles.go:27-41 — one representative per component, so a dense
+    /// component with many elementary cycles still contributes one record.
+    #[test]
+    fn test_one_representative_per_component() {
+        // Complete digraph on four nodes: 15 elementary cycles, one SCC.
+        let mut graph = DiGraph::new();
+        let n: Vec<usize> = (0..4).map(|i| graph.add_node(&format!("n{i}"))).collect();
+        for &u in &n {
+            for &v in &n {
+                if u != v {
+                    graph.add_edge(u, v);
+                }
+            }
+        }
+
+        let found = enumerate_elementary_cycles(&graph, 1000);
+        assert!(found.len() > 5, "sanity: many elementary circuits exist");
+
+        let stored = enumerate_cycles(&graph, 1000);
+        assert_eq!(stored.len(), 1);
+        // DFS from the lowest-index member, lowest-index neighbour first.
+        assert_eq!(stored[0], vec![n[0], n[1], n[0]]);
+    }
+
+    /// graph_cycles.go:46-59 — length ascending, then lexicographic. Both
+    /// orderings are observable in the `Cycles` array.
+    #[test]
+    fn test_sorted_by_length_then_lexicographically() {
+        let mut graph = DiGraph::new();
+        // Components are added in an order that would leave the output unsorted
+        // if the sort were missing.
+        let a = graph.add_node("a");
+        let b = graph.add_node("b");
+        let z = graph.add_node("z");
+        let y = graph.add_node("y");
+        let x = graph.add_node("x");
+        graph.add_edge(z, y);
+        graph.add_edge(y, z); // len-3 record, lexicographically last
+        graph.add_edge(x, x); // len-2 record
+        graph.add_edge(a, b);
+        graph.add_edge(b, a); // len-3 record, lexicographically first
+
+        let cycles = enumerate_cycles(&graph, 100);
+        assert_eq!(
+            cycles,
+            vec![vec![x, x], vec![a, b, a], vec![z, y, z]],
+            "shortest first, then byte-wise by node index"
+        );
+    }
+
+    /// graph_cycles.go:21-23 — a non-positive limit yields the zero value.
+    #[test]
+    fn test_zero_limit_returns_nothing() {
+        let mut graph = DiGraph::new();
+        let a = graph.add_node("a");
+        let b = graph.add_node("b");
+        graph.add_edge(a, b);
+        graph.add_edge(b, a);
+
+        let found = find_cycles_safe(&graph, 0);
+        assert!(found.cycles.is_empty());
+        assert_eq!(found.count, 0);
+        assert!(!found.truncated);
+    }
+
+    /// The `--robot-insights` shape on the large_cyclic_600 fixture, reduced:
+    /// one self-loop plus two- and three-node components, ordered exactly the
+    /// way the golden records them. Nodes are inserted in sorted-ID order
+    /// because that is how the analyzer assigns indices, which is what makes
+    /// "lexicographic on indices" equal Go's comparison of the IDs themselves.
+    #[test]
+    fn test_golden_shaped_multi_component_output() {
+        let mut graph = DiGraph::new();
+        let c1 = graph.add_node("Cyc-1");
+        let c11 = graph.add_node("Cyc-11");
+        let c12 = graph.add_node("Cyc-12");
+        let c2 = graph.add_node("Cyc-2");
+        let c33 = graph.add_node("Cyc-33");
+        let c5 = graph.add_node("Cyc-5");
+        let c6 = graph.add_node("Cyc-6");
+        graph.add_edge(c33, c33);
+        graph.add_edge(c1, c2);
+        graph.add_edge(c2, c1);
+        graph.add_edge(c11, c12);
+        graph.add_edge(c12, c11);
+        graph.add_edge(c5, c6);
+        graph.add_edge(c6, c5);
+
+        let names: Vec<String> = (0..graph.len())
+            .map(|i| graph.node_id(i).unwrap())
+            .collect();
+        let stored = enumerate_cycles(&graph, 100);
+        let printed: Vec<Vec<&str>> = stored
+            .iter()
+            .map(|c| c.iter().map(|&i| names[i].as_str()).collect())
+            .collect();
+
+        assert_eq!(
+            printed,
+            vec![
+                vec!["Cyc-33", "Cyc-33"],
+                vec!["Cyc-1", "Cyc-2", "Cyc-1"],
+                vec!["Cyc-11", "Cyc-12", "Cyc-11"],
+                vec!["Cyc-5", "Cyc-6", "Cyc-5"],
+            ]
+        );
     }
 
     // ========================================================================
