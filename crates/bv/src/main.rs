@@ -524,6 +524,21 @@ fn main() -> ExitCode {
     if presence.has("robot-search") {
         return run_robot_search(&args);
     }
+    // A bare `--search Q` with no `--robot-*` primary. Go prints tab-separated
+    // results here and returns (cmd/bv/main.go:3028-3035); reaching this
+    // point instead launched the interactive TUI, which an agent caller
+    // cannot drive — it just hangs, and blocks CI. Fail fast and scriptable
+    // until the text-mode output path is ported.
+    if let Some(q) = search_flag(&args, "search").filter(|q| !q.trim().is_empty()) {
+        if !flags::ROBOT_PRIMARIES.iter().any(|f| presence.has(f.name)) {
+            eprintln!(
+                "Error: --search without --robot-search is not supported yet; \
+                 use --robot-search for JSON output"
+            );
+            let _ = q;
+            return ExitCode::from(2);
+        }
+    }
     if presence.has("robot-causality") {
         return run_robot_causality(&args);
     }
