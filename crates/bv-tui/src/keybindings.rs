@@ -240,16 +240,41 @@ pub fn build_default_registry() -> KeyRegistry {
     }
 
     // History view bindings (lazy-loaded on first `h` press — real git-log
-    // correlation data, not a placeholder; see TUI_UX_PARITY_PLAN.md G12).
+    // correlation data, not a placeholder). The table mirrors Go's
+    // `handleHistoryKeys` (pkg/ui/model.go:5483-5753) key for key: the view
+    // is entered with `h` and left with `h`/`esc`, and every other binding
+    // is scoped to it, so the runtime arms guard on `ViewMode::History`.
     for (key, desc) in [
-        ("j/↓", "Next bead"),
-        ("k/↑", "Previous bead"),
-        ("J", "Next commit"),
-        ("K", "Previous commit"),
-        ("v", "Toggle bead/git mode"),
-        ("c", "Cycle confidence threshold (0% / 50% / 80%)"),
+        (
+            "j/↓",
+            "Move down in the focused pane (beads on the list, commits in the middle/detail pane)",
+        ),
+        (
+            "k/↑",
+            "Move up in the focused pane (timeline scroll on the timeline pane)",
+        ),
+        ("J", "Next commit (next related bead in git mode)"),
+        ("K", "Previous commit (previous related bead in git mode)"),
+        ("tab", "Cycle pane focus: list → timeline → middle → detail"),
+        (
+            "enter",
+            "Jump to the selected bead in the main list and close",
+        ),
         ("y", "Copy selected commit SHA to clipboard"),
-        ("h", "Close (back to list)"),
+        ("v", "Toggle bead/git mode"),
+        ("c", "Cycle confidence threshold (0% / 50% / 75% / 90%)"),
+        (
+            "f/F",
+            "Toggle the file tree (j/k navigate, enter/l expand or filter, h collapse)",
+        ),
+        ("t", "Toggle the timeline pane (bead mode, ≥100 columns)"),
+        (
+            "/",
+            "Search commits, beads, authors… (enter keeps the filter, esc clears)",
+        ),
+        ("o", "Open the selected commit in the browser"),
+        ("g", "Open the graph view focused on the selected bead"),
+        ("h/esc", "Close (back to list)"),
     ] {
         reg.register(KeyBinding {
             focus: Focus::History,
@@ -264,6 +289,10 @@ pub fn build_default_registry() -> KeyRegistry {
     // `GitLoader::load_at` (shared with `--robot-diff`; see plan Q4).
     // Rows in the List that changed vs the ref carry a diff badge (Go
     // `DiffStatus.Badge()`: new / closed / ~ modified).
+    //
+    // NOTE: `t` is only the Time-Travel prompt *outside* the History view —
+    // inside History it toggles the timeline pane (Go model.go:5680-5693),
+    // and the runtime arms are ordered so that guard wins.
     for (key, desc) in [
         ("t", "Enter revision (prompt) and diff vs ref"),
         ("T", "Instant diff vs HEAD~5"),
@@ -470,8 +499,8 @@ mod tests {
     /// found: the registry said lowercase "g" toggled Graph while runtime
     /// (`lib.rs` `handle_key`) actually binds uppercase "G". Pin the
     /// corrected value so it can't silently drift back. (Lowercase `g` is
-    /// unbound — Go has no manual key for the agent blurb prompt, which
-    /// auto-shows once at startup instead.)
+    /// unbound — Go has no manual agent-prompt key, which auto-shows once at
+    /// startup instead.)
     #[test]
     fn graph_toggle_is_uppercase_g_matching_runtime() {
         let reg = build_default_registry();
@@ -484,5 +513,47 @@ mod tests {
             !list.iter().any(|b| b.key == "g"),
             "lowercase g must stay unbound — no manual agent-prompt key"
         );
+    }
+
+    /// The History confidence ladder is Go's `{0, 0.5, 0.75, 0.9}`
+    /// (history.go:894). The registry used to advertise the drifted
+    /// `0% / 50% / 80%` that the old inlined arithmetic produced; pin the
+    /// corrected text so it cannot drift back with the runtime.
+    #[test]
+    fn history_confidence_help_matches_the_go_ladder() {
+        let reg = build_default_registry();
+        let history = reg.bindings_for(Focus::History);
+        let c = history
+            .iter()
+            .find(|b| b.key == "c")
+            .expect("`c` must be registered for the History view");
+        assert!(
+            c.desc.contains("0% / 50% / 75% / 90%"),
+            "help text drifted from the Go threshold ladder: {}",
+            c.desc
+        );
+        assert!(
+            !c.desc.contains("80%"),
+            "the 0.8 step is Go's 0.75: {}",
+            c.desc
+        );
+    }
+
+    /// Go binds `tab`, `enter`, `o`, `g`, `f`/`F`, `t` and `/` inside
+    /// `handleHistoryKeys`. Pin them so a future registry edit cannot quietly
+    /// drop a key the runtime handles.
+    #[test]
+    fn history_view_registers_every_go_key() {
+        let reg = build_default_registry();
+        let history = reg.bindings_for(Focus::History);
+        for key in [
+            "j/↓", "k/↑", "J", "K", "tab", "enter", "y", "v", "c", "f/F", "t", "/", "o", "g",
+            "h/esc",
+        ] {
+            assert!(
+                history.iter().any(|b| b.key == key),
+                "History is missing the `{key}` binding"
+            );
+        }
     }
 }

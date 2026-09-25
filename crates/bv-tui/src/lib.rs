@@ -256,6 +256,22 @@ pub struct App {
     /// True once `history` has been populated with real correlation data
     /// (lazy-loaded on first `h` press — Go bv-h305-style deferred cost).
     pub history_loaded: bool,
+    /// Go `m.historyLoading` (model.go:9226-9245): a background
+    /// `build_history_report` walk is in flight. The worker publishes onto
+    /// `history_rx`; `poll_history_load` drains it on the run loop's tick.
+    pub history_loading: bool,
+    /// Go `m.historyLoadFailed` — selects the
+    /// `"History unavailable; press h to retry"` placeholder
+    /// (model.go:6357-6362) over `"Loading history…"`.
+    pub history_load_failed: bool,
+    /// Go's `(dataGeneration, requestGeneration)` pair (model.go:595-671).
+    /// A completion carrying a generation other than the newest is dropped,
+    /// so a slow walk can never overwrite a fresher dataset.
+    pub history_generation: u64,
+    /// Receiver half of the background history load.
+    pub history_rx: Option<
+        crossbeam_channel::Receiver<(u64, Result<bv_correlation::history::HistoryReport, String>)>,
+    >,
     /// Revision-input buffer for Time-Travel (Go `focusTimeTravelInput`).
     /// `Some` = prompt open and capturing keys, `None` = closed.
     pub time_travel_prompt: Option<String>,
@@ -395,7 +411,10 @@ pub enum ViewMode {
     /// Bead↔commit correlation view (Go `pkg/ui/history.go`). Was
     /// previously aliased under `TimeTravel` — split out because Go treats
     /// History and Time-Travel as two distinct features with distinct keys
-    /// (`h` vs `t`/`T`). See TUI_UX_PARITY_PLAN.md G1/G12.
+    /// (`h` vs `t`/`T`). Note that inside History `t` is *not* the global
+    /// Time-Travel key: Go scopes it to the timeline-pane toggle
+    /// (model.go:5680-5693) and the `handle_key` arms are ordered so that
+    /// guard wins.
     History,
     /// Revision-diff mode (Go `focusTimeTravelInput` → `SnapshotDiff`).
     /// `t` opens the revision prompt, `T` diffs instantly vs HEAD~5;
@@ -588,6 +607,91 @@ fn copy_to_clipboard(text: &str) -> Result<(), String> {
     shell_copy_fallback(text)
 }
 
+/// Go `correlation.CorrelatorOptions{Limit: 500}` for the TUI
+/// (model.go:659-661, "Reasonable limit for TUI performance"). This is the
+/// same cap `bv_correlation::history` applies as its own default when
+/// `Limit == 0`, so it is named here only to make the Go constant explicit.
+const HISTORY_COMMIT_LIMIT: i64 = 500;
+
+/// Go `openBrowserURL` (model.go:5846-5864). Honours the same
+/// `BV_NO_BROWSER` / `BV_TEST_MODE` suppression Go uses, so a test run never
+/// launches a browser.
+fn open_browser_url(url: &str) -> Result<(), String> {
+    if std::env::var("BV_NO_BROWSER").is_ok_and(|v| !v.is_empty())
+        || std::env::var("BV_TEST_MODE").is_ok_and(|v| !v.is_empty())
+    {
+        return Ok(());
+    }
+    let (cmd, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
+        ("open", &[url])
+    } else if cfg!(target_os = "windows") {
+        ("rundll32", &["url.dll,FileProtocolHandler", url])
+    } else {
+        ("xdg-open", &[url])
+    };
+    std::process::Command::new(cmd)
+        .args(args)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("{e}"))
+}
+
+/// Go `gitRemoteToWebURL` (model.go:5794-5843) — SSH and HTTPS(S) remotes to
+/// a browsable `https://host/owner/repo` URL, with `.git` and any query or
+/// fragment stripped.
+fn git_remote_to_web_url(remote: &str) -> Option<String> {
+    let remote = remote.trim();
+    if remote.is_empty() {
+        return None;
+    }
+    if let Some(rest) = remote.strip_prefix("git@") {
+        let rest = rest.strip_suffix(".git").unwrap_or(rest);
+        let rest = rest.replacen(':', "/", 1);
+        return normalize_git_remote_web_url(&format!("https://{rest}"));
+    }
+    if remote.starts_with("https://")
+        || remote.starts_with("http://")
+        || remote.starts_with("ssh://")
+    {
+        return normalize_git_remote_web_url(remote);
+    }
+    None
+}
+
+/// Go `normalizeGitRemoteWebURL` (model.go:5819-5843).
+fn normalize_git_remote_web_url(remote: &str) -> Option<String> {
+    let (scheme, rest) = remote.split_once("://")?;
+    let scheme = match scheme {
+        "https" | "http" => scheme,
+        // `ssh://[user@]host/owner/repo` → `https://host/owner/repo`.
+        "ssh" => "https",
+        _ => return None,
+    };
+    // ssh://git@host/... — drop the userinfo.
+    let authority = rest.split('/').next()?;
+    let host = match authority.rsplit_once('@') {
+        Some((user, host)) if scheme == "https" && !user.is_empty() => host,
+        _ => authority,
+    };
+    if host.is_empty() {
+        return None;
+    }
+    // Strip the query/fragment, then the trailing `/` and the `.git` suffix.
+    let path = rest
+        .split_once('/')
+        .map(|(_, p)| p)
+        .unwrap_or("")
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("");
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    if path.is_empty() {
+        return None;
+    }
+    Some(format!("{scheme}://{host}/{path}"))
+}
+
 /// Legacy shell-out clipboard path, kept as a headless fallback for
 /// `copy_to_clipboard` when `arboard` has no display to talk to.
 fn shell_copy_fallback(text: &str) -> Result<(), String> {
@@ -743,6 +847,10 @@ impl App {
             recipe_picker: None,
             repo_picker: None,
             history_loaded: false,
+            history_loading: false,
+            history_load_failed: false,
+            history_generation: 0,
+            history_rx: None,
             time_travel_prompt: None,
             time_travel_result: None,
             time_travel_error: None,
@@ -820,9 +928,7 @@ impl App {
             app.graph_metrics.clone(),
         ));
         // Initialize history view (empty for now — populated when user presses h).
-        app.history = Some(crate::views::history::HistoryState::build_from_beads(
-            vec![],
-        ));
+        app.history = Some(crate::views::history::HistoryState::new());
         app.refresh_watch_target();
         app.apply_filter();
         app
@@ -1434,6 +1540,13 @@ impl App {
         // opens on the next keypress after the window (documented latency,
         // same tradeoff as Go's message-queue tick).
         self.resolve_pending_tutorial_tap();
+        // Go `handleHistoryKeys` is a whole function (model.go:5483-5753) with
+        // three ordered regions: the search input, the file tree, then the
+        // general switch. Handle the first two here so the main `match` only
+        // sees keys the History view has not already claimed.
+        if self.current_view == ViewMode::History && self.handle_history_modal_key(code) {
+            return true;
+        }
         match code {
             KeyCode::Tab => {
                 self.focus_detail = !self.focus_detail;
@@ -1514,11 +1627,12 @@ impl App {
                         }
                     }
                 } else if self.current_view == ViewMode::History {
-                    // Fixed: was previously nested unreachably inside the
-                    // Graph arm above (dead code — see TUI_UX_PARITY_PLAN.md
-                    // G11), so History's bead cursor never actually moved.
+                    // Go `MoveDown` / `MoveDownGit` (history.go:793-832,
+                    // :1311-1333): the cursor belongs to the *focused* pane —
+                    // beads on the list, commits in the middle/detail pane,
+                    // timeline scroll on the timeline pane.
                     if let Some(ref mut h) = self.history {
-                        h.move_bead_down();
+                        h.move_down();
                     }
                 } else if self.current_view == ViewMode::Alerts {
                     if self.alerts_cursor + 1 < self.alerts.len() {
@@ -1566,8 +1680,10 @@ impl App {
                         self.graph_scroll = self.graph_cursor;
                     }
                 } else if self.current_view == ViewMode::History {
+                    // Go `MoveUp` / `MoveUpGit` (history.go:768-790,
+                    // :1287-1308) — focus-aware, same as `j` above.
                     if let Some(ref mut h) = self.history {
-                        h.move_bead_up();
+                        h.move_up();
                     }
                 } else if self.current_view == ViewMode::Alerts {
                     self.alerts_cursor = self.alerts_cursor.saturating_sub(1);
@@ -1600,22 +1716,24 @@ impl App {
             }
             KeyCode::Char('c') => {
                 if self.current_view == ViewMode::History {
-                    // Cycle confidence threshold: 0.0 -> 0.5 -> 0.8 -> 0.0
-                    // (Go's confidence filter cycle; bvr has no dedicated
-                    // cycle method on HistoryState, so it's inlined here).
-                    if let Some(ref mut h) = self.history {
-                        h.min_confidence = if h.min_confidence >= 0.8 {
+                    // Go only cycles the confidence filter in bead mode
+                    // (model.go:5660-5669), and the ladder is the four
+                    // thresholds {0, 0.5, 0.75, 0.9} (history.go:894).
+                    let conf = if let Some(ref mut h) = self.history {
+                        if h.is_git_mode() {
                             0.0
-                        } else if h.min_confidence >= 0.5 {
-                            0.8
                         } else {
-                            0.5
-                        };
-                        self.status_msg = format!(
-                            "History confidence \u{2265} {:.0}%",
-                            h.min_confidence * 100.0
-                        );
-                    }
+                            h.cycle_confidence()
+                        }
+                    } else {
+                        0.0
+                    };
+                    // Go model.go:5661-5668.
+                    self.status_msg = if conf == 0.0 {
+                        "\u{1f50d} Showing all commits".to_string()
+                    } else {
+                        format!("\u{1f50d} Confidence filter: \u{2265}{:.0}%", conf * 100.0)
+                    };
                 } else {
                     self.filter_mode = FilterMode::Closed;
                     self.apply_filter();
@@ -1625,6 +1743,59 @@ impl App {
             KeyCode::Char('r') => {
                 self.filter_mode = FilterMode::Ready;
                 self.apply_filter();
+                true
+            }
+            // ---- History-scoped keys -------------------------------------
+            // Go binds `f`, `t`, `/`, `tab`, `enter`, `esc`, `o` and `g`
+            // *inside* `handleHistoryKeys` (model.go:5483-5753). These arms
+            // sit ahead of the global `f` / `t` / `/` arms below, which would
+            // otherwise shadow them: the global `f` opens Flow-Matrix, the
+            // global `t` opens the Time-Travel revision prompt, and the global
+            // `/` opens the main-list fuzzy search. Go has no global `t` at
+            // all, so the guard below is what makes the timeline toggle
+            // reachable (the TUI_UX_PARITY_PLAN.md G5 collision).
+            KeyCode::Char('/') if self.current_view == ViewMode::History => {
+                if let Some(ref mut h) = self.history {
+                    h.start_search();
+                    self.status_msg =
+                        "\u{1f50d} Type to search commits, beads, authors...".to_string();
+                }
+                true
+            }
+            KeyCode::Char('f') | KeyCode::Char('F') if self.current_view == ViewMode::History => {
+                if let Some(ref mut h) = self.history {
+                    h.toggle_file_tree();
+                    self.status_msg = if h.is_file_tree_visible() {
+                        "\u{1f4c1} File tree: j/k navigate, Enter select, Esc close".to_string()
+                    } else {
+                        "\u{1f4c1} File tree hidden".to_string()
+                    };
+                }
+                true
+            }
+            KeyCode::Char('t') if self.current_view == ViewMode::History => {
+                let Some(ref mut h) = self.history else {
+                    return true;
+                };
+                // Go's refusal message when the pane cannot be shown
+                // (model.go:5683-5686).
+                // Go's exact strings (model.go:5683-5692), emoji included.
+                if !h.timeline_available() {
+                    self.status_msg =
+                        "\u{1f552} Timeline needs bead mode and \u{2265}100 columns".to_string();
+                } else if h.toggle_timeline() {
+                    self.status_msg = "\u{1f552} Timeline pane shown (t to hide)".to_string();
+                } else {
+                    self.status_msg = "\u{1f552} Timeline pane hidden (t to show)".to_string();
+                }
+                true
+            }
+            KeyCode::Enter if self.current_view == ViewMode::History => {
+                self.jump_from_history();
+                true
+            }
+            KeyCode::Char('g') if self.current_view == ViewMode::History => {
+                self.goto_history_graph();
                 true
             }
             KeyCode::Char('/') => {
@@ -1757,24 +1928,30 @@ impl App {
             }
             KeyCode::Char('J') if self.current_view == ViewMode::History => {
                 if let Some(ref mut h) = self.history {
-                    h.move_commit_down();
+                    h.next_commit();
                 }
                 true
             }
             KeyCode::Char('K') if self.current_view == ViewMode::History => {
                 if let Some(ref mut h) = self.history {
-                    h.move_commit_up();
+                    h.prev_commit();
                 }
                 true
             }
             KeyCode::Char('v') if self.current_view == ViewMode::History => {
                 if let Some(ref mut h) = self.history {
                     h.toggle_mode();
+                    // Go model.go:5558-5566.
+                    self.status_msg = if h.is_git_mode() {
+                        "\u{1f500} Git Mode: commits on left, related beads on right".to_string()
+                    } else {
+                        "\u{1f4e6} Bead Mode: beads on left, commits on right".to_string()
+                    };
                 }
                 true
             }
             KeyCode::Char('y') if self.current_view == ViewMode::History => {
-                self.copy_commit_sha();
+                self.copy_history_commit_sha();
                 true
             }
             KeyCode::Char('!') => {
@@ -2292,21 +2469,10 @@ impl App {
         }
     }
 
-    /// Copy the selected commit's SHA in the History view (Go `y`).
-    fn copy_commit_sha(&mut self) {
-        let Some(ref history) = self.history else {
-            return;
-        };
-        let Some(commit) = history.selected_commit() else {
-            self.status_msg = "No commit selected".to_string();
-            return;
-        };
-        let sha = commit.sha.clone();
-        match copy_to_clipboard(&sha) {
-            Ok(()) => self.status_msg = format!("Copied {sha} to clipboard"),
-            Err(e) => self.status_msg = format!("Clipboard failed: {e}"),
-        }
-    }
+    /// Copy the selected commit's SHA in the History view (Go `y`) — moved to
+    /// `copy_history_commit_sha` next to the loader, because the git-mode half
+    /// needs the same bead-or-commit selection Go's handler uses
+    /// (model.go:5636-5658).
     /// Lazily build the Actionable view state on first `F` (same deferred
     /// pattern as History/LabelDashboard — see G15). Rebuilt from scratch on
     /// `reload_from_disk` because that reconstructs the whole `App`.
@@ -2566,74 +2732,357 @@ impl App {
             .collect()
     }
 
-    /// Lazily populate the History view with real bead↔commit correlation
-    /// data (Go's `pkg/ui` loads this eagerly; bvr defers the git-log walk
-    /// to first entry, matching the `App::new` comment's original intent —
-    /// see TUI_UX_PARITY_PLAN.md G12). No-op after the first successful load
-    /// or if not inside a git repo.
+    /// The two modal regions of Go's `handleHistoryKeys` — the search input
+    /// (model.go:5485-5503) and the file tree (model.go:5506-5548) — plus
+    /// the `esc` that closes the view (model.go:5756-5759). Returns `true`
+    /// when the key was consumed, mirroring Go's early `return m, nil`.
+    ///
+    /// Anything not claimed here falls through to the guarded History arms in
+    /// `handle_key`'s main `match`.
+    fn handle_history_modal_key(&mut self, code: KeyCode) -> bool {
+        // `h` and `esc` close the view whatever the state is (model.go:5756),
+        // so they are checked before the `history` borrow — otherwise an
+        // unpopulated History would trap the user.
+        if matches!(code, KeyCode::Esc) {
+            self.current_view = ViewMode::List;
+            return true;
+        }
+        let Some(ref mut h) = self.history else {
+            return false;
+        };
+
+        // --- search input ---
+        if h.is_search_active() {
+            match code {
+                KeyCode::Esc => {
+                    h.cancel_search();
+                    self.status_msg = "\u{1f50d} Search cancelled".to_string();
+                }
+                KeyCode::Enter => {
+                    // Blur but keep the query and the filtered result
+                    // (Go `FinishSearch`).
+                    h.finish_search();
+                }
+                KeyCode::Backspace => h.backspace_search(),
+                KeyCode::Char(c) => h.push_search_char(c),
+                _ => {}
+            }
+            return true;
+        }
+
+        // --- file tree ---
+        if h.file_tree_has_focus() {
+            match code {
+                KeyCode::Char('j') | KeyCode::Down => h.move_file_tree_down(),
+                KeyCode::Char('k') | KeyCode::Up => h.move_file_tree_up(),
+                KeyCode::Enter | KeyCode::Char('l') => {
+                    // A directory expands, a file becomes the filter
+                    // (model.go:5516-5531).
+                    if h.selected_file_is_dir() {
+                        h.toggle_expand_file();
+                    } else {
+                        h.select_file();
+                        self.status_msg =
+                            format!("\u{1f4c1} Filtering by: {}", h.selected_file_name());
+                    }
+                }
+                KeyCode::Char('h') => h.collapse_file_node(),
+                KeyCode::Esc => {
+                    if !h.file_filter().is_empty() {
+                        h.clear_file_filter();
+                        self.status_msg = "\u{1f4c1} File filter cleared".to_string();
+                    } else {
+                        h.set_file_tree_focus(false);
+                        self.status_msg =
+                            "\u{1f4c1} File tree: press Tab to return focus".to_string();
+                    }
+                }
+                KeyCode::Tab => h.set_file_tree_focus(false),
+                _ => {}
+            }
+            return true;
+        }
+
+        // `tab` cycles pane focus (model.go:5593-5608). It lives here because
+        // the global `Tab` arm above toggles the list/detail split and would
+        // otherwise shadow it. With the file tree marked visible Go routes Tab
+        // through List→Detail→FileTree→List instead of `ToggleFocus`; the
+        // file-tree panel is never rendered by Go's own layout (see
+        // `render_file_tree_panel`), so this only moves the focus highlight.
+        if let KeyCode::Tab = code {
+            if h.is_file_tree_visible() {
+                if h.file_tree_has_focus() {
+                    h.set_file_tree_focus(false);
+                } else if h.is_detail_focused() {
+                    h.set_file_tree_focus(true);
+                } else {
+                    h.toggle_focus();
+                }
+            } else {
+                h.toggle_focus();
+            }
+            return true;
+        }
+
+        // `o` opens the selected commit in a browser (model.go:5694-5728). Like
+        // `tab`, it must beat the global `o` = "show open issues".
+        if let KeyCode::Char('o') = code {
+            self.open_history_commit_in_browser();
+            return true;
+        }
+
+        false
+    }
+
+    /// Go `enterHistoryView` (model.go:9222-9245) + `LoadHistoryCmd`
+    /// (model.go:595-671): build the *full* `correlation.HistoryReport` on a
+    /// background thread with `CorrelatorOptions{Limit: 500}` ("Reasonable
+    /// limit for TUI performance", model.go:659-661), then hand it to
+    /// `HistoryState` via the generation-fenced channel.
+    ///
+    /// The narrower `correlator::correlate` path is deliberately not used: its
+    /// `CorrelatedCommit` has `files: Vec<String>` (no action, no line counts)
+    /// and no `method`, so it cannot back the per-file change lines, the
+    /// method label, the lifecycle section or the cycle-time summary that Go
+    /// renders. The report the TUI shows is therefore the same one
+    /// `--robot-history` and the pages export already build.
+    ///
+    /// Re-entering the view after a failure retries: `history_loaded` is only
+    /// set once a report actually lands.
     fn load_history_if_needed(&mut self) {
-        if self.history_loaded {
+        if self.history_loaded || self.history_loading {
             return;
         }
-        self.history_loaded = true; // don't retry every keypress on failure
         let Ok(cwd) = std::env::current_dir() else {
+            self.history_load_failed = true;
             self.status_msg = "History: could not determine working directory".to_string();
             return;
         };
-        let commits = match bv_correlation::correlator::walk_commits(&cwd, 1000) {
-            Ok(c) => c,
-            Err(e) => {
-                self.status_msg = format!("History: git log failed ({e})");
-                return;
-            }
-        };
-        // CorrelatedCommit carries a correlation `reason`, not the original
-        // commit subject line — look the real message up by sha for display.
-        let messages_by_sha: std::collections::HashMap<String, String> = commits
-            .iter()
-            .map(|c| (c.sha.clone(), c.message.clone()))
-            .collect();
-        let issues: Vec<bv_core::model::Issue> = self.issue_map.values().cloned().collect();
-        let report = bv_correlation::correlator::correlate(&issues, &commits);
-        let mut bead_histories: Vec<crate::views::history::BeadHistory> = report
-            .into_iter()
-            .filter_map(|(bead_id, commits)| {
-                let issue = self.issue_map.get(&bead_id)?;
-                let mut hist_commits: Vec<crate::views::history::HistoryCommit> = commits
-                    .into_iter()
-                    .map(|c| crate::views::history::HistoryCommit {
-                        short_sha: c.sha.chars().take(7).collect(),
-                        message: messages_by_sha
-                            .get(&c.sha)
-                            .cloned()
-                            .unwrap_or_else(|| c.reason.clone()),
-                        sha: c.sha,
-                        author: c.author,
-                        timestamp: c.timestamp,
-                        confidence: c.confidence,
-                        files: c.files,
-                    })
-                    .collect();
-                hist_commits.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-                Some(crate::views::history::BeadHistory {
-                    bead_id: bead_id.clone(),
-                    title: issue.title.clone(),
-                    status: issue.status.as_str().to_string(),
-                    commits: hist_commits,
-                })
+        let beads: Vec<bv_correlation::history::BeadInfo> = self
+            .issue_map
+            .values()
+            .map(|i| bv_correlation::history::BeadInfo {
+                id: i.id.clone(),
+                title: i.title.clone(),
+                status: i.status.as_str().to_string(),
             })
             .collect();
-        bead_histories.sort_by(|a, b| a.bead_id.cmp(&b.bead_id));
-        let has_data = !bead_histories.is_empty();
-        self.history = Some(crate::views::history::HistoryState::build_from_beads(
-            bead_histories,
-        ));
-        self.status_msg = if has_data {
-            "History loaded".to_string()
-        } else {
-            "History: no correlated commits found".to_string()
+        if beads.is_empty() {
+            // Go: "No issue history available" (model.go:9241-9244).
+            self.status_msg = "No issue history available".to_string();
+            return;
+        }
+        let opts = bv_correlation::history::HistoryOptions {
+            limit: HISTORY_COMMIT_LIMIT,
+            ..Default::default()
         };
+        let generated_at = jiff::Timestamp::now().to_string();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        self.history_generation += 1;
+        let generation = self.history_generation;
+        self.history_rx = Some(rx);
+        self.history_loading = true;
+        self.history_load_failed = false;
+        self.status_msg = "Loading history…".to_string();
+        // std::thread + a bounded channel; the project bans tokio (AGENTS.md).
+        std::thread::spawn(move || {
+            let out = bv_correlation::history::build_history_report(
+                &cwd,
+                &beads,
+                &opts,
+                None,
+                generated_at,
+            );
+            let _ = tx.send((generation, out));
+        });
     }
+
+    /// Drain a completed background history load. Called from the run loop's
+    /// ~500ms tick, so a slow `git log -p` walk never blocks a keypress.
+    /// A result whose generation is stale is discarded, mirroring Go's
+    /// `(dataGeneration, requestGeneration)` fencing (model.go:665-670).
+    pub fn poll_history_load(&mut self) {
+        if !self.history_loading {
+            return;
+        }
+        let Some(rx) = &self.history_rx else {
+            self.history_loading = false;
+            return;
+        };
+        let Ok((generation, result)) = rx.try_recv() else {
+            return;
+        };
+        self.history_loading = false;
+        self.history_rx = None;
+        if generation != self.history_generation {
+            // A newer request superseded this one, so this result is stale.
+            // `load_history_if_needed` will not start a replacement while a
+            // load is in flight, so nothing is pending: surface the retry
+            // placeholder rather than spinning on "Loading history…".
+            self.history_load_failed = true;
+            return;
+        }
+        match result {
+            Ok(report) => {
+                let beads_with_commits = report.stats.beads_with_commits;
+                match self.history.as_mut() {
+                    Some(h) if h.has_report() => h.set_report(report),
+                    _ => {
+                        self.history =
+                            Some(crate::views::history::HistoryState::from_report(report))
+                    }
+                }
+                self.history_loaded = true;
+                self.history_load_failed = false;
+                self.status_msg =
+                    format!("Loaded history: {beads_with_commits} beads with commits");
+            }
+            Err(e) => {
+                self.history_load_failed = true;
+                self.status_msg = format!("History unavailable: {e}");
+            }
+        }
+    }
+
+    /// Go `y` — copy the selected commit's SHA, in either view mode
+    /// (model.go:5636-5658).
+    fn copy_history_commit_sha(&mut self) {
+        let Some(ref history) = self.history else {
+            return;
+        };
+        let (sha, short_sha) = if history.is_git_mode() {
+            match history.selected_git_commit() {
+                Some(c) => (c.sha.clone(), c.short_sha.clone()),
+                None => {
+                    self.status_msg = "\u{274c} No commit selected".to_string();
+                    return;
+                }
+            }
+        } else {
+            match history.selected_commit() {
+                Some(c) => (c.sha.clone(), c.short_sha.clone()),
+                None => {
+                    self.status_msg = "\u{274c} No commit selected".to_string();
+                    return;
+                }
+            }
+        };
+        match copy_to_clipboard(&sha) {
+            Ok(()) => self.status_msg = format!("\u{1f4cb} Copied {short_sha} to clipboard"),
+            Err(e) => self.status_msg = format!("Clipboard failed: {e}"),
+        }
+    }
+
+    /// Go `o` — open the selected commit in a browser (model.go:5694-5728).
+    /// Resolves `git remote get-url origin` → web URL → `<web>/commit/<sha>`
+    /// (model.go:575-582).
+    fn open_history_commit_in_browser(&mut self) {
+        let Some(ref history) = self.history else {
+            return;
+        };
+        let sha = if history.is_git_mode() {
+            history.selected_git_commit().map(|c| c.sha.clone())
+        } else {
+            history.selected_commit().map(|c| c.sha.clone())
+        };
+        let Some(sha) = sha else {
+            self.status_msg = "\u{274c} No commit selected".to_string();
+            return;
+        };
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let output = std::process::Command::new("git")
+            .args(["remote", "get-url", "origin"])
+            .current_dir(&cwd)
+            .output();
+        let web_url = match output {
+            Ok(o) if o.status.success() => {
+                git_remote_to_web_url(&String::from_utf8_lossy(&o.stdout))
+            }
+            _ => None,
+        };
+        let Some(web_url) = web_url else {
+            self.status_msg = "\u{274c} No git remote configured".to_string();
+            return;
+        };
+        let url = format!("{web_url}/commit/{sha}");
+        match open_browser_url(&url) {
+            Ok(()) => {
+                let short: String = sha.chars().take(7).collect();
+                self.status_msg = format!("\u{1f310} Opened {short} in browser");
+            }
+            Err(e) => self.status_msg = format!("\u{274c} Could not open browser: {e}"),
+        }
+    }
+
+    /// Go `g` — reveal the selected bead and jump to the Graph view
+    /// (model.go:5729-5755).
+    fn goto_history_graph(&mut self) {
+        let Some(ref history) = self.history else {
+            return;
+        };
+        let bead_id = if history.is_git_mode() {
+            history.selected_related_bead_id().to_string()
+        } else {
+            history.selected_bead_id().to_string()
+        };
+        if bead_id.is_empty() {
+            self.status_msg = "\u{274c} No bead selected".to_string();
+            return;
+        }
+        self.reveal_issue(&bead_id);
+        self.select_issue_in_list(&bead_id);
+        self.current_view = ViewMode::Graph;
+        self.status_msg = format!("\u{1f4ca} Graph view: {bead_id}");
+    }
+
+    /// Go `enter` — reveal the selected bead in the main list and leave
+    /// History (model.go:5609-5635).
+    fn jump_from_history(&mut self) {
+        let Some(ref history) = self.history else {
+            return;
+        };
+        let bead_id = if history.is_git_mode() {
+            history.selected_related_bead_id().to_string()
+        } else {
+            history.selected_bead_id().to_string()
+        };
+        if bead_id.is_empty() {
+            return;
+        }
+        self.reveal_issue(&bead_id);
+        self.select_issue_in_list(&bead_id);
+        self.current_view = ViewMode::List;
+        self.show_detail = true;
+        self.focus_detail = true;
+    }
+
+    /// Select `id` in the filtered list if it is present (Go's `m.list.Select`
+    /// loop inside the `enter` and `g` handlers). `cursor` indexes
+    /// `filtered_indices`.
+    fn select_issue_in_list(&mut self, id: &str) {
+        if let Some(pos) = self
+            .filtered_indices
+            .iter()
+            .position(|&i| self.rows[i].id == id)
+        {
+            self.cursor = pos;
+        }
+    }
+
+    /// Go `revealRecipeIssue` — clear filters that would hide the target so
+    /// the bead is actually visible in the list.
+    fn reveal_issue(&mut self, id: &str) {
+        if self.filtered_indices.iter().any(|&i| self.rows[i].id == id) {
+            return;
+        }
+        if self.issue_map.contains_key(id) {
+            self.filter_mode = FilterMode::All;
+            self.label_filter = None;
+            self.search_query.clear();
+            self.apply_filter();
+        }
+    }
+
     /// Number of flattened entries in the current Time-Travel diff
     /// (added + removed + changed), for cursor clamping.
     fn time_travel_entry_count(&self) -> usize {
@@ -2960,7 +3409,7 @@ fn age_str(created_at: &Option<String>) -> String {
     String::new()
 }
 
-pub fn render(f: &mut Frame, app: &App) {
+pub fn render(f: &mut Frame, app: &mut App) {
     match app.current_view {
         ViewMode::Tree => {
             let issues: Vec<bv_core::model::Issue> = app.issue_map.values().cloned().collect();
@@ -3088,12 +3537,34 @@ pub fn render(f: &mut Frame, app: &App) {
             return;
         }
         ViewMode::History => {
-            if let Some(ref history) = app.history {
-                crate::views::history::render_history(f, history, f.area());
+            // Go model.go:6353-6364: while the background correlation walk is
+            // in flight (or after it failed) the whole view is replaced by a
+            // centered placeholder rather than the panels.
+            if !app.history_loaded || app.history_load_failed {
+                let message = if app.history_load_failed {
+                    "History unavailable; press h to retry"
+                } else {
+                    "Loading history…"
+                };
+                let block = ratatui::widgets::Paragraph::new(message)
+                    .alignment(ratatui::layout::Alignment::Center)
+                    .style(ratatui::style::Style::default().fg(app.theme.secondary));
+                let rows = ratatui::layout::Layout::vertical([
+                    ratatui::layout::Constraint::Fill(1),
+                    ratatui::layout::Constraint::Length(1),
+                    ratatui::layout::Constraint::Fill(1),
+                ])
+                .split(f.area());
+                f.render_widget(block, rows[1]);
+            } else if let Some(ref mut history) = app.history {
+                crate::views::history::render_history(f, history, &app.theme, f.area());
             } else {
-                let msg =
-                    ratatui::widgets::Paragraph::new("No history data available (press h to load)");
-                f.render_widget(msg, f.area());
+                crate::views::history::render_empty(
+                    f,
+                    &app.theme,
+                    f.area(),
+                    "No history data loaded",
+                );
             }
             render_status_bar(f, app);
             render_overlays(f, app);
@@ -4423,10 +4894,14 @@ pub fn render_debug_view(app: &mut App, view: &str, width: u16, height: u16) -> 
             crate::views::board::render_board(f, app, f.area(), app.board_mode, app.board_column)
         }
         _ => match app.history {
-            Some(ref history) => crate::views::history::render_history(f, history, f.area()),
-            None => f.render_widget(
-                ratatui::widgets::Paragraph::new("No history data available (press h to load)"),
+            Some(ref mut history) => {
+                crate::views::history::render_history(f, history, &app.theme, f.area())
+            }
+            None => crate::views::history::render_empty(
+                f,
+                &app.theme,
                 f.area(),
+                "No history data available",
             ),
         },
     });
@@ -4538,6 +5013,10 @@ fn tui_event_loop(
         // Live reload (Go fsnotify; TUI_UX_PARITY_PLAN.md Phase F): piggyback
         // on this same ~500ms tick instead of a background notify watcher.
         app.check_for_reload();
+        // Same trick for the background History correlation walk (Go's
+        // `HistoryLoadedMsg`): drain the channel here so a slow `git log -p`
+        // never blocks a keypress.
+        app.poll_history_load();
         // Poll events with timeout so freshness badge stays live
         if event::poll(std::time::Duration::from_millis(500))? {
             match event::read()? {
@@ -4647,18 +5126,98 @@ mod tests {
         assert_ne!(start, app.sort_mode);
     }
 
+    /// Go's `LoadHistoryCmd` (model.go:595-671) is a background `tea.Cmd`, so
+    /// `h` *starts* the correlation walk and renders the `"Loading history…"`
+    /// placeholder; `history_loaded` is only set once `poll_history_load`
+    /// drains the result. Both assertions are deterministic here because
+    /// `poll_history_load` only runs from the run loop's tick, which this test
+    /// never calls.
     #[test]
     fn history_toggle_loads_lazily_and_switches_view() {
         let mut app = make_app(3);
         assert!(!app.history_loaded);
         app.handle_key(KeyCode::Char('h'));
         assert_eq!(app.current_view, ViewMode::History);
-        assert!(app.history_loaded, "h should trigger lazy history load");
-        // Toggling back to List must not reset history_loaded (no reload
-        // needed the second time `h` is pressed).
+        assert!(app.history_loading, "h should start the background walk");
+        assert!(
+            !app.history_loaded,
+            "history_loaded only flips once the walk returns"
+        );
+        // Toggling back to List must not restart or reset the in-flight walk.
         app.handle_key(KeyCode::Char('h'));
         assert_eq!(app.current_view, ViewMode::List);
+        assert!(app.history_loading, "the in-flight walk is left alone");
+        assert!(!app.history_loaded);
+    }
+
+    /// Go fences a load with a `(dataGeneration, requestGeneration)` pair so a
+    /// slow walk can never overwrite a newer dataset (model.go:595-671).
+    /// Drives the channel directly, so the test needs no git walk.
+    #[test]
+    fn history_load_drops_stale_generations_and_retries() {
+        let mut app = make_app(3);
+        app.handle_key(KeyCode::Char('h'));
+        assert!(app.history_loading);
+        let generation = app.history_generation;
+
+        // A completion from an older request is discarded. Nothing is pending
+        // by then, so it must surface the retry placeholder rather than spin.
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        app.history_rx = Some(rx);
+        tx.send((generation - 1, Err("stale".to_string()))).unwrap();
+        app.poll_history_load();
+        assert!(!app.history_loading);
+        assert!(!app.history_loaded, "a stale result must not be applied");
+        assert!(app.history_load_failed);
+
+        // Re-entering retries, and a current-generation report lands.
+        app.handle_key(KeyCode::Char('h')); // back to the List
+        app.handle_key(KeyCode::Char('h')); // retry
+        assert_eq!(app.current_view, ViewMode::History);
+        assert!(app.history_loading);
+        let generation = app.history_generation;
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        app.history_rx = Some(rx);
+        let report = bv_correlation::history::HistoryReport {
+            generated_at: "2026-01-01T00:00:00Z".into(),
+            data_hash: "hash".into(),
+            git_range: "all history".into(),
+            latest_commit_sha: String::new(),
+            window: bv_correlation::history::HistoryWindow {
+                revision: String::new(),
+                limit: 500,
+                since: None,
+                until: None,
+                commits: 0,
+            },
+            stats: bv_correlation::history::HistoryStats {
+                total_beads: 0,
+                beads_with_commits: 0,
+                total_commits: 0,
+                unique_authors: 0,
+                avg_commits_per_bead: 0.0,
+                avg_cycle_time_days: None,
+                method_distribution: BTreeMap::new(),
+                strategies: None,
+                feedback_applied: None,
+            },
+            histories: BTreeMap::new(),
+            commit_index: BTreeMap::new(),
+            causal_history: None,
+        };
+        tx.send((generation, Ok(report))).unwrap();
+        app.poll_history_load();
+        assert!(!app.history_loading);
         assert!(app.history_loaded);
+        assert!(!app.history_load_failed);
+        assert!(
+            app.history.as_ref().is_some_and(|h| h.has_report()),
+            "the report must reach the view"
+        );
+        assert_eq!(
+            app.status_msg, "Loaded history: 0 beads with commits",
+            "Go model.go:9231"
+        );
     }
 
     /// Regression test for TUI_UX_PARITY_PLAN.md G11: j/k inside the
@@ -5799,7 +6358,7 @@ mod tests {
         // pass merely because the marker never appears at all.
         let backend = ratatui::backend::TestBackend::new(100, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(f, &app)).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
         let full = buffer_to_lines(terminal.backend().buffer());
         let last = full.lines().next_back().unwrap();
         assert!(last.contains("\u{1f4cb}"), "control last row:\n{last}");
@@ -5905,5 +6464,37 @@ mod footer_state_tests {
         release_instance_lock(&dir);
         assert!(!lock.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Go `gitRemoteToWebURL` (model.go:5794-5817) + `normalizeGitRemoteWebURL`
+    /// (:5819-5843), which the History view's `o` binding depends on to build
+    /// `<web>/commit/<sha>`. A wrong rewrite sends the user to a 404.
+    #[test]
+    fn git_remote_to_web_url_matches_go() {
+        // SSH scp-style: git@host:owner/repo.git
+        assert_eq!(
+            git_remote_to_web_url("git@github.com:Dicklesworthstone/beads_viewer.git"),
+            Some("https://github.com/Dicklesworthstone/beads_viewer".to_string())
+        );
+        // HTTPS: keep the host and path, drop `.git`.
+        assert_eq!(
+            git_remote_to_web_url("https://github.com/owner/repo.git"),
+            Some("https://github.com/owner/repo".to_string())
+        );
+        // ssh:// URL: scheme becomes https and the userinfo is dropped.
+        assert_eq!(
+            git_remote_to_web_url("ssh://git@github.com/owner/repo.git"),
+            Some("https://github.com/owner/repo".to_string())
+        );
+        // Trailing slash, query and fragment are all stripped.
+        assert_eq!(
+            git_remote_to_web_url("https://github.com/owner/repo/?tab=readme#top"),
+            Some("https://github.com/owner/repo".to_string())
+        );
+        // A remote with no repository path is not browsable.
+        assert_eq!(git_remote_to_web_url("https://github.com"), None);
+        // Unrecognised forms, and empty input, are rejected.
+        assert_eq!(git_remote_to_web_url("file:///tmp/repo"), None);
+        assert_eq!(git_remote_to_web_url("   "), None);
     }
 }

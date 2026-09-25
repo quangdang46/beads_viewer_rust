@@ -160,6 +160,19 @@ pub struct Theme {
     pub warning: Color,     // Yellow-orange
     pub highlight: Color,   // Selection background
     pub muted: Color,       // Muted text
+    /// Dim secondary text. Go `Theme.Subtext` (theme.go:102, values :186):
+    /// Dark `#BFBFBF` / Light `#666666`. Distinct from `secondary`/`muted`
+    /// (both `#6272A4` in the dark palette) — history.go paints event details,
+    /// commit messages, timeline detail lines and empty-state text in it.
+    pub subtext: Color,
+    /// Panel borders and the timeline spine. Go `Theme.Border`
+    /// (theme.go:121, values :204): Dark `#44475A` / Light `#AAAAAA`. Same hex
+    /// as `highlight` in the dark palette but a different role: `highlight` is a
+    /// selection *background*, `border` is a foreground.
+    pub border: Color,
+    /// Navigation hints in pane footers. Go `ColorFooterHint`
+    /// (styles.go:90): Light `#444444` / Dark `#C8C8D0`.
+    pub footer_hint: Color,
 }
 
 impl Default for Theme {
@@ -180,6 +193,9 @@ impl Default for Theme {
             warning: Color::Rgb(255, 184, 108),     // #FFB86C Orange
             highlight: Color::Rgb(68, 71, 90),      // #44475A Current line
             muted: Color::Rgb(98, 114, 164),        // #6272A4 Comment
+            subtext: Color::Rgb(191, 191, 191),     // #BFBFBF Dim (theme.go:186)
+            border: Color::Rgb(68, 71, 90),         // #44475A Border (theme.go:204)
+            footer_hint: Color::Rgb(200, 200, 208), // #C8C8D0 (styles.go:90)
         }
     }
 }
@@ -203,6 +219,9 @@ impl Theme {
             warning: Color::Rgb(176, 104, 0),     // #B06800 (styles.go:43)
             highlight: Color::Rgb(224, 224, 224), // #E0E0E0 (theme.go:205)
             muted: Color::Rgb(102, 102, 102),     // #666666 (styles.go:36)
+            subtext: Color::Rgb(102, 102, 102),   // #666666 Dim (theme.go:186)
+            border: Color::Rgb(170, 170, 170),    // #AAAAAA Border (theme.go:204)
+            footer_hint: Color::Rgb(68, 68, 68),  // #444444 (styles.go:90)
         }
     }
 
