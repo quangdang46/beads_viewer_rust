@@ -1376,32 +1376,106 @@ fn check_dependency_addition(
     (true, Vec::new(), String::new())
 }
 
+/// Go `Analyzer.activeCycleGraph` (graph.go:1524-1552), reduced to what
+/// `DetectCycleWarnings` needs: the same node set in the same sorted-issue-ID
+/// index space, with every edge whose endpoint is closed-like dropped.
+///
+/// The index space must NOT be rebuilt from the surviving issues — Go's
+/// `newCompactDirectedGraph(len(a.nodeToID))` keeps all original node ids, and
+/// `findCyclesSafe` orders its output by those ids (graph_cycles.go:46-59). A
+/// closed issue in the middle of a cycle must break the cycle, not renumber
+/// the rest of the graph around it.
+fn active_cycle_graph(issues: &[Issue]) -> crate::DiGraph {
+    let g = build_graph(issues);
+
+    let closed_ids: HashSet<&str> = issues
+        .iter()
+        .filter(|i| is_closed_like_status(i.status))
+        .map(|i| i.id.as_str())
+        .collect();
+    if closed_ids.is_empty() {
+        return g;
+    }
+
+    let closed: HashSet<usize> = (0..g.len())
+        .filter(|&idx| {
+            g.node_id(idx)
+                .is_some_and(|id| closed_ids.contains(id.as_str()))
+        })
+        .collect();
+
+    // Rebuild the same node order with the ineligible edges removed. `add_node`
+    // assigns indices in insertion order, so iterating 0..len() reproduces the
+    // original sorted-ID mapping exactly. `add_edge` is idempotent and `g`'s
+    // successors are already index-sorted, so the neighbour order Go's
+    // `sort.Slice` produces (graph_cycles.go:95-97) is preserved.
+    let mut active = crate::DiGraph::with_capacity(g.len(), g.edge_count());
+    for idx in 0..g.len() {
+        if let Some(id) = g.node_id(idx) {
+            active.add_node(&id);
+        }
+    }
+    for idx in 0..g.len() {
+        if closed.contains(&idx) {
+            continue;
+        }
+        for &to in g.successors_slice(idx) {
+            if !closed.contains(&to) {
+                active.add_edge(idx, to);
+            }
+        }
+    }
+    active
+}
+
 /// Generate suggestions for dependency cycles in the graph.
 /// Matches Go `DetectCycleWarnings` exactly.
 pub fn detect_cycle_warnings(issues: &[Issue], config: &CycleWarningConfig) -> Vec<Suggestion> {
-    if issues.len() < 2 {
+    detect_cycle_warnings_with_source(issues, config, "")
+}
+
+/// `detect_cycle_warnings` with the loaded issues file, for the mutation-action
+/// routing. See [`detect_duplicates_with_source`] for the same convention.
+pub fn detect_cycle_warnings_with_source(
+    issues: &[Issue],
+    config: &CycleWarningConfig,
+    source_path: &str,
+) -> Vec<Suggestion> {
+    // cycle_warnings.go:33 — Go's guard is "no issues" or "no cycles asked
+    // for", not "fewer than two issues": a lone issue that depends on itself
+    // is a reportable self-loop.
+    if issues.is_empty() || config.max_cycles == 0 {
         return Vec::new();
     }
 
-    let g = build_graph(issues);
-    let cycles_raw = crate::algorithms::cycles::enumerate_cycles(&g, 100);
+    // cycle_warnings.go:41-47. `findCyclesSafe` returns at most one cycle per
+    // SCC, so when self-loops are filtered out the small output limit would
+    // hide reportable cycles behind skipped ones; scan every component instead.
+    let mut max_cycles_to_store = config.max_cycles;
+    if !config.include_self_loops && max_cycles_to_store < issues.len() {
+        max_cycles_to_store = issues.len();
+    }
+
+    let g = active_cycle_graph(issues);
+    let cycles_raw = crate::algorithms::cycles::enumerate_cycles(&g, max_cycles_to_store);
 
     if cycles_raw.is_empty() {
         return Vec::new();
     }
 
-    // Convert node indices to issue IDs and append closing node (Go parity).
+    // `findCyclesSafe` already stores the CLOSED path — graph_cycles.go:138
+    // appends the closing node — and Go's `consumeCycles` (graph.go:2211-2217)
+    // copies every node it returns, so the cycle IDs are used verbatim. A
+    // self-loop is therefore the doubled record `["Cyc-33", "Cyc-33"]`.
     let cycles: Vec<Vec<String>> = cycles_raw
         .iter()
         .filter_map(|cycle| {
             if cycle.is_empty() {
                 return None;
             }
-            let start = cycle[0];
-            let mut path: Vec<String> = cycle.iter().filter_map(|&idx| g.node_id(idx)).collect();
-            // Append closing node (Go includes it).
-            if let Some(start_id) = g.node_id(start) {
-                path.push(start_id);
+            let path: Vec<String> = cycle.iter().filter_map(|&idx| g.node_id(idx)).collect();
+            if path.is_empty() {
+                return None;
             }
             Some(path)
         })
@@ -1409,14 +1483,16 @@ pub fn detect_cycle_warnings(issues: &[Issue], config: &CycleWarningConfig) -> V
 
     let mut suggestions: Vec<Suggestion> = Vec::new();
 
-    for (i, cycle) in cycles.iter().enumerate() {
-        if i >= config.max_cycles {
-            break;
-        }
-
-        // Skip self-loops if configured.
+    for cycle in cycles.iter() {
+        // Skip self-loops if configured (cycle_warnings.go:67-71).
         if cycle.len() == 2 && cycle[0] == cycle[1] && !config.include_self_loops {
             continue;
+        }
+
+        // cycle_warnings.go:72-74 — the cap counts EMITTED suggestions, not
+        // iterations, so a skipped self-loop does not consume a slot.
+        if suggestions.len() >= config.max_cycles {
+            break;
         }
 
         let cycle_path = format_cycle_path(cycle);
@@ -1453,11 +1529,23 @@ pub fn detect_cycle_warnings(issues: &[Issue], config: &CycleWarningConfig) -> V
         .with_metadata("cycle_length", serde_json::json!(cycle_len))
         .with_metadata("cycle_path", serde_json::json!(path_without_close));
 
-        // Add action command to break the cycle.
+        // Add action command to break the cycle (cycle_warnings.go:112-119).
+        // Go removes the LAST edge in the cycle, from `cycle[len-2]` to
+        // `cycle[0]`, and routes it through the issues' live tracker origin
+        // rather than printing a command string. When the source has no
+        // verified route the command is absent and the reason is recorded in
+        // metadata instead — the hardcoded `br dep remove <id> <id>` this
+        // replaces claimed an action the tool cannot actually perform.
         if cycle_len >= 2 {
             let from = &cycle[cycle_len - 1];
             let to = &cycle[0];
-            sug = sug.with_action(&format!("br dep remove {} {}", from, to));
+            sug = sug.with_mutation_action(
+                source_path,
+                from,
+                to,
+                bv_core::tracker::MutationKind::RemoveDependency,
+                "",
+            );
         }
 
         // If there's a second issue, mark it as related.
@@ -1514,7 +1602,7 @@ pub fn generate_all_suggestions(
         && (config.filter_type.is_none()
             || config.filter_type.as_deref() == Some(SuggestionType::CycleWarning.as_str()))
     {
-        let cycles = detect_cycle_warnings(issues, &config.cycles);
+        let cycles = detect_cycle_warnings_with_source(issues, &config.cycles, source_path);
         all_suggestions.extend(cycles);
     }
 
@@ -1736,6 +1824,165 @@ mod tests {
         let config = CycleWarningConfig::default();
         let suggestions = detect_cycle_warnings(&issues, &config);
         assert!(suggestions.is_empty());
+    }
+
+    /// A blocking `issue -> depends_on` dependency edge.
+    fn blocking_dep(issue_id: &str, depends_on: &str) -> bv_core::model::Dependency {
+        bv_core::model::Dependency {
+            issue_id: issue_id.to_string(),
+            depends_on_id: depends_on.to_string(),
+            depends_on_legacy: String::new(),
+            target_id_legacy: String::new(),
+            r#type: bv_core::model::DependencyType::Blocks,
+            created_at: None,
+            created_by: String::new(),
+        }
+    }
+
+    /// An issue that blocking-depends on itself.
+    fn self_loop_issue(id: &str) -> Issue {
+        let mut i = make_issue(id, "Self", "");
+        i.dependencies.push(blocking_dep(id, id));
+        i
+    }
+
+    /// An `a -> b` blocking edge (a depends on b).
+    fn depends_on(a: Issue, b: &str) -> Issue {
+        let mut i = a;
+        i.dependencies.push(blocking_dep(&i.id, b));
+        i
+    }
+
+    /// cycle_warnings.go:33 — Go's guard is "no issues", not "fewer than two".
+    /// A lone issue that depends on itself is a reportable self-loop, and this
+    /// is the exact shape the `Cyc-33` row of the large_cyclic_600 corpus has.
+    #[test]
+    fn detect_cycle_warnings_reports_a_lone_self_loop() {
+        let issues = vec![self_loop_issue("A-1")];
+        let suggestions = detect_cycle_warnings(&issues, &CycleWarningConfig::default());
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].target_bead, "A-1");
+        assert_eq!(suggestions[0].summary, "Self-loop: A-1 depends on itself");
+        assert_eq!(suggestions[0].reason, "Cycle path: A-1 \u{2192} A-1");
+        assert_eq!(
+            suggestions[0].metadata.as_ref().unwrap()["cycle_length"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            suggestions[0].metadata.as_ref().unwrap()["cycle_path"],
+            serde_json::json!(["A-1"])
+        );
+        // cycle_warnings.go:113 guards on cycleLen >= 2, so a self-loop never
+        // gets an action and never gets a related bead.
+        assert!(suggestions[0].action_command.is_none());
+        assert!(suggestions[0].related_bead.is_none());
+    }
+
+    /// graph_cycles.go:138 stores the CLOSED path, so a two-node cycle is
+    /// three records long and `cycleLen` is 2 — not 3. The doubled-closing-node
+    /// bug this guards against produced `["A-1","A-2","A-1","A-1"]` and a
+    /// `cycleLen` of 3.
+    #[test]
+    fn detect_cycle_warnings_cycle_length_excludes_only_the_closing_node() {
+        let issues = vec![
+            depends_on(make_issue("A-1", "One", ""), "A-2"),
+            depends_on(make_issue("A-2", "Two", ""), "A-1"),
+        ];
+        let suggestions = detect_cycle_warnings(&issues, &CycleWarningConfig::default());
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].summary, "Direct cycle between A-1 and A-2");
+        assert_eq!(
+            suggestions[0].reason,
+            "Cycle path: A-1 \u{2192} A-2 \u{2192} A-1"
+        );
+        assert_eq!(suggestions[0].confidence, 1.0);
+        let meta = suggestions[0].metadata.as_ref().unwrap();
+        assert_eq!(meta["cycle_length"], serde_json::json!(2));
+        assert_eq!(meta["cycle_path"], serde_json::json!(["A-1", "A-2"]));
+        assert_eq!(suggestions[0].related_bead.as_deref(), Some("A-2"));
+    }
+
+    /// graph_cycles.go:27-41 — one representative per SCC. Three nodes in one
+    /// SCC hold two distinct elementary circuits; Go reports one warning.
+    #[test]
+    fn detect_cycle_warnings_emits_one_per_component() {
+        // a->b, b->c, c->b : b and c form the only SCC.
+        let issues = vec![
+            depends_on(make_issue("A-1", "One", ""), "A-2"),
+            depends_on(make_issue("A-2", "Two", ""), "A-3"),
+            depends_on(make_issue("A-3", "Three", ""), "A-2"),
+        ];
+        let suggestions = detect_cycle_warnings(&issues, &CycleWarningConfig::default());
+        assert_eq!(suggestions.len(), 1, "one representative per SCC");
+    }
+
+    /// cycle_warnings.go:112-119 + types.go:120-125. With no resolved origin
+    /// there is no command to give; the reason is recorded as metadata and
+    /// `IsActionable` stays false. The hardcoded `br dep remove A-2 A-1` this
+    /// replaces claimed an action the tool cannot perform, and made
+    /// `stats.actionable_count` 9 where the oracle reports 0.
+    #[test]
+    fn cycle_warning_routes_through_the_mutation_helper() {
+        let issues = vec![
+            depends_on(make_issue("A-1", "One", ""), "A-2"),
+            depends_on(make_issue("A-2", "Two", ""), "A-1"),
+        ];
+        let suggestions =
+            detect_cycle_warnings_with_source(&issues, &CycleWarningConfig::default(), "");
+        assert_eq!(suggestions.len(), 1);
+        assert!(
+            suggestions[0].action_command.is_none(),
+            "no verified route means no command, got {:?}",
+            suggestions[0].action_command
+        );
+        assert!(
+            suggestions[0].action.is_none(),
+            "no verified route means no argv, got {:?}",
+            suggestions[0].action
+        );
+        assert_eq!(
+            suggestions[0].metadata.as_ref().unwrap()["action_unavailable_reason"],
+            serde_json::json!("source has no verified live tracker route")
+        );
+        assert!(!suggestions[0].is_actionable());
+    }
+
+    /// cycle_warnings.go:67-74 — the `MaxCycles` cap counts EMITTED
+    /// suggestions. With self-loops filtered, a skipped `[n, n]` record must
+    /// not consume one of the three slots, so the third real cycle is reported.
+    #[test]
+    fn max_cycles_counts_emitted_suggestions_not_records() {
+        let issues = vec![
+            self_loop_issue("A-0"),
+            depends_on(make_issue("A-1", "One", ""), "A-2"),
+            depends_on(make_issue("A-2", "Two", ""), "A-1"),
+            depends_on(make_issue("A-3", "Three", ""), "A-4"),
+            depends_on(make_issue("A-4", "Four", ""), "A-3"),
+            depends_on(make_issue("A-5", "Five", ""), "A-6"),
+            depends_on(make_issue("A-6", "Six", ""), "A-5"),
+        ];
+        let config = CycleWarningConfig {
+            max_cycles: 2,
+            include_self_loops: false,
+        };
+        let suggestions = detect_cycle_warnings(&issues, &config);
+        assert_eq!(suggestions.len(), 2);
+        // The self-loop sorts first (length 2 beats length 3) and is skipped
+        // without consuming a slot.
+        let targets: Vec<&str> = suggestions.iter().map(|s| s.target_bead.as_str()).collect();
+        assert_eq!(targets, vec!["A-1", "A-3"]);
+    }
+
+    /// graph.go:1524-1552 — a closed-like issue breaks an operational cycle
+    /// rather than closing it. Closed issues stay in the graph for centrality
+    /// but must not be able to form one.
+    #[test]
+    fn closed_issue_breaks_an_operational_cycle() {
+        let mut closed = depends_on(make_issue("A-2", "Two", ""), "A-1");
+        closed.status = Status::Closed;
+        let issues = vec![depends_on(make_issue("A-1", "One", ""), "A-2"), closed];
+        let suggestions = detect_cycle_warnings(&issues, &CycleWarningConfig::default());
+        assert!(suggestions.is_empty(), "closed member breaks the cycle");
     }
 
     #[test]

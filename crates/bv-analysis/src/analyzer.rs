@@ -80,7 +80,68 @@ pub struct MetricStatus {
     pub slack: StatusEntry,
 }
 
+/// Go `sourceDateEpochActive` (cmd/bv/main.go:1174-1181): `SOURCE_DATE_EPOCH`
+/// is set and, after trimming, parses as a base-10 64-bit integer.
+///
+/// Go's `strconv.ParseInt(value, 10, 64)` and Rust's `i64::from_str` accept
+/// the same language — an optional sign then at least one digit, with no
+/// underscores and no base prefix — so the two agree on every input.
+fn source_date_epoch_active() -> bool {
+    std::env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .map(|v| v.trim().parse::<i64>().is_ok())
+        .unwrap_or(false)
+}
+
+/// Go's gate on the two order-dependent metrics (pkg/analysis/graph.go:2163 and
+/// :2271): `len(stats.TopologicalOrder) == len(a.issueMap)`. Phase 1 only fills
+/// `TopologicalOrder` when gonum's `topo.Sort` returns no error, so the gate is
+/// "the whole graph is orderable".
+///
+/// gonum's `topo.Sort` is a DFS that errors on *any* back edge, and a self-edge
+/// is a back edge. `topological_sort_gonum` here is Tarjan-based and only
+/// rejects multi-node SCCs, so it would let a graph whose only cycle is a
+/// self-loop through and report the metric as computed where Go skips it. The
+/// scan below is what closes that gap; [`build_graph`] keeps self-loops, so
+/// they really do reach here.
+fn topological_order_available(g: &DiGraph) -> bool {
+    let n = g.len();
+    if topological_sort_gonum(g).map(|o| o.len() == n) != Some(true) {
+        return false;
+    }
+    !(0..n).any(|v| g.successors_slice(v).contains(&v))
+}
+
 impl MetricStatus {
+    /// Go `stabilizeRobotMetricStatusForPinnedClock` (cmd/bv/main.go:1190-1202):
+    /// zero the elapsed duration of all nine entries when the clock is pinned.
+    ///
+    /// `statusEntry.MarshalJSON` (pkg/analysis/graph.go:130-147) drops `ms`
+    /// whenever `Elapsed == 0`, so a pinned-clock document carries no `ms` key
+    /// at all on any metric — that is what makes a golden reproducible at all.
+    /// Rust stores a real measured duration and therefore emits nine
+    /// wall-clock floats per document; the golden corpus has zero.
+    ///
+    /// Go applies this at each robot entrypoint, which covers every
+    /// serialization of a `MetricStatus` (robot_registry.go:892, :1008, :1984,
+    /// and the two triage sites via `stabilizeRobotTriageForPinnedClock`).
+    /// Doing it where the status is built is equivalent for those and also
+    /// covers the non-robot consumers, which serialize the same struct.
+    pub fn stabilize_for_pinned_clock(&mut self) {
+        if !source_date_epoch_active() {
+            return;
+        }
+        self.page_rank.ms = 0.0;
+        self.betweenness.ms = 0.0;
+        self.eigenvector.ms = 0.0;
+        self.hits.ms = 0.0;
+        self.critical.ms = 0.0;
+        self.cycles.ms = 0.0;
+        self.kcore.ms = 0.0;
+        self.articulation.ms = 0.0;
+        self.slack.ms = 0.0;
+    }
+
     /// Serialize with Go's exact JSON keys.
     pub fn to_json_map(&self) -> serde_json::Value {
         serde_json::json!({
@@ -780,6 +841,12 @@ pub fn analyze_phase2_blocking(
     let mut status = MetricStatus::default();
     let mut out = GraphAnalysisPhase2::default();
     let n = g.len();
+    // Go runs the two order-dependent metrics only when Phase 1's topological
+    // sort covered every issue (graph.go:2163, :2271); on a cyclic graph it
+    // skips both, reports the cycle as the reason, and leaves the map nil.
+    // Both height DPs need a valid order, so running them anyway would report
+    // a metric Go never computed.
+    let order_available = topological_order_available(&g);
 
     if budget.skip_phase2 {
         let reason = "BV_SKIP_PHASE2 set";
@@ -875,19 +942,27 @@ pub fn analyze_phase2_blocking(
             }
         }
 
-        // Critical path heights DP.
-        let t0 = Instant::now();
-        let gc = std::sync::Arc::clone(&g);
-        match run_with_timeout(budget.timeout_for(n), move || critical_path_heights(&gc)) {
-            Ok(heights) => {
-                status.critical = StatusEntry::computed(t0.elapsed().as_secs_f64() * 1000.0);
-                let mut m = BTreeMap::new();
-                for (i, v) in heights.into_iter().enumerate() {
-                    m.insert(g.node_id(i).unwrap_or_default().to_string(), v);
+        // Critical path heights DP. Go's unavailable branch still charges the
+        // elapsed time to the profile (graph.go:2179), but a measured duration
+        // is not reproducible and the pinned-clock pass zeroes it, so the
+        // skipped entry carries ms 0 — byte-identical to Go under
+        // SOURCE_DATE_EPOCH, and the only deterministic choice without one.
+        if order_available {
+            let t0 = Instant::now();
+            let gc = std::sync::Arc::clone(&g);
+            match run_with_timeout(budget.timeout_for(n), move || critical_path_heights(&gc)) {
+                Ok(heights) => {
+                    status.critical = StatusEntry::computed(t0.elapsed().as_secs_f64() * 1000.0);
+                    let mut m = BTreeMap::new();
+                    for (i, v) in heights.into_iter().enumerate() {
+                        m.insert(g.node_id(i).unwrap_or_default().to_string(), v);
+                    }
+                    out.critical_path_score = Some(m);
                 }
-                out.critical_path_score = Some(m);
+                Err(()) => status.critical = StatusEntry::timeout(0.0),
             }
-            Err(()) => status.critical = StatusEntry::timeout(0.0),
+        } else {
+            status.critical = StatusEntry::skipped(CYCLE_UNAVAILABLE_REASON);
         }
 
         // Cycles: skip entirely for XL graphs (Go ConfigForSize: >2000 nodes).
@@ -955,17 +1030,24 @@ pub fn analyze_phase2_blocking(
     }
 
     let t0 = Instant::now();
-    let gc = std::sync::Arc::clone(&g);
-    match run_with_timeout(budget.timeout_for(n), move || {
-        crate::algorithms::slack::slack(&gc)
-    }) {
-        Ok(slacks) => {
-            status.slack = StatusEntry::computed(t0.elapsed().as_secs_f64() * 1000.0);
-            out.slack = Some(idx_to_score_map(&g, slacks));
+    // Go gate at pkg/analysis/graph.go:2271, with the same unavailable branch
+    // as critical path above (graph.go:2163).
+    if order_available {
+        let gc = std::sync::Arc::clone(&g);
+        match run_with_timeout(budget.timeout_for(n), move || {
+            crate::algorithms::slack::slack(&gc)
+        }) {
+            Ok(slacks) => {
+                status.slack = StatusEntry::computed(t0.elapsed().as_secs_f64() * 1000.0);
+                out.slack = Some(idx_to_score_map(&g, slacks));
+            }
+            Err(()) => status.slack = StatusEntry::timeout(0.0),
         }
-        Err(()) => status.slack = StatusEntry::timeout(0.0),
+    } else {
+        status.slack = StatusEntry::skipped(CYCLE_UNAVAILABLE_REASON);
     }
 
+    status.stabilize_for_pinned_clock();
     (status, out)
 }
 
@@ -998,6 +1080,11 @@ pub fn recommend_sample_size(nodes: usize) -> usize {
 pub fn critical_path(g: &DiGraph) -> Vec<usize> {
     critical_path_nodes(g)
 }
+
+/// Go's reason for an order-dependent metric it could not run
+/// (pkg/analysis/graph.go:2177 and :2274).
+const CYCLE_UNAVAILABLE_REASON: &str =
+    "dependency graph contains a cycle; topological order unavailable";
 
 /// Go `stateFromTiming` (pkg/analysis/graph.go:229-238).
 fn state_from_timing(enabled: bool, timed_out: bool) -> &'static str {
@@ -1369,6 +1456,7 @@ fn analyze_phase2_with_profile(
         articulation: entry(articulation_ran, false, profile.articulation),
         slack,
     };
+    out.status.stabilize_for_pinned_clock();
 }
 
 fn ms_total(d: Duration) -> f64 {
@@ -1514,6 +1602,158 @@ mod tests {
         assert_eq!(status.slack.state, "computed");
         assert!(out.core_number.is_some());
         assert!(out.page_rank.is_none());
+    }
+
+    /// Go gates both order-dependent metrics on a complete topological order
+    /// (pkg/analysis/graph.go:2163 and :2271) and reports Go's exact reason
+    /// string when it is missing.
+    #[test]
+    fn cyclic_graph_skips_critical_path_and_slack_with_go_reason() {
+        let issues = vec![
+            issue_with_blocking_deps("a", &["b"]),
+            issue_with_blocking_deps("b", &["c"]),
+            issue_with_blocking_deps("c", &["a"]),
+        ];
+        let g = build_graph(&issues);
+        let (status, out) =
+            analyze_phase2_blocking(std::sync::Arc::new(g), &AnalysisBudget::default());
+        assert_eq!(status.critical.state, "skipped");
+        assert_eq!(status.critical.reason, CYCLE_UNAVAILABLE_REASON);
+        assert_eq!(status.slack.state, "skipped");
+        assert_eq!(status.slack.reason, CYCLE_UNAVAILABLE_REASON);
+        // Go leaves both maps nil when the metric did not run.
+        assert_eq!(out.critical_path_score, None);
+        assert_eq!(out.slack, None);
+    }
+
+    /// A self-edge is a back edge for gonum's `topo.Sort`, so Go reports the
+    /// graph as unorderable even though its only SCC is a singleton — which is
+    /// the case Tarjan-based `topological_sort_gonum` cannot see.
+    #[test]
+    fn self_loop_is_not_an_available_order() {
+        let mut g = DiGraph::new();
+        g.add_node("a");
+        g.add_node("b");
+        let a = g.node_idx("a").unwrap();
+        let b = g.node_idx("b").unwrap();
+        g.add_edge(a, b);
+        g.add_edge(a, a);
+        assert!(
+            topological_sort_gonum(&g).is_some(),
+            "Tarjan sees no multi-node SCC; only the self-edge scan catches it"
+        );
+        assert!(!topological_order_available(&g));
+
+        let (status, out) =
+            analyze_phase2_blocking(std::sync::Arc::new(g), &AnalysisBudget::default());
+        assert_eq!(status.slack.state, "skipped");
+        assert_eq!(status.slack.reason, CYCLE_UNAVAILABLE_REASON);
+        assert_eq!(out.slack, None);
+    }
+
+    #[test]
+    fn acyclic_graph_still_computes_critical_path_and_slack() {
+        let g = chain(12);
+        assert!(topological_order_available(&g));
+        let (status, out) =
+            analyze_phase2_blocking(std::sync::Arc::new(g), &AnalysisBudget::default());
+        assert_eq!(status.critical.state, "computed");
+        assert_eq!(status.critical.reason, "");
+        assert_eq!(status.slack.state, "computed");
+        assert_eq!(status.slack.reason, "");
+        assert_eq!(out.critical_path_score.expect("heights present").len(), 12);
+        assert_eq!(out.slack.expect("slack present").len(), 12);
+    }
+
+    /// Go `stabilizeRobotMetricStatusForPinnedClock` zeroes all nine elapsed
+    /// values when SOURCE_DATE_EPOCH parses, and `statusEntry.MarshalJSON`
+    /// drops `ms` for a zero elapsed, so the pinned document carries no `ms`
+    /// key on any metric (pkg/analysis/graph.go:130-147).
+    ///
+    /// The env var is process-global, so these run in one test to keep the
+    /// mutation from racing another test in the same binary.
+    #[test]
+    fn pinned_clock_drops_ms_and_unpinned_keeps_it() {
+        fn entry(ms: f64) -> StatusEntry {
+            StatusEntry {
+                state: "computed".into(),
+                ms,
+                ..Default::default()
+            }
+        }
+        fn status_with_ms() -> MetricStatus {
+            MetricStatus {
+                page_rank: entry(1.5),
+                betweenness: entry(1.5),
+                eigenvector: entry(1.5),
+                hits: entry(1.5),
+                critical: entry(1.5),
+                cycles: entry(1.5),
+                kcore: entry(1.5),
+                articulation: entry(1.5),
+                slack: entry(1.5),
+            }
+        }
+        fn all_ms_are_zero(s: &MetricStatus) -> bool {
+            [
+                &s.page_rank,
+                &s.betweenness,
+                &s.eigenvector,
+                &s.hits,
+                &s.critical,
+                &s.cycles,
+                &s.kcore,
+                &s.articulation,
+                &s.slack,
+            ]
+            .iter()
+            .all(|e| e.ms == 0.0)
+        }
+
+        // Unset: Go's ParseInt never runs on an empty value, so the status
+        // keeps its measured durations.
+        std::env::remove_var("SOURCE_DATE_EPOCH");
+        let mut unpinned = status_with_ms();
+        unpinned.stabilize_for_pinned_clock();
+        assert!(!all_ms_are_zero(&unpinned), "ms must survive unpinned");
+
+        // A value that is not a base-10 integer is not a pinned clock.
+        std::env::set_var("SOURCE_DATE_EPOCH", "not-a-number");
+        let mut garbage = status_with_ms();
+        garbage.stabilize_for_pinned_clock();
+        assert!(
+            !all_ms_are_zero(&garbage),
+            "ms must survive an unparsable epoch"
+        );
+
+        // Go trims before parsing, so surrounding whitespace still pins.
+        std::env::set_var("SOURCE_DATE_EPOCH", "  1787407612  ");
+        assert!(source_date_epoch_active(), "TrimSpace then ParseInt");
+        let mut padded = status_with_ms();
+        padded.stabilize_for_pinned_clock();
+        assert!(all_ms_are_zero(&padded));
+
+        std::env::set_var("SOURCE_DATE_EPOCH", "1787407612");
+        let (status, _) =
+            analyze_phase2_blocking(std::sync::Arc::new(chain(8)), &AnalysisBudget::default());
+        let json = status.to_json_map();
+        for key in [
+            "PageRank",
+            "Betweenness",
+            "Eigenvector",
+            "HITS",
+            "Critical",
+            "Cycles",
+            "KCore",
+            "Articulation",
+            "Slack",
+        ] {
+            assert!(
+                json[key].get("ms").is_none(),
+                "{key} still carries ms under a pinned clock: {json}"
+            );
+        }
+        std::env::remove_var("SOURCE_DATE_EPOCH");
     }
 
     #[test]

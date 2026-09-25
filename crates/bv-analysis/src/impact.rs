@@ -120,10 +120,16 @@ pub fn time_to_impact_explanation(
 }
 
 /// Go `computeUrgency` explanation (pkg/analysis/priority.go:590).
+///
+/// `score` is the same capped urgency score `compute_urgency` returned — Go
+/// builds the explanation from it in the same function, and its
+/// `else if score > 0.1` arm is what emits "moderate time pressure" for an
+/// aging issue that has no urgent label and so accumulated no reasons.
 pub fn urgency_explanation(
     labels: &[String],
     created_at: Option<&str>,
     now: &jiff::Timestamp,
+    score: f64,
 ) -> String {
     let mut reasons: Vec<String> = Vec::new();
     let mut urgent_label = String::new();
@@ -150,7 +156,13 @@ pub fn urgency_explanation(
         reasons.push(format!("aging ({days:.0} days)"));
     }
     if reasons.is_empty() {
-        return String::new();
+        // Go priority.go:593-595 — an issue past the decay threshold with no
+        // urgent label has score but no reasons, and Go still explains it.
+        return if score > 0.1 {
+            "moderate time pressure".to_string()
+        } else {
+            String::new()
+        };
     }
     reasons.join(", ")
 }
@@ -607,6 +619,7 @@ pub fn compute_impact_scores_with_weights(
                 &issue.labels,
                 issue.created_at.as_deref(),
                 &inputs.now,
+                urgency_norm,
             ),
             risk_explanation: risk_expl.clone(),
             risk_signals: Some(RiskSignalsDetail {

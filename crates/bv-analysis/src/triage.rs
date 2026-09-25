@@ -246,53 +246,324 @@ pub fn compute_row_triage(issues: &[Issue]) -> std::collections::HashMap<String,
     out
 }
 
-/// Compute the set of issue IDs that have >=1 open blocker.
-///
-/// Go parity (`br ready`/`br blocked`): blocking is inherited through
-/// parent-child links — a child of a (transitively) blocked parent is
-/// blocked even when it carries no direct `blocks` edge itself. Routes
-/// through [`crate::blocker_chain::open_blockers`] (direct blocking edges
-/// + transitive parent-blocked propagation) so every consumer agrees.
-pub fn compute_blocked_set(issues: &[Issue]) -> std::collections::HashSet<String> {
-    use std::collections::{HashMap, HashSet};
-    let by_id: HashMap<&str, &Issue> = issues.iter().map(|i| (i.id.as_str(), i)).collect();
-    let mut blocked = HashSet::new();
-    for i in issues {
-        // Skip self-loops: Go's graph drops them (gonum SimpleGraph rejects
-        // self-edges), so a self-edge must not count as its own blocker.
-        let direct = i.dependencies.iter().any(|dep| {
-            if !dep.r#type.is_blocking() {
-                return false;
+// === Readiness authority — port of Go `pkg/model/readiness.go` ===
+//
+// Go's `model.ReadinessIndex` is the ONE dependency authority behind every
+// triage surface that asks "can this be worked on":
+//
+//   * `computeCountsWithContext` (triage.go:888) -> `ctx.IsActionable` ->
+//     `getActionableIssuesAfterCompletions(nil)` -> `Readiness().Ready`
+//   * `buildUnblocksMap` (triage.go:811) -> `getOpenBlockersInternal` ->
+//     `Readiness().Blockers`
+//   * `buildUnblocksMap`'s readiness gate (triage.go:819) ->
+//     `isActionableAfterCompletions` -> `Readiness().ReadyAfter`
+//
+// Porting it once, here, keeps all three answering identically. The previous
+// Rust code answered the first two with two independent approximations that
+// disagreed with each other and with Go.
+
+/// Go `model.DependencyState` (readiness.go:14-17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DepState {
+    Satisfied,
+    Unsatisfied,
+    Unknown,
+}
+
+/// Go `combineDependencyState` (readiness.go:99-107). `Unknown` dominates
+/// `Unsatisfied` dominates `Satisfied` — the join is commutative and
+/// associative, which is why Go's map-order queue below is deterministic.
+fn combine(a: DepState, b: DepState) -> DepState {
+    if a == DepState::Unknown || b == DepState::Unknown {
+        DepState::Unknown
+    } else if a == DepState::Unsatisfied || b == DepState::Unsatisfied {
+        DepState::Unsatisfied
+    } else {
+        DepState::Satisfied
+    }
+}
+
+/// Go `closedForReadiness` (readiness.go:79) — NOTE: this is `closed` +
+/// `tombstone`, not Go's narrower `Issue.IsClosed()`.
+fn closed_for_readiness(status: Status) -> bool {
+    matches!(status, Status::Closed | Status::Tombstone)
+}
+
+/// Go `readinessIssue` (readiness.go:32-39) — the decision inputs only.
+struct ReadinessIssue<'a> {
+    status: Status,
+    defer_until: Option<jiff::Timestamp>,
+    /// `(depends_on_id, type)`, pre-folded from the legacy field names.
+    deps: Vec<(&'a str, bv_core::model::DependencyType)>,
+}
+
+impl ReadinessIssue<'_> {
+    /// Go `readinessIssue.isDeferredAt` (readiness.go:42-44) —
+    /// `DeferUntil != nil && DeferUntil.After(now)`.
+    fn is_deferred_at(&self, now: jiff::Timestamp) -> bool {
+        self.defer_until.is_some_and(|d| d > now)
+    }
+}
+
+/// Go `model.ReadinessIndex` (readiness.go:26-30).
+struct Readiness<'a> {
+    issues: std::collections::HashMap<&'a str, ReadinessIssue<'a>>,
+    states: std::collections::HashMap<&'a str, DepState>,
+    children: std::collections::HashMap<&'a str, Vec<&'a str>>,
+}
+
+impl<'a> Readiness<'a> {
+    /// Go `NewReadinessIndex` (readiness.go:46-77) followed by `compute()`.
+    fn new(issues: &'a [Issue]) -> Self {
+        let mut r = Readiness {
+            issues: std::collections::HashMap::new(),
+            states: std::collections::HashMap::new(),
+            children: std::collections::HashMap::new(),
+        };
+        for issue in issues {
+            let deps: Vec<(&'a str, bv_core::model::DependencyType)> = issue
+                .dependencies
+                .iter()
+                .map(|d| (d.effective_depends_on(), d.r#type))
+                .collect();
+            // readiness.go:114-116 — parent-child is a rollup edge; record
+            // the reverse index here so the queue phase can walk children.
+            for (target, ty) in &deps {
+                if *ty == bv_core::model::DependencyType::ParentChild {
+                    r.children
+                        .entry(target)
+                        .or_default()
+                        .push(issue.id.as_str());
+                }
             }
-            let target = dep.effective_depends_on();
-            target != i.id
-                && by_id
-                    .get(target)
-                    .is_some_and(|b| b.status.is_open() && b.id != i.id)
-        });
-        if direct {
-            blocked.insert(i.id.clone());
-            continue;
+            r.issues.insert(
+                issue.id.as_str(),
+                ReadinessIssue {
+                    status: issue.status,
+                    defer_until: bv_core::model::parse_ts(&issue.defer_until),
+                    deps,
+                },
+            );
         }
-        // Ancestor-epic inheritance (#2): a child of a (transitively)
-        // blocked parent is blocked even with no direct `blocks` edge.
-        // Go's getOpenBlockersInternal surfaces the open parent only when
-        // the parent is itself transitively blocked — never for a
-        // standalone open parent — which is exactly what open_blockers
-        // computes; here we only accept the parent-propagated part.
-        let inherited = crate::blocker_chain::open_blockers(&by_id, &i.id)
-            .into_iter()
-            .any(|b| {
-                i.dependencies.iter().any(|d| {
-                    d.r#type == bv_core::model::DependencyType::ParentChild
-                        && d.effective_depends_on() == b.as_str()
-                })
-            });
-        if inherited {
-            blocked.insert(i.id.clone());
+        r.compute();
+        r
+    }
+
+    /// Go `ReadinessIndex.compute` (readiness.go:109-161).
+    ///
+    /// Blocking edges are decided in one pass; parent-child edges defer their
+    /// verdict until the parent has been resolved, then propagate. Note there
+    /// is NO self-edge exclusion: a `blocks` dependency pointing at the issue
+    /// itself finds `other` present and open, so the issue lands in
+    /// `Unsatisfied` and is never actionable. The gonum graph the metrics run
+    /// on rejects self-edges, but readiness never consults that graph.
+    fn compute(&mut self) {
+        let mut pending: std::collections::HashMap<&'a str, i64> = std::collections::HashMap::new();
+        for (&id, issue) in self.issues.iter() {
+            self.states.insert(id, DepState::Satisfied);
+            let closed = closed_for_readiness(issue.status);
+            for (target, ty) in &issue.deps {
+                if closed {
+                    continue;
+                }
+                let other = self.issues.get(*target);
+                if ty.is_blocking() {
+                    match other {
+                        None => {
+                            self.states.insert(id, DepState::Unknown);
+                        }
+                        Some(o) if !closed_for_readiness(o.status) => {
+                            let cur = self.states[&id];
+                            self.states.insert(id, combine(cur, DepState::Unsatisfied));
+                        }
+                        Some(_) => {}
+                    }
+                } else if *ty == bv_core::model::DependencyType::ParentChild {
+                    match other {
+                        None => {
+                            self.states.insert(id, DepState::Unknown);
+                        }
+                        Some(o) if !closed_for_readiness(o.status) => {
+                            *pending.entry(id).or_insert(0) += 1;
+                        }
+                        Some(_) => {}
+                    }
+                }
+            }
+        }
+
+        // readiness.go:141-157 — process parents before children. There is no
+        // depth cutoff, and a parent cycle (and its descendants) stays
+        // unresolved.
+        let mut queue: Vec<&'a str> = Vec::new();
+        for (&id, issue) in self.issues.iter() {
+            if !closed_for_readiness(issue.status) && pending.get(id).copied().unwrap_or(0) == 0 {
+                queue.push(id);
+            }
+        }
+        let mut head = 0usize;
+        while head < queue.len() {
+            let id = queue[head];
+            head += 1;
+            let kids = self.children.get(id).cloned().unwrap_or_default();
+            let parent_state = self.states[id];
+            for child in kids {
+                if self
+                    .issues
+                    .get(child)
+                    .is_some_and(|c| closed_for_readiness(c.status))
+                {
+                    continue;
+                }
+                let cur = self.states[child];
+                self.states.insert(child, combine(cur, parent_state));
+                let e = pending.entry(child).or_insert(0);
+                *e -= 1;
+                if *e == 0 {
+                    queue.push(child);
+                }
+            }
+        }
+        for (&id, &remaining) in pending.iter() {
+            if remaining > 0 {
+                self.states.insert(id, DepState::Unknown);
+            }
         }
     }
-    blocked
+
+    /// Go `ReadinessIndex.DependencyState` (readiness.go:165-170) — an ID the
+    /// index never saw is `Unknown`, not `Satisfied`.
+    fn dependency_state(&self, id: &str) -> DepState {
+        self.states.get(id).copied().unwrap_or(DepState::Unknown)
+    }
+
+    /// Go `ReadinessIndex.Blockers` (readiness.go:199-216) — the IDs that
+    /// explain why an item was withheld, including blocker IDs that are absent
+    /// from the source entirely. A `parent-child` edge counts only when the
+    /// parent's state is not `Satisfied`, so an open unblocked parent does not
+    /// gate its child.
+    fn blockers(&self, id: &str) -> Vec<String> {
+        let Some(issue) = self.issues.get(id) else {
+            return Vec::new();
+        };
+        if closed_for_readiness(issue.status) {
+            return Vec::new();
+        }
+        let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (target, ty) in &issue.deps {
+            let unresolved_blocking = ty.is_blocking()
+                && self
+                    .issues
+                    .get(*target)
+                    .is_none_or(|o| !closed_for_readiness(o.status));
+            let unresolved_parent = *ty == bv_core::model::DependencyType::ParentChild
+                && self.dependency_state(target) != DepState::Satisfied;
+            if unresolved_blocking || unresolved_parent {
+                set.insert((*target).to_string());
+            }
+        }
+        set.into_iter().collect()
+    }
+
+    /// Go `ReadinessIndex.Ready` (readiness.go:175-179).
+    fn ready(&self, id: &str, now: jiff::Timestamp) -> bool {
+        let Some(issue) = self.issues.get(id) else {
+            return false;
+        };
+        issue.status.is_open()
+            && !issue.is_deferred_at(now)
+            && self.dependency_state(id) == DepState::Satisfied
+    }
+
+    /// Go `ReadinessIndex.ReadyAfter` (readiness.go:223-262) — the bounded
+    /// what-if frontier. `completed == None` (Go's empty map) defers to
+    /// [`Readiness::ready`].
+    fn ready_after(
+        &self,
+        id: &str,
+        now: jiff::Timestamp,
+        completed: Option<&std::collections::BTreeSet<String>>,
+    ) -> bool {
+        let Some(completed) = completed else {
+            return self.ready(id, now);
+        };
+        let Some((&key, issue)) = self.issues.get_key_value(id) else {
+            return false;
+        };
+        if completed.contains(id) || !issue.status.is_open() || issue.is_deferred_at(now) {
+            return false;
+        }
+        let mut states = std::collections::HashMap::new();
+        let mut visiting = std::collections::BTreeSet::new();
+        self.visit(key, completed, &mut states, &mut visiting) == DepState::Satisfied
+    }
+
+    /// Go's inner `visit` closure (readiness.go:234-261). Recursion depth is
+    /// bounded by the parent-child chain; a cycle resolves to `Unknown`, which
+    /// withholds readiness rather than looping.
+    fn visit(
+        &self,
+        id: &'a str,
+        completed: &std::collections::BTreeSet<String>,
+        states: &mut std::collections::HashMap<&'a str, DepState>,
+        visiting: &mut std::collections::BTreeSet<&'a str>,
+    ) -> DepState {
+        let Some(issue) = self.issues.get(id) else {
+            return DepState::Unknown;
+        };
+        if visiting.contains(id) {
+            return DepState::Unknown;
+        }
+        if completed.contains(id) || closed_for_readiness(issue.status) {
+            return DepState::Satisfied;
+        }
+        if let Some(&s) = states.get(id) {
+            return s;
+        }
+        visiting.insert(id);
+        let mut state = DepState::Satisfied;
+        for (target, ty) in &issue.deps {
+            if ty.is_blocking() {
+                match self.issues.get(*target) {
+                    None => state = DepState::Unknown,
+                    Some(o) if !completed.contains(*target) && !closed_for_readiness(o.status) => {
+                        state = combine(state, DepState::Unsatisfied)
+                    }
+                    Some(_) => {}
+                }
+            } else if *ty == bv_core::model::DependencyType::ParentChild {
+                state = combine(state, self.visit(target, completed, states, visiting));
+            }
+        }
+        visiting.remove(id);
+        states.insert(id, state);
+        state
+    }
+}
+
+/// Compute the set of issue IDs that are not dependency-ready.
+///
+/// Go parity (`br ready`/`br blocked`): the authority is
+/// `ReadinessIndex.DependencyState`, not a per-edge "does this have an open
+/// blocker" scan. Three behaviours only the index reproduces:
+///
+///   * a self-blocking dependency — `blocks` pointing at the issue itself —
+///     leaves the target present and open, so the issue is `Unsatisfied`
+///     (readiness.go:120-127 has no self-edge exclusion);
+///   * a `parent-child` parent that is itself blocked, or whose own parent
+///     chain never resolves, withholds the child;
+///   * a blocking dependency naming an issue absent from the source leaves the
+///     state `Unknown`, which also withholds readiness.
+pub fn compute_blocked_set(issues: &[Issue]) -> std::collections::HashSet<String> {
+    let readiness = Readiness::new(issues);
+    issues
+        .iter()
+        .filter(|i| {
+            !closed_for_readiness(i.status)
+                && readiness.dependency_state(i.id.as_str()) != DepState::Satisfied
+        })
+        .map(|i| i.id.clone())
+        .collect()
 }
 
 /// Assemble the full triage recommendation list (ranked) + quick_ref +
@@ -558,34 +829,45 @@ pub fn build_triage(issues: &[Issue], g: &DiGraph, now: jiff::Timestamp) -> Tria
     // triageScore = baseScore * 0.70 + unblockBoost + quickwinBoost
     // This transforms raw impact scores into triage-prioritized scores.
 
-    // 1. Compute the unblocks map (Go `buildUnblocksMap`, triage.go:797).
-    //    Reverse map: blocker_id -> the issues it would unblock. Only an issue
-    //    blocked by EXACTLY ONE open blocker counts, and only when completing
-    //    that blocker makes the issue actionable. This is deliberately not
-    //    plain in-degree: Go only credits a blocker for issues it alone holds up.
+    // 1. Compute the unblocks map (Go `buildUnblocksMap`, triage.go:797-831).
+    //    Reverse map: blocker_id -> the issues it would unblock. Three
+    //    conditions, all load-bearing:
+    //      * the candidate is neither closed-like nor deferred (triage.go:802);
+    //      * its open-blocker set has EXACTLY ONE member (triage.go:815) —
+    //        completing one of two blockers leaves the other holding it up, so
+    //        Go credits nobody;
+    //      * completing that single blocker actually makes it actionable
+    //        (triage.go:819 -> `isActionableAfterCompletions`), which withholds
+    //        parked statuses, unresolved parent chains and output eligibility.
+    //    The blocker set is `Readiness().Blockers`, not a raw in-degree scan:
+    //    it deduplicates, keeps blockers absent from the source, and rolls up
+    //    `parent-child` parents that are themselves unresolved.
+    let readiness = Readiness::new(issues);
     let mut unblocks_map: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for issue in issues {
-        if matches!(issue.status, Status::Closed | Status::Tombstone) {
+        if closed_for_readiness(issue.status)
+            || readiness
+                .issues
+                .get(issue.id.as_str())
+                .is_some_and(|r| r.is_deferred_at(now))
+        {
             continue;
         }
         unblocks_map.entry(issue.id.clone()).or_default();
-        let open_blockers: Vec<&str> = issue
-            .dependencies
-            .iter()
-            .filter(|d| d.r#type.is_blocking())
-            .map(|d| d.effective_depends_on())
-            .filter(|bid| !bid.is_empty())
-            .filter(|bid| {
-                issues.iter().any(|i| {
-                    i.id == *bid && !matches!(i.status, Status::Closed | Status::Tombstone)
-                })
-            })
-            .collect();
+        let open_blockers = readiness.blockers(issue.id.as_str());
         if open_blockers.len() == 1 {
-            unblocks_map
-                .entry(open_blockers[0].to_string())
-                .or_default()
-                .push(issue.id.clone());
+            let blocker_id = &open_blockers[0];
+            let mut completed: std::collections::BTreeSet<String> = Default::default();
+            completed.insert(blocker_id.clone());
+            // Go's `IsCandidate` is the output-eligibility scope; the CLI only
+            // sets a candidate set for `--repo`/`--label-scope`, so an
+            // unscoped `--robot-triage` accepts every loaded issue.
+            if readiness.ready_after(issue.id.as_str(), now, Some(&completed)) {
+                unblocks_map
+                    .entry(blocker_id.clone())
+                    .or_default()
+                    .push(issue.id.clone());
+            }
         }
     }
     for list in unblocks_map.values_mut() {
@@ -664,11 +946,14 @@ pub fn build_triage(issues: &[Issue], g: &DiGraph, now: jiff::Timestamp) -> Tria
     // unblocks map (triage.go:947) and `BlockedBy` from the context's open
     // blockers, set only when non-empty (triage.go:949). Both are omitted
     // when empty, so the field order is reasons, unblocks_ids, blocked_by.
-    let issue_index: std::collections::HashMap<&str, &Issue> =
-        issues.iter().map(|i| (i.id.as_str(), i)).collect();
+    // `BlockedBy` is `ctx.OpenBlockers` (triage_context.go:228) — the same
+    // `Readiness().Blockers` the unblocks map keys off, so a single blocker
+    // set answers both. `blocker_chain::open_blockers` is a near-miss of that
+    // authority: it drops blocking targets missing from the source and treats
+    // a tombstone parent as still blocking, both of which Go counts.
     for rec in recommendations.iter_mut() {
         rec.unblocks_ids = unblocks_map.get(&rec.id).cloned().unwrap_or_default();
-        rec.blocked_by = crate::blocker_chain::open_blockers(&issue_index, &rec.id);
+        rec.blocked_by = readiness.blockers(&rec.id);
         // Go's claimable gate requires zero open blockers
         // (isClaimableRecommendation, triage.go:1191). The impact scorer
         // stamps a preliminary verdict before it can see the dependency graph,
@@ -763,6 +1048,38 @@ mod tests {
             .collect()
     }
 
+    /// Minimal dependency-free open issue, for graph/readiness unit tests.
+    fn bare_issue(id: &str) -> Issue {
+        Issue {
+            id: id.to_string(),
+            content_hash: String::new(),
+            title: id.to_string(),
+            description: String::new(),
+            design: String::new(),
+            acceptance_criteria: String::new(),
+            notes: String::new(),
+            status: Status::Open,
+            priority: 2,
+            issue_type: "task".into(),
+            assignee: String::new(),
+            estimated_minutes: None,
+            created_at: None,
+            updated_at: None,
+            due_date: None,
+            defer_until: None,
+            closed_at: None,
+            external_ref: None,
+            compaction_level: 0,
+            compacted_at: None,
+            compacted_at_commit: None,
+            original_size: 0,
+            labels: vec![],
+            dependencies: vec![],
+            comments: vec![],
+            source_repo: String::new(),
+        }
+    }
+
     #[test]
     fn small_chain_quick_ref_matches_golden() {
         // Golden: open=12 actionable=1 blocked=0 in_progress=0 not_closed=12
@@ -795,5 +1112,105 @@ mod tests {
                 (&w[1].id, w[1].score)
             );
         }
+    }
+
+    /// Go `ReadinessIndex.compute` (readiness.go:120-127) has no self-edge
+    /// exclusion: a `blocks` dependency naming the issue itself finds the
+    /// target present and open, so the issue is `Unsatisfied` and never
+    /// actionable. `large_cyclic_600` carries exactly one such node (Cyc-33)
+    /// and the Go golden puts actionable at 149, not 150.
+    #[test]
+    fn self_blocking_dependency_is_dependency_blocked() {
+        use bv_core::model::Dependency;
+        let mut self_loop = fixture_issues("small_chain")
+            .into_iter()
+            .find(|i| i.status == Status::Open)
+            .expect("small_chain has an open issue");
+        let id = self_loop.id.clone();
+        self_loop.dependencies.push(Dependency {
+            issue_id: id.clone(),
+            depends_on_id: id.clone(),
+            depends_on_legacy: String::new(),
+            target_id_legacy: String::new(),
+            r#type: bv_core::model::DependencyType::Blocks,
+            created_at: None,
+            created_by: String::new(),
+        });
+        let issues = vec![self_loop];
+        let blocked = compute_blocked_set(&issues);
+        assert!(
+            blocked.contains(&id),
+            "a self-blocking dependency must leave the issue dependency-blocked"
+        );
+        let readiness = Readiness::new(&issues);
+        assert_eq!(
+            readiness.dependency_state(id.as_str()),
+            DepState::Unsatisfied
+        );
+    }
+
+    /// The same fixture the gap above came from: 600 issues, one of them
+    /// (Cyc-33) self-blocking. The Go golden's
+    /// `project_health.counts` is actionable 149 / dependency_blocked 451.
+    #[test]
+    fn large_cyclic_counts_match_go_golden() {
+        let issues = fixture_issues("large_cyclic_600");
+        let blocked = compute_blocked_set(&issues);
+        let (counts, _) = compute_counts(&issues, &blocked);
+        assert_eq!(counts.total, 600);
+        assert_eq!(counts.actionable, 149);
+        assert_eq!(counts.dependency_blocked, 451);
+        assert!(blocked.contains("Cyc-33"), "Cyc-33 is the only self-loop");
+    }
+
+    /// Go `buildUnblocksMap` (triage.go:797-831): a blocker is credited only
+    /// for issues it is the SOLE open blocker of, and only when completing it
+    /// makes the issue actionable. Two open blockers mean neither of them is
+    /// credited — the `Cyc-354`/`Cyc-417` case the Go golden settles at
+    /// `Cyc-354 -> [Cyc-355]`.
+    #[test]
+    fn unblocks_credits_only_the_sole_open_blocker() {
+        use bv_core::model::Dependency;
+        let blocks = |issue_id: &str, target: &str| Dependency {
+            issue_id: issue_id.to_string(),
+            depends_on_id: target.to_string(),
+            depends_on_legacy: String::new(),
+            target_id_legacy: String::new(),
+            r#type: bv_core::model::DependencyType::Blocks,
+            created_at: None,
+            created_by: String::new(),
+        };
+        // A-1 blocks A-2 only. B-1 and B-2 both block B-3, so neither is
+        // B-3's sole blocker.
+        let a1 = bare_issue("A-1");
+        let mut a2 = bare_issue("A-2");
+        a2.dependencies.push(blocks("A-2", "A-1"));
+        let b1 = bare_issue("B-1");
+        let b2 = bare_issue("B-2");
+        let mut b3 = bare_issue("B-3");
+        b3.dependencies.push(blocks("B-3", "B-1"));
+        b3.dependencies.push(blocks("B-3", "B-2"));
+        let issues = vec![a1, a2, b1, b2, b3];
+        let readiness = Readiness::new(&issues);
+        assert_eq!(readiness.blockers("A-2"), vec!["A-1".to_string()]);
+        assert_eq!(
+            readiness.blockers("B-3"),
+            vec!["B-1".to_string(), "B-2".to_string()],
+            "Go sorts and dedupes the blocker set (readiness.go:212-214)"
+        );
+        let g = crate::analyzer::build_graph(&issues);
+        let out = build_triage(&issues, &g, jiff::Timestamp::now());
+        let unblocks_of = |id: &str| {
+            out.recommendations
+                .iter()
+                .find(|r| r.id == id)
+                .map(|r| r.unblocks_ids.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(unblocks_of("A-1"), vec!["A-2".to_string()]);
+        assert!(
+            unblocks_of("B-1").is_empty() && unblocks_of("B-2").is_empty(),
+            "an issue with two open blockers is credited to neither"
+        );
     }
 }

@@ -1,7 +1,7 @@
 //! Drift detection — port of Go `pkg/drift` (Calculator + Result + exit
 //! codes) and `pkg/baseline` snapshot format v1.
 
-use bv_core::model::Issue;
+use bv_core::model::{Issue, Status};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -27,6 +27,7 @@ pub enum AlertType {
     PagerankChange,
     StaleIssue,
     BlockingCascade,
+    HighImpactUnblock,
 }
 
 /// Go's `omitempty` on a float64 field: absent, or present-but-zero, both leave
@@ -35,16 +36,28 @@ fn is_absent_or_zero(v: &Option<f64>) -> bool {
     v.is_none_or(|x| x == 0.0)
 }
 
+/// Go's `omitempty` on an int field — `UnblocksCount` / `DownstreamPrioritySum`
+/// (pkg/drift/drift.go:95-96) — behaves exactly like the float64 case: a
+/// present-but-zero value still leaves the key out.
+fn is_absent_or_zero_i64(v: &Option<i64>) -> bool {
+    v.is_none_or(|x| x == 0)
+}
+
+/// One drift alert — Go `drift.Alert` (pkg/drift/drift.go:71-97).
+///
+/// The field order below is Go's struct declaration order and is load-bearing:
+/// serde emits keys in declaration order, and the frozen corpus carries that
+/// same order (`golden/xl_2500____robot_alerts.json` blocking_cascade entry:
+/// type, severity, message, details, issue_id, detected_at, labels,
+/// suggested_action, unblocks_count, downstream_priority_sum). Reordering
+/// these fields would change output bytes even though every value still
+/// compared equal after key sorting.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Alert {
     #[serde(rename = "type")]
     pub alert_type: AlertType,
     pub severity: Severity,
     pub message: String,
-    /// Go populates this on every alert (e.g. drift.go:560); the Rust struct
-    /// previously dropped it, so alerts serialized without the field.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub suggested_action: String,
     // Go declares these as plain float64 with `omitempty`
     // (pkg/drift/drift.go:75-77), so a present-but-zero value is omitted. The
     // Option shape is kept so bv-tui and other callers are untouched.
@@ -60,17 +73,21 @@ pub struct Alert {
     pub details: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub issue_id: String,
-    // Go carries the flagged issue's labels so `--alert-label` can filter on
-    // them (pkg/drift/drift.go:86, populated at :607/:702/:950/:996/:1090).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub labels: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detected_at: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // Go carries the flagged issue's labels so `--alert-label` can filter on
+    // them (pkg/drift/drift.go:86, populated at :607/:702/:950/:996/:1090).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+    /// Go populates this on every alert (e.g. drift.go:560); the Rust struct
+    /// previously dropped it, so alerts serialized without the field.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub suggested_action: String,
+    #[serde(default, skip_serializing_if = "is_absent_or_zero_i64")]
     pub unblocks_count: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "is_absent_or_zero_i64")]
     pub downstream_priority_sum: Option<i64>,
 }
 
@@ -120,6 +137,15 @@ pub struct DriftConfig {
     pub blocking_cascade_info_threshold: i64,
     /// Minimum unblocks count for a warning-level BlockingCascade alert.
     pub blocking_cascade_warning_threshold: i64,
+    /// An actionable issue that unblocks at least this many downstream items
+    /// is a `high_impact_unblock` candidate, provided one of them is at least
+    /// as urgent as [`DriftConfig::high_impact_priority_max`]. Go default 3
+    /// (pkg/drift/config.go:120).
+    pub high_impact_unblock_min: i64,
+    /// Most urgent priority (P0=0 … P4=4) that still counts as "high impact"
+    /// downstream. Go default 1, i.e. P0 or P1
+    /// (pkg/drift/config.go:121).
+    pub high_impact_priority_max: i32,
     /// Graph-size cap for the whole-graph proactive checks. Go default 2000
     /// (pkg/drift/config.go:125); above it the checks are skipped and the
     /// reason is reported so silence is not mistaken for health.
@@ -147,6 +173,8 @@ impl Default for DriftConfig {
             proactive_max_issues: 2000,
             blocking_cascade_info_threshold: 3,
             blocking_cascade_warning_threshold: 5,
+            high_impact_unblock_min: 3,
+            high_impact_priority_max: 1,
             disabled_alerts: Vec::new(),
             label_overrides: BTreeMap::new(),
         }
@@ -410,6 +438,37 @@ fn compute_unblocks(issues: &[Issue], issue_id: &str) -> Vec<String> {
     unblocks
 }
 
+/// The actionable issues in the order Go emits the cascade/unblock families
+/// from: `sortedByID(analyzer.GetActionableIssues())`
+/// (pkg/drift/drift.go:668-676 and :925, ordered by `sortedByID` at :812-816).
+///
+/// `sortedByID` compares `out[i].ID < out[j].ID` — a byte-wise string
+/// comparison, so "XL-1" < "XL-110" < "XL-14", NOT numeric order. The frozen
+/// corpus carries exactly that order: `golden/xl_2500____robot_alerts.json`
+/// lists blocking_cascade as XL-1, XL-110, XL-1237, XL-14, XL-186, … and
+/// high_impact_unblock as XL-1, XL-1237, XL-14, XL-186, … . Appending alerts in
+/// this iteration order is what reproduces it; a numeric sort of the alerts
+/// does not.
+///
+/// Readiness here mirrors the existing `blocking_cascade` filter: closed and
+/// deferred issues are skipped, as is anything still carrying an open blocker
+/// (`blocker_chain::open_blockers`, which also propagates parent-child
+/// blocking). Go spells the same contract `IsCandidate(id) &&
+/// Readiness().ReadyAfter(id, now, nil)` (graph.go:2836-2842).
+fn actionable_by_id<'a>(
+    issues: &'a [Issue],
+    by_id: &std::collections::HashMap<&str, &'a Issue>,
+) -> Vec<&'a Issue> {
+    let mut out: Vec<&Issue> = issues
+        .iter()
+        .filter(|i| !i.status.is_closed() && i.status != Status::Deferred)
+        // Skip issues that have open blockers — they can't be completed yet.
+        .filter(|i| crate::blocker_chain::open_blockers(by_id, &i.id).is_empty())
+        .collect();
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
 /// Emit BlockingCascade alerts for issues whose completion would unblock
 /// many downstream dependents.  Mirrors Go `Calculator.checkBlockingCascade`.
 fn check_blocking_cascade(
@@ -428,22 +487,14 @@ fn check_blocking_cascade(
     }
     let now_str = now.to_string();
 
-    // Only check actionable (non-closed, non-deferred) issues.
-    // Go `checkBlockingCascade` only emits for issues that are NOT themselves
-    // blocked by open issues — i.e., issues that can actually be completed now.
     let by_id: BTreeMap<&str, &Issue> = issues.iter().map(|i| (i.id.as_str(), i)).collect();
     // Ancestor-epic parity (#2): inherited parent-child blocking gates this too.
     let by_id_map: std::collections::HashMap<&str, &Issue> =
         issues.iter().map(|i| (i.id.as_str(), i)).collect();
-    let mut cascades: Vec<Alert> = Vec::new();
-    for issue in issues {
-        if issue.status.is_closed() || issue.status == bv_core::model::Status::Deferred {
-            continue;
-        }
-        // Skip issues that have open blockers — they can't be completed yet.
-        if !crate::blocker_chain::open_blockers(&by_id_map, &issue.id).is_empty() {
-            continue;
-        }
+
+    // Go appends one alert per qualifying actionable issue while walking that
+    // list, so the alert order IS the iteration order.
+    for issue in actionable_by_id(issues, &by_id_map) {
         let unblocked = compute_unblocks(issues, &issue.id);
         let count = unblocked.len() as i64;
         if count == 0 {
@@ -466,7 +517,7 @@ fn check_blocking_cascade(
             .map(|i| i.priority as i64)
             .sum();
 
-        cascades.push(Alert {
+        result.push(Alert {
             alert_type: AlertType::BlockingCascade,
             severity,
             labels: issue.labels.clone(),
@@ -487,26 +538,89 @@ fn check_blocking_cascade(
             downstream_priority_sum: Some(priority_sum),
         });
     }
-    // Go sorts blocking_cascade alerts by numeric issue_id for deterministic
-    // output (e.g. XL-14 < XL-110, not lexicographic XL-110 < XL-14).
-    cascades.sort_by(|a, b| {
-        let na = a
-            .issue_id
-            .rsplit('-')
-            .next()
-            .and_then(|s| s.parse::<u64>().ok());
-        let nb = b
-            .issue_id
-            .rsplit('-')
-            .next()
-            .and_then(|s| s.parse::<u64>().ok());
-        match (na, nb) {
-            (Some(a), Some(b)) => a.cmp(&b),
-            _ => a.issue_id.cmp(&b.issue_id),
+}
+
+/// Emit HighImpactUnblock alerts — `blocking_cascade`'s priority-aware sibling.
+/// Port of Go `Calculator.checkHighImpactUnblock` (pkg/drift/drift.go:915-957).
+///
+/// An actionable issue qualifies when it unblocks at least
+/// `high_impact_unblock_min` items AND at least one of those is at priority
+/// `<= high_impact_priority_max`; two or more such downstream items escalate
+/// the alert from info to warning. Go runs this check with no
+/// `expensiveCheckAllowed` guard, so `proactive_max_issues` does not suppress
+/// it (contrast `checkPotentialDuplicate` at :1015-1018).
+fn check_high_impact_unblock(
+    result: &mut DriftResult,
+    cfg: &DriftConfig,
+    issues: &[Issue],
+    now: jiff::Timestamp,
+) {
+    if cfg.is_alert_disabled("high_impact_unblock") || issues.is_empty() {
+        return;
+    }
+    let min_unblocks = cfg.high_impact_unblock_min;
+    if min_unblocks <= 0 {
+        return;
+    }
+    let max_priority = cfg.high_impact_priority_max;
+    let now_str = now.to_string();
+
+    let by_id: BTreeMap<&str, &Issue> = issues.iter().map(|i| (i.id.as_str(), i)).collect();
+    let by_id_map: std::collections::HashMap<&str, &Issue> =
+        issues.iter().map(|i| (i.id.as_str(), i)).collect();
+
+    for issue in actionable_by_id(issues, &by_id_map) {
+        let unblocks = compute_unblocks(issues, &issue.id);
+        if (unblocks.len() as i64) < min_unblocks {
+            continue;
         }
-    });
-    for alert in cascades {
-        result.push(alert);
+        // `issueMap[id]` in Go: a downstream id with no row is not urgent.
+        let mut urgent: Vec<String> = unblocks
+            .iter()
+            .filter(|id| {
+                by_id
+                    .get(id.as_str())
+                    .is_some_and(|downstream| downstream.priority <= max_priority)
+            })
+            .cloned()
+            .collect();
+        if urgent.is_empty() {
+            continue;
+        }
+        urgent.sort();
+
+        let severity = if urgent.len() >= 2 {
+            Severity::Warning
+        } else {
+            Severity::Info
+        };
+
+        result.push(Alert {
+            alert_type: AlertType::HighImpactUnblock,
+            severity,
+            // Go drift.go:948-955 — BaselineVal/CurrentVal/Delta stay zero, so
+            // `omitempty` leaves all three out of the payload.
+            message: format!(
+                "Completing {} unblocks {} item(s), {} of them at P{} or higher",
+                issue.id,
+                unblocks.len(),
+                urgent.len(),
+                max_priority
+            ),
+            suggested_action: "Schedule this issue next; it releases high-priority downstream work"
+                .into(),
+            baseline_val: None,
+            current_val: None,
+            delta: None,
+            details: urgent,
+            issue_id: issue.id.clone(),
+            labels: issue.labels.clone(),
+            label: String::new(),
+            detected_at: Some(now_str.clone()),
+            unblocks_count: Some(unblocks.len() as i64),
+            // Go never sets DownstreamPrioritySum here; 0 is omitted either way.
+            downstream_priority_sum: None,
+        });
     }
 }
 
@@ -544,13 +658,35 @@ pub fn calculate(
         }
     }
 
-    // Cycles: any NEW cycle is critical.
-    if !new_cycles.is_empty() {
-        let names: Vec<String> = new_cycles.iter().map(|c| c.join(" -> ")).collect();
+    // Cycles: any NEW cycle is critical. Go `checkCycles`
+    // (pkg/drift/drift.go:317-355) reports the COUNT, not the rendered list,
+    // and carries the cycles in `details` joined with U+2192 ARROW.
+    if !cfg.is_alert_disabled("new_cycle") && !new_cycles.is_empty() {
+        let details: Vec<String> = new_cycles
+            .iter()
+            .map(|cycle| cycle.join(" \u{2192} "))
+            .collect();
         r.push(Alert {
             alert_type: AlertType::NewCycle,
             severity: Severity::Critical,
-            message: format!("New dependency cycles introduced: {}", names.join("; ")),
+            message: format!("{} new cycle(s) detected", new_cycles.len()),
+            suggested_action:
+                "Break the cycle by removing or reversing one dependency edge (bv --robot-suggest lists cycle-break candidates)"
+                    .into(),
+            // Go's BaselineVal is `len(c.baseline.Cycles)`
+            // (pkg/drift/drift.go:346) — the number of cycles RECORDED IN THE
+            // BASELINE SNAPSHOT, not `baseline.Stats.CycleCount`. `cycles` is a
+            // top-level baseline.json key (pkg/baseline/baseline.go:43) that
+            // `BaselineStats` never carries, and Go leaves the baseline's
+            // `Cycles` nil whenever no baseline file exists
+            // (cmd/bv/robot_registry.go:1158), so every golden here omits the
+            // field. Emitting `baseline.cycle_count` instead would be a
+            // different number Go never prints on this path.
+            baseline_val: None,
+            current_val: Some(current.cycle_count as f64),
+            delta: Some(new_cycles.len() as f64),
+            details,
+            detected_at: Some(now.to_string()),
             ..Default::default()
         });
     }
@@ -719,6 +855,13 @@ pub fn calculate(
 
     // Blocking cascade: BFS downstream through blocked issues.
     check_blocking_cascade(&mut r, cfg, issues, now);
+
+    // Go runs checkHighImpactUnblock immediately after checkBlockingCascade
+    // (pkg/drift/drift.go:292), with only the non-gated checkVelocityDrop
+    // between the graph families. The alert array is in generation order, so
+    // this position is load-bearing: the frozen corpus carries every
+    // blocking_cascade alert before any high_impact_unblock alert.
+    check_high_impact_unblock(&mut r, cfg, issues, now);
 
     r
 }
@@ -1183,6 +1326,283 @@ mod tests {
                 .iter()
                 .any(|a| a.alert_type == AlertType::BlockingCascade && a.issue_id == "X-1"),
             "X-2 is still blocked by X-BOTH -- X-1 must not appear"
+        );
+    }
+
+    #[test]
+    fn blocking_cascade_emits_in_bytewise_id_order_not_numeric() {
+        // Go's `sortedByID` (pkg/drift/drift.go:812-816) compares IDs with `<`,
+        // so "XL-110" and "XL-1237" sort BEFORE "XL-14". The frozen corpus
+        // (golden/xl_2500____robot_alerts.json) carries exactly that order; a
+        // numeric sort would interleave them differently and change bytes.
+        let s = snap(10, 10, 0.1, 0, 5);
+        let mut issues = Vec::new();
+        for id in ["XL-1", "XL-14", "XL-110", "XL-1237"] {
+            let blocker = casc_issue(id, bv_core::model::Status::Open, 1);
+            for i in 0..3 {
+                let dep_id = format!("{id}-d{i}");
+                let mut dep = casc_issue(&dep_id, bv_core::model::Status::Open, 2);
+                dep.dependencies.push(casc_dep(&dep_id, id));
+                issues.push(dep);
+            }
+            issues.push(blocker);
+        }
+        let r = calculate(
+            &s,
+            &s,
+            &DriftConfig::default(),
+            &[],
+            &issues,
+            jiff::Timestamp::now(),
+        );
+        let order: Vec<&str> = r
+            .alerts
+            .iter()
+            .filter(|a| a.alert_type == AlertType::BlockingCascade)
+            .map(|a| a.issue_id.as_str())
+            .collect();
+        assert_eq!(order, vec!["XL-1", "XL-110", "XL-1237", "XL-14"]);
+    }
+
+    // -- HighImpactUnblock tests -------------------------------------------
+
+    /// A blocker with `n` P1 dependents and `m` low-priority ones, so the
+    /// unblocks count (`high_impact_unblock_min` = 3) and the urgent count
+    /// (drives info vs warning) can be varied independently.
+    fn high_impact_issue(id: &str, urgent: usize, routine: usize) -> Vec<Issue> {
+        let mut issues = vec![casc_issue(id, bv_core::model::Status::Open, 1)];
+        for i in 0..urgent {
+            let dep_id = format!("{id}-u{i}");
+            let mut dep = casc_issue(&dep_id, bv_core::model::Status::Open, 1);
+            dep.dependencies.push(casc_dep(&dep_id, id));
+            issues.push(dep);
+        }
+        for i in 0..routine {
+            let dep_id = format!("{id}-r{i}");
+            let mut dep = casc_issue(&dep_id, bv_core::model::Status::Open, 3);
+            dep.dependencies.push(casc_dep(&dep_id, id));
+            issues.push(dep);
+        }
+        issues
+    }
+
+    #[test]
+    fn high_impact_unblock_warns_on_two_urgent_downstream_items() {
+        let s = snap(10, 10, 0.1, 0, 5);
+        // 3 unblocks, 2 of them P1 → warning (Go drift.go:940-943).
+        let issues = high_impact_issue("H-1", 2, 1);
+        let r = calculate(
+            &s,
+            &s,
+            &DriftConfig::default(),
+            &[],
+            &issues,
+            jiff::Timestamp::now(),
+        );
+        let alert = r
+            .alerts
+            .iter()
+            .find(|a| a.alert_type == AlertType::HighImpactUnblock)
+            .expect("expected a high_impact_unblock alert");
+        assert_eq!(alert.severity, Severity::Warning);
+        assert_eq!(alert.issue_id, "H-1");
+        assert_eq!(alert.unblocks_count, Some(3));
+        assert_eq!(alert.details, vec!["H-1-u0", "H-1-u1"]);
+        assert_eq!(
+            alert.message,
+            "Completing H-1 unblocks 3 item(s), 2 of them at P1 or higher"
+        );
+        assert_eq!(
+            alert.suggested_action,
+            "Schedule this issue next; it releases high-priority downstream work"
+        );
+        // Go leaves BaselineVal/CurrentVal/Delta/DownstreamPrioritySum unset.
+        assert_eq!(alert.baseline_val, None);
+        assert_eq!(alert.current_val, None);
+        assert_eq!(alert.delta, None);
+        assert_eq!(alert.downstream_priority_sum, None);
+    }
+
+    #[test]
+    fn high_impact_unblock_info_on_a_single_urgent_downstream_item() {
+        let s = snap(10, 10, 0.1, 0, 5);
+        // 3 unblocks, exactly 1 of them P1 → info.
+        let issues = high_impact_issue("H-2", 1, 2);
+        let r = calculate(
+            &s,
+            &s,
+            &DriftConfig::default(),
+            &[],
+            &issues,
+            jiff::Timestamp::now(),
+        );
+        let alert = r
+            .alerts
+            .iter()
+            .find(|a| a.alert_type == AlertType::HighImpactUnblock)
+            .expect("expected a high_impact_unblock alert");
+        assert_eq!(alert.severity, Severity::Info);
+        assert_eq!(alert.details, vec!["H-2-u0"]);
+    }
+
+    #[test]
+    fn high_impact_unblock_skipped_when_no_downstream_is_urgent() {
+        let s = snap(10, 10, 0.1, 0, 5);
+        // 3 unblocks but every one is P3 — above high_impact_priority_max (1).
+        let issues = high_impact_issue("H-3", 0, 3);
+        let r = calculate(
+            &s,
+            &s,
+            &DriftConfig::default(),
+            &[],
+            &issues,
+            jiff::Timestamp::now(),
+        );
+        assert!(
+            !r.alerts
+                .iter()
+                .any(|a| a.alert_type == AlertType::HighImpactUnblock),
+            "no downstream at P1 or higher -- blocking_cascade still fires, unblock must not"
+        );
+        assert!(r
+            .alerts
+            .iter()
+            .any(|a| a.alert_type == AlertType::BlockingCascade));
+    }
+
+    #[test]
+    fn high_impact_unblock_below_min_unblocks_is_not_alerted() {
+        let s = snap(10, 10, 0.1, 0, 5);
+        // Only 2 unblocks, both P1 — under high_impact_unblock_min (3).
+        let issues = high_impact_issue("H-4", 2, 0);
+        let r = calculate(
+            &s,
+            &s,
+            &DriftConfig::default(),
+            &[],
+            &issues,
+            jiff::Timestamp::now(),
+        );
+        assert!(
+            !r.alerts
+                .iter()
+                .any(|a| a.alert_type == AlertType::HighImpactUnblock),
+            "2 unblocks is under the threshold of 3"
+        );
+    }
+
+    #[test]
+    fn high_impact_unblock_skipped_when_disabled() {
+        let s = snap(10, 10, 0.1, 0, 5);
+        let cfg = DriftConfig {
+            disabled_alerts: vec!["high_impact_unblock".into()],
+            ..Default::default()
+        };
+        let issues = high_impact_issue("H-5", 2, 1);
+        let r = calculate(&s, &s, &cfg, &[], &issues, jiff::Timestamp::now());
+        assert!(!r
+            .alerts
+            .iter()
+            .any(|a| a.alert_type == AlertType::HighImpactUnblock));
+    }
+
+    #[test]
+    fn high_impact_unblock_runs_after_blocking_cascade() {
+        // Go's Calculate runs checkBlockingCascade then checkHighImpactUnblock
+        // (pkg/drift/drift.go:291-292) and the alert array is in generation
+        // order, so a qualifying issue must contribute cascade-then-unblock.
+        let s = snap(10, 10, 0.1, 0, 5);
+        let issues = high_impact_issue("H-6", 2, 1);
+        let r = calculate(
+            &s,
+            &s,
+            &DriftConfig::default(),
+            &[],
+            &issues,
+            jiff::Timestamp::now(),
+        );
+        let kinds: Vec<AlertType> = r.alerts.iter().map(|a| a.alert_type).collect();
+        let cascade_at = kinds
+            .iter()
+            .position(|k| *k == AlertType::BlockingCascade)
+            .expect("cascade alert");
+        let unblock_at = kinds
+            .iter()
+            .position(|k| *k == AlertType::HighImpactUnblock)
+            .expect("unblock alert");
+        assert!(
+            cascade_at < unblock_at,
+            "blocking_cascade must precede high_impact_unblock, got {kinds:?}"
+        );
+    }
+
+    // -- new_cycle shape ----------------------------------------------------
+
+    #[test]
+    fn new_cycle_reports_count_and_arrow_separated_details() {
+        let base = snap(10, 10, 0.1, 0, 5);
+        let mut cur = snap(10, 10, 0.1, 0, 5);
+        cur.cycle_count = 2;
+        let r = calculate(
+            &base,
+            &cur,
+            &DriftConfig::default(),
+            &[vec!["A".into(), "B".into(), "A".into()], vec!["C".into()]],
+            &[],
+            jiff::Timestamp::now(),
+        );
+        let alert = r
+            .alerts
+            .iter()
+            .find(|a| a.alert_type == AlertType::NewCycle)
+            .expect("expected a new_cycle alert");
+        assert_eq!(alert.message, "2 new cycle(s) detected");
+        assert_eq!(alert.details, vec!["A \u{2192} B \u{2192} A", "C"]);
+        assert_eq!(alert.current_val, Some(2.0));
+        assert_eq!(alert.delta, Some(2.0));
+        assert_eq!(alert.severity, Severity::Critical);
+        assert_eq!(
+            alert.suggested_action,
+            "Break the cycle by removing or reversing one dependency edge (bv --robot-suggest lists cycle-break candidates)"
+        );
+    }
+
+    #[test]
+    fn new_cycle_skipped_when_disabled() {
+        let s = snap(10, 10, 0.1, 0, 5);
+        let cfg = DriftConfig {
+            disabled_alerts: vec!["new_cycle".into()],
+            ..Default::default()
+        };
+        let r = calculate(
+            &s,
+            &s,
+            &cfg,
+            &[vec!["A".into(), "B".into(), "A".into()]],
+            &[],
+            jiff::Timestamp::now(),
+        );
+        assert!(!r.alerts.iter().any(|a| a.alert_type == AlertType::NewCycle));
+    }
+
+    #[test]
+    fn zero_downstream_priority_sum_is_omitted_like_go_omitempty() {
+        // Go declares UnblocksCount/DownstreamPrioritySum as plain ints with
+        // `omitempty` (pkg/drift/drift.go:95-96), so a present-but-zero value
+        // still leaves the key out of the payload.
+        let alert = Alert {
+            alert_type: AlertType::BlockingCascade,
+            severity: Severity::Info,
+            message: "m".into(),
+            unblocks_count: Some(3),
+            downstream_priority_sum: Some(0),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&alert).unwrap();
+        assert_eq!(json["unblocks_count"], serde_json::json!(3));
+        assert!(
+            json.get("downstream_priority_sum").is_none(),
+            "Go omits a zero downstream_priority_sum, got {json}"
         );
     }
 }
