@@ -2035,7 +2035,6 @@ pub fn modifier_recovery_examples(modifier: &str) -> &'static [&'static str] {
 /// * unmapped modifier → `""`
 /// * exactly one example → `"\nTry: `<invocation>`."`
 /// * several → `"\nTry one of:"` then `"\n  `<invocation>`"` per example
-#[allow(dead_code)] // consumed by the validation layer, which this file does not own
 pub fn format_modifier_recovery_examples(modifier: &str) -> String {
     let examples = modifier_recovery_examples(modifier);
     match examples {
