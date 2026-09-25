@@ -1356,13 +1356,17 @@ fn triage_claimable(
 fn run_robot_triage() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
     let as_of = extract_as_of();
-    let (loaded, _hash, as_of_commit) = match load_issues_auto(&cwd, as_of.as_deref()) {
-        Ok(x) => x,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            return ExitCode::from(1);
-        }
-    };
+    // Use load_issues_auto_meta, not load_issues_auto: the latter discards the
+    // SourceMeta, and re-deriving it via source_meta_for() is what hard-codes
+    // errors/skipped to zero — making claim_safe unconditionally true.
+    let (loaded, _hash, as_of_commit, loaded_source) =
+        match load_issues_auto_meta(&cwd, as_of.as_deref()) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return ExitCode::from(1);
+            }
+        };
     // --label narrows the analysis to the label's subgraph (Go
     // scopeLoadedIssues, main.go:4870-4900), while the envelope keeps
     // describing the loaded file.
@@ -1386,7 +1390,7 @@ fn run_robot_triage() -> ExitCode {
     // only the CLI layer has, so it is resolved here rather than in the
     // analysis layer.
     // Describe the loaded file, not the scoped analysis set.
-    let source = source_meta_for(&loaded);
+    let source = loaded_source;
     for rec in out.recommendations.iter_mut() {
         let origin = bv_core::tracker::resolve_issue_origin(&source.path, &rec.id);
         let actions = bv_core::tracker::build_actions(&origin, rec.claimable);
@@ -5439,7 +5443,7 @@ fn run_robot_suggest(args: &[String]) -> ExitCode {
         .cloned();
 
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (issues, hash, _as_of_commit) = match load_issues_auto(&cwd, None) {
+    let (issues, hash, _as_of_commit, loaded_source) = match load_issues_auto_meta(&cwd, None) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -5478,7 +5482,7 @@ fn run_robot_suggest(args: &[String]) -> ExitCode {
     }
     // Tracker-backed mutation commands need the loaded source path; the
     // suggestion layer cannot resolve an issue's live route without it.
-    let source = source_meta_for(&issues);
+    let source = loaded_source;
     let output = bv_analysis::suggestions::generate_robot_suggest_output(
         &issues,
         &config,
