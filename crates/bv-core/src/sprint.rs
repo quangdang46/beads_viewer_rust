@@ -342,18 +342,20 @@ pub fn estimate_eta_for_issue(
         estimate_complexity_minutes(issue, median_minutes, critical_path_depth);
 
     // Velocity per day
-    let (velocity_per_day, velocity_samples, velocity_factors) =
+    let (velocity_per_day, velocity_samples, mut velocity_factors) =
         estimate_velocity_minutes_per_day(all_issues, issue, now, median_minutes);
 
-    let velocity_per_day = if velocity_per_day <= 0.0 {
+    // Go eta.go:50-56 — the conservative default is one median-sized issue
+    // per work week, the final fallback is 1h/day, and BOTH the swap and the
+    // reason are recorded in the factor list. Dropping the reason factor left
+    // every factor array one entry short.
+    let (velocity_per_day, velocity_factors) = if velocity_per_day <= 0.0 {
         let fallback = median_minutes as f64 / 5.0;
-        if fallback > 0.0 {
-            fallback
-        } else {
-            60.0
-        }
+        let value = if fallback > 0.0 { fallback } else { 60.0 };
+        velocity_factors.push("velocity: no recent closures; using default".to_string());
+        (value, velocity_factors)
     } else {
-        velocity_per_day
+        (velocity_per_day, velocity_factors)
     };
 
     let capacity_per_day = velocity_per_day * agents as f64;
@@ -430,19 +432,29 @@ fn estimate_complexity_minutes(
         "epic" => 2.0,
         _ => 1.0,
     };
-    factors.push(format!("type: {}x{:.1}", issue.issue_type, type_weight));
+    // Go eta.go:125 uses the Unicode MULTIPLICATION SIGN U+00D7
+    // (`fmt.Sprintf("type: %s×%.1f", ...)`), not ASCII "x".
+    factors.push(format!(
+        "type: {}\u{d7}{:.1}",
+        issue.issue_type, type_weight
+    ));
 
     // Depth factor — Go: 1.0 + min(1.0, depth/10.0)
     let depth_factor = 1.0 + (critical_path_depth / 10.0).min(1.0);
-    factors.push(format!("depth: {critical_path_depth:.0}x{depth_factor:.2}"));
+    // Go eta.go:133 — `fmt.Sprintf("depth: %.0f×%.2f", ...)`, again U+00D7.
+    factors.push(format!(
+        "depth: {critical_path_depth:.0}\u{d7}{depth_factor:.2}"
+    ));
 
     // Description factor — Go: 1.0 + min(1.0, runeCount/2000.0)
     let desc_runes = issue.description.chars().count();
     let desc_factor = 1.0 + (desc_runes as f64 / 2000.0).min(1.0);
+    // Go eta.go:139-141 — `fmt.Sprintf("desc: %dr×%.2f", ...)` and the
+    // literal "desc: empty×1.00". U+00D7, and NO space before it.
     if desc_runes > 0 {
-        factors.push(format!("desc: {desc_runes}r x{desc_factor:.2}"));
+        factors.push(format!("desc: {desc_runes}r\u{d7}{desc_factor:.2}"));
     } else {
-        factors.push("desc: empty x1.00".to_string());
+        factors.push("desc: empty\u{d7}1.00".to_string());
     }
 
     let derived = (base_minutes as f64 * type_weight * depth_factor * desc_factor) as i64;
@@ -631,7 +643,17 @@ fn duration_days(days: f64) -> jiff::SignedDuration {
     if days <= 0.0 {
         return jiff::SignedDuration::ZERO;
     }
-    jiff::SignedDuration::from_secs((days * 86400.0) as i64)
+    // Go `durationDays` (eta.go:283-288) is
+    // `time.Duration(days * float64(24*time.Hour))` — nanoseconds, not
+    // seconds. `float64(24*time.Hour)` is 8.64e13 ns, so the product keeps
+    // sub-second resolution and the resulting `time.Time` marshals as
+    // RFC3339Nano ("2026-08-23T08:31:58.976744186Z"). Rounding to whole
+    // seconds here dropped the fraction entirely.
+    let total_nanos = (days * 86_400_000_000_000.0) as i64;
+    jiff::SignedDuration::new(
+        total_nanos.div_euclid(1_000_000_000),
+        total_nanos.rem_euclid(1_000_000_000) as i32,
+    )
 }
 
 /// Fallback to a recent timestamp (avoids Option unwrap in velocity calc).
@@ -682,11 +704,20 @@ pub fn estimate_forecast(
 ///
 /// Mirrors Go's `robot-forecast` handler with `ForecastSummary` when
 /// forecasting multiple issues.
+///
+/// `critical_path_score` is the analyzer's per-issue critical-path score
+/// (`GraphStats.GetCriticalPathScore`, graph.go:344). Go's forecast handler
+/// passes the real `graphStats` into every `EstimateETAForIssue` call
+/// (robot_registry.go:1521, :1539), so the complexity `depth` factor is the
+/// issue's actual graph height. A hardcoded 0.0 made every forecast report
+/// `depth: 0\u{d7}1.00` and understate the estimate. An id absent from the
+/// map reads as depth 0, matching a nil `criticalPathScore`.
 pub fn compute_forecast_output(
     issues: &[Issue],
     sprint_bead_ids: Option<&HashSet<String>>,
     label_filter: Option<&str>,
     agents: i64,
+    critical_path_score: &BTreeMap<String, f64>,
     now: jiff::Timestamp,
 ) -> ForecastOutput {
     let target_issues: Vec<&Issue> = issues
@@ -711,7 +742,11 @@ pub fn compute_forecast_output(
 
     let mut forecasts = Vec::new();
     for issue in &target_issues {
-        if let Ok(eta) = estimate_eta_for_issue(issues, &issue.id, agents, 0.0, now) {
+        let depth = critical_path_score
+            .get(issue.id.as_str())
+            .copied()
+            .unwrap_or(0.0);
+        if let Ok(eta) = estimate_eta_for_issue(issues, &issue.id, agents, depth, now) {
             forecasts.push(eta);
         }
     }
@@ -813,16 +848,26 @@ pub struct CapacityOutput {
 /// - parallelizable_pct = (total - serial) / total * 100
 /// - estimated_days = (serial + parallel / agents) / (60 * 8)
 /// - bottlenecks: issues blocking most others, top 5
+///
+/// `critical_path_score` is the analyzer's per-issue critical-path score
+/// (`GraphStats.GetCriticalPathScore`, graph.go:344), keyed by issue id.
+/// Go's `handleRobotCapacity` (robot_registry.go:3536, :3576) passes the real
+/// `graphStats` into `EstimateETAForIssue`, so the `depth` factor
+/// (`eta.go:130-133`) is the issue's actual graph depth. Passing 0.0 here made
+/// the factor `depth: 0\u{d7}1.00` and dropped every depth multiplier from both
+/// `total_minutes` and `serial_minutes`. An issue absent from the map reads as
+/// depth 0, which is what Go's `GetCriticalPathScore` returns for a nil map.
 pub fn calculate_capacity(
     issues: &[Issue],
     agents: i64,
     label_filter: Option<&str>,
+    critical_path_score: &BTreeMap<String, f64>,
 ) -> CapacityOutput {
     let agents = agents.max(1);
     let median_minutes = compute_median_estimated_minutes(issues);
 
     // Filter by label if specified
-    let target_issues: Vec<&Issue> = issues
+    let mut target_issues: Vec<&Issue> = issues
         .iter()
         .filter(|i| {
             if let Some(label) = label_filter {
@@ -833,12 +878,19 @@ pub fn calculate_capacity(
         })
         .collect();
 
-    // Build issue map and collect open issues
+    // Go robot_registry.go:3557 sorts the target set by id BEFORE the open
+    // filter at :3559-3566, so `openIssues` — and every list derived from it
+    // in issue order — is id-sorted. Leaving it in loader order put each
+    // bottleneck's `blocks` array in a different order than the oracle.
+    target_issues.sort_by(|a, b| a.id.cmp(&b.id));
+
+    // Build issue map and collect open issues. Go's open test is
+    // `!Status.IsClosed() && !Status.IsTombstone()` (:3562).
     let issue_map: HashMap<&str, &Issue> =
         target_issues.iter().map(|i| (i.id.as_str(), *i)).collect();
     let open_issues: Vec<&Issue> = target_issues
         .iter()
-        .filter(|i| !i.status.is_closed())
+        .filter(|i| !i.status.is_closed() && i.status != model::Status::Tombstone)
         .copied()
         .collect();
 
@@ -846,7 +898,14 @@ pub fn calculate_capacity(
     let total_minutes: i64 = open_issues
         .iter()
         .map(|iss| {
-            let (minutes, _) = estimate_complexity_minutes(iss, median_minutes, 0.0);
+            let (minutes, _) = estimate_complexity_minutes(
+                iss,
+                median_minutes,
+                critical_path_score
+                    .get(iss.id.as_str())
+                    .copied()
+                    .unwrap_or(0.0),
+            );
             minutes
         })
         .sum();
@@ -857,6 +916,11 @@ pub fn calculate_capacity(
     let mut blocks: HashMap<&str, Vec<&str>> = HashMap::new();
 
     for iss in &open_issues {
+        // Go robot_registry.go:3588 — `seen` is per dependent, so a repeated
+        // dependency record from one issue contributes a single edge (and a
+        // single `blocks` entry), matching the dedup Go does before
+        // `blockerCounts[v]++` in the graph builder (graph.go:1640-1646).
+        let mut seen: HashSet<&str> = HashSet::new();
         for dep in &iss.dependencies {
             let dep_id = dep.effective_depends_on();
             if dep_id.is_empty() {
@@ -864,6 +928,9 @@ pub fn calculate_capacity(
             }
             // Only blocking dependencies count for capacity
             if !dep.r#type.is_blocking() {
+                continue;
+            }
+            if !seen.insert(dep_id) {
                 continue;
             }
             if issue_map.contains_key(dep_id) {
@@ -939,7 +1006,14 @@ pub fn calculate_capacity(
         .iter()
         .filter_map(|id| issue_map.get(id.as_str()))
         .map(|iss| {
-            let (minutes, _) = estimate_complexity_minutes(iss, median_minutes, 0.0);
+            let (minutes, _) = estimate_complexity_minutes(
+                iss,
+                median_minutes,
+                critical_path_score
+                    .get(iss.id.as_str())
+                    .copied()
+                    .unwrap_or(0.0),
+            );
             minutes
         })
         .sum();
@@ -970,7 +1044,14 @@ pub fn calculate_capacity(
             }
         })
         .collect();
-    bottlenecks.sort_by_key(|b| std::cmp::Reverse(b.blocks_count));
+    // Go robot_registry.go:3644-3650 — blocks_count descending, then id
+    // ascending. Without the id tiebreak a stable sort kept loader order, so
+    // a different set of five survived the `[:5]` truncation.
+    bottlenecks.sort_by(|a, b| {
+        b.blocks_count
+            .cmp(&a.blocks_count)
+            .then_with(|| a.id.cmp(&b.id))
+    });
     bottlenecks.truncate(5);
 
     CapacityOutput {
@@ -1629,7 +1710,7 @@ mod tests {
         let c = make_issue("C", Status::Closed);
 
         let now = "2026-01-05T00:00:00Z".parse::<jiff::Timestamp>().unwrap();
-        let out = compute_forecast_output(&[a, b, c], None, None, 1, now);
+        let out = compute_forecast_output(&[a, b, c], None, None, 1, &BTreeMap::new(), now);
 
         assert_eq!(out.forecast_count, 2); // A and B are open
         assert!(out.summary.is_some()); // multiple forecasts
@@ -1648,7 +1729,8 @@ mod tests {
         b.estimated_minutes = Some(60);
 
         let now = "2026-01-05T00:00:00Z".parse::<jiff::Timestamp>().unwrap();
-        let out = compute_forecast_output(&[a, b], None, Some("frontend"), 1, now);
+        let out =
+            compute_forecast_output(&[a, b], None, Some("frontend"), 1, &BTreeMap::new(), now);
 
         assert_eq!(out.forecast_count, 1);
         assert_eq!(out.forecasts[0].issue_id, "A");
@@ -1683,7 +1765,7 @@ mod tests {
 
     #[test]
     fn capacity_empty_issues() {
-        let out = calculate_capacity(&[], 1, None);
+        let out = calculate_capacity(&[], 1, None, &BTreeMap::new());
         assert_eq!(out.open_issue_count, 0);
         assert_eq!(out.total_minutes, 0);
         assert!(out.critical_path.is_empty());
@@ -1694,7 +1776,7 @@ mod tests {
     fn capacity_all_closed() {
         let a = make_issue("A", Status::Closed);
         let b = make_issue("B", Status::Closed);
-        let out = calculate_capacity(&[a, b], 1, None);
+        let out = calculate_capacity(&[a, b], 1, None, &BTreeMap::new());
         assert_eq!(out.open_issue_count, 0);
         assert_eq!(out.total_minutes, 0);
     }
@@ -1706,7 +1788,7 @@ mod tests {
         let mut b = make_issue("B", Status::Open);
         b.estimated_minutes = Some(120);
 
-        let out = calculate_capacity(&[a, b], 1, None);
+        let out = calculate_capacity(&[a, b], 1, None, &BTreeMap::new());
         assert_eq!(out.open_issue_count, 2);
         assert_eq!(out.total_minutes, 180);
         // No dependencies: critical path = longest single issue (B: 120m)
@@ -1731,7 +1813,7 @@ mod tests {
             created_by: String::new(),
         }];
 
-        let out = calculate_capacity(&[a, b], 1, None);
+        let out = calculate_capacity(&[a, b], 1, None, &BTreeMap::new());
         assert_eq!(out.open_issue_count, 2);
         // A is actionable (no blockers), B is blocked by A
         assert_eq!(out.actionable_count, 1);
@@ -1771,7 +1853,7 @@ mod tests {
             created_by: String::new(),
         }];
 
-        let out = calculate_capacity(&[a, b, c, d], 1, None);
+        let out = calculate_capacity(&[a, b, c, d], 1, None, &BTreeMap::new());
         // A blocks C and D -> bottleneck
         assert!(!out.bottlenecks.is_empty());
         assert_eq!(out.bottlenecks[0].id, "A");
@@ -1787,7 +1869,7 @@ mod tests {
         b.labels = vec!["frontend".into()];
         b.estimated_minutes = Some(120);
 
-        let out = calculate_capacity(&[a, b], 1, Some("backend"));
+        let out = calculate_capacity(&[a, b], 1, Some("backend"), &BTreeMap::new());
         assert_eq!(out.open_issue_count, 1); // only A
         assert_eq!(out.label.as_deref(), Some("backend"));
     }
@@ -1808,7 +1890,7 @@ mod tests {
             created_by: String::new(),
         }];
 
-        let out = calculate_capacity(&[a, b], 1, None);
+        let out = calculate_capacity(&[a, b], 1, None, &BTreeMap::new());
         // Related dependency doesn't block: both actionable
         assert_eq!(out.actionable_count, 2);
         // Critical path: max(A, B) since they're independent = B (120m)
@@ -1822,7 +1904,7 @@ mod tests {
         let mut b = make_issue("B", Status::Open);
         b.estimated_minutes = Some(100);
 
-        let out = calculate_capacity(&[a, b], 1, None);
+        let out = calculate_capacity(&[a, b], 1, None, &BTreeMap::new());
         // No dependencies: critical path = one issue (100m)
         // parallelizable = (200 - 100) / 200 * 100 = 50%
         assert!((out.parallelizable_pct - 50.0).abs() < 1.0);
@@ -1835,8 +1917,8 @@ mod tests {
         let mut b = make_issue("B", Status::Open);
         b.estimated_minutes = Some(480);
 
-        let out1 = calculate_capacity(&[a.clone(), b.clone()], 1, None);
-        let out2 = calculate_capacity(&[a, b], 2, None);
+        let out1 = calculate_capacity(&[a.clone(), b.clone()], 1, None, &BTreeMap::new());
+        let out2 = calculate_capacity(&[a, b], 2, None, &BTreeMap::new());
 
         // With 2 agents, parallel work is halved
         assert!(out2.estimated_days < out1.estimated_days);

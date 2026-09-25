@@ -40,6 +40,12 @@ scripts/.bv-go.exe
 # Scratch dir used by parity/differential harnesses while porting. Not source.
 tmp/
 
+# Instance lock files. Contents are just {"pid":N}, so every run dirties the
+# tree and every diff is noise. The four tracked ones under tests/fixtures/ are
+# kept in git for history but must not be committed with a fresh pid.
+.bv.lock
+**/.bv.lock
+
 # OS / editor
 .DS_Store
 *.swp

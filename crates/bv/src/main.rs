@@ -1870,11 +1870,21 @@ fn run_robot_next() -> ExitCode {
 /// Go builds recommendations against the full scored set and slices only the
 /// user-visible list, so top_picks and quick_wins are unaffected (issue #146).
 fn recommendations_top_n(recs: &[bv_analysis::impact::IssueImpact]) -> Vec<serde_json::Value> {
-    const TOP_N: usize = 10;
-    recs.iter()
-        .take(TOP_N)
+    recommendations_top_n_refs(recs)
+        .into_iter()
         .map(|r| serde_json::to_value(r).unwrap_or(serde_json::Value::Null))
         .collect()
+}
+
+/// Go `opts.TopN` (triage.go:592-594 — 10 when unset) applied to the scored
+/// set. Go slices `allRecommendations` to this at :666-669 and the sliced
+/// list is what the track/label groupers receive (:697, :700) as well as what
+/// the `recommendations` field carries.
+fn recommendations_top_n_refs(
+    recs: &[bv_analysis::impact::IssueImpact],
+) -> Vec<&bv_analysis::impact::IssueImpact> {
+    const TOP_N: usize = 10;
+    recs.iter().take(TOP_N).collect()
 }
 
 /// Go's claimability gate for a triage recommendation (triage.go:657).
@@ -1907,6 +1917,281 @@ fn resolve_not_ready_labels() -> Vec<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
+        .collect()
+}
+
+/// Go `formatUnblockList` (triage.go:1729-1738) — the id list suffix of the
+/// unblock-cascade reason. `joinStrings` is a plain `strings.Join`.
+fn format_unblock_list(ids: &[String]) -> String {
+    if ids.len() <= 3 {
+        return ids.join(", ");
+    }
+    format!("{}, {}, +{} more", ids[0], ids[1], ids.len() - 2)
+}
+
+/// Go `GenerateTriageReasons`'s unblock-cascade reason (triage.go:1554-1562),
+/// the FIRST reason it appends. It is a pure function of `UnblocksIDs`, which
+/// `build_triage` stamps from `unblocksMap[score.IssueID]` (triage.go:947) —
+/// the map that credits a dependent only when this issue is its SOLE open
+/// blocker. `build_triage` instead derived the same line from the raw graph
+/// in-degree, which counts dependents that are still multiply blocked, so the
+/// line is restated here from the authority. Replaces the line in place when
+/// present, inserts at the head when Go would emit one and the scorer emitted
+/// none, and drops it when the authority says this issue unblocks nothing.
+fn restate_unblock_reason(reasons: &mut Vec<String>, unblocks_ids: &[String]) {
+    const CASCADE: &str = "🎯 Completing this unblocks ";
+    const LIST: &str = "🔓 Unblocks ";
+    let pos = reasons
+        .iter()
+        .position(|r| r.starts_with(CASCADE) || r.starts_with(LIST));
+    let go_line = if unblocks_ids.len() >= 3 {
+        Some(format!(
+            "{CASCADE}{} downstream issues ({})",
+            unblocks_ids.len(),
+            format_unblock_list(unblocks_ids)
+        ))
+    } else if !unblocks_ids.is_empty() {
+        Some(format!(
+            "{LIST}{} item(s): {}",
+            unblocks_ids.len(),
+            format_unblock_list(unblocks_ids)
+        ))
+    } else {
+        None
+    };
+    match (pos, go_line) {
+        (Some(p), Some(line)) => reasons[p] = line,
+        (Some(p), None) => {
+            reasons.remove(p);
+        }
+        (None, Some(line)) => reasons.insert(0, line),
+        (None, None) => {}
+    }
+}
+
+/// Go `generateTrackID` (plan.go:305-320) — a 1-based track number rendered in
+/// base-26 alphabetic: A, B, … Z, AA, AB, …. Returns `track-?` for n <= 0.
+fn generate_track_id(n: i64) -> String {
+    if n <= 0 {
+        return "track-?".to_string();
+    }
+    let mut v = n - 1; // 0-based
+    let mut letters: Vec<char> = Vec::new();
+    while v >= 0 {
+        letters.insert(0, (b'A' + (v % 26) as u8) as char);
+        v = v / 26 - 1;
+    }
+    format!("track-{}", letters.iter().collect::<String>())
+}
+
+/// Go `layerReason` (triage.go:1905-1916).
+fn layer_reason(depth: i64) -> String {
+    match depth {
+        0 => "Actionable now - can work in parallel".to_string(),
+        1 => "Becomes actionable after layer 0 completes".to_string(),
+        d if d >= 999 => "Cyclic dependencies detected".to_string(),
+        d => format!("Becomes actionable after layer {} completes", d - 1),
+    }
+}
+
+/// The `top_pick` a track/label group carries: Go builds a fresh `TopPick`
+/// from the winning recommendation (triage.go:1873-1880, 1968-1975), so
+/// `unblocks` is the length of `UnblocksIDs` — the same authority
+/// `build_triage` stamped — not a graph in-degree.
+fn group_top_pick(r: &&bv_analysis::impact::IssueImpact) -> serde_json::Value {
+    serde_json::json!({
+        "id": r.id,
+        "title": r.title,
+        "score": r.score,
+        "reasons": r.reasons,
+        "unblocks": r.unblocks_ids.len(),
+    })
+}
+
+/// Go binds the top recommendation's claim action onto the group
+/// (`group.ClaimCommand = rec.Actions.Claim.Shell`, triage.go:1882-1884 and
+/// :1977-1979), and blanks it on every update. `claim` is absent when the
+/// tracker route is unverified, which is exactly the omitempty case.
+fn group_claim_command(r: &&bv_analysis::impact::IssueImpact) -> String {
+    r.actions
+        .as_ref()
+        .and_then(|a| a.get("claim"))
+        .and_then(|c| c.get("shell"))
+        .and_then(|s| s.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Go `buildRecommendationsByTrack` (pkg/analysis/triage.go:1800-1901) —
+/// recommendations grouped into execution tracks by blocker depth.
+///
+/// Depth is the longest open-blocker chain above the item, computed by the
+/// memoised DFS at :1812-1851 over `rec.BlockedBy`; a cycle yields -1, which
+/// :1858-1860 rewrites to 999 so cyclic work lands in its own track. Groups
+/// are emitted in ascending depth and each keeps the recommendations in the
+/// scored order Go appends them.
+fn build_recommendations_by_track(
+    recs: &[&bv_analysis::impact::IssueImpact],
+    issue_by_id: &std::collections::HashMap<&str, &bv_core::model::Issue>,
+) -> Vec<serde_json::Value> {
+    let by_id: std::collections::HashMap<&str, &bv_analysis::impact::IssueImpact> =
+        recs.iter().map(|r| (r.id.as_str(), *r)).collect();
+    let mut depths: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+
+    fn dfs(
+        id: &str,
+        by_id: &std::collections::HashMap<&str, &bv_analysis::impact::IssueImpact>,
+        depths: &mut std::collections::HashMap<String, i64>,
+        visited: &mut std::collections::HashSet<String>,
+    ) -> i64 {
+        if let Some(&d) = depths.get(id) {
+            return d;
+        }
+        if !visited.insert(id.to_string()) {
+            return -1; // Go: `visited[id]` is already true — cycle.
+        }
+        let depth = match by_id.get(id) {
+            Some(rec) if !rec.blocked_by.is_empty() => {
+                let mut max_blocker_depth = 0i64;
+                for blocker in &rec.blocked_by {
+                    let d = dfs(blocker, by_id, depths, visited);
+                    if d == -1 {
+                        depths.insert(id.to_string(), -1);
+                        visited.remove(id);
+                        return -1;
+                    }
+                    if d + 1 > max_blocker_depth {
+                        max_blocker_depth = d + 1;
+                    }
+                }
+                max_blocker_depth
+            }
+            // Go triage.go:1823 — a recommendation that is not in the scored
+            // set, or has no blockers, is depth 0.
+            _ => 0,
+        };
+        visited.remove(id);
+        depths.insert(id.to_string(), depth);
+        depth
+    }
+
+    for rec in recs {
+        let mut visited = std::collections::HashSet::new();
+        dfs(rec.id.as_str(), &by_id, &mut depths, &mut visited);
+    }
+
+    // Go accumulates into a map keyed by depth, then emits `sort.Ints(depths)`
+    // (triage.go:1893-1900). A BTreeMap keyed by depth gives the same order.
+    let mut groups: std::collections::BTreeMap<i64, serde_json::Map<String, serde_json::Value>> =
+        std::collections::BTreeMap::new();
+    let mut top_score: std::collections::BTreeMap<i64, f64> = std::collections::BTreeMap::new();
+    for rec in recs {
+        let depth = match depths.get(rec.id.as_str()) {
+            Some(&d) if d >= 0 => d,
+            _ => 999,
+        };
+        let entry = groups.entry(depth).or_insert_with(|| {
+            let mut m = serde_json::Map::new();
+            m.insert(
+                "track_id".into(),
+                serde_json::json!(generate_track_id(depth + 1)),
+            );
+            m.insert("reason".into(), serde_json::json!(layer_reason(depth)));
+            m.insert("recommendations".into(), serde_json::json!([]));
+            m
+        });
+        entry
+            .get_mut("recommendations")
+            .and_then(|v| v.as_array_mut())
+            .expect("recommendations is an array")
+            .push(serde_json::to_value(rec).unwrap_or(serde_json::Value::Null));
+        let unblocks = rec.unblocks_ids.len();
+        *entry
+            .entry("total_unblocks".to_string())
+            .or_insert(serde_json::json!(0usize)) = serde_json::json!(
+            entry
+                .get("total_unblocks")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize
+                + unblocks
+        );
+        // Go triage.go:1872-1885 — the top pick is the highest-scoring
+        // CLAIMABLE recommendation seen so far, and each improvement rebinds
+        // the claim command alongside it.
+        let score = top_score.get(&depth).copied();
+        if triage_claimable(rec, issue_by_id) && score.is_none_or(|s| rec.score > s) {
+            top_score.insert(depth, rec.score);
+            entry.insert("top_pick".into(), group_top_pick(rec));
+            let cmd = group_claim_command(rec);
+            if cmd.is_empty() {
+                entry.remove("claim_command");
+            } else {
+                entry.insert("claim_command".into(), serde_json::json!(cmd));
+            }
+        }
+    }
+    groups
+        .into_values()
+        .map(serde_json::Value::Object)
+        .collect()
+}
+
+/// Go `buildRecommendationsByLabel` (pkg/analysis/triage.go:1919-1990) —
+/// recommendations bucketed by their PRIMARY label, `"unlabeled"` when the
+/// item carries none. There is no normalization: the label is compared and
+/// sorted byte-for-byte, and the group order is `sort.Slice` on the raw
+/// string (triage.go:1985-1987), so a BTreeMap keyed by the label reproduces
+/// it.
+fn build_recommendations_by_label(
+    recs: &[&bv_analysis::impact::IssueImpact],
+    issue_by_id: &std::collections::HashMap<&str, &bv_core::model::Issue>,
+) -> Vec<serde_json::Value> {
+    let mut groups: std::collections::BTreeMap<String, serde_json::Map<String, serde_json::Value>> =
+        std::collections::BTreeMap::new();
+    let mut top_score: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    for rec in recs {
+        // Go triage.go:1925-1928 — first label wins, verbatim.
+        let label = rec
+            .labels
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "unlabeled".to_string());
+        let entry = groups.entry(label.clone()).or_insert_with(|| {
+            let mut m = serde_json::Map::new();
+            m.insert("label".into(), serde_json::json!(label));
+            m.insert("recommendations".into(), serde_json::json!([]));
+            m
+        });
+        entry
+            .get_mut("recommendations")
+            .and_then(|v| v.as_array_mut())
+            .expect("recommendations is an array")
+            .push(serde_json::to_value(rec).unwrap_or(serde_json::Value::Null));
+        let unblocks = rec.unblocks_ids.len();
+        *entry
+            .entry("total_unblocks".to_string())
+            .or_insert(serde_json::json!(0usize)) = serde_json::json!(
+            entry
+                .get("total_unblocks")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize
+                + unblocks
+        );
+        let score = top_score.get(&label).copied();
+        if triage_claimable(rec, issue_by_id) && score.is_none_or(|s| rec.score > s) {
+            top_score.insert(label.clone(), rec.score);
+            entry.insert("top_pick".into(), group_top_pick(rec));
+            let cmd = group_claim_command(rec);
+            if cmd.is_empty() {
+                entry.remove("claim_command");
+            } else {
+                entry.insert("claim_command".into(), serde_json::json!(cmd));
+            }
+        }
+    }
+    groups
+        .into_values()
+        .map(serde_json::Value::Object)
         .collect()
 }
 
@@ -1991,6 +2276,7 @@ fn run_robot_triage() -> ExitCode {
         let origin = bv_core::tracker::resolve_issue_origin(&source.path, &rec.id);
         let actions = bv_core::tracker::build_actions(&origin, rec.claimable);
         rec.actions = Some(serde_json::to_value(&actions).unwrap_or(serde_json::Value::Null));
+        restate_unblock_reason(&mut rec.reasons, &rec.unblocks_ids);
     }
 
     // Build top_picks: Go `buildTopPicks` — only claimable recommendations
@@ -2018,14 +2304,14 @@ fn run_robot_triage() -> ExitCode {
         })
         .take(3)
         .map(|r| {
-            let unblocks: usize = issues
-                .iter()
-                .filter(|o| {
-                    o.dependencies
-                        .iter()
-                        .any(|d| d.r#type.is_blocking() && d.effective_depends_on() == r.id)
-                })
-                .count();
+            // Go buildTopPicks (triage.go:1165) reads `len(rec.UnblocksIDs)` —
+            // the size of the value `buildUnblocksMap` (triage.go:797-831) put
+            // under this blocker id, which `build_triage` already stamped onto
+            // every recommendation. That map credits a dependent only when the
+            // dependent has EXACTLY ONE open blocker and is actionable once
+            // that one completes, so a raw in-degree scan over-credits
+            // fan-in nodes whose dependents are still multiply blocked.
+            let unblocks = r.unblocks_ids.len();
             serde_json::json!({
                 "id": r.id,
                 "title": r.title,
@@ -2045,28 +2331,15 @@ fn run_robot_triage() -> ExitCode {
             .iter()
             .filter(|r| triage_claimable(r, &issue_by_id))
             .map(|r| {
-                let unblocks_count = issues
-                    .iter()
-                    .filter(|o| {
-                        o.dependencies
-                            .iter()
-                            .any(|d| d.r#type.is_blocking() && d.effective_depends_on() == r.id)
-                    })
-                    .count();
-                let mut unblocks_ids: Vec<String> = issues
-                    .iter()
-                    .filter(|o| {
-                        o.dependencies
-                            .iter()
-                            .any(|d| d.r#type.is_blocking() && d.effective_depends_on() == r.id)
-                    })
-                    .map(|o| o.id.clone())
-                    .collect();
-                // Go reads `unblocksMap[id]`, whose values are sorted for
-                // determinism (triage.go:826-827), so the emitted
-                // `unblocks_ids` is lexicographically sorted — not in issue
-                // iteration order.
-                unblocks_ids.sort();
+                // Go buildQuickWins (triage.go:979-983) reads
+                // `unblocksMap[score.IssueID]` — the same map
+                // `buildUnblocksMap` built and `build_triage` stamped onto the
+                // recommendation as `unblocks_ids`, already lexicographically
+                // sorted at triage.rs (Go triage.go:826-827). A raw in-degree
+                // scan counted dependents that are still multiply blocked,
+                // which Go credits to nobody.
+                let unblocks_count = r.unblocks_ids.len();
+                let unblocks_ids: Vec<String> = r.unblocks_ids.clone();
                 let unblock_impact = ((unblocks_count as f64) + 1.0).log2();
                 // Go compares BlockerRatioNorm (triage.go:988), not the
                 // weighted blocker_ratio. They differ by the 0.13 weight, so
@@ -2380,6 +2653,31 @@ fn run_robot_triage() -> ExitCode {
             "commands": commands,
     });
     payload["triage"] = triage_body;
+    // Go passes the grouping flags into `analysis.TriageOptions`
+    // (robot_registry.go:2210, :2213); `ComputeTriageWithOptions` then calls
+    // `buildRecommendationsByTrack` (triage.go:697) or
+    // `buildRecommendationsByLabel` (:700) and assigns the result to
+    // `TriageResult.RecommendationsByTrack` / `RecommendationsByLabel`
+    // (triage.go:52-53). Both are `omitempty`, so the array appears ONLY for
+    // the flag that asked for it — the three triage primaries share one
+    // handler, so this is the same condition for all of them. The grouping
+    // runs on the FULL scored list, before the TopN slice.
+    {
+        let argv: Vec<String> = std::env::args().collect();
+        // Both builders take the TopN-SLICED list, not `allRecommendations`:
+        // Go slices at triage.go:666-669 and passes that same `recommendations`
+        // to both groupers at :697 and :700.
+        let grouped: Vec<&bv_analysis::impact::IssueImpact> =
+            recommendations_top_n_refs(&out.recommendations);
+        if argv.iter().any(|a| a == "--robot-triage-by-track") {
+            payload["triage"]["recommendations_by_track"] =
+                serde_json::json!(build_recommendations_by_track(&grouped, &issue_by_id));
+        }
+        if argv.iter().any(|a| a == "--robot-triage-by-label") {
+            payload["triage"]["recommendations_by_label"] =
+                serde_json::json!(build_recommendations_by_label(&grouped, &issue_by_id));
+        }
+    }
     // Add as_of/as_of_commit only when --as-of was used (Go omitempty parity).
     if let Some(ref a) = as_of {
         payload["triage"]["as_of"] = serde_json::json!(a);
@@ -2415,6 +2713,137 @@ fn run_robot_triage() -> ExitCode {
     }
 }
 
+/// Go `ConfigForSize`'s `MaxCyclesToStore` for a graph of `nodes` nodes
+/// (pkg/analysis/config.go:98-250), which is the `limit` the analyzer hands
+/// `findCyclesSafe` (graph.go:2222). The XL tier sets `ComputeCycles: false`,
+/// so Go stores an empty list there; the other tiers cap at 1000 / 100 / 50 /
+/// 10 for < 100 / < 500 / < 2000 / >= 2000 nodes respectively.
+fn baseline_cycle_limit(nodes: usize) -> usize {
+    match nodes {
+        0..=99 => 1000,
+        100..=499 => 100,
+        500..=1999 => 50,
+        _ => 0,
+    }
+}
+
+/// Go `findCyclesSafe` (pkg/analysis/graph_cycles.go:20-68) over the Rust
+/// graph, returning issue-ID cycle paths.
+///
+/// `g`'s edge direction matches Go's analysis graph (graph.go:1653: "Issue (u)
+/// depends on v → edge u -> v"), so Go's `g.From(u)` is this graph's successor
+/// list and the traversal below walks the same edges in the same direction.
+/// Node ids are the issue-id-sorted dense indices `build_graph` assigns, so
+/// comparing indices is Go's comparing `node.ID()`.
+fn find_cycles_safe(g: &bv_graph_core::DiGraph, limit: usize) -> Vec<Vec<String>> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let scc = bv_analysis::algorithms::cycles::tarjan_scc(g);
+    let mut cycles: Vec<Vec<String>> = Vec::new();
+    for comp in &scc.components {
+        if comp.len() == 1 {
+            // graph_cycles.go:29-35 — a singleton SCC is a cycle only when the
+            // node has an edge to itself, and Go renders that as `[n, n]`.
+            let n = comp[0];
+            if g.successors_slice(n).contains(&n) {
+                cycles.push(vec![node_label(g, n), node_label(g, n)]);
+            }
+            continue;
+        }
+        if let Some(cycle) = find_one_cycle_in_scc(g, comp) {
+            cycles.push(cycle);
+        }
+    }
+    // graph_cycles.go:46-59 — length ascending, then lexicographic on the id
+    // sequence, for determinism.
+    cycles.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.iter().cmp(b.iter())));
+    // graph_cycles.go:61-64 — the total is recorded before the slice, so
+    // truncation is reported without claiming every simple cycle was missed.
+    cycles.truncate(limit);
+    cycles
+}
+
+fn node_label(g: &bv_graph_core::DiGraph, idx: usize) -> String {
+    g.node_id(idx).unwrap_or_default()
+}
+
+/// Go `findOneCycleInSCC` (pkg/analysis/graph_cycles.go:71-155): a single
+/// cycle from one strongly connected component, found by an iterative DFS
+/// over in-component successors in ascending-id order. The first edge back
+/// into the current stack closes the cycle; the path is returned from that
+/// node's stack position through the top, plus the closing node.
+fn find_one_cycle_in_scc(g: &bv_graph_core::DiGraph, scc: &[usize]) -> Option<Vec<String>> {
+    // graph_cycles.go:77-79 — sorted start points, and a mutable copy since
+    // Go sorts the caller's slice in place.
+    let mut members: Vec<usize> = scc.to_vec();
+    members.sort_unstable();
+
+    // graph_cycles.go:88-104 — adjacency restricted to the component and
+    // sorted by id. Node indices are id-sorted, so index order is id order.
+    let in_scc: std::collections::BTreeSet<usize> = members.iter().copied().collect();
+    let mut adj: std::collections::HashMap<usize, Vec<usize>> =
+        std::collections::HashMap::with_capacity(members.len());
+    for &u in &members {
+        let mut neighbors: Vec<usize> = g
+            .successors_slice(u)
+            .iter()
+            .copied()
+            .filter(|n| in_scc.contains(n))
+            .collect();
+        neighbors.sort_unstable();
+        adj.insert(u, neighbors);
+    }
+
+    let mut visited: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut on_stack: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut stack_pos: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut neighbor_index: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
+    let mut stack: Vec<usize> = Vec::new();
+
+    // graph_cycles.go:129-132 — seed with the lowest-id member.
+    if let Some(&first) = members.first() {
+        stack_pos.insert(first, 0);
+        stack.push(first);
+    }
+
+    while let Some(&u) = stack.last() {
+        let u_id = u;
+        if visited.insert(u_id) {
+            on_stack.insert(u_id);
+        }
+        let idx = *neighbor_index.get(&u_id).unwrap_or(&0);
+        let empty: Vec<usize> = Vec::new();
+        let neighbors = adj.get(&u_id).unwrap_or(&empty);
+        if idx < neighbors.len() {
+            let v = neighbors[idx];
+            neighbor_index.insert(u_id, idx + 1);
+            if on_stack.contains(&v) {
+                // graph_cycles.go:139-147 — the edge u -> v closes the loop:
+                // everything from v's stack position to the top, then v again.
+                if let Some(&pos) = stack_pos.get(&v) {
+                    let mut cycle: Vec<String> =
+                        stack[pos..].iter().map(|&n| node_label(g, n)).collect();
+                    cycle.push(node_label(g, v));
+                    return Some(cycle);
+                }
+            }
+            if !visited.contains(&v) {
+                stack_pos.insert(v, stack.len());
+                stack.push(v);
+            }
+        } else {
+            // graph_cycles.go:149-156 — exhausted, backtrack.
+            on_stack.remove(&u_id);
+            stack_pos.remove(&u_id);
+            stack.pop();
+            neighbor_index.remove(&u_id);
+        }
+    }
+    None
+}
+
 fn capture_baseline(
 ) -> Result<(bv_analysis::drift::BaselineStats, Vec<Vec<String>>, String), String> {
     let cwd = std::env::current_dir().unwrap_or_default();
@@ -2428,7 +2857,6 @@ fn capture_baseline(
 fn capture_baseline_for(
     issues: &[bv_core::model::Issue],
 ) -> Result<(bv_analysis::drift::BaselineStats, Vec<Vec<String>>, String), String> {
-    use bv_analysis::algorithms::cycles::tarjan_scc;
     let hash = bv_core::data_hash::compute_data_hash(issues);
     let g = bv_analysis::analyzer::build_graph(issues);
     let p1 = bv_analysis::analyzer::analyze_phase1(&g);
@@ -2438,19 +2866,18 @@ fn capture_baseline_for(
         .filter(|i| i.status.is_open() && !blocked.contains(&i.id))
         .count();
 
-    let scc = tarjan_scc(&g);
-    let mut new_cycles: Vec<Vec<String>> = Vec::new();
-    // Non-trivial SCCs (size > 1) are cycles; single-node self-loops don't
-    // exist in this graph model.
-    for comp in &scc.components {
-        if comp.len() > 1 {
-            new_cycles.push(
-                comp.iter()
-                    .map(|i| g.node_id(*i).unwrap_or_default().to_string())
-                    .collect(),
-            );
-        }
-    }
+    // Go's baseline cycle list is `stats.Cycles()` (robot_registry.go:1147),
+    // i.e. exactly what `Analyzer.findCyclesSafe` stored
+    // (graph_cycles.go:20-68): ONE representative cycle per strongly
+    // connected component — a self-loop rendered as `[n, n]` for a singleton
+    // SCC, otherwise the first cycle a sorted iterative DFS finds inside the
+    // component — sorted by length ascending then lexicographically, and
+    // truncated to the tier's `MaxCyclesToStore` only after the pre-limit
+    // count is recorded. Pushing the whole SCC member list instead reported
+    // component contents that are not a cycle at all, and dropped the
+    // self-loop entirely, so the drift baseline disagreed with the oracle on
+    // both the count and every cycle's contents.
+    let new_cycles = find_cycles_safe(&g, baseline_cycle_limit(g.len()));
     // Go keeps the top 10 PageRank entries for drift comparison
     // (main.go:5242 buildMetricItems): rank by value descending, then
     // truncate. Ranking by graph iteration order instead selected a
@@ -5585,7 +6012,7 @@ fn build_priority_recommendation(
         issues.iter().map(|i| (i.id.as_str(), i)).collect();
     // Go's what-if names the issues this one directly unblocks, capped at 10
     // in the output; the full list is needed for the days-saved estimate.
-    let unblocks_ids: Vec<String> = issues
+    let mut unblocks_ids: Vec<String> = issues
         .iter()
         .filter(|o| {
             o.dependencies
@@ -5594,6 +6021,13 @@ fn build_priority_recommendation(
         })
         .map(|o| o.id.clone())
         .collect();
+    // Go `computeUnblocks` (plan.go:111) finishes with `sort.Strings(unblocks)`
+    // over the FULL list, before any capping. Rust's `String: Ord` is byte-wise
+    // like Go's, so "TREE-10" precedes "TREE-8" ('1' 0x31 < '8' 0x38) exactly
+    // as Go orders it. Sorting the full list — not the MaxUnblockedIDsShown
+    // slice — also fixes the order `estimateDaysSaved` sums in (order is
+    // irrelevant to the sum, but the cap would otherwise slice unsorted ids).
+    unblocks_ids.sort();
     let unblocks_count = unblocks_ids
         .len()
         .max(unblocks_by_id.get(&r.id).copied().unwrap_or(0));
@@ -5898,7 +6332,11 @@ fn what_if_delta(
     let estimated_days_saved = if counted == 0 {
         0.0
     } else {
-        total_minutes / counted as f64 / 480.0
+        // Go priority.go:1106 is `return totalMinutes / 480.0` — a SUM over the
+        // unblocked issues converted to 8-hour work-days. It is NOT a per-item
+        // average; `counted` only guards the zero case. Dividing by it here made
+        // the result N× too small whenever more than one issue is unblocked.
+        total_minutes / 480.0
     };
 
     let mut delta = serde_json::json!({
@@ -6684,13 +7122,25 @@ fn run_robot_alerts() -> ExitCode {
     // on a small graph.
     let mut priority_alerts: Vec<serde_json::Value> = Vec::new();
     let mut duplicate_alerts: Vec<serde_json::Value> = Vec::new();
+    // Go `expensiveCheckAllowed` (pkg/drift/drift.go:122-132) refuses both
+    // whole-graph proactive families once the graph outgrows
+    // `proactive_max_issues`, recording a SkippedCheck instead.
+    // `checkPotentialDuplicate` consults it at :1015-1018 and
+    // `checkPriorityMismatch` at :1062-1064, so NEITHER family is built on an
+    // oversized graph — they are not merely unreported. The skip is already
+    // emitted below as `skipped_checks`; this is the matching suppression of
+    // the work, which the previous code recorded without honouring. Go's
+    // `checkHighImpactUnblock` (:292) deliberately has no such guard, so it is
+    // not gated here.
+    let proactive_limit = bv_analysis::drift::DriftConfig::default().proactive_max_issues;
+    let proactive_allowed = proactive_limit == 0 || loaded.len() <= proactive_limit;
     // Go stamps every alert with `c.nowUTC()` (drift.go:1048, 1098).
     let detected_at = robot_now()
         .to_string()
         .get(..19)
         .map(|t| format!("{t}Z"))
         .unwrap_or_default();
-    {
+    if proactive_allowed {
         const MIN_CONFIDENCE: f64 = 0.6; // Go default, drift/config.go:124
         let issue_by_id: std::collections::HashMap<&str, &bv_core::model::Issue> =
             loaded.iter().map(|i| (i.id.as_str(), i)).collect();
@@ -6732,8 +7182,10 @@ fn run_robot_alerts() -> ExitCode {
 
     // Go `checkPotentialDuplicate` (pkg/drift/drift.go:1011-1053). Closed and
     // tombstoned issues are excluded: pairing them buries the live duplicates
-    // under history. Runs after priority_mismatch (drift.go:300-301).
-    {
+    // under history. Go's Calculate runs it at drift.go:300, i.e. BEFORE
+    // `checkPriorityMismatch` at :301 — which is the order the chain below
+    // emits. Same `expensiveCheckAllowed` guard as above (:1015-1018).
+    if proactive_allowed {
         let live: Vec<&bv_core::model::Issue> = loaded
             .iter()
             .filter(|i| {
@@ -8839,14 +9291,13 @@ fn run_robot_sprint_list() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let active_id = sprints.iter().find(|s| s.is_active()).map(|s| s.id.clone());
     let mut payload = full_envelope_for(&hash, &issues);
+    // Go's output struct for this command is exactly
+    // `{RobotEnvelope, SprintCount, Sprints}` (robot_registry.go:1349-1353).
+    // An `issue_count` field had no counterpart there and is not a member of
+    // `model.Sprint` either (pkg/model/types.go:498-507), so it is dropped.
     payload["sprint_count"] = serde_json::json!(sprints.len());
     payload["sprints"] = serde_json::to_value(&sprints).unwrap_or_default();
-    if let Some(id) = &active_id {
-        payload["active_sprint_id"] = serde_json::json!(id);
-    }
-    payload["issue_count"] = serde_json::json!(issues.len());
     emit_json(&payload)
 }
 
@@ -9029,11 +9480,30 @@ fn run_robot_forecast(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     }
 
+    // Go robot_registry.go:1519-1521 threads the analyzer's real `graphStats`
+    // into every `EstimateETAForIssue` call, so the complexity `depth` factor
+    // is `GetCriticalPathScore(issue.ID)` (graph.go:344) rather than a
+    // constant. `computeHeights` (graph.go:2464-2486) is the Go producer;
+    // `critical_path_heights` is its Rust counterpart and yields zeros for a
+    // cyclic graph, which is what a nil `criticalPathScore` reads as.
+    let forecast_graph = bv_analysis::build_graph(&issues);
+    let forecast_cp: std::collections::BTreeMap<String, f64> =
+        bv_graph_core::critical_path_heights(&forecast_graph)
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                (
+                    forecast_graph.node_id(i).unwrap_or_default().to_string(),
+                    *v,
+                )
+            })
+            .collect();
     let out = bv_core::sprint::compute_forecast_output(
         &issues,
         sprint_bead_ids.as_ref(),
         label_filter.as_deref(),
         agents,
+        &forecast_cp,
         robot_now(),
     );
     // Go robot_registry.go:1571-1589 — agents/filters/forecast_count/forecasts/
@@ -9487,7 +9957,21 @@ fn run_robot_capacity(args: &[String]) -> ExitCode {
     // (:828-830) and the closed filter (:841) as two independent, correctly
     // ordered steps, and its `CapacityOutput` (sprint.rs:783-797) matches Go's
     // emit struct at robot_registry.go:3651-3682 field for field.
-    let out = bv_core::sprint::calculate_capacity(&issues, agents, label.as_deref());
+    //
+    // Go runs the analyzer first (robot_registry.go:3536) and threads the real
+    // `graphStats` into every `EstimateETAForIssue` call (:3576), so the
+    // complexity `depth` factor is `GetCriticalPathScore(issue.ID)`
+    // (graph.go:344) — a per-issue graph height. The same map backs
+    // `computeHeights` (graph.go:2464-2486) and returns zeros for a cyclic
+    // graph, which is what a nil `criticalPathScore` reads as.
+    let cap_graph = bv_analysis::build_graph(&issues);
+    let cp_scores: std::collections::BTreeMap<String, f64> =
+        bv_graph_core::critical_path_heights(&cap_graph)
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (cap_graph.node_id(i).unwrap_or_default().to_string(), *v))
+            .collect();
+    let out = bv_core::sprint::calculate_capacity(&issues, agents, label.as_deref(), &cp_scores);
     let mut payload = full_envelope_for(&hash, &issues);
     let obj = payload.as_object_mut().expect("envelope is an object");
     for (k, v) in serde_json::to_value(&out)
