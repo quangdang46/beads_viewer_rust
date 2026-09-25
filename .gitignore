@@ -14,6 +14,16 @@ dist/
 .beads/*.db-wal-lock-*
 .beads/.beads.vacuum.*
 
+# Per-developer beads sidecars written by bv/bvr next to issues.jsonl. Go's
+# loader allowlists only issues.jsonl / beads.jsonl / beads.base.jsonl and
+# explicitly never discovers these (see its README "Sidecars such as
+# sync_base.jsonl, sprints.jsonl, correlation_feedback.jsonl ... require an
+# explicit file override"), so they carry no shared state worth committing.
+.beads/sprints.jsonl
+.beads/correlation_feedback.jsonl
+.beads/sync_base.jsonl
+.beads/deletions.jsonl
+
 # Persistent semantic search index (bv_search::index_sync default path;
 # rebuilt on demand from .beads/issues.jsonl, same convention Go bv uses —
 # neither binary commits this).
@@ -26,6 +36,9 @@ beads_viewer/
 # A ~60 MB local build artifact; never commit it.
 scripts/.bv-go
 scripts/.bv-go.exe
+
+# Scratch dir used by parity/differential harnesses while porting. Not source.
+tmp/
 
 # OS / editor
 .DS_Store

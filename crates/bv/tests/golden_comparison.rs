@@ -12,10 +12,15 @@
 //!   `GOLDEN_GATE_BASELINE_FAILS`. Lower the constant as parity work lands;
 //!   never raise it. When it reaches 0 the gate is a hard byte-for-byte
 //!   contract.
+//! - Goldens the corpus provably cannot decide are classified as corpus
+//!   defects against a separate, equally-ratcheted bucket, and are reported by
+//!   name. They are never dropped silently.
 //!
-//! Note: `selfrepo` goldens were captured 2026-08-22 against the live repo's
-//! `.beads/issues.jsonl`, which legitimately drifts as beads are added here —
-//! expect selfrepo diffs until goldens are recaptured at a frozen bead set.
+//! Note: `selfrepo` goldens were captured against this live repo's
+//! `.beads/issues.jsonl` and its live git history, both of which move
+//! continuously as work lands. The two cases that read git HEAD are detected
+//! and classified automatically (see [`Inapplicable::HeadDrift`]) rather than
+//! being carried as an open-ended exemption.
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -123,6 +128,152 @@ fn requires_git_history(slug: &str) -> bool {
     slug == "robot_history"
 }
 
+/// A frozen golden that this corpus provably cannot decide, together with the
+/// condition *measured from the corpus itself* that proves it.
+///
+/// Every variant is decided by inspecting the golden (and, for
+/// [`Inapplicable::HeadDrift`], the live working tree) — never by a hardcoded
+/// list of case names. That distinction is the whole point. A hardcoded skip
+/// is permanent: it keeps weakening the gate forever, long after the defect
+/// that justified it was fixed, and nobody notices because the number is
+/// expected. A predicate *re-arms itself* — the moment a golden is recaptured
+/// correctly the condition stops holding, the case falls back to strict
+/// byte-for-byte comparison, and any divergence in it fails the gate again.
+///
+/// The two conditions are narrow on purpose. Each is a statement about a
+/// property no correct implementation can have, not a description of a
+/// symptom.
+#[derive(Debug)]
+enum Inapplicable {
+    /// The golden was captured before the v0.25.0 source envelope existed.
+    PreEnvelopeGolden,
+    /// The golden pins a git revision that the live repository no longer
+    /// resolves to, so the case's expected output is a function of a HEAD that
+    /// has moved since capture.
+    HeadDrift {
+        field: &'static str,
+        golden_sha: String,
+        live_sha: String,
+    },
+}
+
+impl std::fmt::Display for Inapplicable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Inapplicable::PreEnvelopeGolden => write!(
+                f,
+                "CORPUS DEFECT (pre-envelope golden): carries a data_hash but no source_kind, \
+                 so it was captured before v0.25.0 attached the source envelope to every \
+                 robot payload. No v0.25.0 implementation can reproduce it. Recapture to \
+                 re-arm this case."
+            ),
+            Inapplicable::HeadDrift {
+                field,
+                golden_sha,
+                live_sha,
+            } => write!(
+                f,
+                "CORPUS DEFECT (git HEAD drift): golden {field}={golden_sha}, but the live \
+                 repository now resolves to {live_sha}. This case reads this repo's own git \
+                 history, so it cannot match a golden frozen at an earlier HEAD. Recapture at \
+                 a frozen commit to re-arm this case."
+            ),
+        }
+    }
+}
+
+/// Resolve a git ref in `cwd`, or `None` if git is unavailable or the ref does
+/// not resolve (e.g. a checkout shallower than `HEAD~5`).
+fn git_rev_parse(cwd: &Path, rev: &str) -> Option<String> {
+    let out = Command::new("git")
+        .args(["rev-parse", rev])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// The git revision a golden froze itself to, and the ref that reproduces it.
+///
+/// The pin lives in the golden's own payload, so this is a statement about the
+/// corpus rather than an assumption about which commands read git:
+///
+/// - `--robot-history` records the newest commit it walked as
+///   `latest_commit_sha`, i.e. `HEAD` at capture time.
+/// - `--robot-diff --diff-since HEAD~5` records the revision it resolved the
+///   flag to, twice: `resolved_revision` and `diff.from_revision`.
+fn golden_git_pin(golden: &Value) -> Option<(&'static str, String, &'static str)> {
+    if let Some(sha) = golden.get("latest_commit_sha").and_then(Value::as_str) {
+        return Some(("latest_commit_sha", sha.to_string(), "HEAD"));
+    }
+    let sha = golden
+        .get("resolved_revision")
+        .or_else(|| golden.pointer("/diff/from_revision"))
+        .and_then(Value::as_str)?;
+    Some(("resolved_revision", sha.to_string(), "HEAD~5"))
+}
+
+/// Classify a golden the corpus cannot decide, or `None` if it must be compared.
+///
+/// Returning `None` whenever the deciding evidence is *absent* is deliberate.
+/// If git cannot be resolved — missing binary, or a checkout shallower than
+/// `HEAD~5` — the HEAD-drift check declines to classify and the case is
+/// compared strictly. The gate must never skip a case on the grounds that it
+/// could not check.
+fn classify(cwd: &Path, golden: &Value) -> Option<Inapplicable> {
+    // A pre-v0.25.0 capture. v0.25.0 attaches `source_kind` to every robot
+    // payload that carries a `data_hash` (cmd/bv/robot_registry.go builds it
+    // from `ctx.Envelope()`), so a golden with a `data_hash` and no
+    // `source_kind` predates the envelope and no v0.25.0 build can reproduce
+    // it.
+    //
+    // The discriminator is the *missing envelope marker*, not the digest
+    // width. Width is not a safe proxy: `--robot-history` carries its own
+    // 12-char correlation-artifact hash rather than the 64-char issue
+    // fingerprint, and that golden is a current-generation v0.25.0 capture —
+    // Go and Rust both still emit `fac2ff3294dc` for it today. Keying on
+    // width would have misfiled that case here instead of letting it fall
+    // through to the HEAD-drift check that is its actual reason for not
+    // matching. The `data_hash` guard keeps `--robot-schema` (no `data_hash`,
+    // envelope nested under an `envelope` key) and `--robot-recipes` (no
+    // `data_hash`) out of this branch.
+    let pre_envelope = golden
+        .get("data_hash")
+        .and_then(Value::as_str)
+        .filter(|_| golden.get("source_kind").is_none())
+        .map(|_| Inapplicable::PreEnvelopeGolden);
+    if let Some(why) = pre_envelope {
+        return Some(why);
+    }
+
+    // A golden frozen against a git HEAD that has since moved. Only
+    // meaningful when this run's data *is* a git working tree; the synthetic
+    // fixtures are not, and their git-dependent cases are already retired by
+    // the `.git` precondition above.
+    let pin = if cwd.join(".git").exists() {
+        golden_git_pin(golden)
+    } else {
+        None
+    };
+    pin.and_then(|(field, golden_sha, rev)| {
+        git_rev_parse(cwd, rev).map(|live_sha| (field, golden_sha, live_sha))
+    })
+    .and_then(|(field, golden_sha, live_sha)| {
+        if live_sha == golden_sha {
+            None
+        } else {
+            Some(Inapplicable::HeadDrift {
+                field,
+                golden_sha,
+                live_sha,
+            })
+        }
+    })
+}
+
 /// Strip nondeterministic fields: timestamps → placeholder, timing
 /// measurements and data_hash removed entirely (they vary run-to-run
 /// across beads data changes and Go/Rust execution). Floats are rounded
@@ -153,6 +304,33 @@ fn normalize(v: &Value) -> Value {
                 match k.as_str() {
                     "ms" | "compute_time_ms" | "data_hash" => {}
                     "source_path" | "authority_hash" | "scope_hash" => {}
+                    // `duration_ms` is a wall-clock measurement, not a result.
+                    // Go declares it at beads_viewer/pkg/correlation/types.go:189
+                    // (`DurationMS float64 `json:"duration_ms"``) and fills it
+                    // from `time.Since(start)` at correlator.go:249, :272 and
+                    // :288 — one `time.Since` per correlation strategy, so its
+                    // value is a property of how fast the machine that ran the
+                    // extraction was. No implementation can reproduce another
+                    // run's number; Go's own suite zeroes it for the same
+                    // reason (correlator_test.go:640).
+                    //
+                    // It is stamped rather than dropped, unlike `ms` /
+                    // `compute_time_ms` above. Those are `omitempty` on the Go
+                    // side (graph.go:143-146 emits `ms` only when Elapsed != 0),
+                    // so they are legitimately present on one side and absent on
+                    // the other and can only be dropped. `duration_ms` is a
+                    // plain float64 with no omitempty and is therefore always
+                    // present on both sides — stamping keeps the structural
+                    // check that the field exists in the position Go puts it,
+                    // and discards only the value that cannot be matched.
+                    //
+                    // Emitted by `--robot-history` (correlation stats) only;
+                    // golden/selfrepo____robot_history.json is the sole golden
+                    // in the corpus that carries it (3 occurrences, one per
+                    // strategy).
+                    "duration_ms" => {
+                        out.insert(k.clone(), Value::String("<WALLCLOCK>".into()));
+                    }
                     "generated_at" | "timestamp" | "detected_at" => {
                         out.insert(k.clone(), Value::String("<TIMESTAMP>".into()));
                     }
@@ -209,33 +387,58 @@ fn canonical(v: &Value) -> String {
     serde_json::to_string(&sort_keys_recursive(&normalize(v))).expect("json serialize")
 }
 
-/// Ratchet baseline: number of content divergences at gate introduction
-/// (2026-09-06: 35 remaining after goldens recaptured from Rust binary;
-/// data_hash now normalized. Remaining are algorithmic parity diffs
-/// between Rust and Go implementations).
+/// Ratchet baseline: number of content divergences the gate tolerates.
 /// Lower as parity lands; the test fails if divergences exceed this count.
 ///
-/// 2026-09-07 (issue #1): the last algorithmic diff — xl_2500's
-/// blocking_cascade alert ordering — is fixed (Go sorts numerically by
-/// issue-id suffix, e.g. XL-14 < XL-110, not lexicographically). The 10
-/// remaining diffs are all `selfrepo` cases, which the note above already
-/// documents as expected drift: those goldens were captured 2026-08-22
-/// against this live repo's `.beads/issues.jsonl`, which has since gained
-/// beads. Not a Rust/Go algorithmic divergence.
+/// 2026-09-25: the previous comment on this constant claimed the 11 remaining
+/// divergences were "all `selfrepo` cases". That was wrong and the count was
+/// hiding real parity work. Measured today, of the 14 divergences:
+/// 2 are `selfrepo` git-HEAD drift and 1 is a pre-envelope golden — all three
+/// are corpus defects now classified by [`classify`] and counted in
+/// `CORPUS_DEFECT_BASELINE` — leaving 11 genuine Rust/Go divergences, none of
+/// them `selfrepo`:
 ///
-/// 2026-09-09: raised 10 -> 11. `selfrepo____robot_history` joined the
-/// drift set — `--robot-history` walks the live repo's own git log
-/// (`bv_correlation::correlator::walk_commits`), so *any* commit landing
-/// in this repo after the golden capture (not just `.beads/issues.jsonl`
-/// growth) shifts its output away from the frozen 2026-08-22 golden.
-/// Verified this is pure selfrepo drift, not a Rust/Go algorithmic
-/// regression, by `git stash`-ing all code changes from this session and
-/// re-running the gate: still 11 divergences, byte-identical diff
-/// locations — the only thing that changed selfrepo's ground truth was
-/// this session's own `beads: fix malformed dependency records...` commit
-/// landing in the repo's git history. Every one of these 11 is
-/// `selfrepo____*`; still zero algorithmic (non-selfrepo) diffs.
+///   medium_tree____robot_priority
+///   large_cyclic_600____robot_{triage,plan,insights,priority,suggest,alerts,label_health}
+///   xl_2500____robot_{priority,alerts,label_health}
+///
+/// So the number is unchanged at 11, but its composition is: the three corpus
+/// defects left the diff set and the pre-existing selfrepo baseline was
+/// masking nine non-selfrepo algorithmic divergences that are real port work.
+/// Those are owned by the analysis/label_health streams. This constant must
+/// not be raised, and should be lowered as each of those eleven lands.
 const GOLDEN_GATE_BASELINE_FAILS: usize = 11;
+
+/// Ratchet baseline: number of goldens this corpus provably cannot decide,
+/// counted by [`classify`] and reported by name in the gate summary.
+///
+/// The count is pinned so the exemption cannot quietly widen. Both current
+/// entries are verified, not assumed:
+///
+/// 1. `selfrepo____robot_history` and
+///    `selfrepo____robot_diff___diff_since_HEAD~5` — git HEAD drift. Proven by
+///    running the v0.25.0 Go oracle (`beads_viewer/.bv-go`) against the
+///    goldens *today*: Go itself no longer matches either golden, and Rust is
+///    byte-identical to Go for both cases under the harness's own
+///    normalization. The golden pins are real commits that have since moved
+///    (`latest_commit_sha` 0b36acd5 is now HEAD~122; `resolved_revision`
+///    29f7867a is now HEAD~101, versus the live HEAD~5 5344c07c). Nothing in
+///    the port can close a 96-commit gap.
+/// 2. `large_cyclic_600____robot_label_attention` — pre-envelope golden: it
+///    carries a `data_hash` (a 16-char v0.20.0 truncation) but no
+///    `source_kind`, which is what [`classify`] keys on. Independently of
+///    that, the oracle cannot run this case at all: Go panics with
+///    `simple: adding self edge` at
+///    beads_viewer/pkg/analysis/label_health.go:1592, an unguarded
+///    `g.SetEdge` that the fixture's Cyc-33 self-loop trips. Every other
+///    `--robot-*` flag runs on this fixture, so the corpus defect is specific
+///    to this case, not to the fixture.
+///
+/// Lower this as goldens are recaptured. Note the coverage cost of entry 1:
+/// while HEAD keeps moving, those two selfrepo cases check nothing. The real
+/// fix is a recapture at a frozen commit (or a dedicated fixture repo with a
+/// fixed history), which is a corpus change and out of scope for the harness.
+const CORPUS_DEFECT_BASELINE: usize = 3;
 
 #[test]
 fn rust_output_matches_frozen_go_goldens() {
@@ -254,8 +457,10 @@ fn rust_output_matches_frozen_go_goldens() {
     let mut skip = 0usize;
     let mut infra_fails = 0usize;
     let mut diff_fails = 0usize;
+    let mut corpus_defects = 0usize;
     let mut infra_msgs: Vec<String> = Vec::new();
     let mut diff_msgs: Vec<String> = Vec::new();
+    let mut corpus_msgs: Vec<String> = Vec::new();
 
     for (fixture_name, cwd) in &fixtures {
         for (args, slug) in cases {
@@ -327,6 +532,16 @@ fn rust_output_matches_frozen_go_goldens() {
                 continue;
             };
 
+            // The corpus itself is the problem, not the port. Counted in its
+            // own bucket, reported by name, and ratcheted separately below so
+            // that adding a new undecidable golden fails the gate instead of
+            // quietly enlarging the exemption.
+            if let Some(why) = classify(cwd, &golden_json) {
+                corpus_defects += 1;
+                corpus_msgs.push(format!("{case}: {why}"));
+                continue;
+            }
+
             let (a, b) = (canonical(&rust_json), canonical(&golden_json));
             if a == b {
                 pass += 1;
@@ -345,9 +560,13 @@ fn rust_output_matches_frozen_go_goldens() {
     }
 
     eprintln!(
-        "Golden gate: PASS={pass} DIFF_FAILS={diff_fails} INFRA_FAILS={infra_fails} SKIP={skip}"
+        "Golden gate: PASS={pass} DIFF_FAILS={diff_fails} INFRA_FAILS={infra_fails} \
+         SKIP={skip} CORPUS_DEFECTS={corpus_defects}"
     );
     for m in &diff_msgs {
+        eprintln!("  {m}");
+    }
+    for m in &corpus_msgs {
         eprintln!("  {m}");
     }
     for m in &infra_msgs {
@@ -366,6 +585,15 @@ fn rust_output_matches_frozen_go_goldens() {
         "Parity regressed: {diff_fails} divergences > baseline {}. Fix or lower the baseline:\n{}",
         GOLDEN_GATE_BASELINE_FAILS,
         diff_msgs.join("\n")
+    );
+    // The corpus-defect bucket is a ratchet too, so undecidable goldens cannot
+    // accumulate silently. It only shrinks when goldens are recaptured.
+    assert!(
+        corpus_defects <= CORPUS_DEFECT_BASELINE,
+        "New undecidable golden(s): {corpus_defects} corpus defects > baseline {CORPUS_DEFECT_BASELINE}. \
+         Each is a golden this corpus cannot decide, so it contributes no parity coverage. \
+         Recapture the affected goldens, or justify and raise the baseline deliberately:\n{}",
+        corpus_msgs.join("\n")
     );
 }
 
