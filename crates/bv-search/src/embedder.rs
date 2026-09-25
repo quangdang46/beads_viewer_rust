@@ -82,12 +82,19 @@ pub fn hash_embed(text: &str, dim: usize) -> Vec<f32> {
         add_hashed_token(&mut vec, token);
     }
 
-    // L2 normalize.
-    let norm: f32 = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
-    if norm > 0.0 {
-        for v in &mut vec {
-            *v /= norm;
-        }
+    // Go `normalizeL2` (pkg/search/hash_embedder.go:89-100). Two details
+    // decide the last bit and are not interchangeable: the sum of squares is
+    // accumulated in f64, and the scale is `1/sqrt` computed in f64 and then
+    // narrowed, rather than dividing by an f32 norm. Either shortcut shifts
+    // every embedding by an ULP, which propagates into cosine scores and
+    // therefore into search result ordering.
+    let sum: f64 = vec.iter().map(|&v| f64::from(v) * f64::from(v)).sum();
+    if sum == 0.0 {
+        return vec;
+    }
+    let scale = (1.0 / sum.sqrt()) as f32;
+    for v in &mut vec {
+        *v *= scale;
     }
     vec
 }
