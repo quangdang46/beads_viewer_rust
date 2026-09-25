@@ -3305,7 +3305,11 @@ fn run_robot_insights() -> ExitCode {
     payload["Hubs"] = serde_json::Value::Array(top_items_go(&hub_obj, INSIGHTS_LIMIT));
     payload["Authorities"] = serde_json::Value::Array(top_items_go(&auth_obj, INSIGHTS_LIMIT));
     payload["Cores"] = serde_json::Value::Array(top_items_go(&core_obj, INSIGHTS_LIMIT));
-    payload["Articulation"] = serde_json::json!(art_ids);
+    // Go caps every insights list at the same `limit` (insights.go:88-96,
+    // `limitStrings(artPts, limit)` at :94). Rust emitted the articulation
+    // set uncapped — 204 entries on xl_2500 where Go caps at 50.
+    let art_capped: Vec<&String> = art_ids.iter().take(INSIGHTS_LIMIT).collect();
+    payload["Articulation"] = serde_json::json!(art_capped);
     payload["Slack"] = serde_json::Value::Array(top_items_go(&slack_obj, INSIGHTS_LIMIT));
 
     // Orphans: zero out-degree (nothing depends on them), sorted (Go findOrphans).
@@ -3313,7 +3317,9 @@ fn run_robot_insights() -> ExitCode {
         .filter(|&i| g.out_degree(i) == 0)
         .map(|i| g.node_id(i).unwrap_or_default().to_string())
         .collect();
-    payload["Orphans"] = serde_json::json!(orphans);
+    // Same `limit` applies to Orphans (insights.go:95) — 1855 uncapped here.
+    let orphans_capped: Vec<&String> = orphans.iter().take(INSIGHTS_LIMIT).collect();
+    payload["Orphans"] = serde_json::json!(orphans_capped);
 
     // Cycles: Go emits null when none detected.
     let cycles_from_phase2 = phase2.cycles.clone().unwrap_or_default();
