@@ -797,6 +797,44 @@ th {{ background: #44475a; }}
 }
 
 /// Compute graph metrics and run the TUI event loop.
+/// Go `limitMaps` / `limitMapInt` (cmd/bv/robot_registry.go:1884-1931) — keep
+/// the top `limit` entries of a metric map, value descending with the key
+/// ascending as tie-break, so the result is deterministic.
+///
+/// Without this every `--robot-insights` full_stats map carries every node
+/// (600 on large_cyclic_600, 2500 on xl_2500) where Go carries 200.
+fn limit_metric_map(
+    m: serde_json::Map<String, serde_json::Value>,
+    limit: usize,
+) -> serde_json::Map<String, serde_json::Value> {
+    if limit == 0 || m.len() <= limit {
+        return m;
+    }
+    let mut items: Vec<(String, serde_json::Value)> = m.into_iter().collect();
+    items.sort_by(|a, b| {
+        let (ka, va) = (&a.0, &a.1);
+        let (kb, vb) = (&b.0, &b.1);
+        let na = va.as_f64().unwrap_or(f64::NEG_INFINITY);
+        let nb = vb.as_f64().unwrap_or(f64::NEG_INFINITY);
+        na.partial_cmp(&nb)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .reverse()
+            .then_with(|| ka.cmp(kb))
+    });
+    items.truncate(limit);
+    items.into_iter().collect()
+}
+
+/// `BV_INSIGHTS_MAP_LIMIT` (Go internal/env/env.go:131). A positive integer
+/// overrides the default; anything else keeps it.
+fn insights_map_limit() -> usize {
+    std::env::var("BV_INSIGHTS_MAP_LIMIT")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(200)
+}
+
 fn launch_tui(app: &mut bv_tui::App, issues: &[bv_core::model::Issue]) -> ExitCode {
     let g = bv_analysis::build_graph(issues);
     let pr = bv_graph_core::pagerank_default(&g);
@@ -3363,18 +3401,40 @@ fn run_robot_insights() -> ExitCode {
     });
 
     // full_stats — exactly Go's 9 fields (mapLimit=200 default).
+    let map_limit = insights_map_limit();
     let mut fs = serde_json::Map::new();
-    fs.insert("pagerank".into(), serde_json::Value::Object(pr_obj));
-    fs.insert("betweenness".into(), serde_json::Value::Object(bw_obj));
-    fs.insert("eigenvector".into(), serde_json::Value::Object(ev_obj));
-    fs.insert("hubs".into(), serde_json::Value::Object(hub_obj));
-    fs.insert("authorities".into(), serde_json::Value::Object(auth_obj));
+    fs.insert(
+        "pagerank".into(),
+        serde_json::Value::Object(limit_metric_map(pr_obj, map_limit)),
+    );
+    fs.insert(
+        "betweenness".into(),
+        serde_json::Value::Object(limit_metric_map(bw_obj, map_limit)),
+    );
+    fs.insert(
+        "eigenvector".into(),
+        serde_json::Value::Object(limit_metric_map(ev_obj, map_limit)),
+    );
+    fs.insert(
+        "hubs".into(),
+        serde_json::Value::Object(limit_metric_map(hub_obj, map_limit)),
+    );
+    fs.insert(
+        "authorities".into(),
+        serde_json::Value::Object(limit_metric_map(auth_obj, map_limit)),
+    );
     fs.insert(
         "critical_path_score".into(),
-        serde_json::Value::Object(cp_obj),
+        serde_json::Value::Object(limit_metric_map(cp_obj, map_limit)),
     );
-    fs.insert("core_number".into(), serde_json::Value::Object(core_obj));
-    fs.insert("slack".into(), serde_json::Value::Object(slack_obj));
+    fs.insert(
+        "core_number".into(),
+        serde_json::Value::Object(limit_metric_map(core_obj, map_limit)),
+    );
+    fs.insert(
+        "slack".into(),
+        serde_json::Value::Object(limit_metric_map(slack_obj, map_limit)),
+    );
     fs.insert("articulation_points".into(), serde_json::json!(art_ids));
     payload["full_stats"] = serde_json::Value::Object(fs);
 
