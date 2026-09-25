@@ -8,6 +8,7 @@ authors.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml_ng = "0.10"
 thiserror = { workspace = true }
 sha2 = { workspace = true }
 ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
