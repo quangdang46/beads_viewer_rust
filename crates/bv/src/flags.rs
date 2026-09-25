@@ -1,6 +1,8 @@
 //! Flag registry — port of Go `cmd/bv` flag definitions (main.go:1417-1663)
-//! with category grouping, robot-primary classification, and the
-//! modifier-requires validation table (main.go:1699-1780).
+//! with category grouping, robot-primary classification, and the validation
+//! tables Go drives its three post-parse checks from: the ordered
+//! modifier-requires rules (main.go:1786-1843), the modifier-requires recovery
+//! examples (main.go:257-316), and the enum-value rules (main.go:1845-1848).
 
 /// A single CLI flag definition.
 #[derive(Debug, Clone)]
@@ -1233,6 +1235,14 @@ fn wrap(indent: usize, cols: usize, s: &str) -> String {
     r
 }
 
+/// Every long flag name the registry knows about, robot primaries first.
+/// Used by `--generate-docs` to record the accepted surface as an artifact.
+pub fn flag_names() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = ROBOT_PRIMARIES.iter().map(|f| f.name).collect();
+    names.extend(MODIFIER_FLAGS.iter().map(|f| f.name));
+    names
+}
+
 /// Port of pflag `FlagUsagesWrapped` (flag.go:707-778) for one section: the
 /// widest left column sets the description column for every row in it.
 fn flag_usages(rows: &[&HelpFlag]) -> String {
@@ -1675,12 +1685,22 @@ const fn f2(name: &'static str) -> FlagDef {
     }
 }
 
-/// Modifier-requires table (subset of Go's ~50 rules covering all pairs).
+/// Modifier-requires table — Go `modifierRules` (main.go:1786-1843), in Go's
+/// order. All 58 rows.
+///
+/// The ORDER IS SEMANTICS, not presentation. Go's `validateModifierFlags`
+/// walks this slice and returns the first rule whose modifier was supplied
+/// without a satisfying co-flag, so `bv --graph-preset roomy --severity info`
+/// reports `--graph-preset requires --export-graph` (row 1804), not
+/// `--severity requires --robot-alerts` (row 1806). Consumers must therefore
+/// iterate this slice front-to-back and take the first hit; a sorted or
+/// re-derived order makes a two-problem command report the wrong error.
 pub const MODIFIER_REQUIRES: &[(&str, &[&str])] = &[
-    // Go main.go:1786-1792 — report-export options ride with a report command.
+    // main.go:1786-1788 — report-export options ride with a report command.
     ("export-format", &["export", "export-md"]),
     ("export-include-graph", &["export", "export-md"]),
     ("export-template", &["export", "export-md"]),
+    // main.go:1789-1795
     ("robot-diff", &["diff-since"]),
     ("robot-search", &["search"]),
     ("search-limit", &["search"]),
@@ -1688,11 +1708,13 @@ pub const MODIFIER_REQUIRES: &[(&str, &[&str])] = &[
     ("search-mode", &["search"]),
     ("search-preset", &["search"]),
     ("search-weights", &["search"]),
+    // main.go:1796-1800
     ("attention-limit", &["robot-label-attention"]),
     ("schema-command", &["robot-schema"]),
     ("suggest-type", &["robot-suggest"]),
     ("suggest-confidence", &["robot-suggest"]),
     ("suggest-bead", &["robot-suggest"]),
+    // main.go:1801-1805 — graph output vs. graph *export* are different commands.
     ("graph-format", &["robot-graph"]),
     (
         "graph-root",
@@ -1705,11 +1727,15 @@ pub const MODIFIER_REQUIRES: &[(&str, &[&str])] = &[
         ],
     ),
     ("graph-depth", &["robot-graph"]),
+    ("graph-preset", &["export-graph"]),
+    ("graph-title", &["export-graph"]),
+    // main.go:1806-1810
     ("severity", &["robot-alerts"]),
     ("alert-type", &["robot-alerts"]),
     ("alert-label", &["robot-alerts"]),
     ("profile-json", &["profile-startup"]),
     ("robot-drift", &["check-drift"]),
+    // main.go:1811-1816
     (
         "history-since",
         &["robot-history", "bead-history", "robot-causality"],
@@ -1735,28 +1761,6 @@ pub const MODIFIER_REQUIRES: &[(&str, &[&str])] = &[
             "robot-next",
         ],
     ),
-    ("min-confidence", &["robot-history", "bead-history"]),
-    ("orphans-min-score", &["robot-orphans"]),
-    ("file-beads-limit", &["robot-file-beads"]),
-    ("hotspots-limit", &["robot-file-hotspots"]),
-    ("relations-threshold", &["robot-file-relations"]),
-    ("relations-limit", &["robot-file-relations"]),
-    ("related-min-relevance", &["robot-related"]),
-    ("related-max-results", &["robot-related"]),
-    ("network-depth", &["robot-impact-network"]),
-    ("forecast-label", &["robot-forecast"]),
-    ("forecast-sprint", &["robot-forecast"]),
-    ("forecast-agents", &["robot-forecast"]),
-    ("agents", &["robot-capacity"]),
-    ("capacity-label", &["robot-capacity"]),
-    ("script-limit", &["emit-script"]),
-    ("script-format", &["emit-script"]),
-    ("pages-title", &["export-pages"]),
-    ("no-live-reload", &["preview-pages"]),
-    ("watch-export", &["export-pages"]),
-    ("debug-width", &["debug-render"]),
-    ("debug-height", &["debug-render"]),
-    // Missing rules from Go (main.go:1699-1780)
     (
         "robot-not-ready-labels",
         &[
@@ -1766,6 +1770,8 @@ pub const MODIFIER_REQUIRES: &[(&str, &[&str])] = &[
             "robot-next",
         ],
     ),
+    ("min-confidence", &["robot-history", "bead-history"]),
+    // main.go:1817-1826
     (
         "correlation-by",
         &["robot-confirm-correlation", "robot-reject-correlation"],
@@ -1774,14 +1780,538 @@ pub const MODIFIER_REQUIRES: &[(&str, &[&str])] = &[
         "correlation-reason",
         &["robot-confirm-correlation", "robot-reject-correlation"],
     ),
+    ("orphans-min-score", &["robot-orphans"]),
+    ("file-beads-limit", &["robot-file-beads"]),
+    ("hotspots-limit", &["robot-file-hotspots"]),
+    ("relations-threshold", &["robot-file-relations"]),
+    ("relations-limit", &["robot-file-relations"]),
+    ("related-min-relevance", &["robot-related"]),
+    ("related-max-results", &["robot-related"]),
+    ("related-include-closed", &["robot-related"]),
+    // main.go:1827-1836
+    ("network-depth", &["robot-impact-network"]),
+    ("forecast-label", &["robot-forecast"]),
+    ("forecast-sprint", &["robot-forecast"]),
+    ("forecast-agents", &["robot-forecast"]),
+    ("agents", &["robot-capacity"]),
+    ("capacity-label", &["robot-capacity"]),
     ("robot-by-label", &["robot-priority"]),
     ("robot-by-assignee", &["robot-priority"]),
+    ("script-limit", &["emit-script"]),
+    ("script-format", &["emit-script"]),
+    // main.go:1837-1843
+    ("pages-title", &["export-pages"]),
     ("pages-include-closed", &["export-pages"]),
     ("pages-include-history", &["export-pages"]),
-    ("graph-preset", &["export-graph"]),
-    ("graph-title", &["export-graph"]),
-    ("related-include-closed", &["robot-related"]),
+    ("no-live-reload", &["preview-pages"]),
+    ("watch-export", &["export-pages"]),
+    ("debug-width", &["debug-render"]),
+    ("debug-height", &["debug-render"]),
 ];
+
+// ---------------------------------------------------------------------------
+// Modifier-requires recovery examples (Go `modifierRecoveryExamples`,
+// main.go:257-316, formatted by `formatModifierRecoveryExamples`,
+// main.go:238-255)
+// ---------------------------------------------------------------------------
+
+/// Concrete invocations Go appends to a modifier-requires error so the caller
+/// can retry without reading the docs. Row order mirrors Go's `switch`, and
+/// the eleven modifiers Go leaves undecorated simply have no row here — Go's
+/// `default` arm returns `nil`, which formats to the empty string, so an
+/// undecorated error must stay byte-identical to the undecorated form.
+///
+/// Strings are copied verbatim from Go, quotes and all. `search-min-score`
+/// rides with the other five search modifiers on Go's 257-263 row.
+pub const MODIFIER_RECOVERY_EXAMPLES: &[(&str, &[&str])] = &[
+    // main.go:259-264
+    (
+        "robot-search",
+        &[
+            r#"bv robot-search "login oauth" --json"#,
+            r#"bv --search "login oauth" --robot-search --format json"#,
+        ],
+    ),
+    (
+        "search-limit",
+        &[
+            r#"bv robot-search "login oauth" --json"#,
+            r#"bv --search "login oauth" --robot-search --format json"#,
+        ],
+    ),
+    (
+        "search-min-score",
+        &[
+            r#"bv robot-search "login oauth" --json"#,
+            r#"bv --search "login oauth" --robot-search --format json"#,
+        ],
+    ),
+    (
+        "search-mode",
+        &[
+            r#"bv robot-search "login oauth" --json"#,
+            r#"bv --search "login oauth" --robot-search --format json"#,
+        ],
+    ),
+    (
+        "search-preset",
+        &[
+            r#"bv robot-search "login oauth" --json"#,
+            r#"bv --search "login oauth" --robot-search --format json"#,
+        ],
+    ),
+    (
+        "search-weights",
+        &[
+            r#"bv robot-search "login oauth" --json"#,
+            r#"bv --search "login oauth" --robot-search --format json"#,
+        ],
+    ),
+    // main.go:265-269
+    (
+        "robot-diff",
+        &[
+            "bv robot-diff HEAD~1 --json",
+            "bv --robot-diff --diff-since HEAD~1 --format json",
+        ],
+    ),
+    // main.go:270-278
+    ("schema-command", &["bv robot-schema triage --json"]),
+    ("graph-format", &["bv robot-graph mermaid --json"]),
+    ("graph-depth", &["bv robot-graph mermaid --json"]),
+    ("graph-root", &["bv robot-graph json --graph-root A --json"]),
+    // main.go:279-288
+    ("severity", &["bv robot-alerts --severity critical --json"]),
+    (
+        "alert-type",
+        &["bv robot-alerts --severity critical --json"],
+    ),
+    (
+        "alert-label",
+        &["bv robot-alerts --severity critical --json"],
+    ),
+    (
+        "robot-drift",
+        &["bv --check-drift --robot-drift --format json"],
+    ),
+    (
+        "history-since",
+        &[r#"bv robot-history --history-since "30 days ago" --json"#],
+    ),
+    // main.go:289-297
+    (
+        "history-limit",
+        &[r#"bv robot-history --history-since "30 days ago" --json"#],
+    ),
+    (
+        "min-confidence",
+        &[r#"bv robot-history --history-since "30 days ago" --json"#],
+    ),
+    (
+        "robot-history-timeout-ms",
+        &["bv robot-triage --robot-history-timeout-ms 10000 --json"],
+    ),
+    // main.go:298-305
+    ("brief", &["bv robot-triage --brief --json"]),
+    (
+        "correlation-by",
+        &["bv robot-confirm-correlation deadbeef:A --correlation-by agent --json"],
+    ),
+    (
+        "correlation-reason",
+        &["bv robot-confirm-correlation deadbeef:A --correlation-by agent --json"],
+    ),
+    // main.go:306-310
+    (
+        "orphans-min-score",
+        &["bv robot-orphans --orphans-min-score 30 --json"],
+    ),
+    (
+        "file-beads-limit",
+        &["bv robot-file-beads README.md --file-beads-limit 10 --json"],
+    ),
+    (
+        "hotspots-limit",
+        &["bv robot-file-hotspots --hotspots-limit 10 --json"],
+    ),
+    (
+        "relations-threshold",
+        &["bv robot-file-relations README.md --relations-limit 10 --json"],
+    ),
+    // main.go:311-320
+    (
+        "relations-limit",
+        &["bv robot-file-relations README.md --relations-limit 10 --json"],
+    ),
+    (
+        "related-min-relevance",
+        &["bv robot-related A --related-max-results 5 --json"],
+    ),
+    (
+        "related-max-results",
+        &["bv robot-related A --related-max-results 5 --json"],
+    ),
+    (
+        "related-include-closed",
+        &["bv robot-related A --related-max-results 5 --json"],
+    ),
+    // main.go:321-327
+    (
+        "network-depth",
+        &["bv robot-impact-network A --network-depth 2 --json"],
+    ),
+    (
+        "forecast-label",
+        &["bv robot-forecast all --forecast-agents 3 --json"],
+    ),
+    (
+        "forecast-sprint",
+        &["bv robot-forecast all --forecast-agents 3 --json"],
+    ),
+    // main.go:328-338
+    (
+        "forecast-agents",
+        &["bv robot-forecast all --forecast-agents 3 --json"],
+    ),
+    ("agents", &["bv robot-capacity --agents 3 --json"]),
+    ("capacity-label", &["bv robot-capacity --agents 3 --json"]),
+    (
+        "robot-by-label",
+        &["bv robot-priority --robot-by-label backend --json"],
+    ),
+    // main.go:339-346
+    (
+        "robot-by-assignee",
+        &["bv robot-priority --robot-by-label backend --json"],
+    ),
+    ("script-limit", &["bv --emit-script --script-limit 5"]),
+    ("script-format", &["bv --emit-script --script-limit 5"]),
+    // main.go:347-358
+    (
+        "pages-title",
+        &[r#"bv --export-pages ./bv-pages --pages-title "Nightly Build""#],
+    ),
+    (
+        "pages-include-closed",
+        &[r#"bv --export-pages ./bv-pages --pages-title "Nightly Build""#],
+    ),
+    (
+        "pages-include-history",
+        &[r#"bv --export-pages ./bv-pages --pages-title "Nightly Build""#],
+    ),
+    (
+        "no-live-reload",
+        &["bv --preview-pages ./bv-pages --no-live-reload"],
+    ),
+    (
+        "watch-export",
+        &["bv --export-pages ./bv-pages --watch-export"],
+    ),
+    // main.go:359-361
+    (
+        "debug-width",
+        &["bv --debug-render triage --debug-width 120 --debug-height 40"],
+    ),
+    (
+        "debug-height",
+        &["bv --debug-render triage --debug-width 120 --debug-height 40"],
+    ),
+];
+
+/// Go `modifierRecoveryExamples` (main.go:257). A modifier with no row gets
+/// Go's `default: return nil`, i.e. an empty list.
+pub fn modifier_recovery_examples(modifier: &str) -> &'static [&'static str] {
+    MODIFIER_RECOVERY_EXAMPLES
+        .iter()
+        .find(|(name, _)| *name == modifier)
+        .map_or(&[][..], |(_, examples)| *examples)
+}
+
+/// Go `formatModifierRecoveryExamples` (main.go:238), the suffix
+/// `validateModifierFlags` splices onto `--X requires Y` (main.go:232).
+///
+/// Three shapes, all returned verbatim (leading `\n` included):
+///
+/// * unmapped modifier → `""`
+/// * exactly one example → `"\nTry: `<invocation>`."`
+/// * several → `"\nTry one of:"` then `"\n  `<invocation>`"` per example
+pub fn format_modifier_recovery_examples(modifier: &str) -> String {
+    let examples = modifier_recovery_examples(modifier);
+    match examples {
+        [] => String::new(),
+        [only] => format!("\nTry: `{only}`."),
+        many => {
+            let mut out = String::from("\nTry one of:");
+            for example in many {
+                out.push_str("\n  `");
+                out.push_str(example);
+                out.push('`');
+            }
+            out
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Enum flags (Go `validateEnumFlags`, main.go:363-395; rules at 1845-1848)
+// ---------------------------------------------------------------------------
+
+/// One `enumFlagRule` (main.go:203). `allowed` order is Go's slice order and
+/// is load-bearing: it is both the "expected one of" list and the candidate
+/// order `suggestClosest` walks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnumFlagRule {
+    pub name: &'static str,
+    pub allowed: &'static [&'static str],
+}
+
+/// Go `enumRules` (main.go:1845-1848) — every string flag Go constrains to a
+/// closed set, checked after the modifier-requires pass and before the
+/// exclusive-primary pass.
+pub const ENUM_RULES: &[EnumFlagRule] = &[
+    EnumFlagRule {
+        name: "graph-format",
+        allowed: &["json", "dot", "mermaid"],
+    },
+    EnumFlagRule {
+        name: "script-format",
+        allowed: &["bash", "fish", "zsh"],
+    },
+];
+
+/// A rejected enum value, carrying the parts of Go's error text so a caller
+/// can render it without re-deriving anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumFlagError {
+    /// The `--`-less flag name (Go's `rule.name`).
+    pub name: &'static str,
+    /// The value exactly as supplied — Go quotes the raw value, not the
+    /// lowercased/trimmed one.
+    pub value: String,
+    /// Go's `rule.allowed`, in declaration order.
+    pub allowed: &'static [&'static str],
+    /// Go's `formatDidYouMean` suffix: `"; did you mean \"zsh\"?"` or `""`.
+    /// Always `""` for the empty-value error, which Go emits without a
+    /// suggestion.
+    pub did_you_mean: String,
+}
+
+impl EnumFlagError {
+    /// Go's `validateEnumFlags` error text, byte-for-byte (main.go:378, 384).
+    ///
+    /// The two branches are distinct in Go and stay distinct here: a value that
+    /// normalizes to empty gets no `did you mean`, because there is no typo to
+    /// correct — the flag was simply given no value.
+    pub fn message(&self) -> String {
+        let expected = self.allowed.join(", ");
+        if self.value_is_blank_after_normalizing() {
+            format!(
+                "invalid --{} {} (expected one of {expected})",
+                self.name,
+                go_quote(&self.value)
+            )
+        } else {
+            format!(
+                "invalid --{} {} (expected one of {expected}){}",
+                self.name,
+                go_quote(&self.value),
+                self.did_you_mean
+            )
+        }
+    }
+
+    /// Go normalizes with `strings.ToLower(strings.TrimSpace(value))` and
+    /// branches on the result (main.go:374). The message has to branch the same
+    /// way, so re-derive the predicate instead of storing a second flag.
+    fn value_is_blank_after_normalizing(&self) -> bool {
+        self.value.trim().to_lowercase().is_empty()
+    }
+}
+
+/// Go `validateEnumFlags` (main.go:363), reduced to its pure decision: the
+/// first rule whose flag was supplied with a value outside `allowed` wins,
+/// because Go `return`s immediately.
+///
+/// `supplied` pairs a flag name with its effective value — one entry per
+/// changed string flag. Repeated flags are last-wins, matching pflag's
+/// `FlagSet.GetString`, so pass the value the parser settled on.
+#[allow(dead_code)] // consumed by the validation layer, which this file does not own
+pub fn validate_enum_flags(supplied: &[(&str, &str)]) -> Option<EnumFlagError> {
+    for rule in ENUM_RULES {
+        let Some((_, value)) = supplied.iter().rev().find(|(name, _)| *name == rule.name) else {
+            continue;
+        };
+        let normalized = value.trim().to_lowercase();
+        if normalized.is_empty() {
+            return Some(EnumFlagError {
+                name: rule.name,
+                value: (*value).to_string(),
+                allowed: rule.allowed,
+                did_you_mean: String::new(),
+            });
+        }
+        if !rule.allowed.contains(&normalized.as_str()) {
+            return Some(EnumFlagError {
+                name: rule.name,
+                value: (*value).to_string(),
+                allowed: rule.allowed,
+                did_you_mean: format_did_you_mean(&normalized, rule.allowed),
+            });
+        }
+    }
+    None
+}
+
+/// Go `formatDidYouMean` (main.go:409).
+#[allow(dead_code)] // exercised through validate_enum_flags' error text
+fn format_did_you_mean(value: &str, allowed: &[&'static str]) -> String {
+    let suggestion = suggest_closest(value, allowed);
+    if suggestion.is_empty() {
+        return String::new();
+    }
+    format!("; did you mean {}?", go_quote(suggestion))
+}
+
+/// Go `suggestClosest` (main.go:413). The tie-break is transcribed literally:
+/// a candidate at distance exactly `bestDist` only displaces the incumbent
+/// when it sorts before it, and the walk keeps the FIRST row on a full tie.
+#[allow(dead_code)] // exercised through validate_enum_flags' error text
+fn suggest_closest(value: &str, allowed: &[&'static str]) -> &'static str {
+    let value = normalize_enum_value(value);
+    if value.is_empty() || allowed.is_empty() {
+        return "";
+    }
+    let mut best: Option<&'static str> = None;
+    let mut best_dist = max_suggestion_distance(&value);
+    for candidate in allowed {
+        let normalized = normalize_enum_value(candidate);
+        if normalized.is_empty() {
+            continue;
+        }
+        let dist = levenshtein_distance(&value, &normalized);
+        // Go mutates `bestDist` from the threshold, so the very first
+        // candidate is accepted whenever it lands within it.
+        if dist <= best_dist
+            && best.is_none_or(|incumbent| {
+                dist < best_dist || normalized < normalize_enum_value(incumbent)
+            })
+        {
+            best = Some(candidate);
+            best_dist = dist;
+        }
+    }
+    best.unwrap_or("")
+}
+
+/// Go's `strings.ToLower(strings.TrimSpace(...))`, the normalization applied
+/// before every enum comparison and suggestion.
+fn normalize_enum_value(value: &str) -> String {
+    value.trim().to_lowercase()
+}
+
+/// Go `maxSuggestionDistance` (main.go:451) — a length-tiered ceiling on how
+/// far a typo may be from an accepted value. `len` is a BYTE count, matching
+/// Go, so a multibyte value gets the wider budget a longer string would.
+fn max_suggestion_distance(value: &str) -> usize {
+    match value.len() {
+        0..=4 => 2,
+        5..=10 => 3,
+        _ => 4,
+    }
+}
+
+/// Go `levenshteinDistance` (main.go:422), byte-for-byte. Go indexes
+/// `a[i-1]`/`b[j-1]` directly, so the edit distance it computes is over BYTES,
+/// not chars — a multibyte rune costs 2-4 edits. Porting over `char_indices`
+/// would silently make Rust more forgiving than Go on non-ASCII input.
+#[allow(dead_code)] // exercised through validate_enum_flags' error text
+fn levenshtein_distance(a: &str, b: &str) -> usize {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a == b {
+        return 0;
+    }
+    if a.is_empty() {
+        return b.len();
+    }
+    if b.is_empty() {
+        return a.len();
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            cur[j] = (cur[j - 1] + 1).min(prev[j] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// Go's `%q` (i.e. `strconv.Quote`) for the value and suggestion in enum error
+/// text. Rust's `{:?}` is not a substitute: it spells non-printables as
+/// `\u{7f}` where Go writes `\x7f`, and it escapes `'` where Go does not.
+///
+/// The ASCII half is an exact transcription of `strconv`'s cases. For the rest
+/// it reuses `char::escape_debug` — the only std predicate tracking Unicode
+/// printability — and reshapes its `\u{…}` spelling into Go's `\uXXXX` /
+/// `\UXXXXXXXX`. Flag values are shell text, so the ASCII half is the one that
+/// decides the goldens; the non-ASCII half exists so the two never drift into
+/// emitting invalid UTF-8.
+#[allow(dead_code)] // exercised through validate_enum_flags' error text
+fn go_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        let code = ch as u32;
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            // Go's `strconv.Quote` is `QuoteToASCII`-free and never escapes the
+            // apostrophe; Rust's `escape_debug` always does, so it is split out
+            // here rather than left to fall through.
+            '\'' => out.push('\''),
+            '\u{7}' => out.push_str("\\a"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{b}' => out.push_str("\\v"),
+            // Go's `strconv` escape set for non-printables below U+0100,
+            // plus DEL. These are exactly the runes with a named short form
+            // or an ASCII-range fallback in `strconv.quoteWith`.
+            _ if code < 0x20 || code == 0x7f => out.push_str(&format!("\\x{code:02x}")),
+            _ => {
+                let escaped = ch.escape_debug().to_string();
+                if escaped == ch.to_string() {
+                    out.push(ch);
+                } else if let Some(hex) = escaped
+                    .strip_prefix("\\u{")
+                    .and_then(|h| h.strip_suffix('}'))
+                {
+                    // Go pads to 4 hex digits in the BMP and 8 above it.
+                    let width = if u32::from_str_radix(hex, 16).is_ok_and(|c| c <= 0xFFFF) {
+                        4
+                    } else {
+                        8
+                    };
+                    let prefix = if width == 4 { "\\u" } else { "\\U" };
+                    out.push_str(prefix);
+                    for _ in hex.len()..width {
+                        out.push('0');
+                    }
+                    out.push_str(hex);
+                } else {
+                    out.push_str(&escaped);
+                }
+            }
+        }
+    }
+    out.push('"');
+    out
+}
 
 #[cfg(test)]
 mod tests {
@@ -2181,5 +2711,524 @@ mod tests {
             .find(|(name, _)| *name == "search-min-score")
             .expect("search-min-score missing from MODIFIER_REQUIRES");
         assert_eq!(row.1, &["search"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // A. Evaluation order
+    // -----------------------------------------------------------------------
+
+    /// Go's `modifierRules` in source order. Transcribed independently of
+    /// [`MODIFIER_REQUIRES`] so the table cannot quietly drift: a reordering
+    /// that keeps every rule present still fails here, which is the whole bug
+    /// this ordering guards against.
+    const GO_MODIFIER_RULE_ORDER: &[&str] = &[
+        "export-format",
+        "export-include-graph",
+        "export-template",
+        "robot-diff",
+        "robot-search",
+        "search-limit",
+        "search-min-score",
+        "search-mode",
+        "search-preset",
+        "search-weights",
+        "attention-limit",
+        "schema-command",
+        "suggest-type",
+        "suggest-confidence",
+        "suggest-bead",
+        "graph-format",
+        "graph-root",
+        "graph-depth",
+        "graph-preset",
+        "graph-title",
+        "severity",
+        "alert-type",
+        "alert-label",
+        "profile-json",
+        "robot-drift",
+        "history-since",
+        "history-limit",
+        "brief",
+        "robot-history-timeout-ms",
+        "robot-not-ready-labels",
+        "min-confidence",
+        "correlation-by",
+        "correlation-reason",
+        "orphans-min-score",
+        "file-beads-limit",
+        "hotspots-limit",
+        "relations-threshold",
+        "relations-limit",
+        "related-min-relevance",
+        "related-max-results",
+        "related-include-closed",
+        "network-depth",
+        "forecast-label",
+        "forecast-sprint",
+        "forecast-agents",
+        "agents",
+        "capacity-label",
+        "robot-by-label",
+        "robot-by-assignee",
+        "script-limit",
+        "script-format",
+        "pages-title",
+        "pages-include-closed",
+        "pages-include-history",
+        "no-live-reload",
+        "watch-export",
+        "debug-width",
+        "debug-height",
+    ];
+
+    #[test]
+    fn modifier_rules_are_in_go_evaluation_order() {
+        let actual: Vec<&str> = MODIFIER_REQUIRES.iter().map(|(name, _)| *name).collect();
+        assert_eq!(actual, GO_MODIFIER_RULE_ORDER);
+        assert_eq!(actual.len(), 58, "Go registers 58 modifier rules");
+    }
+
+    /// A two-problem invocation must report the FIRST rule Go hits, and a
+    /// set-based or name-sorted implementation cannot distinguish that. These
+    /// three pairs are the ones the old table got wrong: `graph-preset` and
+    /// `graph-title` sat after the alert/severity rows instead of before them,
+    /// and `robot-not-ready-labels` sat after all of them.
+    #[test]
+    fn first_violation_follows_table_order() {
+        // --graph-preset is row 19, --severity is row 21 (Go main.go:1804, 1806).
+        let hits: Vec<&str> = MODIFIER_REQUIRES
+            .iter()
+            .filter(|(modifier, _)| matches!(*modifier, "graph-preset" | "severity"))
+            .map(|(modifier, _)| *modifier)
+            .collect();
+        assert_eq!(hits, ["graph-preset", "severity"]);
+
+        // --robot-history-timeout-ms is row 28, --min-confidence is row 30
+        // (Go main.go:1814, 1816) — the old table had them the other way round.
+        let hits: Vec<&str> = MODIFIER_REQUIRES
+            .iter()
+            .filter(|(modifier, _)| {
+                matches!(*modifier, "robot-history-timeout-ms" | "min-confidence")
+            })
+            .map(|(modifier, _)| *modifier)
+            .collect();
+        assert_eq!(hits, ["robot-history-timeout-ms", "min-confidence"]);
+
+        // --pages-title is row 52, --no-live-reload is row 55
+        // (Go main.go:1837, 1840) — the old table ran --no-live-reload first.
+        let hits: Vec<&str> = MODIFIER_REQUIRES
+            .iter()
+            .filter(|(modifier, _)| matches!(*modifier, "pages-title" | "no-live-reload"))
+            .map(|(modifier, _)| *modifier)
+            .collect();
+        assert_eq!(hits, ["pages-title", "no-live-reload"]);
+    }
+
+    #[test]
+    fn every_modifier_rule_has_a_distinct_name() {
+        let mut names: Vec<&str> = MODIFIER_REQUIRES.iter().map(|(name, _)| *name).collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            total,
+            "duplicate modifier in MODIFIER_REQUIRES"
+        );
+        for (_, required) in MODIFIER_REQUIRES {
+            assert!(
+                !required.is_empty(),
+                "a rule with no co-flag can never pass"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // B. Recovery examples
+    // -----------------------------------------------------------------------
+
+    /// Go's `modifierRecoveryExamples` switch arms, as the set of modifiers
+    /// that carry a hint. The eleven members of `MODIFIER_REQUIRES` *not*
+    /// listed here are the ones Go's `default: return nil` leaves bare, and
+    /// they must keep formatting to the empty string.
+    const GO_HINTED_MODIFIERS: &[&str] = &[
+        "robot-search",
+        "search-limit",
+        "search-min-score",
+        "search-mode",
+        "search-preset",
+        "search-weights",
+        "robot-diff",
+        "schema-command",
+        "graph-format",
+        "graph-depth",
+        "graph-root",
+        "severity",
+        "alert-type",
+        "alert-label",
+        "robot-drift",
+        "history-since",
+        "history-limit",
+        "min-confidence",
+        "robot-history-timeout-ms",
+        "brief",
+        "correlation-by",
+        "correlation-reason",
+        "orphans-min-score",
+        "file-beads-limit",
+        "hotspots-limit",
+        "relations-threshold",
+        "relations-limit",
+        "related-min-relevance",
+        "related-max-results",
+        "related-include-closed",
+        "network-depth",
+        "forecast-label",
+        "forecast-sprint",
+        "forecast-agents",
+        "agents",
+        "capacity-label",
+        "robot-by-label",
+        "robot-by-assignee",
+        "script-limit",
+        "script-format",
+        "pages-title",
+        "pages-include-closed",
+        "pages-include-history",
+        "no-live-reload",
+        "watch-export",
+        "debug-width",
+        "debug-height",
+    ];
+
+    /// Every rule gets a hint except the eleven Go leaves bare, and the hint
+    /// table invents no rules of its own.
+    #[test]
+    fn recovery_hints_cover_exactly_gos_switch_arms() {
+        let covered: Vec<&str> = MODIFIER_RECOVERY_EXAMPLES
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        let mut expected: Vec<&str> = GO_HINTED_MODIFIERS.to_vec();
+        expected.sort_unstable();
+        let mut actual = covered.clone();
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
+        assert_eq!(covered.len(), 47, "Go's switch arms cover 47 modifiers");
+
+        // The complement — Go's `default: return nil` — in rule-table order.
+        let unhinted: Vec<&str> = MODIFIER_REQUIRES
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| !covered.contains(name))
+            .collect();
+        assert_eq!(
+            unhinted,
+            [
+                "export-format",
+                "export-include-graph",
+                "export-template",
+                "attention-limit",
+                "suggest-type",
+                "suggest-confidence",
+                "suggest-bead",
+                "graph-preset",
+                "graph-title",
+                "profile-json",
+                "robot-not-ready-labels",
+            ],
+            "the unhinted set is Go's default arm, nothing more and nothing less"
+        );
+    }
+
+    #[test]
+    fn recovery_hint_text_matches_go() {
+        // Go main.go:265-269 — two examples get the "Try one of:" block, and
+        // each invocation keeps its own backtick fence.
+        assert_eq!(
+            format_modifier_recovery_examples("search-min-score"),
+            "\nTry one of:\n  `bv robot-search \"login oauth\" --json`\n  `bv --search \"login oauth\" --robot-search --format json`"
+        );
+        assert_eq!(
+            format_modifier_recovery_examples("robot-diff"),
+            "\nTry one of:\n  `bv robot-diff HEAD~1 --json`\n  `bv --robot-diff --diff-since HEAD~1 --format json`"
+        );
+        // Go main.go:270 — a single example gets the short "Try: `x`." form,
+        // with a trailing period, and no "one of".
+        assert_eq!(
+            format_modifier_recovery_examples("schema-command"),
+            "\nTry: `bv robot-schema triage --json`."
+        );
+        assert_eq!(
+            format_modifier_recovery_examples("brief"),
+            "\nTry: `bv robot-triage --brief --json`."
+        );
+        // Go main.go:296-297 — escaped quotes in a double-quoted Go literal.
+        assert_eq!(
+            format_modifier_recovery_examples("history-limit"),
+            "\nTry: `bv robot-history --history-since \"30 days ago\" --json`."
+        );
+        // Go main.go:347-349 — a raw string keeps its double quotes literal.
+        assert_eq!(
+            format_modifier_recovery_examples("pages-title"),
+            "\nTry: `bv --export-pages ./bv-pages --pages-title \"Nightly Build\"`."
+        );
+    }
+
+    #[test]
+    fn unmapped_modifiers_get_no_recovery_hint() {
+        // Go's `default: return nil` formats to "", so these errors stay as
+        // bare as they were before the hint existed.
+        for modifier in [
+            "export-format",
+            "export-include-graph",
+            "export-template",
+            "attention-limit",
+            "suggest-type",
+            "suggest-confidence",
+            "suggest-bead",
+            "graph-preset",
+            "graph-title",
+            "profile-json",
+            "robot-not-ready-labels",
+        ] {
+            assert!(
+                modifier_recovery_examples(modifier).is_empty(),
+                "{modifier} must carry no recovery examples"
+            );
+            assert_eq!(
+                format_modifier_recovery_examples(modifier),
+                "",
+                "{modifier}"
+            );
+        }
+        // A flag nobody has a rule for is equally undecorated.
+        assert_eq!(format_modifier_recovery_examples("not-a-flag"), "");
+    }
+
+    #[test]
+    fn recovery_example_rows_are_shared_across_each_go_case() {
+        // Go returns ONE slice per `case`, so every modifier in a multi-name arm
+        // must resolve to the same examples — a per-modifier typo in the table
+        // is otherwise invisible.
+        for group in [
+            &["graph-format", "graph-depth"][..],
+            &["severity", "alert-type", "alert-label"][..],
+            &["history-since", "history-limit", "min-confidence"][..],
+            &["relations-threshold", "relations-limit"][..],
+            &[
+                "related-min-relevance",
+                "related-max-results",
+                "related-include-closed",
+            ][..],
+            &["forecast-label", "forecast-sprint", "forecast-agents"][..],
+            &["agents", "capacity-label"][..],
+            &["robot-by-label", "robot-by-assignee"][..],
+            &["script-limit", "script-format"][..],
+            &[
+                "pages-title",
+                "pages-include-closed",
+                "pages-include-history",
+            ][..],
+            &["debug-width", "debug-height"][..],
+        ] {
+            let first = modifier_recovery_examples(group[0]);
+            for name in &group[1..] {
+                assert_eq!(modifier_recovery_examples(name), first, "{name}");
+            }
+        }
+        // All six search modifiers share the 257-263 pair, search-min-score
+        // included — it is the row Go's newer flag joined.
+        for name in [
+            "robot-search",
+            "search-limit",
+            "search-min-score",
+            "search-mode",
+            "search-preset",
+            "search-weights",
+        ] {
+            assert_eq!(modifier_recovery_examples(name).len(), 2, "{name}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // C. Enum validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn enum_rules_match_go() {
+        // Go main.go:1845-1848 — graph-format AND script-format, in that order.
+        assert_eq!(ENUM_RULES.len(), 2);
+        assert_eq!(ENUM_RULES[0].name, "graph-format");
+        assert_eq!(ENUM_RULES[0].allowed, &["json", "dot", "mermaid"]);
+        assert_eq!(ENUM_RULES[1].name, "script-format");
+        assert_eq!(ENUM_RULES[1].allowed, &["bash", "fish", "zsh"]);
+    }
+
+    #[test]
+    fn enum_accepts_every_allowed_value_case_insensitively() {
+        for rule in ENUM_RULES {
+            let flag = rule.name;
+            for value in rule.allowed {
+                assert_eq!(
+                    validate_enum_flags(&[(flag, value)]),
+                    None,
+                    "--{flag} {value} must be accepted"
+                );
+                // Go normalizes with TrimSpace + ToLower before comparing.
+                let shouty = value.to_uppercase();
+                assert_eq!(validate_enum_flags(&[(flag, &shouty)]), None, "--{flag}");
+                let padded = format!("  {value}\t");
+                assert_eq!(validate_enum_flags(&[(flag, &padded)]), None, "--{flag}");
+            }
+        }
+    }
+
+    #[test]
+    fn script_format_rejects_an_unknown_shell() {
+        // Go's exact stderr for `--emit-script --script-format sh`:
+        //   invalid --script-format "sh" (expected one of bash, fish, zsh); did you mean "zsh"?
+        let err = validate_enum_flags(&[("script-format", "sh")])
+            .expect("sh is not one of bash|fish|zsh");
+        assert_eq!(err.name, "script-format");
+        assert_eq!(err.value, "sh");
+        assert_eq!(
+            err.message(),
+            "invalid --script-format \"sh\" (expected one of bash, fish, zsh); did you mean \"zsh\"?"
+        );
+    }
+
+    #[test]
+    fn enum_suggestion_follows_gos_distance_ceiling() {
+        // "x" is 1 byte so the ceiling is 2, and it is 3-4 edits from every
+        // allowed value — Go reports the value with no hint at all.
+        let far = validate_enum_flags(&[("script-format", "x")]).expect("x is invalid");
+        assert_eq!(far.did_you_mean, "");
+        assert_eq!(
+            far.message(),
+            "invalid --script-format \"x\" (expected one of bash, fish, zsh)"
+        );
+
+        // "gh" is also 1 edit short of nothing, but 2 edits from "zsh" and 3
+        // from the other two, so the same ceiling admits exactly one candidate.
+        let edge = validate_enum_flags(&[("script-format", "gh")]).expect("gh is invalid");
+        assert_eq!(
+            edge.message(),
+            "invalid --script-format \"gh\" (expected one of bash, fish, zsh); did you mean \"zsh\"?"
+        );
+
+        // "bashh" is 1 edit from "bash" and inside every ceiling. The two
+        // 3-edit candidates never get a look once "bash" tightens `bestDist`.
+        let near = validate_enum_flags(&[("script-format", "bashh")]).expect("bashh is invalid");
+        assert_eq!(
+            near.message(),
+            "invalid --script-format \"bashh\" (expected one of bash, fish, zsh); did you mean \"bash\"?"
+        );
+    }
+
+    /// Go emits a *different* message for a value that normalizes to empty
+    /// (main.go:376): no `did you mean`, because nothing was typed. Keeping the
+    /// two branches apart is the only way `--script-format ""` reads like Go.
+    #[test]
+    fn empty_enum_value_gets_no_did_you_mean() {
+        for blank in ["", "   ", "\t\n"] {
+            let err = validate_enum_flags(&[("script-format", blank)]).expect("blank is invalid");
+            assert_eq!(err.did_you_mean, "", "{blank:?}");
+            assert_eq!(
+                err.message(),
+                format!(
+                    "invalid --script-format {} (expected one of bash, fish, zsh)",
+                    go_quote(blank)
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn graph_format_is_validated_too() {
+        let err = validate_enum_flags(&[("graph-format", "jsonn")]).expect("jsonn is invalid");
+        assert_eq!(
+            err.message(),
+            "invalid --graph-format \"jsonn\" (expected one of json, dot, mermaid); did you mean \"json\"?"
+        );
+    }
+
+    /// Go `return`s on the first failing rule, so a command bad in both ways
+    /// reports `graph-format` (main.go:1846) and never reaches `script-format`.
+    #[test]
+    fn first_failing_enum_rule_wins() {
+        let err = validate_enum_flags(&[("script-format", "sh"), ("graph-format", "svg")])
+            .expect("both are invalid");
+        assert_eq!(err.name, "graph-format");
+        assert_eq!(
+            validate_enum_flags(&[("script-format", "sh")]).map(|e| e.name),
+            Some("script-format")
+        );
+    }
+
+    #[test]
+    fn unsupplied_enum_flags_are_not_checked() {
+        // Go skips a rule unless the flag was `Changed`.
+        assert_eq!(validate_enum_flags(&[]), None);
+        assert_eq!(validate_enum_flags(&[("severity", "nonsense")]), None);
+    }
+
+    #[test]
+    fn repeated_enum_flags_use_the_last_value() {
+        // pflag's GetString is last-wins, so the parser's settled value decides.
+        assert_eq!(
+            validate_enum_flags(&[("script-format", "sh"), ("script-format", "zsh")]),
+            None
+        );
+        let err = validate_enum_flags(&[("script-format", "zsh"), ("script-format", "sh")])
+            .expect("last value is invalid");
+        assert_eq!(err.value, "sh");
+    }
+
+    #[test]
+    fn levenshtein_is_byte_wise_like_go() {
+        assert_eq!(levenshtein_distance("sh", "zsh"), 1);
+        assert_eq!(levenshtein_distance("sh", "bash"), 2);
+        assert_eq!(levenshtein_distance("sh", "fish"), 2);
+        assert_eq!(levenshtein_distance("gh", "bash"), 3);
+        assert_eq!(levenshtein_distance("", "fish"), 4);
+        assert_eq!(levenshtein_distance("kitten", "sitting"), 3);
+        // Go indexes `a[i-1]`, so it scores a 2-byte rune as 2 edits, not the
+        // 1 a char-wise port would report. Same first byte, so "é"→"è" is 1.
+        assert_eq!(levenshtein_distance("e", "é"), 2);
+        assert_eq!(levenshtein_distance("é", "è"), 1);
+    }
+
+    #[test]
+    fn suggestion_ceiling_is_length_tiered_by_bytes() {
+        // Go main.go:451-457 — <=4 bytes gives 2, <=10 gives 3, else 4.
+        assert_eq!(max_suggestion_distance(""), 2);
+        assert_eq!(max_suggestion_distance("sh"), 2);
+        assert_eq!(max_suggestion_distance("merm"), 2);
+        assert_eq!(max_suggestion_distance("bashh"), 3);
+        assert_eq!(max_suggestion_distance("mermai"), 3);
+        assert_eq!(max_suggestion_distance("jsonnnn"), 3);
+        assert_eq!(max_suggestion_distance("a-very-long-value"), 4);
+        // A 2-byte rune pushes a 5-char string out of the top tier.
+        assert_eq!(max_suggestion_distance("ééé"), 3);
+    }
+
+    #[test]
+    fn go_quote_matches_strconv_quote() {
+        assert_eq!(go_quote("sh"), "\"sh\"");
+        assert_eq!(go_quote(""), "\"\"");
+        assert_eq!(go_quote("say \"hi\""), "\"say \\\"hi\\\"\"");
+        assert_eq!(go_quote("back\\slash"), "\"back\\\\slash\"");
+        assert_eq!(go_quote("line\nfeed"), "\"line\\nfeed\"");
+        assert_eq!(go_quote("tab\there"), "\"tab\\there\"");
+        assert_eq!(
+            go_quote("\u{1}\u{7}\u{8}\u{b}\u{c}\u{7f}"),
+            "\"\\x01\\a\\b\\v\\f\\x7f\""
+        );
+        // Go leaves the apostrophe alone inside a string; Rust's Debug would
+        // escape it, which is exactly why this is not `{:?}`.
+        assert_eq!(go_quote("it's"), "\"it's\"");
+        assert_eq!(go_quote("naïve café"), "\"naïve café\"");
     }
 }

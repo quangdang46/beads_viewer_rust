@@ -109,6 +109,8 @@ struct RawIssue {
     updated_at: Option<String>,
     #[serde(default, rename = "due_date")]
     due_date: Option<String>,
+    #[serde(default, rename = "defer_until")]
+    defer_until: Option<String>,
     #[serde(default, rename = "closed_at")]
     closed_at: Option<String>,
     #[serde(default, rename = "external_ref")]
@@ -322,6 +324,7 @@ impl RawIssue {
             created_at: self.created_at,
             updated_at: self.updated_at,
             due_date: self.due_date,
+            defer_until: self.defer_until,
             closed_at: self.closed_at,
             external_ref: self.external_ref,
             compaction_level: self.compaction_level,

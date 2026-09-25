@@ -69,11 +69,18 @@ pub fn validate_modifier_requires(present: &Presence) -> Vec<ValidationError> {
             violations.push(ValidationError::MissingRequirement {
                 modifier: (*modifier).to_string(),
                 required: rendered.clone(),
+                // Go appends the recovery examples to the same message
+                // (cmd/bv/main.go:238), so an agent reading stderr sees the
+                // concrete invocations that satisfy the rule, not just the
+                // requirement.
                 message: if required.len() > 1 {
                     format!("--{modifier} requires one of {rendered}")
                 } else {
                     format!("--{modifier} requires {rendered}")
-                },
+                }
+                .trim_end()
+                .to_string()
+                    + &crate::flags::format_modifier_recovery_examples(modifier),
             });
         }
     }

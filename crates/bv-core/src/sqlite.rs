@@ -104,7 +104,7 @@ pub fn load_issues_sqlite(db_path: &Path) -> Result<Vec<Issue>, SqliteError> {
     // source_repo; omitting them changes the v0.25.0 data_hash, so both are
     // selected here whenever the columns exist.
     let query = format!(
-        "SELECT id, title, {}, status, {}, {}, {}, {}, {}, {}, {}, {} FROM issues {} {}",
+        "SELECT id, title, {}, status, {}, {}, {}, {}, {}, {}, {}, {}, {} FROM issues {} {}",
         expr("description", "NULL"),
         coalesce("priority", "3"),
         coalesce("issue_type", "'task'"),
@@ -114,6 +114,7 @@ pub fn load_issues_sqlite(db_path: &Path) -> Result<Vec<Issue>, SqliteError> {
         expr("labels", "NULL"),
         expr("closed_at", "NULL"),
         expr("source_repo", "''"),
+        expr("defer_until", "NULL"),
         where_clause,
         order_by,
     );
@@ -212,6 +213,9 @@ pub fn load_issues_sqlite(db_path: &Path) -> Result<Vec<Issue>, SqliteError> {
             .get::<_, Option<String>>(10)?
             .and_then(|s| parse_sqlite_time(&s));
         let source_repo: Option<String> = row.get(11)?;
+        let defer_until: Option<String> = row
+            .get::<_, Option<String>>(12)?
+            .and_then(|s| parse_sqlite_time(&s));
 
         let mut labels = labels_json
             .as_deref()
@@ -242,6 +246,7 @@ pub fn load_issues_sqlite(db_path: &Path) -> Result<Vec<Issue>, SqliteError> {
             updated_at,
             due_date: None,
             closed_at,
+            defer_until,
             external_ref: None,
             compaction_level: 0,
             compacted_at: None,

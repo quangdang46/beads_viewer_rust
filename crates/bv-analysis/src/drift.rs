@@ -60,6 +60,10 @@ pub struct Alert {
     pub details: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub issue_id: String,
+    // Go carries the flagged issue's labels so `--alert-label` can filter on
+    // them (pkg/drift/drift.go:86, populated at :607/:702/:950/:996/:1090).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -116,6 +120,10 @@ pub struct DriftConfig {
     pub blocking_cascade_info_threshold: i64,
     /// Minimum unblocks count for a warning-level BlockingCascade alert.
     pub blocking_cascade_warning_threshold: i64,
+    /// Graph-size cap for the whole-graph proactive checks. Go default 2000
+    /// (pkg/drift/config.go:125); above it the checks are skipped and the
+    /// reason is reported so silence is not mistaken for health.
+    pub proactive_max_issues: usize,
     /// Alert types that are disabled and should not generate alerts (bv-167).
     pub disabled_alerts: Vec<String>,
     /// Per-label staleness overrides (bv-167).
@@ -136,6 +144,7 @@ impl Default for DriftConfig {
             stale_warning_days: 14,
             stale_critical_days: 30,
             in_progress_stale_multiplier: 0.5,
+            proactive_max_issues: 2000,
             blocking_cascade_info_threshold: 3,
             blocking_cascade_warning_threshold: 5,
             disabled_alerts: Vec::new(),
@@ -193,11 +202,25 @@ impl DriftConfig {
     }
 }
 
+/// One alert type that `calculate` did not run, with the reason
+/// (Go `SkippedCheck`, pkg/drift/drift.go:117).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SkippedCheck {
+    #[serde(rename = "type")]
+    pub check_type: String,
+    pub reason: String,
+}
+
 /// Complete drift analysis result (Go `Result`).
 #[derive(Debug, Default, Serialize)]
 pub struct DriftResult {
     pub has_drift: bool,
     pub alerts: Vec<Alert>,
+    /// Alert types that were not evaluated, and why (Go `SkippedChecks`,
+    /// pkg/drift/drift.go:111). Emitted so a skipped check is never read as a
+    /// clean one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_checks: Vec<SkippedCheck>,
     pub critical_count: usize,
     pub warning_count: usize,
     pub info_count: usize,
@@ -313,6 +336,9 @@ fn check_staleness(
         result.push(Alert {
             alert_type: AlertType::StaleIssue,
             severity,
+            // Go drift.go:607 — the flagged issue's own labels, so
+            // `--alert-label` can filter on them.
+            labels: issue.labels.clone(),
             suggested_action:
                 "Update, close, or re-triage the issue; stale work hides real priorities".into(),
             message: format!("Issue {} inactive for {:.0} days", issue.id, inactive_days),
@@ -443,6 +469,7 @@ fn check_blocking_cascade(
         cascades.push(Alert {
             alert_type: AlertType::BlockingCascade,
             severity,
+            labels: issue.labels.clone(),
             suggested_action:
                 "Prioritize this issue: closing it releases the listed downstream items".into(),
             message: format!(
@@ -496,6 +523,26 @@ pub fn calculate(
     now: jiff::Timestamp,
 ) -> DriftResult {
     let mut r = DriftResult::default();
+
+    // Go `expensiveCheckAllowed` (pkg/drift/drift.go:122) gates the two
+    // whole-graph proactive checks and records why when it refuses, so a
+    // silent skip is never mistaken for a clean result. Rust does not
+    // implement `potential_duplicate` or `priority_mismatch` at all, so
+    // recording them as skipped is truthful on every graph, not only large
+    // ones — the reason text below matches Go's format exactly.
+    for typ in ["potential_duplicate", "priority_mismatch"] {
+        let limit = cfg.proactive_max_issues;
+        if limit > 0 && issues.len() > limit {
+            r.skipped_checks.push(SkippedCheck {
+                check_type: typ.to_string(),
+                reason: format!(
+                    "{} issues exceed proactive_max_issues={}",
+                    issues.len(),
+                    limit
+                ),
+            });
+        }
+    }
 
     // Cycles: any NEW cycle is critical.
     if !new_cycles.is_empty() {
@@ -844,6 +891,7 @@ mod tests {
             created_at: Some("2026-01-01T00:00:00Z".into()),
             updated_at: Some(updated.into()),
             due_date: None,
+            defer_until: None,
             closed_at: None,
             external_ref: None,
             compaction_level: 0,
@@ -969,6 +1017,7 @@ mod tests {
             created_at: None,
             updated_at: None,
             due_date: None,
+            defer_until: None,
             closed_at: None,
             external_ref: None,
             compaction_level: 0,

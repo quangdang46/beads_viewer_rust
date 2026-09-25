@@ -311,6 +311,7 @@ mod tests {
             created_at: Some(created.to_string()),
             updated_at: Some(created.to_string()),
             due_date: None,
+            defer_until: None,
             closed_at: closed.map(|s| s.to_string()),
             external_ref: None,
             compaction_level: 0,

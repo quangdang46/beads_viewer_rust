@@ -1,11 +1,11 @@
 //! Graph export — port of Go `pkg/export/graph_export.go`.
 //! Formats: json (adjacency), dot, mermaid. Deterministic output (sorted IDs).
+//!
+//! The Mermaid diagram and its sanitizers live in [`crate::mermaid`], which is
+//! the only copy — Go has a single `GenerateMermaidGraph`, and a second Rust
+//! copy is how the two implementations drifted apart in the first place.
 
 use bv_core::model::{Issue, Status};
-
-fn is_closed_like(s: Status) -> bool {
-    matches!(s, Status::Closed | Status::Tombstone)
-}
 
 fn truncate_runes(s: &str, max: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
@@ -34,16 +34,6 @@ fn dot_status_color(status: Status) -> &'static str {
         Status::Blocked => "#FFCDD2",
         _ => "#FFFFFF",
     }
-}
-
-fn sanitize_mermaid_id(s: &str) -> String {
-    s.chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .collect()
-}
-
-fn sanitize_mermaid_text(s: &str) -> String {
-    s.replace('"', "#quot;").replace(['\n', '\r'], " ")
 }
 
 /// Sorted issues by ID for deterministic output.
@@ -149,87 +139,14 @@ pub fn generate_dot(
     sb
 }
 
-/// Mermaid format (Go generateMermaid): graph TD, classDefs, safe IDs,
-/// ==> for blocking / -.-> for related.
+/// Mermaid format (Go `GenerateMermaidGraph`): `graph TD`, the four classDefs,
+/// collision-free safe IDs, a `class` statement per styled node, `==>` for
+/// blocking and `-.->` for related edges.
+///
+/// Go has exactly one Mermaid generator, so this is a re-export rather than a
+/// second implementation.
 pub fn generate_mermaid_graph(issues: &[Issue]) -> String {
-    let ids: std::collections::HashSet<&String> = issues.iter().map(|i| &i.id).collect();
-    let mut sb = String::new();
-    sb.push_str("graph TD\n");
-    sb.push_str("    classDef open fill:#50FA7B,stroke:#333,color:#000\n");
-    sb.push_str("    classDef inprogress fill:#8BE9FD,stroke:#333,color:#000\n");
-    sb.push_str("    classDef blocked fill:#FF5555,stroke:#333,color:#000\n");
-    sb.push_str("    classDef closed fill:#6272A4,stroke:#333,color:#fff\n\n");
-
-    // Deterministic collision-free safe IDs (Go getSafeID).
-    let mut safe_ids: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for i in sorted(issues) {
-        if safe_ids.contains_key(&i.id) {
-            continue;
-        }
-        let base = {
-            let b = sanitize_mermaid_id(&i.id);
-            if b.is_empty() {
-                "node".to_string()
-            } else {
-                b
-            }
-        };
-        let mut safe = base.clone();
-        if used.contains(&safe) {
-            let h: u32 = i.id.bytes().fold(2166136261u32, |acc, b| {
-                acc.wrapping_mul(16777619).wrapping_add(b as u32)
-            });
-            safe = format!("{base}_{h:x}");
-        }
-        used.insert(safe.clone());
-        safe_ids.insert(i.id.clone(), safe);
-    }
-
-    for i in sorted(issues) {
-        let safe_id = &safe_ids[&i.id];
-        let safe_title = sanitize_mermaid_text(&i.title);
-        let safe_label = sanitize_mermaid_text(&i.id);
-        sb.push_str(&format!(
-            "    {safe_id}[\"{safe_label}<br/>{safe_title}\"]\n"
-        ));
-        let class = if is_closed_like(i.status) {
-            Some("closed")
-        } else {
-            match i.status {
-                Status::Open => Some("open"),
-                Status::InProgress => Some("inprogress"),
-                Status::Blocked => Some("blocked"),
-                _ => None,
-            }
-        };
-        if let Some(c) = class {
-            sb.push_str(&format!("    class {safe_id} {c}\n"));
-        }
-    }
-
-    sb.push('\n');
-    for i in sorted(issues) {
-        let mut deps: Vec<_> = i.dependencies.iter().collect();
-        deps.sort_by(|a, b| a.depends_on_id.cmp(&b.depends_on_id));
-        for dep in deps {
-            let target = dep.effective_depends_on();
-            if !ids.contains(&target.to_string()) {
-                continue;
-            }
-            let link = if dep.r#type.is_blocking() {
-                "==>"
-            } else {
-                "-.->"
-            };
-            sb.push_str(&format!(
-                "    {} {} {}\n",
-                safe_ids[&i.id], link, safe_ids[target]
-            ));
-        }
-    }
-
-    sb
+    crate::mermaid::generate_mermaid(issues)
 }
 
 /// Subgraph rooted at `root` up to `depth` hops (Go --graph-root/--graph-depth).
@@ -285,6 +202,7 @@ mod tests {
             created_at: None,
             updated_at: None,
             due_date: None,
+            defer_until: None,
             closed_at: None,
             external_ref: None,
             compaction_level: 0,
@@ -314,18 +232,44 @@ mod tests {
         }
     }
 
+    /// The exact bytes Go v0.25.0 emits for this fixture — captured by running
+    /// `export.GenerateMermaidGraph` against the frozen Go tree. The node ID
+    /// sanitizer keeps "-", the class syntax is `class ID name` (not the `:::`
+    /// shorthand), and there is no trailing `NoLinks` node once edges exist.
     #[test]
-    fn mermaid_has_classdefs_and_blocking_edges() {
+    fn mermaid_matches_go_exactly() {
         let issues = vec![
             issue("a", Status::Open, vec![dep("b", true)]),
             issue("b", Status::Blocked, vec![]),
         ];
-        let m = generate_mermaid_graph(&issues);
-        assert!(m.starts_with("graph TD\n"));
-        assert!(m.contains("classDef open fill:#50FA7B"));
-        assert!(m.contains("==> "));
-        assert!(m.contains("class a open"));
-        assert!(m.contains("class b blocked"));
+        let want = r##"graph TD
+    classDef open fill:#50FA7B,stroke:#333,color:#000
+    classDef inprogress fill:#8BE9FD,stroke:#333,color:#000
+    classDef blocked fill:#FF5555,stroke:#333,color:#000
+    classDef closed fill:#6272A4,stroke:#333,color:#fff
+
+    a["a<br/>Issue a"]
+    class a open
+    b["b<br/>Issue b"]
+    class b blocked
+
+    a ==> b
+"##;
+        assert_eq!(generate_mermaid_graph(&issues), want);
+    }
+
+    /// The diagram is generated in exactly one place. This guards the two
+    /// entry points against drifting apart again.
+    #[test]
+    fn mermaid_entry_points_agree() {
+        let issues = vec![
+            issue("a", Status::Open, vec![dep("b", true)]),
+            issue("b", Status::Blocked, vec![]),
+        ];
+        assert_eq!(
+            generate_mermaid_graph(&issues),
+            crate::mermaid::generate_mermaid(&issues)
+        );
     }
 
     #[test]

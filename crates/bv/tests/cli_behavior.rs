@@ -405,3 +405,72 @@ fn robot_metrics_emits_timing_and_cache_entries() {
     assert!(!timing.is_empty(), "at least one timing metric");
     assert_eq!(timing[0]["name"], "cycle_detection");
 }
+
+/// Issue #5 regression: `--generate-docs` and `--export` are registered flags,
+/// so they must terminate with a real result. Before these handlers existed
+/// they fell through to the TUI launcher — which hangs in any TTY and is the
+/// footgun AGENTS.md warns about ("NEVER run bare bv/bvr").
+#[test]
+fn generate_docs_exits_zero_without_launching_tui() {
+    let (code, stdout, stderr) = run(&["--generate-docs"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(!stderr.contains("launching TUI"), "{stderr}");
+    assert!(stdout.contains("Generated docs"), "{stdout}");
+}
+
+#[test]
+fn export_writes_a_report_and_exits_zero() {
+    let out_path = std::env::temp_dir().join("bvr-export-regression.md");
+    let _ = std::fs::remove_file(&out_path);
+    let (code, stdout, stderr) = run(&["--export", out_path.to_str().unwrap()]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(!stderr.contains("launching TUI"), "{stderr}");
+    assert!(stdout.contains("Exported"), "{stdout}");
+    let written = std::fs::read_to_string(&out_path).expect("report written");
+    // Go's `ResolveReportOptions` seeds Title with "Beads Export"
+    // (pkg/export/markdown.go:50); "Beads Report" was never a Go value.
+    assert!(written.starts_with("# Beads Export"), "{}", &written[..40]);
+    let _ = std::fs::remove_file(&out_path);
+}
+
+/// Go's section order, from `GenerateMarkdown` (pkg/export/markdown.go:359).
+/// `--export-md` forces `format=markdown`, which keeps the graph block on.
+#[test]
+fn export_md_writes_go_section_order() {
+    let out_path = std::env::temp_dir().join("bvr-export-md-order.md");
+    let _ = std::fs::remove_file(&out_path);
+    let (code, _, stderr) = run(&["--export-md", out_path.to_str().unwrap()]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let written = std::fs::read_to_string(&out_path).expect("report written");
+    let order = ["## Summary", "## Table of Contents", "## Dependency Graph"];
+    let mut cursor = 0;
+    for section in order {
+        let at = written[cursor..]
+            .find(section)
+            .unwrap_or_else(|| panic!("missing or out-of-order section {section}"));
+        cursor += at + section.len();
+    }
+    assert!(
+        written.contains("| Metric | Count |\n|--------|-------|"),
+        "{written}"
+    );
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn export_rejects_conflicting_output_paths() {
+    let (code, _, stderr) = run(&["--export", "/tmp/a.md", "--export-md", "/tmp/b.md"]);
+    assert_eq!(code, 2, "stderr: {stderr}");
+    assert!(stderr.contains("conflicting output paths"), "{stderr}");
+}
+
+#[test]
+fn export_rejects_unknown_format() {
+    let (code, _, stderr) = run(&["--export", "/tmp/x", "--export-format", "bogus"]);
+    assert_eq!(code, 2, "stderr: {stderr}");
+    // Go `ReportOptions.validate` (pkg/export/markdown.go:78).
+    assert!(
+        stderr.contains("export format \"bogus\" must be markdown, json, csv or mermaid"),
+        "{stderr}"
+    );
+}

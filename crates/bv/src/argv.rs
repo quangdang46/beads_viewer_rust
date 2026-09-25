@@ -1,256 +1,610 @@
-//! Argv rewriter — port of Go argv normalization:
-//! - single-dash long flags (`-robot-triage`) -> double dash
-//! - short-flag aliases (`-f`, `-l`, `-r`) -> their long form
-//! - agent-intent aliases: `bv triage` -> `bv --robot-triage`
-//! - bare `--json` (when no primary) -> `bv --robot-triage --json`
+//! Argv rewriter — a port of Go's `cmd/bv` argv normalization
+//! (`rewriteAgentIntentArgs` and friends, cmd/bv/main.go:533-1014).
+//!
+//! Every rewrite here mirrors a Go function one-for-one:
+//!
+//! - `normalize_flag_spelling`      <- `rewriteSingleDashLongFlags` + the
+//!   `-f/-l/-r` shorthands pflag resolves
+//! - `rewrite_agent_intent_command` <- `rewriteAgentIntentCommand` /
+//!   `rewriteCanonicalRobotCommandIntent`
+//! - `rewrite_value_intent`         <- `rewriteRobotValueIntent`
+//! - `rewrite_docs/schema/search/graph_intent` <- their `rewriteRobot*Intent`
+//! - `rewrite_upgrade_intent`       <- `rewriteUpgradeIntent`
+//! - `rewrite_flag_aliases`         <- `rewriteAgentIntentFlagAliases`
+//! - `consume_leading_flag_aliases` <- `consumeLeadingAgentIntentFlagAliases`
+//! - the bare `--json` auto-promote <- `rewriteAgentIntentArgs`'s tail
+//!
+//! Indexing note: Go calls `rewriteAgentIntentArgs(os.Args[1:])`, so `args[0]`
+//! is the first *user* argument. `main` does the same (`std::env::args().skip(1)`),
+//! so there is no program-name slot to account for anywhere in this module.
 
 /// Short-flag -> long-flag aliases advertised in Go `bv --help` (issue #5).
 /// Go declares `-f, --format`, `-l, --label`, `-r, --recipe`; `-h, --help` is
 /// handled separately by the help path, not by alias expansion.
 const SHORT_ALIASES: &[(&str, &str)] = &[("-f", "--format"), ("-l", "--label"), ("-r", "--recipe")];
 
-/// Rewrite raw args into canonical form.
-///
-/// Go's `os.Args` includes the program name and every rewrite indexes from 1.
-/// `main` passes `args().skip(1)`, so that offset does not exist here — the
-/// tests pass a program name and production does not, which previously made
-/// the positional rewrites (the `upgrade` expansion and the auto-promote
-/// insert) behave differently in each: production inserted the promoted
-/// primary between `--format` and its value, and the `upgrade` expansion never
-/// matched at all. `arg_offset` is the single place that difference is
-/// resolved, so both callers get Go's indexing.
+/// Rewrite raw args (argv *without* the program name) into canonical form.
 pub fn rewrite_args(args: &[String]) -> Vec<String> {
-    let arg_offset = usize::from(args.first().is_some_and(|a| !a.starts_with('-')));
-    let mut out = Vec::with_capacity(args.len());
-    for arg in args {
-        // Short-flag alias expansion first: `-f toon` -> `--format toon`,
-        // `-l=foo` -> `--label=foo`. Only the flag token itself is rewritten;
-        // a following value token is left for the normal parse path.
-        let (head, tail) = match arg.strip_prefix('-') {
-            Some(rest) if !rest.starts_with('-') => match rest.find('=') {
-                Some(eq) => (&rest[..eq], &rest[eq..]),
-                None => (rest, ""),
-            },
-            _ => ("", ""),
-        };
+    let normalized: Vec<String> = args.iter().map(|a| normalize_flag_spelling(a)).collect();
+
+    // Go: a recognized first positional is a subcommand and fully determines
+    // the output shape, so it returns before the auto-promote is considered.
+    if let Some(rewritten) = rewrite_agent_intent_command(&normalized) {
+        return rewritten;
+    }
+
+    // Asked before the alias rewrite consumes the spelling, exactly as Go does:
+    // a bare `--format` with no primary drops into the TUI rather than
+    // defaulting to `--robot-triage`, so only the aliases may promote.
+    let wants_structured_output = contains_structured_output_alias(&normalized);
+
+    let rewritten = rewrite_flag_aliases(&normalized, "");
+
+    // Go `rewriteAgentIntentArgs` (cmd/bv/main.go:565-567): promote to
+    // `--robot-triage` only when a structured-output alias is present *and*
+    // neither a robot primary nor a non-robot primary (version/help/update/
+    // pages/export/...) claims the invocation.
+    if wants_structured_output
+        && !has_primary_robot_arg(&rewritten)
+        && !has_non_robot_primary_arg(&rewritten)
+    {
+        let mut promoted = Vec::with_capacity(rewritten.len() + 1);
+        promoted.push("--robot-triage".to_string());
+        promoted.extend(rewritten);
+        return promoted;
+    }
+
+    rewritten
+}
+
+/// Go `rewriteSingleDashLongFlags` (cmd/bv/main.go:533), plus the `-f/-l/-r`
+/// shorthand expansion Go's pflag performs when it parses the result.
+///
+/// Go consults the live `flag.FlagSet` to decide whether `-foo` names a long
+/// flag; there is no flag set here, so the name shape is used instead: a
+/// single-dash token whose name (up to `=`) is longer than one character and
+/// is made only of `[A-Za-z0-9-]` is a long flag. A one-character name is a
+/// short flag, which is why `-o=json` survives as `-o=json` and becomes a
+/// `--format` alias rather than a doubled-dash flag.
+fn normalize_flag_spelling(arg: &str) -> String {
+    let Some(rest) = arg.strip_prefix('-') else {
+        return arg.to_string();
+    };
+    if rest.starts_with('-') {
+        return arg.to_string();
+    }
+
+    let name_len = rest.find('=').unwrap_or(rest.len());
+    let (name, tail) = rest.split_at(name_len);
+    if name.len() == 1 {
         if let Some((_, long)) = SHORT_ALIASES
             .iter()
-            .find(|(short, _)| head.len() == 1 && short.trim_start_matches('-') == head)
+            .find(|(short, _)| short.trim_start_matches('-') == name)
         {
-            out.push(format!("{long}{tail}"));
-            continue;
-        }
-
-        // single-dash long flag: starts with exactly one '-', len > 2, not a
-        // known short cluster, and the rest matches a long-flag pattern.
-        // Skip single-char flags like -o=val or -f (flag name before '=' or
-        // end is exactly one character — that's a short flag, not a long flag).
-        let flag_name_len = arg[1..].find('=').unwrap_or(arg.len() - 1);
-        let is_long_flag = arg.len() > 2
-            && arg.starts_with('-')
-            && !arg.starts_with("--")
-            && flag_name_len > 1
-            && arg[1..]
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '=');
-        if is_long_flag {
-            out.push(format!("-{}", arg));
-        } else {
-            out.push(arg.clone());
+            return format!("{long}{tail}");
         }
     }
+    if name.len() > 1
+        && rest
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '=')
+    {
+        return format!("-{arg}");
+    }
+    arg.to_string()
+}
 
-    // Agent intent aliases on the first bare positional (skipping prog name).
-    const ALIASES: &[(&str, &str)] = &[
-        // Existing 9
-        ("triage", "--robot-triage"),
-        ("next", "--robot-next"),
-        ("plan", "--robot-plan"),
-        ("insights", "--robot-insights"),
-        ("priority", "--robot-priority"),
-        ("alerts", "--robot-alerts"),
-        ("suggest", "--robot-suggest"),
-        ("graph", "--robot-graph"),
-        ("history", "--robot-history"),
-        // Triage family aliases
-        ("recommend", "--robot-triage"),
-        ("recommendations", "--robot-triage"),
-        // Next family
-        ("pick", "--robot-next"),
-        // Insights family
-        ("insight", "--robot-insights"),
-        ("analysis", "--robot-insights"),
-        ("analyze", "--robot-insights"),
-        // Priority family
-        ("priorities", "--robot-priority"),
-        // Suggest family
-        ("suggestions", "--robot-suggest"),
-        // Schema / docs / search
-        ("schemas", "--robot-schema"),
-        ("schema", "--robot-schema"),
-        ("docs", "--robot-docs"),
-        ("doc", "--robot-docs"),
-        ("find", "--robot-search"),
-        ("search", "--robot-search"),
-        // Labels
-        ("labels", "--robot-label-health"),
-        // File analysis
-        ("hotspots", "--robot-file-hotspots"),
-        ("impact", "--robot-impact"),
-        ("related", "--robot-related"),
-        ("blockers", "--robot-blocker-chain"),
-        ("blocker-chain", "--robot-blocker-chain"),
-        ("impact-network", "--robot-impact-network"),
-        ("causality", "--robot-causality"),
-        // Sprints / forecast / capacity
-        ("sprints", "--robot-sprint-list"),
-        ("sprint-list", "--robot-sprint-list"),
-        ("sprint", "--robot-sprint-show"),
-        ("sprint-show", "--robot-sprint-show"),
-        ("forecast", "--robot-forecast"),
-        ("capacity", "--robot-capacity"),
-        ("burndown", "--robot-burndown"),
-        // Upgrade
-        ("upgrade", "--update"),
-        ("self-update", "--update"),
-        ("selfupdate", "--update"),
-        // Meta
-        ("capabilities", "--robot-capabilities"),
-        ("capability", "--robot-capabilities"),
-        ("manifest", "--robot-capabilities"),
-        ("recipes", "--robot-recipes"),
-        ("metrics", "--robot-metrics"),
-        // Diff / drift / orphans / correlation-stats
-        ("diff", "--robot-diff"),
-        ("drift", "--robot-drift"),
-        ("orphans", "--robot-orphans"),
-        ("correlation-stats", "--robot-correlation-stats"),
-    ];
-    // Input here is argv-minus-program; scan from index 0.
-    let mut replaced = false;
-    for slot in out.iter_mut() {
-        if replaced {
-            break;
-        }
-        if slot.starts_with('-') {
-            break; // aliases only valid as first positional
-        }
-        if let Some((_, flag)) = ALIASES.iter().find(|(a, _)| slot == a) {
-            *slot = flag.to_string();
-            replaced = true;
-        }
+/// Go `rewriteAgentIntentCommand` (cmd/bv/main.go:571): the first bare
+/// positional names a subcommand, the canonical `robot-<command>` form, or
+/// nothing at all. `None` means "not a subcommand" and the caller falls
+/// through to the flag-alias pass.
+fn rewrite_agent_intent_command(args: &[String]) -> Option<Vec<String>> {
+    let first = args.first()?;
+    if first.starts_with('-') {
+        return None;
+    }
+    let command = first.to_lowercase();
+    let command = command.trim();
+    let rest = &args[1..];
+
+    if let Some(rewritten) = rewrite_canonical_robot_command(command, rest) {
+        return Some(rewritten);
     }
 
-    // Upgrade intent expansion (Go rewriteUpgradeIntent parity) — runs AFTER
-    // alias rewriting so `upgrade` has already become `--update`. (Go rewriteUpgradeIntent parity):
-    // `bvr upgrade [--check|--dry-run|--rollback] [--yes|-y]` maps onto the
-    // self-update flags. Bare-word aliases accepted; unknown tokens pass through.
-    if out.get(arg_offset).map(|s| s.as_str()) == Some("--update") {
-        let mut mode = "update";
-        let mut yes = false;
-        let mut passthrough: Vec<String> = Vec::new();
-        for arg in out.iter().skip(arg_offset + 1) {
-            match arg.to_lowercase().trim() {
-                "check" | "--check" | "check-update" | "--check-update" => {
-                    if mode == "update" {
-                        mode = "check";
-                    }
-                }
-                "dry-run" | "--dry-run" | "dryrun" | "--dryrun" => {
-                    if mode == "update" {
-                        mode = "dry-run";
-                    }
-                }
-                "rollback" | "--rollback" => mode = "rollback",
-                "yes" | "--yes" | "-y" | "force" | "--force" => yes = true,
-                _ => passthrough.push(arg.clone()),
+    let rewritten = match command {
+        "triage" | "recommend" | "recommendations" => lead_flag(rest, "--robot-triage", "triage"),
+        "next" | "pick" => lead_flag(rest, "--robot-next", "next"),
+        "plan" => lead_flag(rest, "--robot-plan", "plan"),
+        "insights" | "insight" | "analysis" | "analyze" => {
+            lead_flag(rest, "--robot-insights", "insights")
+        }
+        "priority" | "priorities" => lead_flag(rest, "--robot-priority", "priority"),
+        "alerts" => lead_flag(rest, "--robot-alerts", "alerts"),
+        "suggest" | "suggestions" => lead_flag(rest, "--robot-suggest", "suggest"),
+        "recipes" => lead_flag(rest, "--robot-recipes", "recipes"),
+        "metrics" => lead_flag(rest, "--robot-metrics", "metrics"),
+        "capabilities" | "capability" | "manifest" => {
+            lead_flag(rest, "--robot-capabilities", "capabilities")
+        }
+        "docs" | "doc" => rewrite_docs_intent(rest),
+        "schema" | "schemas" => rewrite_schema_intent(rest),
+        "search" | "find" => rewrite_search_intent(rest),
+        "graph" => rewrite_graph_intent(rest),
+        "diff" | "changes" => {
+            rewrite_value_intent(rest, "diff", "--robot-diff", "--diff-since", "")
+        }
+        "history" => rewrite_value_intent(rest, "history", "--robot-history", "--bead-history", ""),
+        "labels" | "label-health" => lead_flag(rest, "--robot-label-health", "label-health"),
+        "label-flow" => lead_flag(rest, "--robot-label-flow", "label-flow"),
+        "label-attention" => lead_flag(rest, "--robot-label-attention", "label-attention"),
+        "hotspots" | "file-hotspots" => lead_flag(rest, "--robot-file-hotspots", "file-hotspots"),
+        "file-beads" => rewrite_value_intent(rest, "file-beads", "", "--robot-file-beads", ""),
+        "file-relations" => {
+            rewrite_value_intent(rest, "file-relations", "", "--robot-file-relations", "")
+        }
+        "impact" => rewrite_value_intent(rest, "impact", "", "--robot-impact", ""),
+        "related" => rewrite_value_intent(rest, "related", "", "--robot-related", ""),
+        "blockers" | "blocker-chain" => {
+            rewrite_value_intent(rest, "blocker-chain", "", "--robot-blocker-chain", "")
+        }
+        "impact-network" => {
+            rewrite_value_intent(rest, "impact-network", "", "--robot-impact-network", "all")
+        }
+        "causality" => rewrite_value_intent(rest, "causality", "", "--robot-causality", ""),
+        "sprints" | "sprint-list" => lead_flag(rest, "--robot-sprint-list", "sprint-list"),
+        "sprint" | "sprint-show" => {
+            rewrite_value_intent(rest, "sprint-show", "", "--robot-sprint-show", "")
+        }
+        "forecast" => rewrite_value_intent(rest, "forecast", "", "--robot-forecast", "all"),
+        "capacity" => lead_flag(rest, "--robot-capacity", "capacity"),
+        "burndown" => rewrite_value_intent(rest, "burndown", "", "--robot-burndown", "current"),
+        "upgrade" | "self-update" | "selfupdate" => rewrite_upgrade_intent(rest),
+        // bvr ships three bare words Go only accepts in `robot-` prefixed
+        // form. They are pure conveniences over flags Go already defines, so
+        // they stay; every word Go does know is routed through Go's own table.
+        "drift" => lead_flag(rest, "--robot-drift", "drift"),
+        "orphans" => lead_flag(rest, "--robot-orphans", "orphans"),
+        "correlation-stats" => lead_flag(rest, "--robot-correlation-stats", "correlation-stats"),
+        _ => return None,
+    };
+    Some(rewritten)
+}
+
+/// Go `rewriteCanonicalRobotCommandIntent` (cmd/bv/main.go:707): the documented
+/// `bv robot-<command>` spellings, which accept the same trailing arguments as
+/// their short forms.
+fn rewrite_canonical_robot_command(command: &str, rest: &[String]) -> Option<Vec<String>> {
+    let rewritten = match command {
+        // Go special-cases `robot-help --json`: the help payload is prose, so a
+        // structured-output request redirects to the docs guide.
+        "robot-help" => {
+            if contains_structured_output_alias(rest) {
+                let mut with_guide = vec!["guide".to_string()];
+                with_guide.extend_from_slice(rest);
+                return Some(rewrite_docs_intent(&with_guide));
             }
+            lead_flag(rest, "--robot-help", "help")
         }
-        let mut expanded = match mode {
-            "check" => vec!["--check-update".to_string()],
-            "dry-run" => vec!["--update-dry-run".to_string()],
-            "rollback" => vec!["--rollback".to_string()],
-            _ => {
-                let mut v = vec!["--update".to_string()];
-                if yes {
-                    v.push("--yes".to_string());
-                }
-                v
-            }
-        };
-        expanded.extend(passthrough);
-        let mut result = out[..arg_offset].to_vec();
-        result.extend(expanded);
-        return result;
+        "robot-triage"
+        | "robot-triage-by-track"
+        | "robot-triage-by-label"
+        | "robot-next"
+        | "robot-plan"
+        | "robot-insights"
+        | "robot-priority"
+        | "robot-alerts"
+        | "robot-suggest"
+        | "robot-recipes"
+        | "robot-metrics"
+        | "robot-label-health"
+        | "robot-label-flow"
+        | "robot-label-attention"
+        | "robot-file-hotspots"
+        | "robot-sprint-list"
+        | "robot-capacity"
+        | "robot-capabilities"
+        | "robot-orphans"
+        | "robot-correlation-stats" => {
+            let context = command.strip_prefix("robot-").unwrap_or(command);
+            lead_flag(rest, &format!("--{command}"), context)
+        }
+        "robot-docs" => rewrite_docs_intent(rest),
+        "robot-schema" => rewrite_schema_intent(rest),
+        "robot-search" => rewrite_search_intent(rest),
+        "robot-graph" => rewrite_graph_intent(rest),
+        "robot-diff" => rewrite_value_intent(rest, "diff", "--robot-diff", "--diff-since", ""),
+        "robot-history" => {
+            rewrite_value_intent(rest, "history", "--robot-history", "--bead-history", "")
+        }
+        "robot-explain-correlation" => {
+            rewrite_value_intent(rest, "correlation", "", "--robot-explain-correlation", "")
+        }
+        "robot-confirm-correlation" => {
+            rewrite_value_intent(rest, "correlation", "", "--robot-confirm-correlation", "")
+        }
+        "robot-reject-correlation" => {
+            rewrite_value_intent(rest, "correlation", "", "--robot-reject-correlation", "")
+        }
+        "robot-file-beads" => {
+            rewrite_value_intent(rest, "file-beads", "", "--robot-file-beads", "")
+        }
+        "robot-file-relations" => {
+            rewrite_value_intent(rest, "file-relations", "", "--robot-file-relations", "")
+        }
+        "robot-impact" => rewrite_value_intent(rest, "impact", "", "--robot-impact", ""),
+        "robot-related" => rewrite_value_intent(rest, "related", "", "--robot-related", ""),
+        "robot-blocker-chain" => {
+            rewrite_value_intent(rest, "blocker-chain", "", "--robot-blocker-chain", "")
+        }
+        "robot-impact-network" => {
+            rewrite_value_intent(rest, "impact-network", "", "--robot-impact-network", "all")
+        }
+        "robot-causality" => rewrite_value_intent(rest, "causality", "", "--robot-causality", ""),
+        "robot-sprint-show" => {
+            rewrite_value_intent(rest, "sprint-show", "", "--robot-sprint-show", "")
+        }
+        "robot-forecast" => rewrite_value_intent(rest, "forecast", "", "--robot-forecast", "all"),
+        "robot-burndown" => {
+            rewrite_value_intent(rest, "burndown", "", "--robot-burndown", "current")
+        }
+        // Drift carries its companion flag in the rewrite so the pair can
+        // never be requested half-way.
+        "robot-drift" => {
+            let mut out = vec!["--check-drift".to_string(), "--robot-drift".to_string()];
+            out.extend(rewrite_flag_aliases(rest, "drift"));
+            out
+        }
+        _ => return None,
+    };
+    Some(rewritten)
+}
+
+/// Go `rewriteRobotValueIntent` (cmd/bv/main.go:822) — the shape shared by
+/// every subcommand that takes one positional target (`diff HEAD~1`,
+/// `related bv-123`, `forecast`, ...).
+///
+/// `bool_flag` is emitted first and is empty for commands that have none;
+/// `value_flag` names the flag the positional is bound to; `default_value`
+/// supplies that flag when the positional is absent but the command has a
+/// sensible default.
+fn rewrite_value_intent(
+    rest: &[String],
+    context: &str,
+    bool_flag: &str,
+    value_flag: &str,
+    default_value: &str,
+) -> Vec<String> {
+    let (prefix, mut rest) = consume_leading_flag_aliases(rest, context);
+    let mut out: Vec<String> = Vec::with_capacity(rest.len() + 3);
+    if !bool_flag.is_empty() {
+        out.push(bool_flag.to_string());
     }
-
-    // Whether an agent-intent output alias is present decides the auto-promote,
-    // and that question must be asked BEFORE the rewrite below consumes the
-    // alias. It cannot be asked afterwards: Go does not auto-promote on a bare
-    // `--format` (with one and no primary, `bv --format toon` drops into the
-    // TUI), so treating the post-rewrite `--format` as the trigger would
-    // promote invocations Go leaves alone.
-    let wants_structured_output = contains_structured_output_alias(&out);
-
-    // Structured-output aliases (Go `rewriteAgentIntentFlagAliases`,
-    // cmd/bv/main.go:885-895): `--json`, `--toon`, and `--output`/`-o` taking
-    // a format value all normalise to `--format <value>`. Without this the
-    // aliases only *triggered* the auto-promote and were then dropped, so
-    // `bvr --toon` silently produced JSON on every host.
-    out = rewrite_output_format_aliases(out);
-
-    // Bare --json auto-promote: if no robot primary flag is present after alias
-    // rewriting, but the user passed a structured-output alias, insert
-    // --robot-triage as the default primary command. This is the key agent
-    // ergonomic.
-    let has_robot_primary = out.iter().any(|arg| {
-        let name = arg.split('=').next().unwrap_or(arg);
-        let name = name.strip_prefix("--").unwrap_or(name);
-        ROBOT_PRIMARY_NAMES.contains(&name)
-    });
-    if !has_robot_primary && wants_structured_output {
-        // Insert at the head of the user args, after the program name when one
-        // is present — never between a value flag and its value.
-        out.insert(arg_offset, "--robot-triage".to_string());
+    if let Some(target) = rest.first().filter(|a| is_positional_value(a)) {
+        out.push(value_flag.to_string());
+        out.push(target.clone());
+        rest = &rest[1..];
+    } else if !default_value.is_empty() {
+        out.push(value_flag.to_string());
+        out.push(default_value.to_string());
+    } else if !value_flag.is_empty() && bool_flag.is_empty() {
+        // No value and no default: Go pushes the bare flag to the *end* so
+        // the parser names the missing argument against the right flag
+        // instead of consuming the user's next token as its value.
+        out.extend(prefix);
+        out.extend(rewrite_flag_aliases(rest, context));
+        out.push(value_flag.to_string());
+        return out;
     }
-
+    out.extend(prefix);
+    out.extend(rewrite_flag_aliases(rest, context));
     out
 }
 
-/// Go `rewriteAgentIntentFlagAliases`'s format cases. Runs after the alias
-/// tables so `-o=toon` has already become `--output=toon`.
-fn rewrite_output_format_aliases(args: Vec<String>) -> Vec<String> {
-    let mut out = Vec::with_capacity(args.len() + 2);
+/// Go `rewriteRobotDocsIntent` (cmd/bv/main.go:762).
+fn rewrite_docs_intent(rest: &[String]) -> Vec<String> {
+    let (prefix, rest) = consume_leading_flag_aliases(rest, "docs");
+    let mut out = vec!["--robot-docs".to_string()];
+    let topic = match rest.first() {
+        Some(first) if is_positional_value(first) => {
+            out.push(first.clone());
+            &rest[1..]
+        }
+        _ => {
+            out.push("guide".to_string());
+            rest
+        }
+    };
+    out.extend(prefix);
+    out.extend(rewrite_flag_aliases(topic, "docs"));
+    out
+}
+
+/// Go `rewriteRobotSchemaIntent` (cmd/bv/main.go:775).
+fn rewrite_schema_intent(rest: &[String]) -> Vec<String> {
+    let (prefix, rest) = consume_leading_flag_aliases(rest, "schema");
+    let mut out = vec!["--robot-schema".to_string()];
+    if let Some(command) = rest.first() {
+        if is_positional_value(command) {
+            out.push("--schema-command".to_string());
+            out.push(normalize_robot_command_name(command));
+            out.extend(prefix);
+            out.extend(rewrite_flag_aliases(&rest[1..], "schema"));
+            return out;
+        }
+    }
+    out.extend(prefix);
+    out.extend(rewrite_flag_aliases(rest, "schema"));
+    out
+}
+
+/// Go `rewriteRobotSearchIntent` (cmd/bv/main.go:786): gathers every bare
+/// token as query text (joined with spaces) and hoists it onto `--search`,
+/// leaving `--robot-search` as the primary.
+fn rewrite_search_intent(rest: &[String]) -> Vec<String> {
+    let mut prefix: Vec<String> = Vec::new();
+    let mut query_parts: Vec<String> = Vec::new();
+    let mut rest = rest;
+    while !rest.is_empty() {
+        if is_positional_value(&rest[0]) {
+            query_parts.push(rest[0].clone());
+            rest = &rest[1..];
+            continue;
+        }
+        let (aliases, remaining) = consume_leading_flag_aliases(rest, "search");
+        if aliases.is_empty() {
+            break;
+        }
+        prefix.extend(aliases);
+        rest = remaining;
+    }
+
+    let mut out = Vec::with_capacity(query_parts.len() + prefix.len() + 3);
+    if !query_parts.is_empty() {
+        out.push("--search".to_string());
+        out.push(query_parts.join(" "));
+    }
+    out.push("--robot-search".to_string());
+    out.extend(prefix);
+    out.extend(rewrite_flag_aliases(rest, "search"));
+    out
+}
+
+/// Go `rewriteRobotGraphIntent` (cmd/bv/main.go:811).
+fn rewrite_graph_intent(rest: &[String]) -> Vec<String> {
+    let (prefix, rest) = consume_leading_flag_aliases(rest, "graph");
+    let mut out = vec!["--robot-graph".to_string()];
+    if let Some(format) = rest.first() {
+        if is_graph_format(format) {
+            out.push("--graph-format".to_string());
+            out.push(format.to_lowercase());
+            out.extend(prefix);
+            out.extend(rewrite_flag_aliases(&rest[1..], "graph"));
+            return out;
+        }
+    }
+    out.extend(prefix);
+    out.extend(rewrite_flag_aliases(rest, "graph"));
+    out
+}
+
+/// Go `rewriteUpgradeIntent` (cmd/bv/main.go:667) — the ergonomic `bv upgrade`
+/// verb over the self-update flags:
+///
+/// ```text
+/// bv upgrade            -> --update
+/// bv upgrade --yes/-y   -> --update --yes
+/// bv upgrade --check    -> --check-update
+/// bv upgrade --dry-run  -> --update-dry-run
+/// bv upgrade --rollback -> --rollback
+/// ```
+///
+/// Bare-word aliases are accepted too; unrecognized tokens pass through so the
+/// parser reports genuine typos instead of silently dropping them.
+fn rewrite_upgrade_intent(rest: &[String]) -> Vec<String> {
+    let mut mode = "update";
+    let mut yes = false;
+    let mut passthrough: Vec<String> = Vec::new();
+    for arg in rest {
+        match arg.to_lowercase().trim() {
+            "check" | "--check" | "check-update" | "--check-update" => {
+                if mode == "update" {
+                    mode = "check";
+                }
+            }
+            "dry-run" | "--dry-run" | "dryrun" | "--dryrun" => {
+                if mode == "update" {
+                    mode = "dry-run";
+                }
+            }
+            "rollback" | "--rollback" => mode = "rollback",
+            "yes" | "--yes" | "-y" | "force" | "--force" => yes = true,
+            _ => passthrough.push(arg.clone()),
+        }
+    }
+
+    let mut out = match mode {
+        "check" => vec!["--check-update".to_string()],
+        "dry-run" => vec!["--update-dry-run".to_string()],
+        "rollback" => vec!["--rollback".to_string()],
+        _ => {
+            let mut v = vec!["--update".to_string()];
+            if yes {
+                v.push("--yes".to_string());
+            }
+            v
+        }
+    };
+    out.extend(passthrough);
+    out
+}
+
+/// `[]string{"<flag>"} + rewriteAgentIntentFlagAliases(rest, context)` — the
+/// common shape of every subcommand that takes no positional.
+fn lead_flag(rest: &[String], flag: &str, context: &str) -> Vec<String> {
+    let mut out = vec![flag.to_string()];
+    out.extend(rewrite_flag_aliases(rest, context));
+    out
+}
+
+/// Go `rewriteAgentIntentFlagAliases` (cmd/bv/main.go:880).
+fn rewrite_flag_aliases(args: &[String], context: &str) -> Vec<String> {
+    let mut rewritten: Vec<String> = Vec::with_capacity(args.len() + 2);
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
         match arg.as_str() {
-            "--json" => out.extend(["--format".to_string(), "json".to_string()]),
-            "--toon" => out.extend(["--format".to_string(), "toon".to_string()]),
-            // `--json=true` / `--toon=false`: Go's switch is on the exact
-            // token, so a `=value` form is not an alias and is left alone.
-            "--output" | "-o" => match args.get(i + 1).map(|v| v.to_lowercase()) {
-                Some(next) if next == "json" || next == "toon" => {
-                    out.extend(["--format".to_string(), next]);
-                    i += 1;
+            "--json" => rewritten.extend(["--format".to_string(), "json".to_string()]),
+            "--toon" => rewritten.extend(["--format".to_string(), "toon".to_string()]),
+            "--output" | "-o" => {
+                // Only a format value is an alias; a file path (the export use)
+                // is left for the normal parse path.
+                match args.get(i + 1).filter(|next| is_robot_output_format(next)) {
+                    Some(next) => {
+                        rewritten.extend(["--format".to_string(), next.to_lowercase()]);
+                        i += 1;
+                    }
+                    None => rewritten.push(arg.clone()),
                 }
-                _ => out.push(arg.clone()),
-            },
-            _ => out.push(arg.clone()),
+            }
+            "--name" => rewritten.push("--label".to_string()),
+            "--limit" => rewritten.push(limit_flag_for_context(context).to_string()),
+            other => rewritten.push(rewrite_equals_arg(other, context)),
         }
         i += 1;
     }
-    out
+    rewritten
+}
+
+/// Go `consumeLeadingAgentIntentFlagAliases` (cmd/bv/main.go:842): like
+/// `rewrite_flag_aliases` but stops at the first token it does not recognize,
+/// so a subcommand can read its positional *after* a leading alias
+/// (`bv search --limit 5 login oauth`).
+fn consume_leading_flag_aliases<'a>(
+    args: &'a [String],
+    context: &str,
+) -> (Vec<String>, &'a [String]) {
+    let mut rewritten: Vec<String> = Vec::new();
+    let mut rest = args;
+    while let Some(arg) = rest.first() {
+        match arg.as_str() {
+            "--json" => {
+                rewritten.extend(["--format".to_string(), "json".to_string()]);
+                rest = &rest[1..];
+            }
+            "--toon" => {
+                rewritten.extend(["--format".to_string(), "toon".to_string()]);
+                rest = &rest[1..];
+            }
+            "--output" | "-o" => match rest.get(1).filter(|next| is_robot_output_format(next)) {
+                Some(next) => {
+                    rewritten.extend(["--format".to_string(), next.to_lowercase()]);
+                    rest = &rest[2..];
+                }
+                None => return (rewritten, rest),
+            },
+            "--limit" => match rest.get(1) {
+                Some(value) => {
+                    rewritten.push(limit_flag_for_context(context).to_string());
+                    rewritten.push(value.clone());
+                    rest = &rest[2..];
+                }
+                None => return (rewritten, rest),
+            },
+            other => match rewrite_leading_equals_alias(other, context) {
+                Some(alias) => {
+                    rewritten.push(alias);
+                    rest = &rest[1..];
+                }
+                None => return (rewritten, rest),
+            },
+        }
+    }
+    (rewritten, rest)
+}
+
+/// Go `rewriteAgentIntentEqualsArg` (cmd/bv/main.go:907).
+fn rewrite_equals_arg(arg: &str, context: &str) -> String {
+    if let Some(alias) = rewrite_leading_equals_alias(arg, context) {
+        return alias;
+    }
+    if let Some(value) = arg.strip_prefix("--name=") {
+        return format!("--label={value}");
+    }
+    arg.to_string()
+}
+
+/// Go `rewriteLeadingAgentIntentEqualsAlias` (cmd/bv/main.go:925).
+fn rewrite_leading_equals_alias(arg: &str, context: &str) -> Option<String> {
+    match arg {
+        // A boolean spelling never changes the requested format: `--toon=false`
+        // still asks for structured output, it just does not ask for TOON.
+        "--json=true" | "--json=false" => return Some("--format=json".to_string()),
+        "--toon=true" => return Some("--format=toon".to_string()),
+        "--toon=false" => return Some("--format=json".to_string()),
+        _ => {}
+    }
+    for prefix in ["--output=", "-o="] {
+        if let Some(value) = arg.strip_prefix(prefix) {
+            if is_robot_output_format(value) {
+                return Some(format!("--format={}", value.to_lowercase()));
+            }
+        }
+    }
+    if let Some(value) = arg.strip_prefix("--limit=") {
+        return Some(format!("{}={value}", limit_flag_for_context(context)));
+    }
+    None
+}
+
+/// Go `limitFlagForAgentContext` (cmd/bv/main.go:951): each context has its own
+/// limit flag; everything else shares the generic `--robot-max-results`.
+fn limit_flag_for_context(context: &str) -> &'static str {
+    match context {
+        "search" => "--search-limit",
+        "label-attention" => "--attention-limit",
+        "file-beads" => "--file-beads-limit",
+        "file-hotspots" => "--hotspots-limit",
+        "history" => "--history-limit",
+        "related" => "--related-max-results",
+        "file-relations" => "--relations-limit",
+        _ => "--robot-max-results",
+    }
+}
+
+/// Go `normalizeRobotCommandName` (cmd/bv/main.go:972).
+fn normalize_robot_command_name(value: &str) -> String {
+    let value = value.to_lowercase();
+    let value = value.trim();
+    if value.is_empty() || value.starts_with("robot-") {
+        value.to_string()
+    } else {
+        format!("robot-{value}")
+    }
+}
+
+/// Go `isPositionalValue` (cmd/bv/main.go:1141).
+fn is_positional_value(arg: &str) -> bool {
+    !arg.is_empty() && !arg.starts_with('-')
+}
+
+/// Go `isRobotOutputFormat` (cmd/bv/main.go:1145).
+fn is_robot_output_format(value: &str) -> bool {
+    matches!(value.to_lowercase().trim(), "json" | "toon")
+}
+
+/// Go `isGraphFormat` (cmd/bv/main.go:1155).
+fn is_graph_format(value: &str) -> bool {
+    matches!(value.to_lowercase().trim(), "json" | "dot" | "mermaid")
 }
 
 /// Check whether args carry an agent-intent structured-output alias.
 ///
-/// Deliberately does *not* count a bare : Go's auto-promote keys off
-/// the aliases, so  with no primary command drops into the
-/// TUI rather than defaulting to . Called before the alias
-/// rewrite, while the alias spellings are still present.
+/// Deliberately does *not* count a bare `--format`: Go's auto-promote keys off
+/// the aliases, so `bv --format toon` with no primary drops into the TUI
+/// rather than defaulting to `--robot-triage`. Called before the alias rewrite,
+/// while the alias spellings are still present.
 fn contains_structured_output_alias(args: &[String]) -> bool {
-    for (i, arg) in args.iter().enumerate() {
+    args.iter().enumerate().any(|(i, arg)| {
         let lower = arg.to_ascii_lowercase();
         if matches!(
             lower.as_str(),
@@ -267,37 +621,33 @@ fn contains_structured_output_alias(args: &[String]) -> bool {
         ) {
             return true;
         }
-        if (arg == "--output" || arg == "-o")
+        (arg == "--output" || arg == "-o")
             && args
                 .get(i + 1)
-                .is_some_and(|next| matches!(next.to_ascii_lowercase().as_str(), "json" | "toon"))
-        {
-            return true;
-        }
-    }
-    false
+                .is_some_and(|next| is_robot_output_format(next))
+    })
 }
 
-/// Robot primary flag names (stripped of `--` prefix) for auto-promote check.
+/// Robot primary flag names (stripped of `--` prefix) for the auto-promote check.
+/// Go `primaryRobotFlagNames` (cmd/bv/main.go:1096).
 const ROBOT_PRIMARY_NAMES: &[&str] = &[
     "robot-help",
     "robot-capabilities",
     "robot-docs",
-    "robot-schema",
-    "robot-recipes",
-    "robot-metrics",
+    "robot-insights",
+    "robot-plan",
+    "robot-priority",
     "robot-triage",
     "robot-next",
     "robot-triage-by-track",
     "robot-triage-by-label",
-    "robot-insights",
-    "robot-plan",
-    "robot-priority",
-    "robot-alerts",
+    "robot-diff",
+    "robot-recipes",
+    "robot-metrics",
+    "robot-schema",
     "robot-suggest",
     "robot-graph",
     "robot-search",
-    "robot-diff",
     "robot-drift",
     "robot-history",
     "robot-explain-correlation",
@@ -323,9 +673,46 @@ const ROBOT_PRIMARY_NAMES: &[&str] = &[
     "robot-label-attention",
 ];
 
+/// Flags that claim an invocation on their own. Go `hasNonRobotPrimaryArg`
+/// (cmd/bv/main.go:1005).
+const NON_ROBOT_PRIMARY_NAMES: &[&str] = &[
+    "version",
+    "help",
+    "check-update",
+    "update",
+    "update-dry-run",
+    "rollback",
+    "pages",
+    "export-pages",
+    "preview-pages",
+    "export",
+    "export-md",
+    "export-graph",
+];
+
+/// Go `hasPrimaryRobotArg` (cmd/bv/main.go:995).
+fn has_primary_robot_arg(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| primary_flag_name(arg, ROBOT_PRIMARY_NAMES))
+}
+
+/// Go `hasNonRobotPrimaryArg` (cmd/bv/main.go:1005).
+fn has_non_robot_primary_arg(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| primary_flag_name(arg, NON_ROBOT_PRIMARY_NAMES))
+}
+
+/// Shared body of both `has*PrimaryArg` helpers: strip a `--flag=value` token
+/// down to its bare name and test membership.
+fn primary_flag_name(arg: &str, names: &[&str]) -> bool {
+    let name = arg.split('=').next().unwrap_or(arg);
+    let name = name.strip_prefix("--").unwrap_or(name);
+    names.contains(&name)
+}
+
 /// First bare positional left unconsumed after `rewrite_args`, if any.
 ///
-/// Go's `flag` package rejects any non-flag argument with
+/// Go's flag parser rejects any non-flag argument with
 /// `unknown command "X" for "bv"`, so only agent-intent words (which
 /// `rewrite_args` rewrites into `--robot-*`) and flag values are legal.
 /// `bvr` must do the same instead of silently falling through to the
@@ -337,7 +724,7 @@ pub fn unconsumed_positional(rewritten: &[String]) -> Option<String> {
     // that takes a value swallows the next token, so `bv --label triage`
     // must not report `triage` as an unknown command.
     let mut prev_is_flag = false;
-    // Input is argv-minus-program (see `rewrite_args` callers), so index 0 is
+    // Input is argv-minus-program (see `rewrite_args`), so index 0 is
     // the first real argument — do not skip it.
     for tok in rewritten.iter() {
         if prev_is_flag && !tok.starts_with('-') {
@@ -391,20 +778,17 @@ mod tests {
 
     #[test]
     fn single_dash_long_flag_normalized() {
-        assert_eq!(
-            rewrite_args(&s(&["bvr", "-robot-triage"])),
-            s(&["bvr", "--robot-triage"])
-        );
+        assert_eq!(rewrite_args(&s(&["-robot-triage"])), s(&["--robot-triage"]));
     }
 
     #[test]
     fn short_flags_untouched() {
         // Unmapped short flags (e.g. -x) still pass through; Go only advertises
         // -f/-l/-r/-h, so anything else is left alone.
-        assert_eq!(rewrite_args(&s(&["bvr", "-x"])), s(&["bvr", "-x"]));
+        assert_eq!(rewrite_args(&s(&["-x"])), s(&["-x"]));
     }
 
-    /// Go's `flag` package rejects bare positionals with
+    /// Go's flag parser rejects bare positionals with
     /// `unknown command "X" for "bv"` (exit 1). `bvr` used to fall through to
     /// the TUI instead, which blocks any non-interactive caller.
     #[test]
@@ -465,221 +849,536 @@ mod tests {
     /// These were previously passing through unexpanded (a documented gap).
     #[test]
     fn short_flag_aliases_expanded() {
+        assert_eq!(rewrite_args(&s(&["-f", "toon"])), s(&["--format", "toon"]));
         assert_eq!(
-            rewrite_args(&s(&["bvr", "-f", "toon"])),
-            s(&["bvr", "--format", "toon"])
+            rewrite_args(&s(&["-l", "backend"])),
+            s(&["--label", "backend"])
         );
         assert_eq!(
-            rewrite_args(&s(&["bvr", "-l", "backend"])),
-            s(&["bvr", "--label", "backend"])
-        );
-        assert_eq!(
-            rewrite_args(&s(&["bvr", "-r", "mytable"])),
-            s(&["bvr", "--recipe", "mytable"])
+            rewrite_args(&s(&["-r", "mytable"])),
+            s(&["--recipe", "mytable"])
         );
     }
 
     #[test]
     fn short_flag_alias_with_equals_expanded() {
-        assert_eq!(
-            rewrite_args(&s(&["bvr", "-f=toon"])),
-            s(&["bvr", "--format=toon"])
-        );
-        assert_eq!(
-            rewrite_args(&s(&["bvr", "-l=backend"])),
-            s(&["bvr", "--label=backend"])
-        );
+        assert_eq!(rewrite_args(&s(&["-f=toon"])), s(&["--format=toon"]));
+        assert_eq!(rewrite_args(&s(&["-l=backend"])), s(&["--label=backend"]));
     }
 
     #[test]
     fn agent_intent_alias_rewritten() {
-        assert_eq!(
-            rewrite_args(&s(&["bvr", "triage"])),
-            s(&["bvr", "--robot-triage"])
-        );
-        assert_eq!(
-            rewrite_args(&s(&["bvr", "next"])),
-            s(&["bvr", "--robot-next"])
-        );
+        assert_eq!(rewrite_args(&s(&["triage"])), s(&["--robot-triage"]));
+        assert_eq!(rewrite_args(&s(&["next"])), s(&["--robot-next"]));
     }
 
     #[test]
     fn double_dash_passthrough() {
         assert_eq!(
-            rewrite_args(&s(&["bvr", "--robot-insights", "--format", "toon"])),
-            s(&["bvr", "--robot-insights", "--format", "toon"])
+            rewrite_args(&s(&["--robot-insights", "--format", "toon"])),
+            s(&["--robot-insights", "--format", "toon"])
         );
     }
 
     #[test]
     fn bare_json_auto_promotes_to_triage() {
         assert_eq!(
-            rewrite_args(&s(&["bvr", "--json"])),
-            s(&["bvr", "--robot-triage", "--format", "json"])
+            rewrite_args(&s(&["--json"])),
+            s(&["--robot-triage", "--format", "json"])
         );
     }
 
     #[test]
     fn bare_toon_auto_promotes_to_triage() {
         assert_eq!(
-            rewrite_args(&s(&["bvr", "--toon"])),
-            s(&["bvr", "--robot-triage", "--format", "toon"])
+            rewrite_args(&s(&["--toon"])),
+            s(&["--robot-triage", "--format", "toon"])
         );
     }
 
     #[test]
     fn output_json_auto_promotes_to_triage() {
+        // Go rewriteLeadingAgentIntentEqualsAlias maps the `=` forms to
+        // `--format=`, so the alias is consumed, not just detected.
         assert_eq!(
-            rewrite_args(&s(&["bvr", "--output=json"])),
-            s(&["bvr", "--robot-triage", "--output=json"])
+            rewrite_args(&s(&["--output=json"])),
+            s(&["--robot-triage", "--format=json"])
         );
     }
 
     #[test]
     fn o_json_auto_promotes_to_triage() {
         assert_eq!(
-            rewrite_args(&s(&["bvr", "-o=json"])),
-            s(&["bvr", "--robot-triage", "-o=json"])
+            rewrite_args(&s(&["-o=json"])),
+            s(&["--robot-triage", "--format=json"])
         );
     }
 
     #[test]
     fn json_with_existing_primary_not_promoted() {
         assert_eq!(
-            rewrite_args(&s(&["bvr", "--robot-insights", "--format", "json"])),
-            s(&["bvr", "--robot-insights", "--format", "json"])
+            rewrite_args(&s(&["--robot-insights", "--format", "json"])),
+            s(&["--robot-insights", "--format", "json"])
         );
     }
 
     #[test]
     fn output_space_json_auto_promotes() {
         assert_eq!(
-            rewrite_args(&s(&["bvr", "--output", "json"])),
-            s(&["bvr", "--robot-triage", "--format", "json"])
+            rewrite_args(&s(&["--output", "json"])),
+            s(&["--robot-triage", "--format", "json"])
         );
     }
 
     #[test]
     fn alias_recommend_goes_to_triage() {
-        assert_eq!(
-            rewrite_args(&s(&["bvr", "recommend"])),
-            s(&["bvr", "--robot-triage"])
-        );
+        assert_eq!(rewrite_args(&s(&["recommend"])), s(&["--robot-triage"]));
     }
 
     #[test]
     fn alias_pick_goes_to_next() {
-        assert_eq!(
-            rewrite_args(&s(&["bvr", "pick"])),
-            s(&["bvr", "--robot-next"])
-        );
+        assert_eq!(rewrite_args(&s(&["pick"])), s(&["--robot-next"]));
+    }
+
+    /// A value command with no positional and no default still emits its
+    /// boolean companion and nothing else.
+    #[test]
+    fn alias_diff_goes_to_robot_diff() {
+        assert_eq!(rewrite_args(&s(&["diff"])), s(&["--robot-diff"]));
     }
 
     #[test]
-    fn upgrade_subcommand_variants() {
-        assert_eq!(
-            rewrite_args(&s(&["bvr", "upgrade", "check"])),
-            s(&["bvr", "--check-update"])
-        );
-        assert_eq!(
-            rewrite_args(&s(&["bvr", "upgrade", "dry-run"])),
-            s(&["bvr", "--update-dry-run"])
-        );
-        assert_eq!(
-            rewrite_args(&s(&["bvr", "upgrade", "rollback"])),
-            s(&["bvr", "--rollback"])
-        );
-        assert_eq!(
-            rewrite_args(&s(&["bvr", "upgrade", "--yes"])),
-            s(&["bvr", "--update", "--yes"])
-        );
+    fn alias_find_goes_to_robot_search() {
+        assert_eq!(rewrite_args(&s(&["find"])), s(&["--robot-search"]));
     }
 
     #[test]
-    fn alias_upgrade_goes_to_update() {
-        assert_eq!(
-            rewrite_args(&s(&["bvr", "upgrade"])),
-            s(&["bvr", "--update"])
-        );
+    fn no_auto_promote_when_version() {
+        assert_eq!(rewrite_args(&s(&["--version"])), s(&["--version"]));
     }
 
     #[test]
     fn alias_capabilities_goes_to_robot_capabilities() {
         assert_eq!(
-            rewrite_args(&s(&["bvr", "capabilities"])),
-            s(&["bvr", "--robot-capabilities"])
-        );
-    }
-
-    #[test]
-    fn alias_diff_goes_to_robot_diff() {
-        assert_eq!(
-            rewrite_args(&s(&["bvr", "diff"])),
-            s(&["bvr", "--robot-diff"])
-        );
-    }
-
-    #[test]
-    fn alias_drift_goes_to_robot_drift() {
-        assert_eq!(
-            rewrite_args(&s(&["bvr", "drift"])),
-            s(&["bvr", "--robot-drift"])
-        );
-    }
-
-    #[test]
-    fn alias_find_goes_to_robot_search() {
-        assert_eq!(
-            rewrite_args(&s(&["bvr", "find"])),
-            s(&["bvr", "--robot-search"])
+            rewrite_args(&s(&["capabilities"])),
+            s(&["--robot-capabilities"])
         );
     }
 
     #[test]
     fn alias_blockers_goes_to_robot_blocker_chain() {
         assert_eq!(
-            rewrite_args(&s(&["bvr", "blockers"])),
-            s(&["bvr", "--robot-blocker-chain"])
+            rewrite_args(&s(&["blockers"])),
+            s(&["--robot-blocker-chain"])
+        );
+    }
+
+    /// Regression: the rewriter used to assume a program-name slot that `main`
+    /// strips, so the subcommand table was consulted one position too far and
+    /// every `bv upgrade <mode>` silently degraded to `bv --update <mode>`.
+    #[test]
+    fn upgrade_subcommand_variants() {
+        assert_eq!(
+            rewrite_args(&s(&["upgrade", "check"])),
+            s(&["--check-update"])
+        );
+        assert_eq!(
+            rewrite_args(&s(&["upgrade", "dry-run"])),
+            s(&["--update-dry-run"])
+        );
+        assert_eq!(
+            rewrite_args(&s(&["upgrade", "rollback"])),
+            s(&["--rollback"])
+        );
+        assert_eq!(
+            rewrite_args(&s(&["upgrade", "--yes"])),
+            s(&["--update", "--yes"])
+        );
+        assert_eq!(
+            rewrite_args(&s(&["upgrade", "-y"])),
+            s(&["--update", "--yes"])
+        );
+    }
+
+    /// Go's `TestAgentIntentArgRewrite` upgrade cases, verbatim.
+    #[test]
+    fn upgrade_flag_forms_match_go() {
+        assert_eq!(rewrite_args(&s(&["upgrade"])), s(&["--update"]));
+        assert_eq!(
+            rewrite_args(&s(&["upgrade", "--check"])),
+            s(&["--check-update"])
+        );
+        assert_eq!(
+            rewrite_args(&s(&["upgrade", "--dry-run"])),
+            s(&["--update-dry-run"])
+        );
+        assert_eq!(
+            rewrite_args(&s(&["upgrade", "--rollback"])),
+            s(&["--rollback"])
+        );
+        assert_eq!(rewrite_args(&s(&["self-update"])), s(&["--update"]));
+        // Unknown tokens pass through so the parser reports the typo.
+        assert_eq!(
+            rewrite_args(&s(&["upgrade", "--bogus"])),
+            s(&["--update", "--bogus"])
+        );
+    }
+
+    /// Regression: the auto-promote fired on `--export-md` invocations. Go
+    /// guards it with `hasNonRobotPrimaryArg`.
+    #[test]
+    fn non_robot_primary_suppresses_auto_promote() {
+        for argv in [
+            vec!["--version", "--json"],
+            vec!["--export-md", "out.md", "--json"],
+            vec!["--export", "out.md", "--json"],
+            vec!["--export-graph", "g.html", "--toon"],
+            vec!["--pages", "--json"],
+            vec!["--export-pages", "./dash", "--json"],
+            vec!["--preview-pages", "./dash", "--json"],
+            vec!["--update-dry-run", "--json"],
+        ] {
+            let want = rewrite_flag_aliases(&s(&argv), "");
+            assert_eq!(
+                rewrite_args(&s(&argv)),
+                want,
+                "expected {argv:?} to keep its own primary"
+            );
+        }
+    }
+
+    /// Go `TestAgentIntentArgRewrite`: subcommand + alias tails.
+    #[test]
+    fn triage_subcommand_rewrites_flag_aliases() {
+        assert_eq!(
+            rewrite_args(&s(&[
+                "triage", "--json", "--name", "backend", "--limit", "3"
+            ])),
+            s(&[
+                "--robot-triage",
+                "--format",
+                "json",
+                "--label",
+                "backend",
+                "--robot-max-results",
+                "3"
+            ])
         );
     }
 
     #[test]
-    fn no_auto_promote_when_version() {
+    fn canonical_robot_command_name() {
         assert_eq!(
-            rewrite_args(&s(&["bvr", "--version"])),
-            s(&["bvr", "--version"])
+            rewrite_args(&s(&["robot-triage", "--json"])),
+            s(&["--robot-triage", "--format", "json"])
+        );
+        assert_eq!(
+            rewrite_args(&s(&["robot-triage-by-track", "--json", "--limit=2"])),
+            s(&[
+                "--robot-triage-by-track",
+                "--format",
+                "json",
+                "--robot-max-results=2"
+            ])
+        );
+    }
+
+    #[test]
+    fn canonical_robot_help_with_json_becomes_docs() {
+        assert_eq!(
+            rewrite_args(&s(&["robot-help", "--json"])),
+            s(&["--robot-docs", "guide", "--format", "json"])
+        );
+    }
+
+    #[test]
+    fn json_false_still_avoids_tui() {
+        assert_eq!(
+            rewrite_args(&s(&["--json=false"])),
+            s(&["--robot-triage", "--format=json"])
+        );
+    }
+
+    #[test]
+    fn toon_false_keeps_structured_output_without_forcing_toon() {
+        assert_eq!(
+            rewrite_args(&s(&["--toon=false"])),
+            s(&["--robot-triage", "--format=json"])
+        );
+    }
+
+    #[test]
+    fn schema_subcommand() {
+        assert_eq!(
+            rewrite_args(&s(&["schema", "triage", "--json"])),
+            s(&[
+                "--robot-schema",
+                "--schema-command",
+                "robot-triage",
+                "--format",
+                "json"
+            ])
+        );
+        assert_eq!(
+            rewrite_args(&s(&["robot-schema", "triage", "--json"])),
+            s(&[
+                "--robot-schema",
+                "--schema-command",
+                "robot-triage",
+                "--format",
+                "json"
+            ])
+        );
+        // Output alias may come before the command.
+        assert_eq!(
+            rewrite_args(&s(&["schema", "--json", "triage"])),
+            s(&[
+                "--robot-schema",
+                "--schema-command",
+                "robot-triage",
+                "--format",
+                "json"
+            ])
+        );
+        // Mixed case is normalized.
+        assert_eq!(
+            rewrite_args(&s(&["schema", "Robot-Triage", "--json"])),
+            s(&[
+                "--robot-schema",
+                "--schema-command",
+                "robot-triage",
+                "--format",
+                "json"
+            ])
+        );
+    }
+
+    #[test]
+    fn search_subcommand_collects_query_words() {
+        assert_eq!(
+            rewrite_args(&s(&["search", "login", "oauth", "--json", "--limit=5"])),
+            s(&[
+                "--search",
+                "login oauth",
+                "--robot-search",
+                "--format",
+                "json",
+                "--search-limit=5"
+            ])
+        );
+        // `--limit <n>` before the query: the space form consumes its value.
+        assert_eq!(
+            rewrite_args(&s(&["search", "--limit", "5", "login", "oauth", "--json"])),
+            s(&[
+                "--search",
+                "login oauth",
+                "--robot-search",
+                "--search-limit",
+                "5",
+                "--format",
+                "json"
+            ])
+        );
+        // An alias may sit between two query words.
+        assert_eq!(
+            rewrite_args(&s(&["search", "login", "--json", "oauth"])),
+            s(&[
+                "--search",
+                "login oauth",
+                "--robot-search",
+                "--format",
+                "json"
+            ])
+        );
+        assert_eq!(
+            rewrite_args(&s(&[
+                "robot-search",
+                "login",
+                "oauth",
+                "--json",
+                "--limit",
+                "5"
+            ])),
+            s(&[
+                "--search",
+                "login oauth",
+                "--robot-search",
+                "--format",
+                "json",
+                "--search-limit",
+                "5"
+            ])
+        );
+    }
+
+    /// `bv robot-search Q` used to exit 2 (`unknown command "robot-search"`).
+    #[test]
+    fn canonical_search_command_with_query_is_not_an_unknown_command() {
+        let args = rewrite_args(&s(&["robot-search", "Q"]));
+        assert_eq!(args, s(&["--search", "Q", "--robot-search"]));
+        assert_eq!(unconsumed_positional(&args), None);
+    }
+
+    /// `bv diff HEAD~1` used to leave `HEAD~1` as an unknown command.
+    #[test]
+    fn diff_subcommand_consumes_its_positional() {
+        let args = rewrite_args(&s(&["diff", "HEAD~1", "--json"]));
+        assert_eq!(
+            args,
+            s(&["--robot-diff", "--diff-since", "HEAD~1", "--format", "json"])
+        );
+        assert_eq!(unconsumed_positional(&args), None);
+    }
+
+    #[test]
+    fn graph_format_positional() {
+        assert_eq!(
+            rewrite_args(&s(&["graph", "mermaid", "--output", "json"])),
+            s(&[
+                "--robot-graph",
+                "--graph-format",
+                "mermaid",
+                "--format",
+                "json"
+            ])
+        );
+        assert_eq!(
+            rewrite_args(&s(&["robot-graph", "mermaid", "--json"])),
+            s(&[
+                "--robot-graph",
+                "--graph-format",
+                "mermaid",
+                "--format",
+                "json"
+            ])
+        );
+        assert_eq!(
+            rewrite_args(&s(&["graph", "--json", "mermaid"])),
+            s(&[
+                "--robot-graph",
+                "--graph-format",
+                "mermaid",
+                "--format",
+                "json"
+            ])
+        );
+    }
+
+    #[test]
+    fn value_commands_consume_their_target() {
+        // Alias before the target.
+        assert_eq!(
+            rewrite_args(&s(&["related", "--json", "bv-123"])),
+            s(&["--robot-related", "bv-123", "--format", "json"])
+        );
+        assert_eq!(
+            rewrite_args(&s(&["robot-related", "bv-123", "--json", "--limit=2"])),
+            s(&[
+                "--robot-related",
+                "bv-123",
+                "--format",
+                "json",
+                "--related-max-results=2"
+            ])
+        );
+    }
+
+    /// With no value and no default, Go parks the bare flag at the end so the
+    /// parser names the right missing argument instead of eating the next token.
+    #[test]
+    fn missing_value_command_parks_the_flag_last() {
+        assert_eq!(
+            rewrite_args(&s(&["robot-related", "--json"])),
+            s(&["--format", "json", "--robot-related"])
+        );
+        assert_eq!(
+            rewrite_args(&s(&[
+                "robot-confirm-correlation",
+                "--correlation-by",
+                "agent",
+                "--json"
+            ])),
+            s(&[
+                "--correlation-by",
+                "agent",
+                "--format",
+                "json",
+                "--robot-confirm-correlation"
+            ])
+        );
+    }
+
+    #[test]
+    fn canonical_diff_and_drift_commands() {
+        assert_eq!(
+            rewrite_args(&s(&["robot-diff", "HEAD~1", "--json"])),
+            s(&["--robot-diff", "--diff-since", "HEAD~1", "--format", "json"])
+        );
+        assert_eq!(
+            rewrite_args(&s(&["robot-drift", "--json"])),
+            s(&["--check-drift", "--robot-drift", "--format", "json"])
+        );
+    }
+
+    #[test]
+    fn docs_subcommand() {
+        assert_eq!(
+            rewrite_args(&s(&["docs", "--json", "guide"])),
+            s(&["--robot-docs", "guide", "--format", "json"])
+        );
+        assert_eq!(
+            rewrite_args(&s(&["robot-docs", "guide", "--json"])),
+            s(&["--robot-docs", "guide", "--format", "json"])
+        );
+        // No topic: Go defaults to the guide.
+        assert_eq!(rewrite_args(&s(&["docs"])), s(&["--robot-docs", "guide"]));
+    }
+
+    #[test]
+    fn update_dry_run_stays_non_robot_with_structured_alias() {
+        assert_eq!(
+            rewrite_args(&s(&["--update-dry-run", "--json"])),
+            s(&["--update-dry-run", "--format", "json"])
+        );
+    }
+
+    #[test]
+    fn name_equals_form_maps_to_label() {
+        assert_eq!(
+            rewrite_args(&s(&["triage", "--name=backend"])),
+            s(&["--robot-triage", "--label=backend"])
         );
     }
 
     #[test]
     fn structured_output_aliases_normalise_to_format() {
-        // Go rewriteAgentIntentFlagAliases (cmd/bv/main.go:885-895). Without
+        // Go rewriteAgentIntentFlagAliases (cmd/bv/main.go:880-905). Without
         // this the aliases only triggered the auto-promote and were then
         // dropped, so `bvr --toon` emitted JSON.
         assert_eq!(
-            rewrite_args(&s(&["bvr", "--toon"])),
-            s(&["bvr", "--robot-triage", "--format", "toon"])
+            rewrite_args(&s(&["--toon"])),
+            s(&["--robot-triage", "--format", "toon"])
         );
         assert_eq!(
-            rewrite_args(&s(&["bvr", "--json"])),
-            s(&["bvr", "--robot-triage", "--format", "json"])
+            rewrite_args(&s(&["--json"])),
+            s(&["--robot-triage", "--format", "json"])
         );
         assert_eq!(
-            rewrite_args(&s(&["bvr", "--output", "toon"])),
-            s(&["bvr", "--robot-triage", "--format", "toon"])
+            rewrite_args(&s(&["--output", "toon"])),
+            s(&["--robot-triage", "--format", "toon"])
         );
-        // Case is normalised on the --output value form.
+        // Case is normalized on the --output value form.
         assert_eq!(
-            rewrite_args(&s(&["bvr", "--output", "TOON"])),
-            s(&["bvr", "--robot-triage", "--format", "toon"])
+            rewrite_args(&s(&["--output", "TOON"])),
+            s(&["--robot-triage", "--format", "toon"])
         );
     }
 
     #[test]
     fn format_alias_rewrite_respects_an_explicit_primary() {
         assert_eq!(
-            rewrite_args(&s(&["bvr", "--robot-next", "--toon"])),
-            s(&["bvr", "--robot-next", "--format", "toon"])
+            rewrite_args(&s(&["--robot-next", "--toon"])),
+            s(&["--robot-next", "--format", "toon"])
         );
     }
 
@@ -688,19 +1387,29 @@ mod tests {
         // Go only rewrites `--output` when the next token is a format; a file
         // path (the export use) must pass through untouched.
         assert_eq!(
-            rewrite_args(&s(&["bvr", "--robot-next", "--output", "report.md"])),
-            s(&["bvr", "--robot-next", "--output", "report.md"])
+            rewrite_args(&s(&["--robot-next", "--output", "report.md"])),
+            s(&["--robot-next", "--output", "report.md"])
         );
     }
 
     #[test]
     fn a_bare_format_flag_does_not_auto_promote() {
-        // Verified against the oracle:  with no primary
+        // Verified against the oracle: `bv --format toon` with no primary
         // drops into the TUI in Go, it does not default to --robot-triage. The
         // auto-promote keys off the agent-intent aliases only.
         assert_eq!(
-            rewrite_args(&s(&["bvr", "--format", "toon"])),
-            s(&["bvr", "--format", "toon"])
+            rewrite_args(&s(&["--format", "toon"])),
+            s(&["--format", "toon"])
+        );
+    }
+
+    /// A non-ASCII first byte must not slice mid-character.
+    #[test]
+    fn multibyte_positional_is_left_alone() {
+        assert_eq!(rewrite_args(&s(&["ü"])), s(&["ü"]));
+        assert_eq!(
+            unconsumed_positional(&rewrite_args(&s(&["ü"]))),
+            Some("ü".into())
         );
     }
 }

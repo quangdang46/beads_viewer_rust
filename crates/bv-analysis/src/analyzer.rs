@@ -176,6 +176,228 @@ impl AnalysisBudget {
             (false, false)
         }
     }
+
+    /// Go `RecommendSampleSize` (pkg/analysis/betweenness_approx.go:489).
+    /// `edge_count` is reserved in Go for future density-aware heuristics and
+    /// is deliberately unused; the parameter is kept so call sites read the
+    /// same as Go's.
+    pub fn recommend_sample_size(&self, node_count: usize, _edge_count: usize) -> usize {
+        if node_count == 0 {
+            return 0;
+        }
+        if node_count < 100 {
+            node_count
+        } else if node_count < 500 {
+            // 20% sample, floored at 50.
+            std::cmp::max(node_count / 5, 50)
+        } else if node_count < 2000 {
+            100
+        } else {
+            200
+        }
+    }
+}
+
+/// Go `AnalysisConfig` as it appears in robot output
+/// (pkg/analysis/config.go:12). Field order is part of the compatibility
+/// contract: Go serializes the struct positionally, and the differential
+/// harness compares canonicalized JSON, so a reordered field is a drift.
+///
+/// The two execution-state fields Go marks `json:"-"` (`DisableCache`,
+/// `RunToCompletion`) are not emitted and so are absent here too.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct AnalysisConfigReport {
+    #[serde(rename = "ComputeBetweenness")]
+    pub compute_betweenness: bool,
+    /// Nanoseconds — Go marshals `time.Duration` as an int64 count of ns.
+    #[serde(rename = "BetweennessTimeout")]
+    pub betweenness_timeout_ns: i64,
+    #[serde(rename = "BetweennessSkipReason")]
+    pub betweenness_skip_reason: &'static str,
+    /// "exact" | "approximate" | "skip" (Go `BetweennessMode`).
+    #[serde(rename = "BetweennessMode")]
+    pub betweenness_mode: &'static str,
+    #[serde(rename = "BetweennessSampleSize")]
+    pub betweenness_sample_size: usize,
+    #[serde(rename = "BetweennessIsApproximate")]
+    pub betweenness_is_approximate: bool,
+
+    #[serde(rename = "ComputePageRank")]
+    pub compute_page_rank: bool,
+    #[serde(rename = "PageRankTimeout")]
+    pub page_rank_timeout_ns: i64,
+    #[serde(rename = "PageRankSkipReason")]
+    pub page_rank_skip_reason: &'static str,
+
+    #[serde(rename = "ComputeHITS")]
+    pub compute_hits: bool,
+    #[serde(rename = "HITSTimeout")]
+    pub hits_timeout_ns: i64,
+    #[serde(rename = "HITSSkipReason")]
+    pub hits_skip_reason: &'static str,
+
+    #[serde(rename = "ComputeCycles")]
+    pub compute_cycles: bool,
+    #[serde(rename = "CyclesTimeout")]
+    pub cycles_timeout_ns: i64,
+    #[serde(rename = "MaxCyclesToStore")]
+    pub max_cycles_to_store: usize,
+    #[serde(rename = "CyclesSkipReason")]
+    pub cycles_skip_reason: &'static str,
+
+    #[serde(rename = "ComputeEigenvector")]
+    pub compute_eigenvector: bool,
+    #[serde(rename = "ComputeCriticalPath")]
+    pub compute_critical_path: bool,
+    #[serde(rename = "ComputeKCore")]
+    pub compute_kcore: bool,
+    #[serde(rename = "ComputeArticulation")]
+    pub compute_articulation: bool,
+    #[serde(rename = "ComputeSlack")]
+    pub compute_slack: bool,
+}
+
+const NS_PER_SEC: i64 = 1_000_000_000;
+const NS_PER_MS: i64 = 1_000_000;
+
+/// Go `ConfigForSize` (pkg/analysis/config.go:98) — byte port.
+///
+/// Tiers, all keyed on node count:
+/// - `< 100`   small: exact betweenness, 2s budgets, 1000 cycles stored
+/// - `< 500`   medium: exact betweenness, 500ms budgets, 100 cycles
+/// - `< 2000`  large: approximate betweenness when density < 0.01 (500ms
+///   budget, sampled), otherwise betweenness is skipped entirely
+/// - `>= 2000` XL: approximate betweenness always; cycles are skipped; HITS
+///   only survives on very sparse graphs (density < 0.001)
+///
+/// `node_count` is the issue count, not the number of nodes carrying edges —
+/// the tier boundary is drawn against the full set.
+pub fn config_for_size(node_count: usize, edge_count: usize, density: f64) -> AnalysisConfigReport {
+    let sample = |n: usize| {
+        if n == 0 {
+            0
+        } else if n < 100 {
+            n
+        } else if n < 500 {
+            std::cmp::max(n / 5, 50)
+        } else if n < 2000 {
+            100
+        } else {
+            200
+        }
+    };
+    let _ = edge_count; // reserved in Go too
+
+    match node_count {
+        n if n < 100 => AnalysisConfigReport {
+            compute_betweenness: true,
+            betweenness_timeout_ns: 2 * NS_PER_SEC,
+            betweenness_skip_reason: "",
+            betweenness_mode: "exact",
+            betweenness_sample_size: 0,
+            betweenness_is_approximate: false,
+            compute_page_rank: true,
+            page_rank_timeout_ns: 2 * NS_PER_SEC,
+            page_rank_skip_reason: "",
+            compute_hits: true,
+            hits_timeout_ns: 2 * NS_PER_SEC,
+            hits_skip_reason: "",
+            compute_cycles: true,
+            cycles_timeout_ns: 2 * NS_PER_SEC,
+            max_cycles_to_store: 1000,
+            cycles_skip_reason: "",
+            compute_eigenvector: true,
+            compute_critical_path: true,
+            compute_kcore: true,
+            compute_articulation: true,
+            compute_slack: true,
+        },
+        n if n < 500 => AnalysisConfigReport {
+            compute_betweenness: true,
+            betweenness_timeout_ns: 500 * NS_PER_MS,
+            betweenness_skip_reason: "",
+            betweenness_mode: "exact",
+            betweenness_sample_size: 0,
+            betweenness_is_approximate: false,
+            compute_page_rank: true,
+            page_rank_timeout_ns: 500 * NS_PER_MS,
+            page_rank_skip_reason: "",
+            compute_hits: true,
+            hits_timeout_ns: 500 * NS_PER_MS,
+            hits_skip_reason: "",
+            compute_cycles: true,
+            cycles_timeout_ns: 500 * NS_PER_MS,
+            max_cycles_to_store: 100,
+            cycles_skip_reason: "",
+            compute_eigenvector: true,
+            compute_critical_path: true,
+            compute_kcore: true,
+            compute_articulation: true,
+            compute_slack: true,
+        },
+        n if n < 2000 => {
+            // Large: approximate betweenness for sparse graphs, skip for dense.
+            let (bw, bw_timeout, bw_reason, bw_mode, bw_sample) = if density < 0.01 {
+                (true, 500 * NS_PER_MS, "", "approximate", sample(node_count))
+            } else {
+                (false, 0, "graph too dense (density > 0.01)", "skip", 0)
+            };
+            AnalysisConfigReport {
+                compute_betweenness: bw,
+                betweenness_timeout_ns: bw_timeout,
+                betweenness_skip_reason: bw_reason,
+                betweenness_mode: bw_mode,
+                betweenness_sample_size: bw_sample,
+                betweenness_is_approximate: false,
+                compute_page_rank: true,
+                page_rank_timeout_ns: 300 * NS_PER_MS,
+                page_rank_skip_reason: "",
+                compute_hits: true,
+                hits_timeout_ns: 300 * NS_PER_MS,
+                hits_skip_reason: "",
+                compute_cycles: true,
+                cycles_timeout_ns: 300 * NS_PER_MS,
+                max_cycles_to_store: 50,
+                cycles_skip_reason: "",
+                compute_eigenvector: true,
+                compute_critical_path: true,
+                compute_kcore: true,
+                compute_articulation: true,
+                compute_slack: true,
+            }
+        }
+        _ => {
+            // XL: HITS only on very sparse graphs; cycles never run.
+            let (hits, hits_timeout, hits_reason) = if density < 0.001 {
+                (true, 200 * NS_PER_MS, "")
+            } else {
+                (false, 0, "graph too large and dense")
+            };
+            AnalysisConfigReport {
+                compute_betweenness: true,
+                betweenness_timeout_ns: 500 * NS_PER_MS,
+                betweenness_skip_reason: "",
+                betweenness_mode: "approximate",
+                betweenness_sample_size: sample(node_count),
+                betweenness_is_approximate: false,
+                compute_page_rank: true,
+                page_rank_timeout_ns: 200 * NS_PER_MS,
+                page_rank_skip_reason: "",
+                compute_hits: hits,
+                hits_timeout_ns: hits_timeout,
+                hits_skip_reason: hits_reason,
+                compute_cycles: false,
+                cycles_timeout_ns: 0,
+                max_cycles_to_store: 10,
+                cycles_skip_reason: "graph too large (>2000 nodes)",
+                compute_eigenvector: true,
+                compute_critical_path: true,
+                compute_kcore: true,
+                compute_articulation: true,
+                compute_slack: true,
+            }
+        }
+    }
 }
 
 /// Phase 1 results — always available immediately.
@@ -227,6 +449,7 @@ pub fn build_graph(issues: &[bv_core::model::Issue]) -> DiGraph {
     for i in &sorted {
         g.add_node(&i.id);
     }
+    let mut edges: Vec<(usize, usize)> = Vec::with_capacity(sorted.len() * 2);
     for i in &sorted {
         let from = match g.node_idx(&i.id) {
             Some(x) => x,
@@ -241,9 +464,23 @@ pub fn build_graph(issues: &[bv_core::model::Issue]) -> DiGraph {
             if let Some(to) = g.node_idx(&target) {
                 // Go keeps self-loops (gonum SetEdge accepts them); they
                 // participate in out-degree and cycle detection there.
-                g.add_edge(from, to);
+                edges.push((from, to));
             }
         }
+    }
+    // Go's `buildCachedAdjacency` sorts every node's neighbour list before the
+    // Brandes walk (betweenness_approx.go:59, :70), and `network.Betweenness`
+    // consumes the same gonum graph. Successor order is not cosmetic: the BFS
+    // stack order follows it, and the delta accumulation is floating point, so
+    // an unsorted list changes the per-node scores. Measured on
+    // large_cyclic_600, 473 of 600 nodes differ between insertion order and
+    // target-index order.
+    //
+    // Node indices are already id-sorted (see above), so sorting by target
+    // index is exactly Go's `sort.Ints(neighbors)`.
+    edges.sort_by_key(|&(from, to)| (from, to));
+    for (from, to) in edges {
+        g.add_edge(from, to);
     }
     g
 }
@@ -572,6 +809,7 @@ mod tests {
             created_at: None,
             updated_at: None,
             due_date: None,
+            defer_until: None,
             closed_at: None,
             external_ref: None,
             compaction_level: 0,
@@ -734,5 +972,120 @@ mod tests {
                 "Slack"
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod config_for_size_tests {
+    use super::*;
+    use serde_json::Value;
+
+    /// The three tiers that appear in the frozen corpus, pinned to the exact
+    /// `analysis_config` objects Go emitted for them. Read from
+    /// `golden/{medium_tree,large_cyclic_600,xl_2500}____robot_insights.json`.
+    fn golden(name: &str) -> Value {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("repo root");
+        let txt = std::fs::read_to_string(
+            repo.join("golden")
+                .join(format!("{name}____robot_insights.json")),
+        )
+        .expect("golden readable");
+        serde_json::from_str::<Value>(&txt).expect("golden parses")["analysis_config"].clone()
+    }
+
+    fn assert_matches_golden(node_count: usize, edge_count: usize, density: f64, name: &str) {
+        let got = serde_json::to_value(config_for_size(node_count, edge_count, density))
+            .expect("serializes");
+        let want = golden(name);
+        for (k, wv) in want.as_object().expect("golden object") {
+            let gv = got
+                .get(k)
+                .unwrap_or_else(|| panic!("{name}: missing field {k}"));
+            assert_eq!(gv, wv, "{name}: field {k}");
+        }
+        // No field beyond Go's set may appear — extra fields are a parity break.
+        for k in got.as_object().expect("serialized object").keys() {
+            assert!(
+                want.get(k).is_some(),
+                "{name}: Rust emitted extra field {k} that Go does not"
+            );
+        }
+    }
+
+    #[test]
+    fn medium_tier_matches_go() {
+        // medium_tree: 121 issues -> 100..499 tier.
+        assert_matches_golden(121, 120, 0.0, "medium_tree");
+    }
+
+    #[test]
+    fn large_tier_matches_go() {
+        // large_cyclic_600: 600 issues, sparse -> approximate, sample 100.
+        assert_matches_golden(600, 900, 0.0025, "large_cyclic_600");
+    }
+
+    #[test]
+    fn xl_tier_matches_go() {
+        // xl_2500: 2500 issues -> approximate sample 200, cycles skipped.
+        assert_matches_golden(2500, 5000, 0.0008, "xl_2500");
+    }
+
+    #[test]
+    fn small_tier_is_exact_with_two_second_budgets() {
+        let c = config_for_size(12, 11, 0.0);
+        assert_eq!(c.betweenness_mode, "exact");
+        assert_eq!(c.betweenness_timeout_ns, 2_000_000_000);
+        assert_eq!(c.max_cycles_to_store, 1000);
+        assert!(c.compute_cycles && c.compute_hits);
+    }
+
+    #[test]
+    fn large_dense_graph_skips_betweenness() {
+        let c = config_for_size(800, 6000, 0.02);
+        assert!(!c.compute_betweenness);
+        assert_eq!(c.betweenness_mode, "skip");
+        assert_eq!(c.betweenness_timeout_ns, 0);
+        assert_eq!(
+            c.betweenness_skip_reason,
+            "graph too dense (density > 0.01)"
+        );
+    }
+
+    #[test]
+    fn xl_dense_graph_skips_hits_but_keeps_betweenness() {
+        let c = config_for_size(3000, 9000, 0.01);
+        assert!(c.compute_betweenness);
+        assert_eq!(c.betweenness_mode, "approximate");
+        assert!(!c.compute_hits);
+        assert_eq!(c.hits_skip_reason, "graph too large and dense");
+        assert_eq!(c.hits_timeout_ns, 0);
+    }
+
+    #[test]
+    fn recommend_sample_size_matches_go_tiers() {
+        let b = AnalysisBudget::default();
+        assert_eq!(b.recommend_sample_size(0, 0), 0);
+        assert_eq!(b.recommend_sample_size(12, 11), 12);
+        assert_eq!(b.recommend_sample_size(121, 120), 50);
+        assert_eq!(b.recommend_sample_size(600, 900), 100);
+        assert_eq!(b.recommend_sample_size(2500, 5000), 200);
+        // 1000/5 = 200 beats the floor of 50.
+        assert_eq!(b.recommend_sample_size(400, 300), 80);
+    }
+
+    #[test]
+    fn tier_boundaries_are_exact() {
+        assert_eq!(config_for_size(99, 0, 0.0).max_cycles_to_store, 1000);
+        assert_eq!(config_for_size(100, 0, 0.0).max_cycles_to_store, 100);
+        assert_eq!(config_for_size(499, 0, 0.0).max_cycles_to_store, 100);
+        assert_eq!(config_for_size(500, 0, 0.0).max_cycles_to_store, 50);
+        assert_eq!(config_for_size(1999, 0, 0.0).max_cycles_to_store, 50);
+        assert_eq!(config_for_size(2000, 0, 0.0).max_cycles_to_store, 10);
+        // Cycles flip off exactly at the XL boundary.
+        assert!(config_for_size(1999, 0, 0.0).compute_cycles);
+        assert!(!config_for_size(2000, 0, 0.0).compute_cycles);
     }
 }

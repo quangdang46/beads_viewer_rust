@@ -374,6 +374,26 @@ pub struct SearchHit {
 mod tests {
     use super::*;
 
+    /// A scratch directory unique to this call.
+    ///
+    /// Keying only on `SystemTime::now().as_nanos()` is not unique: the clock
+    /// is coarse enough that two tests running in parallel can read the same
+    /// nanosecond, land in the same directory, and corrupt each other's
+    /// index. That showed up as an intermittent
+    /// `load_rejects_bad_magic_version_and_trailing_data` failure under
+    /// `cargo test --workspace`. The counter guarantees uniqueness within the
+    /// process; the timestamp keeps separate runs from colliding.
+    fn unique_test_dir() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("bvvi-test-{nanos}-{seq}"))
+    }
+
     fn sample_index() -> VectorIndex {
         let mut idx = VectorIndex::new(4);
         idx.upsert("B-2", [1u8; 32], vec![0.0, 1.0, 0.0, 0.0])
@@ -388,13 +408,7 @@ mod tests {
     #[test]
     fn save_load_round_trip_preserves_entries() {
         let idx = sample_index();
-        let dir = std::env::temp_dir().join(format!(
-            "bvvi-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = unique_test_dir();
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("index.bvvi");
         idx.save(&path).unwrap();
@@ -413,13 +427,7 @@ mod tests {
     #[test]
     fn load_rejects_bad_magic_version_and_trailing_data() {
         let idx = sample_index();
-        let dir = std::env::temp_dir().join(format!(
-            "bvvi-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = unique_test_dir();
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("index.bvvi");
         idx.save(&path).unwrap();

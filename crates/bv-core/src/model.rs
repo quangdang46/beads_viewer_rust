@@ -121,9 +121,7 @@ impl Status {
 pub enum DependencyType {
     #[default]
     Blocks,
-    /// Go `DepConditionalBlocks` — blocking.
     ConditionalBlocks,
-    /// Go `DepWaitsFor` — blocking.
     WaitsFor,
     Related,
     ParentChild,
@@ -142,10 +140,12 @@ impl DependencyType {
         }
     }
 
-    /// Go `DependencyType.IsBlocking` — `""`, `blocks`, `conditional-blocks`,
-    /// and `waits-for` block. Everything else (including a type br invented
-    /// after this build) does not, so an unrecognized type is informational
-    /// rather than an error.
+    /// Go `DependencyType.IsBlocking` (pkg/model/types.go:439): `""`, `blocks`,
+    /// `conditional-blocks` and `waits-for` all block. `""` reaches here as
+    /// [`DependencyType::Blocks`] because [`DependencyType::parse`] maps it.
+    ///
+    /// The two typed conditional relationships are blocking even though their
+    /// names do not say so — they gate readiness exactly like `blocks` does.
     pub fn is_blocking(self) -> bool {
         matches!(
             self,
@@ -162,14 +162,25 @@ impl DependencyType {
             "related" => DependencyType::Related,
             "parent-child" => DependencyType::ParentChild,
             "discovered-from" => DependencyType::DiscoveredFrom,
-            // Go does not validate the type here: it interns whatever string
-            // the record carried, and `IsBlocking` returns false for a name it
-            // does not recognize. Modelling an unknown name as `related`
-            // reproduces that readiness decision (non-blocking) without
-            // rejecting the record. It is still lossy for the *string* — Go
-            // round-trips the original, this does not.
+            // Go's `IsValid` accepts any non-blank type so br's custom
+            // relationships survive loading, and `IsBlocking` is false for
+            // them. A non-blocking variant is therefore the faithful mapping
+            // for anything unrecognized; `raw_is_valid` records the difference
+            // so the loader can still tell a known type from a custom one.
             _ => DependencyType::Related,
         }
+    }
+
+    /// Go `DependencyType.IsValid` (pkg/model/types.go:431) is a non-blank
+    /// test, which is what keeps br's custom relationships loadable.
+    ///
+    /// The loader additionally accepts the **legacy empty** type. Go rejects
+    /// empty there, but Go's `IsBlocking` treats `""` as blocking, and
+    /// pre-typed beads data omits `type` entirely — so rejecting it here
+    /// would drop real issues rather than model them. Whitespace-only is
+    /// still invalid.
+    pub fn raw_is_valid(raw: &str) -> bool {
+        raw.is_empty() || !raw.trim().is_empty()
     }
 }
 
@@ -312,6 +323,14 @@ pub struct Issue {
     pub updated_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub due_date: Option<String>,
+    /// Scheduler deferral: hidden from ready/actionable until this instant
+    /// passes. Go `Issue.DeferUntil` (pkg/model/types.go:30).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_go_time"
+    )]
+    pub defer_until: Option<String>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -516,6 +535,7 @@ mod tests {
             created_at: Some("2026-01-01T00:00:00Z".into()),
             updated_at: Some("2026-01-02T00:00:00Z".into()),
             due_date: None,
+            defer_until: None,
             closed_at: None,
             external_ref: None,
             compaction_level: 0,
@@ -563,6 +583,7 @@ mod tests {
             created_at: None,
             updated_at: None,
             due_date: None,
+            defer_until: None,
             closed_at: None,
             external_ref: None,
             compaction_level: 0,
@@ -574,5 +595,114 @@ mod tests {
             comments: vec![],
             source_repo: String::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod dependency_type_parity_tests {
+    use super::DependencyType;
+
+    /// Go `pkg/model/types.go:420-441` defines six dependency types and
+    /// treats three of them (plus the legacy empty string) as blocking.
+    #[test]
+    fn all_six_go_types_round_trip() {
+        for raw in [
+            "blocks",
+            "conditional-blocks",
+            "waits-for",
+            "related",
+            "parent-child",
+            "discovered-from",
+        ] {
+            let parsed = DependencyType::parse(raw);
+            assert_eq!(parsed.as_str(), raw, "round trip failed for {raw}");
+        }
+    }
+
+    #[test]
+    fn blocking_set_matches_go() {
+        for raw in ["", "blocks", "conditional-blocks", "waits-for"] {
+            assert!(
+                DependencyType::parse(raw).is_blocking(),
+                "Go treats {raw:?} as blocking"
+            );
+        }
+        for raw in [
+            "related",
+            "parent-child",
+            "discovered-from",
+            "some-custom-type",
+        ] {
+            assert!(
+                !DependencyType::parse(raw).is_blocking(),
+                "Go does not treat {raw:?} as blocking"
+            );
+        }
+    }
+
+    /// The bug this closes: both conditional types previously fell through to
+    /// the non-blocking arm, so a `waits-for` edge silently stopped blocking
+    /// the issue that depended on it.
+    #[test]
+    fn conditional_types_are_blocking_not_related() {
+        for raw in ["conditional-blocks", "waits-for"] {
+            let t = DependencyType::parse(raw);
+            assert_ne!(
+                t,
+                DependencyType::Related,
+                "{raw} was collapsing to related"
+            );
+            assert!(t.is_blocking());
+        }
+    }
+
+    /// Go `IsValid` is a non-blank test, not an allowlist: custom br
+    /// relationships must stay loadable. The loader keeps one deliberate
+    /// exception — the legacy empty type, which Go's `IsBlocking` also treats
+    /// as blocking and which pre-typed beads data omits entirely.
+    #[test]
+    fn is_valid_accepts_any_non_blank_type() {
+        assert!(DependencyType::raw_is_valid(""));
+        assert!(!DependencyType::raw_is_valid("   "));
+        assert!(DependencyType::raw_is_valid("blocks"));
+        assert!(DependencyType::raw_is_valid("conditional-blocks"));
+        assert!(DependencyType::raw_is_valid("waits-for"));
+        assert!(DependencyType::raw_is_valid("tracks-instead-of-blocks"));
+    }
+
+    /// Regression guard: the loader rejects an issue whose dependency type
+    /// fails `raw_is_valid`, so an over-strict predicate silently drops whole
+    /// issues instead of failing loudly.
+    #[test]
+    fn every_go_typed_dependency_loads() {
+        for raw in [
+            "blocks",
+            "conditional-blocks",
+            "waits-for",
+            "related",
+            "parent-child",
+            "discovered-from",
+            "",
+        ] {
+            assert!(
+                DependencyType::raw_is_valid(raw),
+                "loader would reject an issue carrying a {raw:?} dependency"
+            );
+        }
+    }
+
+    /// Unknown types stay non-blocking, matching Go's `IsBlocking` for a
+    /// custom relationship.
+    #[test]
+    fn unknown_types_are_non_blocking() {
+        let t = DependencyType::parse("tracks-instead-of-blocks");
+        assert!(!t.is_blocking());
+    }
+
+    /// The legacy empty type still blocks, via the `Blocks` default.
+    #[test]
+    fn empty_type_defaults_to_blocks() {
+        assert_eq!(DependencyType::parse(""), DependencyType::Blocks);
+        assert!(DependencyType::parse("").is_blocking());
     }
 }

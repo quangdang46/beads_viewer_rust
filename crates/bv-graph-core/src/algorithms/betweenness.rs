@@ -131,36 +131,18 @@ fn single_source_betweenness(graph: &DiGraph, source: usize, bc: &mut [f64]) {
     }
 }
 
-/// Sample k unique indices from 0..n using Fisher-Yates shuffle.
+/// Sample `k` unique indices from `0..n` for use as Brandes pivots.
+///
+/// Go's `sampleIndices` ($GOROOT/pkg/analysis/betweenness_approx.go:402) draws
+/// from `rand.New(rand.NewSource(seed))`, so reproducing its pivot *set*
+/// requires Go's generator exactly — the seed alone is not enough, and an
+/// LCG with the same seed picks a different set. Approximate betweenness is a
+/// function of the pivots, so a different set is a different answer.
 fn sample_nodes(n: usize, k: usize, seed: Option<u64>) -> Vec<usize> {
-    let mut indices: Vec<usize> = (0..n).collect();
-
-    // Use getrandom for better randomness in WASM, or seed for testing
-    let mut rng_state = match seed {
-        Some(s) => s,
-        None => {
-            let mut buf = [0u8; 8];
-            // getrandom works in WASM with the wasm_js feature
-            let _ = getrandom::fill(&mut buf);
-            u64::from_le_bytes(buf)
-        }
-    };
-
-    // LCG for shuffling (simple but sufficient for sampling)
-    let lcg = |state: &mut u64| -> usize {
-        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-        (*state >> 33) as usize
-    };
-
-    // Fisher-Yates shuffle for first k elements
-    let k = k.min(n);
-    for i in 0..k {
-        let j = i + lcg(&mut rng_state) % (n - i);
-        indices.swap(i, j);
-    }
-
-    indices.truncate(k);
-    indices
+    // Go always seeds explicitly (the analyzer passes 1). Keep the
+    // unseeded path deterministic-by-seed rather than pulling OS entropy,
+    // which would make output irreproducible across runs.
+    crate::rand::sample_indices(n, k, seed.unwrap_or(1) as i64)
 }
 
 /// Recommend sample size based on graph characteristics.
