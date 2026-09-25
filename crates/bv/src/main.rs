@@ -836,24 +836,18 @@ th {{ background: #44475a; }}
                 .join("issues.jsonl")
                 .to_string_lossy()
                 .to_string();
-            let beads: Vec<bv_correlation::history::BeadInfo> = issues
-                .iter()
-                .map(|i| bv_correlation::history::BeadInfo {
-                    id: i.id.clone(),
-                    title: i.title.clone(),
-                    status: i.status.as_str().to_string(),
-                })
-                .collect();
             let generated_at = jiff_now();
-            match bv_correlation::history::build_history_report(
+            // Go main.go:7088-7095 builds the export's report on a correlator
+            // with the feedback store attached, exactly like the robot paths.
+            match generate_correlation_report(
                 &cwd,
-                &beads,
+                &issues,
                 &bv_correlation::history::HistoryOptions {
                     limit: 500,
                     ..Default::default()
                 },
-                None,
                 generated_at.clone(),
+                true,
             ) {
                 Ok(report) => {
                     match bv_export::time_travel::generate_history_for_export(
@@ -3465,23 +3459,9 @@ fn run_robot_history() -> ExitCode {
         }
     }
 
-    // Go builds BeadInfo from the loaded issues, in load order.
-    let beads: Vec<bv_correlation::history::BeadInfo> = issues
-        .iter()
-        .map(|i| bv_correlation::history::BeadInfo {
-            id: i.id.clone(),
-            title: i.title.clone(),
-            status: i.status.as_str().to_string(),
-        })
-        .collect();
-
-    let mut report = match bv_correlation::history::build_history_report(
-        &cwd,
-        &beads,
-        &opts,
-        None,
-        jiff_now(),
-    ) {
+    // Go builds BeadInfo from the loaded issues, in load order, on a correlator
+    // with the feedback store attached (robot_registry.go:2623-2632).
+    let mut report = match generate_correlation_report(&cwd, &issues, &opts, jiff_now(), true) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Error: generating history report: {e}");
@@ -3587,22 +3567,7 @@ fn run_robot_orphans() -> ExitCode {
         None => 30,
     };
 
-    let beads: Vec<bv_correlation::history::BeadInfo> = issues
-        .iter()
-        .map(|i| bv_correlation::history::BeadInfo {
-            id: i.id.clone(),
-            title: i.title.clone(),
-            status: i.status.as_str().to_string(),
-        })
-        .collect();
-
-    let report = match bv_correlation::history::build_history_report(
-        &cwd,
-        &beads,
-        &opts,
-        None,
-        jiff_now(),
-    ) {
+    let report = match generate_correlation_report(&cwd, &issues, &opts, jiff_now(), true) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Error: generating history report: {e}");
@@ -8560,28 +8525,16 @@ fn run_robot_causality(args: &[String]) -> ExitCode {
         }
     }
 
-    // Go builds BeadInfo from the loaded issues, in load order.
-    let beads: Vec<bv_correlation::history::BeadInfo> = issues
-        .iter()
-        .map(|i| bv_correlation::history::BeadInfo {
-            id: i.id.clone(),
-            title: i.title.clone(),
-            status: i.status.as_str().to_string(),
-        })
-        .collect();
-
     // One frozen instant for both the chain's open end and the result stamp, so
     // `end_time` and `generated_at` cannot disagree.
     let now = jiff_now();
-    let report =
-        match bv_correlation::history::build_history_report(&cwd, &beads, &opts, None, now.clone())
-        {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("Error: generating history report: {e}");
-                return ExitCode::from(1);
-            }
-        };
+    let report = match generate_correlation_report(&cwd, &issues, &opts, now.clone(), true) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error: generating history report: {e}");
+            return ExitCode::from(1);
+        }
+    };
 
     let Some(history) = report.histories.get(&bead_id) else {
         eprintln!("Bead not found: {bead_id}");
@@ -8733,31 +8686,24 @@ fn run_robot_related(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    if !issues.iter().any(|i| i.id == bead_id) {
-        eprintln!("Bead not found: {bead_id}");
-        return ExitCode::from(1);
-    }
+    // No membership pre-check here: Go's handleRobotRelatedWork goes straight
+    // to the report and lets `FindRelatedWorkAt` return nil, so an unknown bead
+    // is reported as "Bead not found in history" (below) rather than by a
+    // separate message Rust used to print first.
 
-    // Go robot_registry.go:3272-3286 builds the report and threads the three
-    // flags into `RelatedWorkOptions` before calling `FindRelatedWorkAt`.
-    let beads: Vec<bv_correlation::history::BeadInfo> = issues
-        .iter()
-        .map(|i| bv_correlation::history::BeadInfo {
-            id: i.id.clone(),
-            title: i.title.clone(),
-            status: i.status.as_str().to_string(),
-        })
-        .collect();
+    // Go robot_registry.go:3272-3286 builds the report on a correlator with the
+    // feedback store attached, then threads the three flags into
+    // `RelatedWorkOptions` before calling `FindRelatedWorkAt`.
     let now = jiff_now();
-    let report = match bv_correlation::history::build_history_report(
+    let report = match generate_correlation_report(
         &cwd,
-        &beads,
+        &issues,
         &bv_correlation::history::HistoryOptions {
             limit: 500,
             ..Default::default()
         },
-        None,
         now.clone(),
+        true,
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -8769,16 +8715,56 @@ fn run_robot_related(args: &[String]) -> ExitCode {
     opts.min_relevance = min_relevance;
     opts.max_results = max_results;
     opts.include_closed = include_closed;
+    // Go robot_registry.go:3268-3277 builds the adjacency from the dispatch
+    // context's issue set — every dependency edge, unfiltered by type — and
+    // always passes a (possibly empty) non-nil map. Leaving this `None` skips
+    // the dependency-cluster detector outright, so `--robot-related` reports
+    // no dependency neighbours at all and serializes the field as `[]`
+    // where Go's nil accumulator gives `null`.
+    opts.dependency_graph = Some(
+        issues
+            .iter()
+            .filter_map(|issue| {
+                let deps: Vec<String> = issue
+                    .dependencies
+                    .iter()
+                    .map(|d| d.depends_on_id.clone())
+                    .collect();
+                if deps.is_empty() {
+                    None
+                } else {
+                    Some((issue.id.clone(), deps))
+                }
+            })
+            .collect(),
+    );
     let Some(result) =
         bv_correlation::related::find_related_work_at(&report, &bead_id, &opts, robot_now())
     else {
+        // Go robot_registry.go:3288 — `Bead not found in history: <id>`.
         eprintln!("Bead not found in history: {bead_id}");
         return ExitCode::from(1);
     };
 
     // Go robot_registry.go:3292 — `withEnvelope(envelope, result)` merges the
     // result's fields into the envelope at top level rather than nesting it.
-    let mut payload = full_envelope_for(&report.data_hash, &issues);
+    //
+    // `ctx.EnvelopeWithHash(report.DataHash)` overrides only the envelope's own
+    // `data_hash` and `scope_hash`; `source_authority` and the `authority_hash`
+    // derived from it still carry the loader's full-file sha256. Build the
+    // envelope with the file hash, then substitute the two report-derived
+    // fields — the same order run_robot_history and run_robot_file_hotspots use.
+    let file_hash = bv_core::data_hash::compute_data_hash(&issues);
+    let mut payload = full_envelope_for(&file_hash, &issues);
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("data_hash".into(), serde_json::json!(report.data_hash));
+        let mut ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
+        ids.sort();
+        let scope_hash = bv_robot::scope_hash("", "", "", &report.data_hash, &ids);
+        if !scope_hash.is_empty() {
+            obj.insert("scope_hash".into(), serde_json::json!(scope_hash));
+        }
+    }
     if let Some(obj) = serde_json::to_value(&result)
         .ok()
         .and_then(|v| v.as_object().cloned())
@@ -9529,7 +9515,120 @@ fn load_correlation_report(
     Ok((issues, hash, report))
 }
 
+/// Go `loadCorrelationFeedbackStore` (robot_registry.go:2744-2754) — the store
+/// the discovered beads directory implies, read from
+/// `<beadsDir>/correlation_feedback.jsonl`. A missing file is not an error
+/// (Go's `Load` returns nil on `os.IsNotExist`), it is an empty store.
+///
+/// Returns `None` only when the beads directory cannot be resolved at all;
+/// Go propagates that as `getting beads directory`, but an unresolvable dir
+/// already fails the repository validation every one of these handlers runs
+/// first, so there is no reachable output difference.
+fn load_correlation_feedback_store(
+    cwd: &std::path::Path,
+) -> Option<bv_correlation::feedback::FeedbackStore> {
+    let dir = bv_core::discovery::get_beads_dir(cwd).ok()?;
+    Some(bv_correlation::feedback::FeedbackStore::new(&dir))
+}
+
+/// Go `generateCorrelationReport` (robot_registry.go:2700-2714) — the correlator
+/// every read path in `cmd/bv` is built with: `NewCorrelator(...).WithFeedbackStore(...)`,
+/// so a stored confirm/reject shapes histories, the commit index and the stats
+/// before any of them is read.
+///
+/// `with_feedback: false` is Go's `generateRawCorrelationReport` (2721-2731),
+/// used only by the two handlers whose subject is a raw correlation:
+/// `--robot-explain-correlation` and `--robot-confirm/reject-correlation`.
+fn generate_correlation_report(
+    cwd: &std::path::Path,
+    issues: &[bv_core::model::Issue],
+    opts: &bv_correlation::history::HistoryOptions,
+    generated_at: String,
+    with_feedback: bool,
+) -> Result<bv_correlation::history::HistoryReport, String> {
+    let beads: Vec<bv_correlation::history::BeadInfo> = issues
+        .iter()
+        .map(|i| bv_correlation::history::BeadInfo {
+            id: i.id.clone(),
+            title: i.title.clone(),
+            status: i.status.as_str().to_string(),
+        })
+        .collect();
+    let store = if with_feedback {
+        load_correlation_feedback_store(cwd)
+    } else {
+        None
+    };
+    bv_correlation::history::build_history_report_with_feedback(
+        cwd,
+        &beads,
+        opts,
+        None,
+        generated_at,
+        store.as_ref(),
+    )
+}
+
+/// Go `parseCorrelationArg` (robot_registry.go:2756-2767) — `SHA:beadID`.
+fn parse_correlation_arg(arg: &str) -> Result<(String, String), String> {
+    let trimmed = arg.trim();
+    let Some((sha, bead_id)) = trimmed.split_once(':') else {
+        return Err(format!("expected format: SHA:beadID, got: {arg:?}"));
+    };
+    let (sha, bead_id) = (sha.trim().to_string(), bead_id.trim().to_string());
+    if sha.is_empty() || bead_id.is_empty() {
+        return Err(format!(
+            "expected non-empty SHA and bead ID in format SHA:beadID, got: {arg:?}"
+        ));
+    }
+    Ok((sha, bead_id))
+}
+
+/// Go `resolveCorrelatedCommit` (robot_registry.go:2769-2801) — find the one
+/// commit in a bead's history that `sha` names. An exact full-SHA hit wins
+/// outright; otherwise a short-SHA equality or full-SHA prefix is a candidate,
+/// and more than one distinct candidate is an error rather than a guess.
+fn resolve_correlated_commit<'a>(
+    commits: &'a [bv_correlation::history::HistoryCommit],
+    sha: &str,
+) -> Result<Option<&'a bv_correlation::history::HistoryCommit>, String> {
+    let sha = sha.trim().to_lowercase();
+    if sha.is_empty() {
+        return Err("commit SHA is required".to_string());
+    }
+    let mut matches: Vec<(usize, &str)> = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (i, commit) in commits.iter().enumerate() {
+        let commit_sha = commit.sha.to_lowercase();
+        if commit_sha == sha {
+            return Ok(Some(&commits[i]));
+        }
+        let short_sha = commit.short_sha.to_lowercase();
+        if (short_sha == sha || commit_sha.starts_with(&sha)) && seen.insert(commit.sha.as_str()) {
+            matches.push((i, commit.sha.as_str()));
+        }
+    }
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(Some(&commits[matches[0].0])),
+        _ => {
+            let mut shas: Vec<&str> = matches.iter().map(|(_, sha)| *sha).collect();
+            shas.sort_unstable();
+            Err(format!(
+                "ambiguous commit SHA prefix {sha:?} matches {} commits: {}",
+                shas.len(),
+                shas.join(", ")
+            ))
+        }
+    }
+}
+
 /// Go `handleRobotExplainCorrelation` — `--robot-explain-correlation SHA:beadID`.
+///
+/// Go encodes the bare `CorrelationExplanation` here: no robot envelope and no
+/// wrapper key (robot_registry.go:2871-2887). The report is the *raw* one, so
+/// a rejected pair can still be explained; the stored decision is attached to
+/// the explanation and overrides its recommendation.
 fn run_robot_explain_correlation(args: &[String]) -> ExitCode {
     let raw = args
         .iter()
@@ -9537,83 +9636,128 @@ fn run_robot_explain_correlation(args: &[String]) -> ExitCode {
         .and_then(|i| args.get(i + 1))
         .cloned()
         .unwrap_or_default();
-    let Some((sha, bead_id)) = raw.split_once(':') else {
-        eprintln!("Error: expected format SHA:beadID, got: {raw:?}");
-        return ExitCode::from(2);
+    let (sha, bead_id) = match parse_correlation_arg(&raw) {
+        Ok(x) => x,
+        Err(e) => {
+            // Go's dispatcher prints `Error handling <flag>: <err>` and exits
+            // with the handler's code, which for a failed parse is 1 (the
+            // handler returned an error, not a usage violation).
+            eprintln!("Error handling --robot-explain-correlation: {e}");
+            return ExitCode::from(1);
+        }
     };
-    let (sha, bead_id) = (sha.trim().to_lowercase(), bead_id.trim());
 
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (_issues, hash, report) = match load_correlation_report(&cwd) {
+    let (issues, _, _) = match load_issues_auto(&cwd, None) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
             return ExitCode::from(1);
         }
     };
-    let Some(commits) = report.get(bead_id) else {
-        eprintln!("Bead not found in correlation report: {bead_id}");
+
+    // Go: `CorrelatorOptions{BeadID: beadID}` — no Limit, so the walk is
+    // unbounded and only this bead's history is assembled.
+    let report = match generate_correlation_report(
+        &cwd,
+        &issues,
+        &bv_correlation::history::HistoryOptions {
+            bead_id: bead_id.clone(),
+            ..Default::default()
+        },
+        jiff_now(),
+        false,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error: generating report: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let Some(history) = report.histories.get(&bead_id) else {
+        eprintln!("Bead not found: {bead_id}");
         return ExitCode::from(1);
     };
-    let Some(hit) = commits
-        .iter()
-        .find(|c| c.sha.to_lowercase().starts_with(&sha))
-    else {
-        eprintln!("Commit {sha} not found in bead {bead_id} correlations");
-        return ExitCode::from(1);
+    let commits = history.commits.as_deref().unwrap_or(&[]);
+    let target = match resolve_correlated_commit(commits, &sha) {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            eprintln!("Commit {sha} not found in bead {bead_id} correlations");
+            return ExitCode::from(1);
+        }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
     };
-    let mut payload = full_envelope_for(&hash, &[]);
-    payload["explanation"] = serde_json::to_value(hit).unwrap_or_default();
-    emit_json(&payload)
+
+    let mut explanation = bv_correlation::scorer::build_explanation(target, &bead_id);
+    if let Some(store) = load_correlation_feedback_store(&cwd) {
+        let all = store.load_all();
+        if let Some(fb) = all.get(&(target.sha.clone(), bead_id.clone())) {
+            explanation.recommendation = describe_correlation_feedback(fb);
+            explanation.feedback = Some(fb.clone());
+        }
+    }
+    emit_json(&serde_json::to_value(&explanation).unwrap_or_default())
+}
+
+/// Go `describeCorrelationFeedback` (robot_registry.go:3899-3919) — the
+/// `<verb> by feedback` phrase a stored decision replaces the recommendation
+/// with. Its switch has no default arm beyond the pass-through, so an
+/// unrecognised type is spelled out verbatim.
+fn describe_correlation_feedback(fb: &bv_correlation::feedback::CorrelationFeedback) -> String {
+    let verb = match fb.feedback_type.as_str() {
+        "confirm" => "confirmed",
+        "reject" => "rejected",
+        "ignore" => "ignored",
+        other => other,
+    };
+    let mut s = format!("{verb} by feedback");
+    let by = fb.feedback_by.trim();
+    if !by.is_empty() {
+        s.push_str(&format!(" ({by})"));
+    }
+    let reason = fb.reason.trim();
+    if !reason.is_empty() {
+        s.push_str(&format!(": {reason}"));
+    }
+    s
 }
 
 /// Go `handleRobotCorrelationStats` — `--robot-correlation-stats`.
+///
+/// Go's output struct (robot_registry.go:2805-2828) *embeds*
+/// `correlation.FeedbackStats` and then `generated_at` / `output_format` /
+/// `version`. It does **not** embed `RobotEnvelope`, so there is no
+/// `data_hash`, no `source_path`, no `scope_hash` — the seven `FeedbackStats`
+/// fields sit at the top level beside three envelope-shaped scalars. The
+/// numbers come from the feedback store alone: no correlation report is
+/// generated on this path.
 fn run_robot_correlation_stats() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (_issues, hash, report) = match load_correlation_report(&cwd) {
-        Ok(x) => x,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            return ExitCode::from(1);
-        }
+    let Some(store) = load_correlation_feedback_store(&cwd) else {
+        eprintln!("Error: getting beads directory");
+        return ExitCode::from(1);
     };
-    let total_commits: usize = report.values().map(|v| v.len()).sum();
-    let (mut explicit, mut temporal) = (0usize, 0usize);
-    let mut confidences: Vec<f64> = Vec::new();
-    for commits in report.values() {
-        for c in commits {
-            confidences.push(c.confidence);
-            if c.methods.contains(&"explicit_id") {
-                explicit += 1;
-            }
-            if c.methods.contains(&"temporal_author") {
-                temporal += 1;
-            }
+    let stats = store.get_stats();
+
+    // Field order is Go's declaration order: the embedded struct first, then
+    // generated_at / output_format (omitempty) / version.
+    let mut obj = serde_json::Map::new();
+    if let Ok(serde_json::Value::Object(fields)) = serde_json::to_value(stats) {
+        for (k, v) in fields {
+            obj.insert(k, v);
         }
     }
-    let avg_confidence = if confidences.is_empty() {
-        0.0
-    } else {
-        confidences.iter().sum::<f64>() / confidences.len() as f64
-    };
-    let beads_dir = cwd.join(".beads");
-    let store = bv_correlation::feedback::FeedbackStore::new(&beads_dir);
-    let (confirmed, rejected, ignored, accuracy) = store.stats();
-
-    let mut payload = full_envelope_for(&hash, &_issues);
-    payload["stats"] = serde_json::json!({
-        "correlated_beads": report.len(),
-        "total_correlated_commits": total_commits,
-        "by_method": { "explicit_id": explicit, "temporal_author": temporal },
-        "avg_confidence": avg_confidence,
-        "feedback": {
-            "confirmed": confirmed,
-            "rejected": rejected,
-            "ignored": ignored,
-            "accuracy": accuracy,
-        },
-    });
-    emit_json(&payload)
+    obj.insert("generated_at".into(), serde_json::json!(jiff_now()));
+    let fmt = output_format();
+    if !fmt.is_empty() {
+        obj.insert("output_format".into(), serde_json::json!(fmt));
+    }
+    obj.insert("version".into(), serde_json::json!(GO_APP_VERSION));
+    emit_json(&serde_json::Value::Object(obj))
 }
 
 /// Go `handleRobotFileBeads` — `--robot-file-beads <path>`.
@@ -9695,59 +9839,77 @@ fn run_robot_file_beads(args: &[String]) -> ExitCode {
 }
 
 /// Go `handleRobotFileHotspots` — `--robot-file-hotspots`.
+///
+/// Go (robot_registry.go:3924-3963) builds a `*HistoryReport` via the shared
+/// `generateCorrelationReport`, hands it to `correlation.NewFileLookup`, and
+/// emits `GetHotspots(hotspotsLimit)` alongside `GetStats()`. Both come from
+/// the same `FileBeadIndex`, so the entries and the aggregate counts can never
+/// disagree. The earlier Rust version rebuilt its own `{path, bead_count,
+/// beads}` shape off the sha-only correlation map, which has no per-file
+/// history and no index stats.
 fn run_robot_file_hotspots(args: &[String]) -> ExitCode {
-    // Go main.go:1566 registers `--hotspots-limit` with default 10, threaded
-    // through robot_registry.go:3946-3949 into `GetHotspots`, whose
-    // `limit <= 0 || limit > len(counts)` guard (file_index.go:370) makes 0
-    // mean "every hotspot" rather than "none".
-    let hotspots_limit: i64 = flag_value(args, "hotspots-limit")
-        .and_then(|raw| go_parse_int_base0(raw).ok())
-        .unwrap_or(10);
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (_issues, hash, report) = match load_correlation_report(&cwd) {
+    if let Err(e) = validate_correlation_repository(&cwd) {
+        eprintln!("Error: {e}");
+        return ExitCode::from(1);
+    }
+    let (issues, _, _) = match load_issues_auto(&cwd, None) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
             return ExitCode::from(1);
         }
     };
-    let mut per_file: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
-        std::collections::BTreeMap::new();
-    for (bead_id, commits) in &report {
-        for c in commits {
-            for f in &c.files {
-                per_file
-                    .entry(f.clone())
-                    .or_default()
-                    .insert(bead_id.clone());
-            }
+
+    // Go main.go:1566 registers `--hotspots-limit` with default 10, threaded
+    // through robot_registry.go:3946-3949 into `GetHotspots`, whose
+    // `limit <= 0 || limit > len(counts)` guard (file_index.go:370) makes 0
+    // mean "every hotspot" rather than "none". Signed, for the same reason.
+    let hotspots_limit: i64 = flag_value(args, "hotspots-limit")
+        .and_then(|raw| go_parse_int_base0(raw).ok())
+        .unwrap_or(10);
+
+    // Go: `limit := 500; if cfg.HistoryLimit != nil { limit = *cfg.HistoryLimit }`.
+    let mut opts = bv_correlation::history::HistoryOptions {
+        limit: 500,
+        ..Default::default()
+    };
+    if let Some(raw) = flag_value(args, "history-limit") {
+        if let Ok(v) = go_parse_int_base0(raw.trim()) {
+            opts.limit = v;
         }
     }
-    let mut hotspots: Vec<serde_json::Value> = per_file
-        .iter()
-        .map(|(path, beads)| {
-            serde_json::json!({
-                "path": path,
-                "bead_count": beads.len(),
-                "beads": beads.iter().collect::<Vec<_>>(),
-            })
-        })
-        .collect();
-    hotspots.sort_by(|a, b| {
-        b["bead_count"]
-            .as_u64()
-            .cmp(&a["bead_count"].as_u64())
-            .then_with(|| a["path"].as_str().cmp(&b["path"].as_str()))
-    });
-    // Go file_index.go:370 — `limit <= 0 || limit > len(counts) { limit = len(counts) }`.
-    let limit = if hotspots_limit <= 0 || hotspots_limit as usize > hotspots.len() {
-        hotspots.len()
-    } else {
-        hotspots_limit as usize
+
+    let report = match generate_correlation_report(&cwd, &issues, &opts, jiff_now(), true) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error: generating history report: {e}");
+            return ExitCode::from(1);
+        }
     };
-    hotspots.truncate(limit);
-    let mut payload = full_envelope_for(&hash, &_issues);
-    payload["hotspots"] = serde_json::Value::Array(hotspots);
+
+    let file_lookup = bv_correlation::file_index::FileLookup::new(&report);
+    let hotspots = file_lookup.get_hotspots(hotspots_limit);
+    let stats = file_lookup.stats();
+
+    // Go's `ctx.EnvelopeWithHash(report.DataHash)` overrides only the envelope's
+    // own `data_hash` and `scope_hash`; `source_authority` and the
+    // `authority_hash` derived from it still carry the *loader's* full-file
+    // sha256. Build the envelope with the file hash, then substitute the two
+    // report-derived fields — the same order run_robot_history uses.
+    let file_hash = bv_core::data_hash::compute_data_hash(&issues);
+    let mut payload = full_envelope_for(&file_hash, &issues);
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("data_hash".into(), serde_json::json!(report.data_hash));
+        let mut ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
+        ids.sort();
+        let scope_hash = bv_robot::scope_hash("", "", "", &report.data_hash, &ids);
+        if !scope_hash.is_empty() {
+            obj.insert("scope_hash".into(), serde_json::json!(scope_hash));
+        }
+    }
+    payload["hotspots"] = serde_json::to_value(hotspots).unwrap_or(serde_json::Value::Null);
+    payload["stats"] = serde_json::to_value(stats).unwrap_or(serde_json::Value::Null);
     emit_json(&payload)
 }
 
@@ -10088,7 +10250,23 @@ fn run_robot_blocker_chain(args: &[String]) -> ExitCode {
 /// short SHA, or unambiguous prefix), and records feedback with the
 /// commit's `original_conf` from the report. Returns exit code 1 if the
 /// SHA is not found or ambiguous, matching Go behavior.
+/// Go `handleRobotCorrelationFeedback` — `--robot-confirm-correlation` /
+/// `--robot-reject-correlation <sha>:<bead>`.
+///
+/// Go encodes a bare `map[string]interface{}` here, with no robot envelope
+/// (robot_registry.go:2955-2965), and Go marshals a map in sorted key order:
+/// bead, by, commit, orig_conf, reason, status.
+///
+/// The report is the *raw* one on purpose: feedback is a decision about a raw
+/// correlation, so the target must still resolve after an earlier rejection
+/// (letting a rejection be flipped) and `orig_conf` must record the strategy
+/// confidence rather than a value a previous confirmation pinned to 1.0.
 fn run_robot_correlation_feedback(args: &[String], flag: &str, feedback_type: &str) -> ExitCode {
+    let status = if feedback_type == "reject" {
+        "rejected"
+    } else {
+        "confirmed"
+    };
     let flag_name = format!("--robot-{flag}");
     let raw = args
         .iter()
@@ -10096,38 +10274,53 @@ fn run_robot_correlation_feedback(args: &[String], flag: &str, feedback_type: &s
         .and_then(|i| args.get(i + 1))
         .cloned()
         .unwrap_or_default();
-    let Some((sha, bead_id)) = raw.split_once(':') else {
-        eprintln!("Error: expected format SHA:beadID, got: {raw:?}");
-        return ExitCode::from(2);
+    let (sha, bead_id) = match parse_correlation_arg(&raw) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("Error handling {flag_name}: {e}");
+            return ExitCode::from(1);
+        }
     };
-    let (sha, bead_id) = (sha.trim(), bead_id.trim());
-    if sha.is_empty() || bead_id.is_empty() {
-        eprintln!("Error: expected non-empty SHA and bead ID in format SHA:beadID, got: {raw:?}");
-        return ExitCode::from(2);
-    }
 
     let cwd = std::env::current_dir().unwrap_or_default();
-
-    // Generate correlation report via the correlator pipeline.
-    let (_issues, hash, report) = match load_correlation_report(&cwd) {
+    let (issues, _, _) = match load_issues_auto(&cwd, None) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
             return ExitCode::from(1);
         }
     };
-
-    // Look up bead's correlation history.
-    let Some(commits) = report.get(bead_id) else {
-        eprintln!("Bead not found: {bead_id}");
+    let Some(store) = load_correlation_feedback_store(&cwd) else {
+        eprintln!("Error: getting beads directory");
         return ExitCode::from(1);
     };
 
-    // Resolve SHA against the bead's correlated commits.
-    let target = match bv_correlation::correlator::resolve_correlated_commit(commits, sha) {
+    let report = match generate_correlation_report(
+        &cwd,
+        &issues,
+        &bv_correlation::history::HistoryOptions {
+            bead_id: bead_id.clone(),
+            ..Default::default()
+        },
+        jiff_now(),
+        false,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error: generating report: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let Some(history) = report.histories.get(&bead_id) else {
+        eprintln!("Bead not found: {bead_id}");
+        return ExitCode::from(1);
+    };
+    let commits = history.commits.as_deref().unwrap_or(&[]);
+    let target = match resolve_correlated_commit(commits, &sha) {
         Ok(Some(c)) => c,
         Ok(None) => {
-            eprintln!("Commit SHA not found in bead {bead_id} correlations");
+            eprintln!("Commit {sha} not found in bead {bead_id} correlations");
             return ExitCode::from(1);
         }
         Err(e) => {
@@ -10135,19 +10328,29 @@ fn run_robot_correlation_feedback(args: &[String], flag: &str, feedback_type: &s
             return ExitCode::from(1);
         }
     };
-
-    let resolved_sha = target.sha.clone();
     let original_conf = target.confidence;
+    let resolved_sha = target.sha.clone();
 
-    let beads_dir = cwd.join(".beads");
-    let store = bv_correlation::feedback::FeedbackStore::new(&beads_dir);
+    // Go main.go:1556-1557 registers `--correlation-by` (default "cli") and
+    // `--correlation-reason` (default ""); `--correlation-by` is trimmed and
+    // only overrides the default when non-empty, `--correlation-reason` is
+    // taken verbatim.
+    let mut feedback_by = "cli".to_string();
+    if let Some(raw_by) = flag_value(args, "correlation-by") {
+        let trimmed = raw_by.trim();
+        if !trimmed.is_empty() {
+            feedback_by = trimmed.to_string();
+        }
+    }
+    let reason = flag_value(args, "correlation-reason").unwrap_or_default();
+
     let fb = bv_correlation::feedback::CorrelationFeedback {
-        commit_sha: resolved_sha.to_lowercase(),
-        bead_id: bead_id.to_string(),
+        commit_sha: resolved_sha.clone(),
+        bead_id: bead_id.clone(),
         feedback_at: jiff_now(),
-        feedback_by: "cli".to_string(),
+        feedback_by: feedback_by.clone(),
         feedback_type: feedback_type.to_string(),
-        reason: String::new(),
+        reason: reason.to_string(),
         original_conf,
     };
     if let Err(e) = store.record(&fb) {
@@ -10155,16 +10358,14 @@ fn run_robot_correlation_feedback(args: &[String], flag: &str, feedback_type: &s
         return ExitCode::from(1);
     }
 
-    let mut payload = full_envelope_for(&hash, &[]);
-    payload["commit"] = serde_json::json!(resolved_sha);
-    payload["bead"] = serde_json::json!(bead_id);
-    payload["status"] = serde_json::json!(if feedback_type == "confirm" {
-        "confirmed"
-    } else {
-        "rejected"
-    });
-    payload["orig_conf"] = serde_json::json!(original_conf);
-    emit_json(&payload)
+    let mut obj = serde_json::Map::new();
+    obj.insert("bead".into(), serde_json::json!(bead_id));
+    obj.insert("by".into(), serde_json::json!(feedback_by));
+    obj.insert("commit".into(), serde_json::json!(resolved_sha));
+    obj.insert("orig_conf".into(), serde_json::json!(original_conf));
+    obj.insert("reason".into(), serde_json::json!(reason));
+    obj.insert("status".into(), serde_json::json!(status));
+    emit_json(&serde_json::Value::Object(obj))
 }
 
 fn run_robot_label_health() -> ExitCode {

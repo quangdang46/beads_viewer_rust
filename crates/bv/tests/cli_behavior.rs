@@ -149,8 +149,33 @@ fn robot_correlation_stats_runs_without_crashing() {
     // pipeline end-to-end (git log walk + explicit/temporal scoring).
     let (code, stdout, _) = run_at_repo_root(&["--robot-correlation-stats"]);
     assert_eq!(code, 0);
-    assert!(stdout.contains("\"correlated_beads\""));
-    assert!(stdout.contains("\"by_method\""));
+    // Go's handler (robot_registry.go:2805-2828) embeds correlation.FeedbackStats
+    // and three envelope-shaped scalars; it does NOT embed RobotEnvelope, so
+    // there is no data_hash / source_path / scope_hash, and none of the
+    // per-correlation counters the old assertion looked for.
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
+    for key in [
+        "total_feedback",
+        "confirmed",
+        "rejected",
+        "ignored",
+        "accuracy_rate",
+        "avg_confirm_conf",
+        "avg_reject_conf",
+        "generated_at",
+        "output_format",
+        "version",
+    ] {
+        assert!(parsed.get(key).is_some(), "missing {key} in {stdout}");
+    }
+    assert!(parsed.get("data_hash").is_none(), "no envelope: {stdout}");
+    assert!(parsed.get("stats").is_none(), "no nested stats: {stdout}");
+    // total_feedback is the sum of the three buckets.
+    let buckets = ["confirmed", "rejected", "ignored"]
+        .iter()
+        .map(|k| parsed[*k].as_u64().unwrap())
+        .sum::<u64>();
+    assert_eq!(parsed["total_feedback"].as_u64().unwrap(), buckets);
 }
 
 #[test]
@@ -179,17 +204,87 @@ fn robot_causality_unknown_bead_exits_one() {
 
 #[test]
 fn robot_related_builds_dependency_edges() {
+    // Subject choice: `beads_viewer_rust-api-freeze-b73` is present in this
+    // repo's `.beads/issues.jsonl`, survives into the correlation report (so
+    // `FindRelatedWorkAt` returns non-nil rather than "Bead not found"), and
+    // genuinely carries dependency edges — it depends on
+    // `beads_viewer_rust-fort-epic-u31` and `beads_viewer_rust-phase0-scaffold-xbe`.
+    //
+    // Every dependency edge in this repo points at a *closed* bead, and Go's
+    // `findDependencyCluster` drops closed candidates unless IncludeClosed is
+    // set (related.go). So the edge assertion needs `--related-include-closed`;
+    // without it the detector correctly returns Go's nil slice, i.e. `null`.
+    let (code, stdout, _) = run_at_repo_root(&[
+        "--robot-related",
+        "beads_viewer_rust-api-freeze-b73",
+        "--related-include-closed",
+    ]);
+    assert_eq!(code, 0);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
+
+    // Go's RelatedWorkResult field names (related.go:37-46). There is no
+    // `related` and no `bead_id` key — the identity fields are `target_bead_id`
+    // and `target_title`.
+    assert_eq!(parsed["target_bead_id"], "beads_viewer_rust-api-freeze-b73");
+    assert_eq!(
+        parsed["target_title"],
+        "Phase 0.5: API Contract Freeze (api-freeze-v1)"
+    );
+    for key in [
+        "file_overlap",
+        "commit_overlap",
+        "dependency_cluster",
+        "concurrent",
+    ] {
+        assert!(parsed.get(key).is_some(), "missing {key} in {stdout}");
+    }
+
+    // The bead has two real dependency edges, so the cluster is non-empty.
+    let cluster = parsed["dependency_cluster"].as_array().expect("array");
+    assert!(
+        !cluster.is_empty(),
+        "should find at least one dependency edge: {stdout}"
+    );
+    let ids: Vec<&str> = cluster
+        .iter()
+        .map(|b| b["bead_id"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&"beads_viewer_rust-fort-epic-u31"),
+        "direct dependency missing from {ids:?}"
+    );
+    for entry in cluster {
+        assert_eq!(entry["relation_type"], "dependency_cluster");
+        assert!(entry["relevance"].as_i64().unwrap() >= 20);
+    }
+
+    // `total_related` is the sum of the four category lengths.
+    let total: usize = [
+        "file_overlap",
+        "commit_overlap",
+        "dependency_cluster",
+        "concurrent",
+    ]
+    .iter()
+    .map(|k| parsed[*k].as_array().map(Vec::len).unwrap_or(0))
+    .sum();
+    assert_eq!(parsed["total_related"].as_u64().unwrap() as usize, total);
+}
+
+#[test]
+fn robot_related_default_excludes_closed_candidates() {
+    // Same bead, no `--related-include-closed`: Go's nil accumulator must
+    // serialize as `null`, not `[]`, and the dependency cluster must be empty
+    // because every one of this repo's dependency targets is closed.
     let (code, stdout, _) =
         run_at_repo_root(&["--robot-related", "beads_viewer_rust-api-freeze-b73"]);
     assert_eq!(code, 0);
-    assert!(stdout.contains("\"related\""));
     let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
-    let related = parsed["related"].as_array().expect("array");
+    assert_eq!(parsed["target_bead_id"], "beads_viewer_rust-api-freeze-b73");
     assert!(
-        !related.is_empty(),
-        "should find at least one dependency edge"
+        parsed["dependency_cluster"].is_null(),
+        "closed dependencies are excluded by default: {stdout}"
     );
-    assert_eq!(parsed["bead_id"], "beads_viewer_rust-api-freeze-b73");
 }
 
 #[test]
@@ -241,8 +336,15 @@ fn robot_capacity_runs_without_crashing() {
 fn robot_explain_correlation_bad_format_exits_two() {
     let (code, _, stderr) =
         run_at_repo_root(&["--robot-explain-correlation", "not-a-valid-format"]);
-    assert_eq!(code, 2);
-    assert!(stderr.contains("expected format SHA:beadID"), "{stderr}");
+    // Go's handler returns the parse error, so the dispatcher prints
+    // `Error handling <flag>: <err>` and exits 1 — not a usage exit of 2.
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains(
+            "Error handling --robot-explain-correlation: expected format: SHA:beadID, got: \"not-a-valid-format\""
+        ),
+        "{stderr}"
+    );
 }
 
 #[test]
