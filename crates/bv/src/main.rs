@@ -5153,29 +5153,13 @@ fn compute_parallel_gain(issues: &[bv_core::model::Issue], limit: usize) -> serd
 /// Go: `--robot-by-label`/`--robot-by-assignee` are modifiers of
 /// `--robot-priority` (main.go:1799-1800) — exact-match filters applied to
 /// the recommendation list, not standalone commands.
-fn run_robot_priority(args: &[String]) -> ExitCode {
-    let by_label = args
-        .iter()
-        .position(|a| a == "--robot-by-label")
-        .and_then(|i| args.get(i + 1))
-        .cloned();
-    let by_assignee = args
-        .iter()
-        .position(|a| a == "--robot-by-assignee")
-        .and_then(|i| args.get(i + 1))
-        .cloned();
-
-    let (issues, _hash, _p1, status, _g) = match load_and_analyze() {
-        Ok(x) => x,
-        Err(code) => return code,
-    };
-    // Go scores the whole graph and filters the *recommendation list*
-    // afterwards (robot_registry.go:940-951). Filtering the issue set first
-    // shrank total_issues and stripped the graph context the surviving
-    // recommendations need, so the filter returned nothing.
-    let hash = bv_core::data_hash::compute_data_hash(&issues);
-    let g = bv_analysis::build_graph(&issues);
-
+/// Go `generateRecommendation` (pkg/analysis/priority.go:735-869) over the full
+/// impact-scoring engine.
+///
+/// Shared by `--robot-priority` and the `priority_mismatch` proactive alert
+/// (pkg/drift/drift.go:1062), which needs the same recommendations.
+fn priority_recommendations(issues: &[bv_core::model::Issue]) -> Vec<serde_json::Value> {
+    let g = bv_analysis::build_graph(issues);
     let pr = bv_graph_core::pagerank_default(&g);
     let bw = bv_graph_core::betweenness(&g);
     let cp = bv_graph_core::critical_path_heights(&g);
@@ -5198,7 +5182,7 @@ fn run_robot_priority(args: &[String]) -> ExitCode {
 
     let now = robot_now();
     let inputs = bv_analysis::impact::ImpactInputs {
-        issues: &issues,
+        issues,
         pagerank: &pr_map,
         betweenness: &bw_map,
         critical_path: Some(&cp_map),
@@ -5237,7 +5221,7 @@ fn run_robot_priority(args: &[String]) -> ExitCode {
     // weighted breakdown values against ad-hoc constants and hardcoded
     // confidence 1, so it never agreed with the oracle.
     let th = PriorityThresholds::default();
-    let unblocks_by_id = build_unblocks_map(&issues);
+    let unblocks_by_id = build_unblocks_map(issues);
     let mut recommendations: Vec<serde_json::Value> = Vec::new();
     for r in &impact_results {
         let Some(issue) = issues.iter().find(|i| i.id == r.id) else {
@@ -5248,13 +5232,42 @@ fn run_robot_priority(args: &[String]) -> ExitCode {
             issue,
             &unblocks_by_id,
             &th,
-            &issues,
+            issues,
             &cp_map,
             (&core_map, &art_set, &slack_map, max_core),
         ) {
             recommendations.push(rec);
         }
     }
+    recommendations
+}
+
+fn run_robot_priority(args: &[String]) -> ExitCode {
+    let by_label = args
+        .iter()
+        .position(|a| a == "--robot-by-label")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    let by_assignee = args
+        .iter()
+        .position(|a| a == "--robot-by-assignee")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+
+    let (issues, _hash, _p1, status, _g) = match load_and_analyze() {
+        Ok(x) => x,
+        Err(code) => return code,
+    };
+    // Go scores the whole graph and filters the *recommendation list*
+    // afterwards (robot_registry.go:940-951). Filtering the issue set first
+    // shrank total_issues and stripped the graph context the surviving
+    // recommendations need, so the filter returned nothing.
+    let hash = bv_core::data_hash::compute_data_hash(&issues);
+    let g = bv_analysis::build_graph(&issues);
+
+    // Shared with the `priority_mismatch` alert so both consume one
+    // implementation of Go's recommendation engine.
+    let mut recommendations = priority_recommendations(&issues);
 
     // Go (priority.go:720) sorts by confidence descending, then impact score,
     // then issue id, so the ordering is stable across runs.
@@ -5517,21 +5530,32 @@ fn run_robot_alerts() -> ExitCode {
     // an empty top-list and reports every current entry as "entered top".
     // Reading `stats.pagerank` here instead made the two binaries disagree
     // about the same file, so the comparison is anchored to Go's layout.
-    let baseline_doc: serde_json::Value = std::fs::read_to_string(BASELINE_PATH)
+    // Whether a baseline was actually recorded matters: with no file at all
+    // there is nothing to have changed, and Go exits rather than inventing a
+    // comparison. With a file present, Go honours its exact layout below —
+    // including an absent `top_metrics.pagerank`, which it reads as an empty
+    // list and therefore reports every current entry as newly entered.
+    let baseline_on_disk = std::fs::read_to_string(BASELINE_PATH)
         .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default();
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+    let baseline_doc = baseline_on_disk.clone().unwrap_or_default();
     let mut baseline_stats: bv_analysis::drift::BaselineStats = baseline_doc
         .get("stats")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_else(|| current.clone());
-    // Go keys the top-list by `top_metrics.pagerank`; an absent key means an
-    // empty map, which is what makes every current entry count as "entered".
-    baseline_stats.pagerank = baseline_doc
-        .get("top_metrics")
-        .and_then(|tm| tm.get("pagerank"))
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
+    // Go keys the top-list by `top_metrics.pagerank`. When that key is
+    // genuinely present, honour it. When it is absent, leave the baseline's
+    // own PageRank alone: overwriting it with an empty map made every current
+    // entry count as having "entered top", inventing a change that no
+    // recorded baseline ever observed. A missing top-list is not evidence of
+    // change.
+    if let Some(doc) = &baseline_on_disk {
+        baseline_stats.pagerank = doc
+            .get("top_metrics")
+            .and_then(|tm| tm.get("pagerank"))
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+    }
     let result = bv_analysis::drift::calculate(
         &baseline_stats,
         &current,
@@ -5580,7 +5604,53 @@ fn run_robot_alerts() -> ExitCode {
             .count()
     };
     let mut payload = full_envelope_for(&hash, &loaded);
-    payload["alerts"] = serde_json::to_value(&filtered_alerts).unwrap_or_default();
+
+    // Go `checkPriorityMismatch` (pkg/drift/drift.go:1062-1100). Uses the same
+    // recommendations as `--robot-priority` so both agree on what
+    // "under-prioritised" means. Only "increase" directions alert: "could be
+    // lower" is hygiene for --robot-priority and fires for nearly every leaf
+    // on a small graph.
+    let mut priority_alerts: Vec<serde_json::Value> = Vec::new();
+    {
+        const MIN_CONFIDENCE: f64 = 0.6; // Go default, drift/config.go:124
+        let issue_by_id: std::collections::HashMap<&str, &bv_core::model::Issue> =
+            loaded.iter().map(|i| (i.id.as_str(), i)).collect();
+        for rec in priority_recommendations(&loaded) {
+            let conf = rec["confidence"].as_f64().unwrap_or(0.0);
+            if conf < MIN_CONFIDENCE || rec["direction"].as_str() != Some("increase") {
+                continue;
+            }
+            let id = rec["issue_id"].as_str().unwrap_or_default();
+            let cur = rec["current_priority"].as_i64().unwrap_or(0);
+            let sug = rec["suggested_priority"].as_i64().unwrap_or(0);
+            let labels: Vec<&str> = issue_by_id
+                .get(id)
+                .map(|i| i.labels.iter().map(|l| l.as_str()).collect())
+                .unwrap_or_default();
+            let alert = serde_json::json!({
+                "type": "priority_mismatch",
+                "severity": "warning",
+                "message": format!("{id} is P{cur} but graph impact suggests P{sug} (confidence {conf:.2})"),
+                "issue_id": id,
+                "labels": labels,
+                "baseline_value": cur,
+                "current_value": sug,
+                "delta": sug - cur,
+                "details": rec["reasoning"].clone(),
+                "suggested_action": format!("Review with bv --robot-priority; if it holds, set the priority to P{sug}"),
+            });
+            priority_alerts.push(alert);
+        }
+    }
+
+    // Go appends priority_mismatch after staleness (drift.go:288 runs
+    // checkStaleness, :301 runs checkPriorityMismatch), so these go last.
+    let all_alerts: Vec<serde_json::Value> = filtered_alerts
+        .iter()
+        .cloned()
+        .chain(priority_alerts)
+        .collect();
+    payload["alerts"] = serde_json::to_value(&all_alerts).unwrap_or_default();
     // Go emits `skipped_checks` alongside the alerts so a check that did not
     // run is never read as one that found nothing. Derived directly from Go's
     // `expensiveCheckAllowed` rule rather than by re-running the analysis.
