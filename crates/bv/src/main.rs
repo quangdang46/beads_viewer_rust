@@ -5597,12 +5597,6 @@ fn run_robot_alerts() -> ExitCode {
         })
         .map(|a| serde_json::to_value(a).unwrap_or_default())
         .collect();
-    let count_sev = |s: &str| {
-        filtered_alerts
-            .iter()
-            .filter(|a| a.get("severity").and_then(|v| v.as_str()) == Some(s))
-            .count()
-    };
     let mut payload = full_envelope_for(&hash, &loaded);
 
     // Go `checkPriorityMismatch` (pkg/drift/drift.go:1062-1100). Uses the same
@@ -5611,6 +5605,13 @@ fn run_robot_alerts() -> ExitCode {
     // lower" is hygiene for --robot-priority and fires for nearly every leaf
     // on a small graph.
     let mut priority_alerts: Vec<serde_json::Value> = Vec::new();
+    let mut duplicate_alerts: Vec<serde_json::Value> = Vec::new();
+    // Go stamps every alert with `c.nowUTC()` (drift.go:1048, 1098).
+    let detected_at = robot_now()
+        .to_string()
+        .get(..19)
+        .map(|t| format!("{t}Z"))
+        .unwrap_or_default();
     {
         const MIN_CONFIDENCE: f64 = 0.6; // Go default, drift/config.go:124
         let issue_by_id: std::collections::HashMap<&str, &bv_core::model::Issue> =
@@ -5627,27 +5628,78 @@ fn run_robot_alerts() -> ExitCode {
                 .get(id)
                 .map(|i| i.labels.iter().map(|l| l.as_str()).collect())
                 .unwrap_or_default();
-            let alert = serde_json::json!({
+            // Go declares baseline_value/current_value/delta with
+            // `omitempty` (drift.go:75-77), so a priority of P0 omits
+            // current_value rather than emitting 0.
+            let mut alert = serde_json::json!({
                 "type": "priority_mismatch",
                 "severity": "warning",
                 "message": format!("{id} is P{cur} but graph impact suggests P{sug} (confidence {conf:.2})"),
                 "issue_id": id,
                 "labels": labels,
-                "baseline_value": cur,
-                "current_value": sug,
                 "delta": sug - cur,
                 "details": rec["reasoning"].clone(),
+                "detected_at": detected_at.clone(),
                 "suggested_action": format!("Review with bv --robot-priority; if it holds, set the priority to P{sug}"),
             });
+            if cur != 0 {
+                alert["baseline_value"] = serde_json::json!(cur);
+            }
+            if sug != 0 {
+                alert["current_value"] = serde_json::json!(sug);
+            }
             priority_alerts.push(alert);
         }
     }
 
-    // Go appends priority_mismatch after staleness (drift.go:288 runs
-    // checkStaleness, :301 runs checkPriorityMismatch), so these go last.
+    // Go `checkPotentialDuplicate` (pkg/drift/drift.go:1011-1053). Closed and
+    // tombstoned issues are excluded: pairing them buries the live duplicates
+    // under history. Runs after priority_mismatch (drift.go:300-301).
+    {
+        let live: Vec<&bv_core::model::Issue> = loaded
+            .iter()
+            .filter(|i| {
+                !matches!(
+                    i.status,
+                    bv_core::model::Status::Closed | bv_core::model::Status::Tombstone
+                )
+            })
+            .collect();
+        if live.len() >= 2 {
+            let owned: Vec<bv_core::model::Issue> = live.into_iter().cloned().collect();
+            let cfg = bv_analysis::suggestions::DuplicateConfig::default();
+            // Go caps duplicate alerts at config.DuplicateMaxAlerts
+            // (drift/config.go:123, default 10) and breaks out of the loop
+            // once the cap is reached, on top of the detector's own
+            // MaxSuggestions=20. Both caps are needed: the detector alone
+            // yields 20 here, Go emits 10.
+            const MAX_ALERTS: usize = 10;
+            for s in bv_analysis::suggestions::detect_duplicates(&owned, &cfg) {
+                if duplicate_alerts.len() >= MAX_ALERTS {
+                    break;
+                }
+                let rel = s.related_bead.clone();
+                duplicate_alerts.push(serde_json::json!({
+                    "type": "potential_duplicate",
+                    "severity": "info",
+                    "message": s.summary,
+                    "issue_id": s.target_bead,
+                    "related_issue_id": rel,
+                    "details": [s.reason],
+                    "detected_at": detected_at.clone(),
+                    "suggested_action": "Compare the two issues; close one as a duplicate or link them with a related dependency",
+                }));
+            }
+        }
+    }
+
+    // Go appends the proactive alerts after staleness (drift.go:288 runs
+    // checkStaleness, then :300 potential duplicate and :301 priority
+    // mismatch), so both land at the end.
     let all_alerts: Vec<serde_json::Value> = filtered_alerts
         .iter()
         .cloned()
+        .chain(duplicate_alerts)
         .chain(priority_alerts)
         .collect();
     payload["alerts"] = serde_json::to_value(&all_alerts).unwrap_or_default();
@@ -5674,11 +5726,18 @@ fn run_robot_alerts() -> ExitCode {
             }
         }
     }
+    // The summary covers the alerts actually emitted, including the
+    // proactive checks appended above.
+    let count_sev_in = |list: &[serde_json::Value], s: &str| {
+        list.iter()
+            .filter(|a| a.get("severity").and_then(|v| v.as_str()) == Some(s))
+            .count()
+    };
     payload["summary"] = serde_json::json!({
-        "total": filtered_alerts.len(),
-        "critical": count_sev("critical"),
-        "warning": count_sev("warning"),
-        "info": count_sev("info"),
+        "total": all_alerts.len(),
+        "critical": count_sev_in(&all_alerts, "critical"),
+        "warning": count_sev_in(&all_alerts, "warning"),
+        "info": count_sev_in(&all_alerts, "info"),
     });
     // Go robot_registry.go:1240-1248 — the full seven-hint list, including the
     // proactive and drift-vs-baseline filter combinations.
