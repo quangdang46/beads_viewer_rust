@@ -4015,10 +4015,24 @@ fn generate_advanced_insights(
     let mut paths: Vec<serde_json::Value> = Vec::new();
     let mut used_sources: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut total_paths = 0i64;
-    for &(_, len) in &path_ends {
-        if len > 0 {
-            total_paths += 1;
+    // Go counts `representativeCount` as the distinct SOURCE nodes that have
+    // at least one non-trivial path (advanced_insights.go:929-937), over every
+    // candidate — not just the ones that survive into `paths`. Counting only
+    // the emitted paths reported 5 where Go reports 391, which understated how
+    // many sources were actually omitted.
+    let mut representative_sources: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
+    for &(i, len) in &path_ends {
+        if len == 0 {
+            continue;
         }
+        total_paths += 1;
+        // Walk to the root the same way the emit loop does, to find the source.
+        let mut head = i as i64;
+        while pred[head as usize] != -1 {
+            head = pred[head as usize];
+        }
+        representative_sources.insert(head as usize);
     }
     for &(i, len) in &path_ends {
         if paths.len() >= 5 {
@@ -4062,7 +4076,7 @@ fn generate_advanced_insights(
             "",
             paths.len() >= 5 && total_paths > 5,
             paths.len() as i64,
-            used_sources.len() as i64,
+            representative_sources.len() as i64,
         ),
         "how_to_use": "Representative longest critical paths. Focus on issues appearing in multiple paths.",
     });
@@ -4097,10 +4111,9 @@ fn generate_advanced_insights(
             }
         }
     }
-    let current_actionable = open_set
-        .iter()
-        .filter(|id| blocked_by.get(*id).is_none_or(|v| v.is_empty()))
-        .count();
+    // (The actionable count itself is no longer needed here: the suggestion
+    // loop below re-derives per-candidate readiness, and max_parallel is now
+    // projected from the completed set rather than from this base count.)
     let mut pc_candidates: Vec<(String, i64, i64, Vec<String>)> = Vec::new();
     // Go iterates `actionable`, not every open issue (advanced_insights.go:983):
     // the suggestion is "complete this to widen parallel work", which only
@@ -4140,7 +4153,29 @@ fn generate_advanced_insights(
     pc_candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     let pc_total = pc_candidates.len();
     pc_candidates.truncate(5);
-    let max_parallel = current_actionable as i64 + pc_candidates.first().map_or(0, |c| c.1);
+    // Go projects the ready width after completing the returned cut as a SET
+    // (advanced_insights.go:1037): `len(getActionableIssuesAfterCompletions(completedCut))`.
+    // Rust added only the first suggestion's gain, which under-counts whenever
+    // more than one suggestion is returned (1859 vs 1872 on xl_2500).
+    let completed_cut: std::collections::HashSet<&str> = pc_candidates
+        .iter()
+        .map(|(id, _, _, _)| id.as_str())
+        .collect();
+    let max_parallel = open_set
+        .iter()
+        .filter(|id| {
+            // A completed issue is no longer a candidate for future work, so
+            // it drops out of the actionable set.
+            if completed_cut.contains(*id) {
+                return false;
+            }
+            blocked_by.get(*id).is_none_or(|blockers| {
+                blockers
+                    .iter()
+                    .all(|b| completed_cut.contains(b) || !open_set.contains(b))
+            })
+        })
+        .count() as i64;
     // Go emits the cut suggestions themselves (advanced_insights.go:186-199);
     // Rust computed the candidates and then dropped them.
     let pc_suggestions: Vec<serde_json::Value> = pc_candidates
