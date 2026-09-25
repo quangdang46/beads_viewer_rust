@@ -3353,9 +3353,10 @@ fn run_robot_insights() -> ExitCode {
     if fixed_status.critical.state == "skipped" {
         fixed_status.critical.reason.clear();
     }
-    if fixed_status.cycles.state == "skipped" {
-        fixed_status.cycles.reason.clear();
-    }
+    // NOT cleared, unlike the siblings above: Go keeps the cycles skip reason.
+    // On an XL graph cycle detection never runs, and "graph too large (>2000
+    // nodes)" is the only thing telling a reader the absence of cycles is
+    // unknown rather than observed. Clearing it asserted a clean DAG.
     if fixed_status.kcore.state == "skipped" {
         fixed_status.kcore.reason.clear();
     }
@@ -3463,7 +3464,10 @@ fn run_robot_insights() -> ExitCode {
         "slack".into(),
         serde_json::Value::Object(limit_metric_map(slack_obj, map_limit)),
     );
-    fs.insert("articulation_points".into(), serde_json::json!(art_ids));
+    // Go's `limitSlice` (robot_registry.go:1932-1939) caps this list at the
+    // same mapLimit as the maps: `in[:limit]`, no sorting.
+    let art_limited: Vec<&String> = art_ids.iter().take(map_limit).collect();
+    fs.insert("articulation_points".into(), serde_json::json!(art_limited));
     payload["full_stats"] = serde_json::Value::Object(fs);
 
     // top_what_ifs — Go TopWhatIfDeltas (bv-83): exact delta semantics.
@@ -4157,6 +4161,11 @@ fn generate_advanced_insights(
         pc_status["count"] = serde_json::json!(pc_suggestions.len());
         pc_status["limited"] = serde_json::json!(pc_total);
     }
+    // Go's FeatureStatus.Capped marks that the result was truncated at the
+    // limit, distinct from `limited` which is the pre-cap count.
+    if pc_total > pc_suggestions.len() {
+        pc_status["capped"] = serde_json::json!(true);
+    }
     let mut parallel_cut = serde_json::json!({
         "status": pc_status,
         "max_parallel": max_parallel,
@@ -4170,7 +4179,28 @@ fn generate_advanced_insights(
     let parallel_gain = compute_parallel_gain(issues, 5);
 
     // ---- Cycle Break — Go generateCycleBreakSuggestions ----
-    let cycle_break = if cycles.is_empty() {
+    //
+    // Go distinguishes "no cycles" from "cycles were never computed".
+    // `ConfigForSize` disables cycle detection above the XL threshold
+    // (config.go:190-197, CyclesSkipReason "graph too large (>2000 nodes)"),
+    // so on a large graph an empty cycle list means *unknown*, not *acyclic*.
+    // Rust reported "No cycles detected - the dependency graph is a proper
+    // DAG" there, which is the one conclusion the data does not support.
+    let cycles_skipped = bv_analysis::analyzer::AnalysisBudget::default().skip_cycles(issues.len());
+    let cycle_break = if cycles_skipped {
+        serde_json::json!({
+            "status": feature_status(
+                "skipped",
+                "cycle detection skipped: graph too large (>2000 nodes)",
+                false,
+                0,
+                0,
+            ),
+            "cycle_count": 0,
+            "how_to_use": "Structural fix suggestions. Apply BEFORE working on cycle members.",
+            "advisory": "Cycle analysis is unavailable; do not infer that the dependency graph is acyclic.",
+        })
+    } else if cycles.is_empty() {
         serde_json::json!({
             "status": feature_status("available", "", false, 0, 0),
             "cycle_count": 0,
@@ -5257,6 +5287,9 @@ fn compute_parallel_gain(issues: &[bv_core::model::Issue], limit: usize) -> serd
     if total > 0 {
         status["count"] = serde_json::json!(items.len());
         status["limited"] = serde_json::json!(total);
+    }
+    if total > items.len() {
+        status["capped"] = serde_json::json!(true);
     }
     out["status"] = status;
     if items.is_empty() {
