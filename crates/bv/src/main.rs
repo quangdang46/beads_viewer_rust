@@ -825,6 +825,78 @@ th {{ background: #44475a; }}
         );
 
         std::fs::create_dir_all(&out_dir).ok();
+        // Go main.go:1624 registers `--pages-include-history` with default
+        // TRUE, and main.go:3178-3190 writes `data/history.json` for the
+        // time-travel scrubber whenever it is on. Rust wrote only index.html,
+        // so the DEFAULT invocation lost the history data — the flag being
+        // unwired was not just an ignored modifier.
+        if !args.iter().any(|a| a == "--no-pages-include-history") {
+            let beads_file = cwd
+                .join(".beads")
+                .join("issues.jsonl")
+                .to_string_lossy()
+                .to_string();
+            let beads: Vec<bv_correlation::history::BeadInfo> = issues
+                .iter()
+                .map(|i| bv_correlation::history::BeadInfo {
+                    id: i.id.clone(),
+                    title: i.title.clone(),
+                    status: i.status.as_str().to_string(),
+                })
+                .collect();
+            let generated_at = jiff_now();
+            match bv_correlation::history::build_history_report(
+                &cwd,
+                &beads,
+                &bv_correlation::history::HistoryOptions {
+                    limit: 500,
+                    ..Default::default()
+                },
+                None,
+                generated_at.clone(),
+            ) {
+                Ok(report) => {
+                    match bv_export::time_travel::generate_history_for_export(
+                        &cwd,
+                        &beads_file,
+                        &report,
+                        &generated_at,
+                    ) {
+                        Ok(history) => {
+                            match serde_json::to_string_pretty(&history) {
+                                Ok(json) => {
+                                    // Go warns and continues on write failure
+                                    // rather than aborting the export.
+                                    if let Err(e) =
+                                        std::fs::create_dir_all(format!("{out_dir}/data"))
+                                    {
+                                        println!("  → Warning: failed to create data dir: {e}");
+                                    } else if let Err(e) =
+                                        std::fs::write(format!("{out_dir}/data/history.json"), json)
+                                    {
+                                        println!("  → Warning: failed to write history.json: {e}");
+                                    } else {
+                                        println!(
+                                            "  → history.json ({} commits)",
+                                            history.commits.len()
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    println!("  → Warning: failed to encode history.json: {e}");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            println!("  → Warning: failed to generate history data: {e}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("  → Warning: failed to generate history report: {e}");
+                }
+            }
+        }
         match std::fs::write(format!("{out_dir}/index.html"), html) {
             Ok(_) => {
                 println!("Static site exported to {out_dir}");
@@ -867,6 +939,122 @@ th {{ background: #44475a; }}
                 return ExitCode::from(1);
             }
         }
+    }
+
+    /// Go `analysis.NewAnalyzer(issues).ComputeImpactScores()` (main.go:2505-2506)
+    /// — the same graph and metric maps `priority_recommendations` builds, kept as
+    /// its own helper so `--feedback-accept`/`--feedback-ignore` can reach the
+    /// per-issue `Breakdown` that `ScoreContributions` is derived from.
+    fn impact_scores_with_breakdown(
+        issues: &[bv_core::model::Issue],
+    ) -> Vec<bv_analysis::impact::IssueImpact> {
+        let g = bv_analysis::build_graph(issues);
+        let pr = bv_graph_core::pagerank_default(&g);
+        let bw = bv_graph_core::betweenness(&g);
+        let cp = bv_graph_core::critical_path_heights(&g);
+        let to_map = |v: &[f64]| -> std::collections::BTreeMap<String, f64> {
+            v.iter()
+                .enumerate()
+                .map(|(i, x)| (g.node_id(i).unwrap_or_default().to_string(), *x))
+                .collect()
+        };
+        let (pr_map, bw_map, cp_map) = (to_map(&pr), to_map(&bw), to_map(&cp));
+        bv_analysis::impact::compute_impact_scores(&bv_analysis::impact::ImpactInputs {
+            issues,
+            pagerank: &pr_map,
+            betweenness: &bw_map,
+            critical_path: Some(&cp_map),
+            g: &g,
+            now: robot_now(),
+        })
+    }
+
+    // Go main.go:2441-2530 — the four `--feedback-*` flags form one early
+    // block that runs before recipes and before any robot dispatch, and each
+    // branch exits. Precedence is reset > show > record, and `--feedback-ignore`
+    // wins over `--feedback-accept` for the issue id when both are given
+    // (main.go:2473-2477).
+    let fb_accept = flag_value(&args, "feedback-accept").unwrap_or_default();
+    let fb_ignore = flag_value(&args, "feedback-ignore").unwrap_or_default();
+    let fb_reset = presence.has("feedback-reset");
+    let fb_show = presence.has("feedback-show");
+    if !fb_accept.is_empty() || !fb_ignore.is_empty() || fb_reset || fb_show {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let beads_dir = match bv_core::discovery::get_beads_dir(&cwd) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("Error getting beads directory: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        let mut feedback = match bv_analysis::feedback::load_feedback(&beads_dir) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("Error loading feedback: {e}");
+                return ExitCode::from(1);
+            }
+        };
+
+        if fb_reset {
+            feedback.reset();
+            if let Err(e) = feedback.save(&beads_dir) {
+                eprintln!("Error saving feedback: {e}");
+                return ExitCode::from(1);
+            }
+            println!("Feedback data reset to defaults.");
+            return ExitCode::from(0);
+        }
+
+        if fb_show {
+            // Go main.go:2464-2469 — `ToJSON` re-indented with two spaces and
+            // printed, deliberately NOT wrapped in the robot envelope.
+            match serde_json::to_string_pretty(&feedback.to_json()) {
+                Ok(s) => println!("{s}"),
+                Err(e) => {
+                    eprintln!("Error encoding feedback: {e}");
+                    return ExitCode::from(1);
+                }
+            }
+            return ExitCode::from(0);
+        }
+
+        let (issue_id, action) = if !fb_ignore.is_empty() {
+            (fb_ignore, "ignore")
+        } else {
+            (fb_accept, "accept")
+        };
+        // Go main.go:2494-2512 needs the issue's impact score and breakdown, so
+        // the issues have to load for accept/ignore even though reset/show do
+        // not.
+        let issues = match bv_core::discovery::load_issues_from_repo(&cwd) {
+            Ok((issues, _)) => issues,
+            Err(e) => {
+                eprintln!("Error loading issues: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        let Some(found) = issues.iter().find(|i| i.id == issue_id) else {
+            eprintln!("Issue not found: {issue_id}");
+            return ExitCode::from(1);
+        };
+        let _ = found;
+        let scores = impact_scores_with_breakdown(&issues);
+        let hit = scores.iter().find(|s| s.id == issue_id);
+        let score = hit.map(|s| s.score).unwrap_or(0.0);
+        let contributions = hit
+            .map(|s| bv_analysis::feedback::ScoreContributions::from(&s.breakdown))
+            .unwrap_or_default();
+        if let Err(e) = feedback.record_feedback(issue_id, action, score, contributions) {
+            eprintln!("Error recording feedback: {e}");
+            return ExitCode::from(1);
+        }
+        if let Err(e) = feedback.save(&beads_dir) {
+            eprintln!("Error saving feedback: {e}");
+            return ExitCode::from(1);
+        }
+        println!("Recorded {action} feedback for {issue_id} (score: {score:.3})");
+        println!("{}", feedback.summary());
+        return ExitCode::from(0);
     }
 
     // Any recognized `--robot-*` primary that reached this point is a real
@@ -977,6 +1165,30 @@ th {{ background: #44475a; }}
             let (issues, _) = apply_scope(&issues);
             eprintln!("Loaded {} issues — launching TUI", issues.len());
             let mut app = bv_tui::App::new(issues.clone());
+            // Go main.go:4526-4531 — `--debug-render` REPLACES the TUI: render
+            // one view, print it, exit 0. The flag help says "output to file"
+            // but Go prints to stdout, so the print is what is faithful.
+            if let Some(view) = flag_value(&args, "debug-render").filter(|v| !v.is_empty()) {
+                // Go main.go:1631-1632 register 180x50. A non-numeric value is
+                // pflag's parse error, not a silent fallback to the default.
+                let mut dims = [180u16, 50u16];
+                for (i, name) in ["debug-width", "debug-height"].iter().enumerate() {
+                    if let Some(raw) = flag_value(&args, name) {
+                        match go_parse_int_base0(raw) {
+                            Ok(v) if (0..=u16::MAX as i64).contains(&v) => dims[i] = v as u16,
+                            _ => {
+                                eprintln!(
+                                    "invalid argument {raw:?} for \"--{name}\" flag: parse error"
+                                );
+                                return ExitCode::from(1);
+                            }
+                        }
+                    }
+                }
+                let rendered = bv_tui::render_debug_view(&mut app, view, dims[0], dims[1]);
+                println!("{rendered}");
+                return ExitCode::from(0);
+            }
             launch_tui(&mut app, &issues)
         }
         Err(e) => {
@@ -8442,6 +8654,43 @@ fn run_robot_causality(args: &[String]) -> ExitCode {
     emit_json(&sorted)
 }
 
+/// Go `percentOrFraction.Set` (cmd/bv/flag_types.go:67-96) — accepts an int
+/// 0-100 (percent) or a float 0.0-1.0 (fraction), canonicalized to int percent.
+/// A `.` anywhere signals fractional intent; `int(f*100 + 0.5)` rounds to
+/// nearest so 0.235 becomes 24 and 0.999 becomes 100.
+fn parse_percent_or_fraction(flag: &str, raw: &str) -> Result<i64, String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return Err(format!(
+            "--{flag}: empty value (expected int 0-100 or float 0.0-1.0)"
+        ));
+    }
+    if s.contains('.') {
+        let f: f64 = s.parse().map_err(|_| {
+            format!(
+                "--{flag}: {raw:?} is not a number (expected int 0-100 percent OR float 0.0-1.0 fraction)"
+            )
+        })?;
+        if !(0.0..=1.0).contains(&f) {
+            return Err(format!(
+                "--{flag}: float {f} out of range (expected 0.0-1.0 fraction; for percent use int 0-100)"
+            ));
+        }
+        return Ok((f * 100.0 + 0.5) as i64);
+    }
+    let n: i64 = s.parse().map_err(|_| {
+        format!(
+            "--{flag}: {raw:?} is not an integer (expected int 0-100 percent OR float 0.0-1.0 fraction)"
+        )
+    })?;
+    if !(0..=100).contains(&n) {
+        return Err(format!(
+            "--{flag}: int {n} out of range (expected 0-100 percent; for fraction use float 0.0-1.0)"
+        ));
+    }
+    Ok(n)
+}
+
 /// Go `handleRobotRelated` — `--robot-related <bead-id>`.
 fn run_robot_related(args: &[String]) -> ExitCode {
     let bead_id = args
@@ -8450,15 +8699,34 @@ fn run_robot_related(args: &[String]) -> ExitCode {
         .and_then(|i| args.get(i + 1))
         .cloned()
         .unwrap_or_default();
-    let max_results: usize = args
-        .iter()
-        .position(|a| a == "--related-max-results")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|s| s.parse().ok())
+    // Go main.go:1578 registers `--related-min-relevance` as a
+    // percentOrFraction defaulting to 20 (flag_types.go:61).
+    let min_relevance: i64 = match flag_value(args, "related-min-relevance") {
+        Some(raw) => match parse_percent_or_fraction("related-min-relevance", raw) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::from(2);
+            }
+        },
+        None => 20,
+    };
+    // Go main.go:1584 — default 10. The cap is guarded by `MaxResults > 0`
+    // (related.go:216-218), so 0 means UNLIMITED rather than "emit nothing".
+    let max_results: usize = flag_value(args, "related-max-results")
+        .and_then(|raw| go_parse_int_base0(raw).ok())
+        .map(|v| v.max(0) as usize)
         .unwrap_or(10);
+    // Go main.go:1585 — default false. Tombstones are skipped either way
+    // (related.go:509-518); only `closed` is gated on this flag.
+    let include_closed = args.iter().any(|a| a == "--related-include-closed");
 
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (issues, hash, report) = match load_correlation_report(&cwd) {
+    if let Err(e) = validate_correlation_repository(&cwd) {
+        eprintln!("Error: {e}");
+        return ExitCode::from(1);
+    }
+    let (issues, _hash, _as_of_commit) = match load_issues_auto(&cwd, None) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -8469,34 +8737,56 @@ fn run_robot_related(args: &[String]) -> ExitCode {
         eprintln!("Bead not found: {bead_id}");
         return ExitCode::from(1);
     }
-    let network = bv_correlation::network::build_network(&issues, &report);
-    let sub = bv_correlation::network::sub_network(&network, &bead_id, 2);
 
-    let mut related: Vec<serde_json::Value> = sub
-        .edges
+    // Go robot_registry.go:3272-3286 builds the report and threads the three
+    // flags into `RelatedWorkOptions` before calling `FindRelatedWorkAt`.
+    let beads: Vec<bv_correlation::history::BeadInfo> = issues
         .iter()
-        .filter(|e| e.from == bead_id || e.to == bead_id)
-        .map(|e| {
-            let other = if e.from == bead_id { &e.to } else { &e.from };
-            serde_json::json!({
-                "bead_id": other,
-                "title": sub.nodes.get(other).map(|n| n.title.clone()).unwrap_or_default(),
-                "relation_type": e.edge_type,
-                "weight": e.weight,
-                "shared": e.shared,
-            })
+        .map(|i| bv_correlation::history::BeadInfo {
+            id: i.id.clone(),
+            title: i.title.clone(),
+            status: i.status.as_str().to_string(),
         })
         .collect();
-    related.sort_by(|a, b| b["weight"].as_u64().cmp(&a["weight"].as_u64()));
-    // Go related.go:216-218 — the cap is guarded by `MaxResults > 0`, so
-    // `--related-max-results 0` means UNLIMITED rather than "emit nothing".
-    if max_results > 0 && related.len() > max_results {
-        related.truncate(max_results);
-    }
+    let now = jiff_now();
+    let report = match bv_correlation::history::build_history_report(
+        &cwd,
+        &beads,
+        &bv_correlation::history::HistoryOptions {
+            limit: 500,
+            ..Default::default()
+        },
+        None,
+        now.clone(),
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error: generating history report: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut opts = bv_correlation::related::default_related_work_options();
+    opts.min_relevance = min_relevance;
+    opts.max_results = max_results;
+    opts.include_closed = include_closed;
+    let Some(result) =
+        bv_correlation::related::find_related_work_at(&report, &bead_id, &opts, robot_now())
+    else {
+        eprintln!("Bead not found in history: {bead_id}");
+        return ExitCode::from(1);
+    };
 
-    let mut payload = full_envelope_for(&hash, &issues);
-    payload["bead_id"] = serde_json::json!(bead_id);
-    payload["related"] = serde_json::Value::Array(related);
+    // Go robot_registry.go:3292 — `withEnvelope(envelope, result)` merges the
+    // result's fields into the envelope at top level rather than nesting it.
+    let mut payload = full_envelope_for(&report.data_hash, &issues);
+    if let Some(obj) = serde_json::to_value(&result)
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+    {
+        for (k, v) in obj {
+            payload[k] = v;
+        }
+    }
     emit_json(&payload)
 }
 
@@ -9334,6 +9624,15 @@ fn run_robot_file_beads(args: &[String]) -> ExitCode {
         .and_then(|i| args.get(i + 1))
         .cloned()
         .unwrap_or_default();
+    // Go main.go:1564 registers `--file-beads-limit` with default 20, read at
+    // robot_registry.go:3141-3148. A negative value clamps to 0 (emit none),
+    // which is the opposite of `--relations-limit` — Go's guard there is
+    // `if len(...) > closedLimit`, so a negative limit cannot be passed on to
+    // the slice and must be floored first or the truncation would panic.
+    let closed_limit: i64 = flag_value(args, "file-beads-limit")
+        .and_then(|raw| go_parse_int_base0(raw).ok())
+        .unwrap_or(20)
+        .max(0);
     let cwd = std::env::current_dir().unwrap_or_default();
     let (_issues, hash, report) = match load_correlation_report(&cwd) {
         Ok(x) => x,
@@ -9342,30 +9641,56 @@ fn run_robot_file_beads(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let mut beads: Vec<serde_json::Value> = Vec::new();
+    // Go builds the split open/closed view through `correlation.NewFileLookup`
+    // (robot_registry.go:3139-3140). That needs a `HistoryReport`, which this
+    // path does not build: `correlate()` yields sha/timestamp/files but not
+    // the per-commit numstat that `BeadReference.total_changes` sums, so that
+    // one field stays 0 here rather than being invented. Everything else in
+    // the reference (id, title, status, commit shas, last touch) comes from
+    // the correlation map plus the loaded issues.
+    let mut by_id: std::collections::HashMap<&str, (&str, &str)> = std::collections::HashMap::new();
+    for i in &_issues {
+        by_id.insert(i.id.as_str(), (i.title.as_str(), i.status.as_str()));
+    }
+    let mut open_beads: Vec<serde_json::Value> = Vec::new();
+    let mut closed_beads: Vec<serde_json::Value> = Vec::new();
     for (bead_id, commits) in &report {
         let touching: Vec<&bv_correlation::correlator::CorrelatedCommit> = commits
             .iter()
             .filter(|c| c.files.iter().any(|f| f == &path))
             .collect();
-        if !touching.is_empty() {
-            let max_conf = touching.iter().map(|c| c.confidence).fold(0.0, f64::max);
-            beads.push(serde_json::json!({
-                "bead_id": bead_id,
-                "commit_count": touching.len(),
-                "max_confidence": max_conf,
-            }));
+        if touching.is_empty() {
+            continue;
+        }
+        let (title, status) = by_id.get(bead_id.as_str()).copied().unwrap_or(("", ""));
+        let last_touch = touching
+            .iter()
+            .map(|c| c.timestamp.as_str())
+            .max()
+            .unwrap_or_default();
+        let entry = serde_json::json!({
+            "bead_id": bead_id,
+            "title": title,
+            "status": status,
+            "commit_shas": touching.iter().map(|c| c.sha.clone()).collect::<Vec<_>>(),
+            "last_touch": last_touch,
+            "total_changes": 0,
+        });
+        // Go splits on the bead's normalized status, not on the commit.
+        match bv_correlation::file_index::classify_bead_status(status) {
+            (_, true) => closed_beads.push(entry),
+            _ => open_beads.push(entry),
         }
     }
-    beads.sort_by(|a, b| {
-        b["max_confidence"]
-            .as_f64()
-            .partial_cmp(&a["max_confidence"].as_f64())
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    if closed_beads.len() > closed_limit as usize {
+        closed_beads.truncate(closed_limit as usize);
+    }
+    let total_beads = open_beads.len() + closed_beads.len();
     let mut payload = full_envelope_for(&hash, &_issues);
-    payload["path"] = serde_json::json!(path);
-    payload["beads"] = serde_json::Value::Array(beads);
+    payload["file_path"] = serde_json::json!(path);
+    payload["total_beads"] = serde_json::json!(total_beads);
+    payload["open_beads"] = serde_json::Value::Array(open_beads);
+    payload["closed_beads"] = serde_json::Value::Array(closed_beads);
     emit_json(&payload)
 }
 
@@ -9443,30 +9768,15 @@ fn run_robot_file_relations(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let mut co_change: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
-    let mut seen_shas: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-    for commits in report.values() {
-        for c in commits {
-            if !c.files.iter().any(|f| f == &path) || !seen_shas.insert(c.sha.as_str()) {
-                continue;
-            }
-            for other in &c.files {
-                if other != &path {
-                    *co_change.entry(other.clone()).or_insert(0) += 1;
-                }
-            }
-        }
+    // Go main.go:1571 registers `--relations-threshold` with default 0.5, and
+    // file_index.go:484-486 re-applies the same 0.5 whenever the value is
+    // <= 0, so a 0 or a negative means "50% co-occurrence", not "no filter".
+    let mut relations_threshold: f64 = flag_value(args, "relations-threshold")
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .unwrap_or(0.5);
+    if relations_threshold <= 0.0 {
+        relations_threshold = 0.5;
     }
-    let mut related: Vec<serde_json::Value> = co_change
-        .into_iter()
-        .map(|(f, count)| serde_json::json!({ "path": f, "co_change_count": count }))
-        .collect();
-    related.sort_by(|a, b| {
-        b["co_change_count"]
-            .as_u64()
-            .cmp(&a["co_change_count"].as_u64())
-            .then_with(|| a["path"].as_str().cmp(&b["path"].as_str()))
-    });
     // Go main.go:1572 registers `--relations-limit` with default 10, threaded
     // through robot_registry.go:3013-3015 into `GetRelatedFiles`, whose
     // `limit <= 0 { limit = 10 }` guard (file_index.go:487-489) makes 0 fall
@@ -9479,9 +9789,69 @@ fn run_robot_file_relations(args: &[String]) -> ExitCode {
     } else {
         10
     } as usize;
+
+    // Go's `CoChangeMatrix` records, per file, how many distinct commits
+    // touched it and which of those also touched each neighbour. The
+    // correlation score is count / total_commits, which is what the
+    // threshold filters on — the previous raw-count ranking ignored both the
+    // denominator and the threshold entirely.
+    let mut total_commits: u64 = 0;
+    let mut co_change: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut samples: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    let mut seen_shas: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for commits in report.values() {
+        for c in commits {
+            if !c.files.iter().any(|f| f == &path) || !seen_shas.insert(c.sha.as_str()) {
+                continue;
+            }
+            total_commits += 1;
+            for other in &c.files {
+                if other != &path {
+                    *co_change.entry(other.clone()).or_insert(0) += 1;
+                    samples
+                        .entry(other.clone())
+                        .or_default()
+                        .push(c.sha.clone());
+                }
+            }
+        }
+    }
+    let mut related: Vec<serde_json::Value> = Vec::new();
+    if total_commits > 0 {
+        for (f, count) in co_change {
+            let correlation = count as f64 / total_commits as f64;
+            if correlation < relations_threshold {
+                continue;
+            }
+            // Go file_index.go:519-521 collects then sorts the sample commits
+            // and keeps the first three; taking them straight from a map made
+            // the output vary between runs.
+            let mut shas = samples.remove(&f).unwrap_or_default();
+            shas.sort();
+            shas.truncate(3);
+            related.push(serde_json::json!({
+                "file_path": f,
+                "co_change_count": count,
+                "total_commits": total_commits,
+                "correlation": correlation,
+                "sample_commits": shas,
+            }));
+        }
+    }
+    related.sort_by(|a, b| {
+        b["co_change_count"]
+            .as_u64()
+            .cmp(&a["co_change_count"].as_u64())
+            .then_with(|| a["file_path"].as_str().cmp(&b["file_path"].as_str()))
+    });
     related.truncate(relations_limit);
     let mut payload = full_envelope_for(&hash, &_issues);
-    payload["path"] = serde_json::json!(path);
+    // Go `CoChangeResult` (file_index.go:495-500) — an unknown file short-
+    // circuits with an empty list but still reports these two.
+    payload["file_path"] = serde_json::json!(path);
+    payload["total_commits"] = serde_json::json!(total_commits);
+    payload["threshold"] = serde_json::json!(relations_threshold);
     payload["related_files"] = serde_json::Value::Array(related);
     emit_json(&payload)
 }

@@ -26,6 +26,9 @@ last-touched
 .sync.lock
 sync_base.jsonl
 
+# Local feedback collected by the tracker CLI (per-machine, not shared)
+feedback.json
+
 # Merge artifacts (temporary files from 3-way merge)
 beads.base.jsonl
 beads.base.meta.json
