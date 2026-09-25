@@ -237,6 +237,23 @@ fn main() -> ExitCode {
     let mut violations = validation::validate_modifier_requires(&presence);
     violations.extend(validation::validate_exclusive_primaries(&presence));
 
+    // Enum-valued flags (--graph-format, --script-format) were registered and
+    // ported but never checked, so an invalid value was accepted and only
+    // failed later — or not at all. Go rejects at validation time with a
+    // "did you mean" suggestion.
+    let enum_supplied: Vec<(&str, &str)> = flags::ENUM_RULES
+        .iter()
+        .filter_map(|rule| {
+            let value = flag_value(&args, rule.name)?;
+            Some((rule.name, value))
+        })
+        .collect();
+    if let Some(err) = flags::validate_enum_flags(&enum_supplied) {
+        eprintln!("Error: {}", err.message());
+        eprintln!("Usage: bvr --robot-help  (full robot surface arrives with dispatch phase)");
+        return ExitCode::from(2);
+    }
+
     if !violations.is_empty() {
         for v in &violations {
             eprintln!("Error: {v}");
@@ -5950,6 +5967,22 @@ type CorrelationReport =
 /// Read `--<name>` / `--<name>=<value>` out of the raw argv. Go's `flag`
 /// package accepts both spellings and several Rust handlers already rely on
 /// the `=` form (see `history_flag_value`).
+/// Value of a `--name value` / `--name=value` flag, borrowed from `args`.
+/// Same scan as `search_flag`; this one avoids allocating.
+fn flag_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    let long = format!("--{name}");
+    let with_eq = format!("--{name}=");
+    for (i, a) in args.iter().enumerate() {
+        if let Some(v) = a.strip_prefix(&with_eq) {
+            return Some(v);
+        }
+        if a == &long {
+            return args.get(i + 1).map(|s| s.as_str());
+        }
+    }
+    None
+}
+
 fn search_flag(args: &[String], name: &str) -> Option<String> {
     let long = format!("--{name}");
     let with_eq = format!("--{name}=");
