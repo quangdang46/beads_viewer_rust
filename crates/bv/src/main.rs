@@ -4367,35 +4367,12 @@ fn plan_analysis_config(nodes: usize) -> serde_json::Value {
 
 /// Go `AnalysisConfig` for `--robot-priority`: full Phase-2 config.
 fn priority_analysis_config(nodes: usize) -> serde_json::Value {
-    let (bt_ns, pr_ns, cycles_ns, max_cycles) = match nodes {
-        n if n < 100 => (2_000_000_000i64, 2_000_000_000i64, 2_000_000_000i64, 1000),
-        n if n < 500 => (500_000_000i64, 500_000_000i64, 500_000_000i64, 100),
-        n if n < 2000 => (500_000_000i64, 300_000_000i64, 300_000_000i64, 50),
-        _ => (500_000_000i64, 200_000_000i64, 0i64, 10),
-    };
-    serde_json::json!({
-        "ComputeBetweenness": true,
-        "BetweennessTimeout": bt_ns,
-        "BetweennessSkipReason": "",
-        "BetweennessMode": "exact",
-        "BetweennessSampleSize": 0,
-        "BetweennessIsApproximate": false,
-        "ComputePageRank": true,
-        "PageRankTimeout": pr_ns,
-        "PageRankSkipReason": "",
-        "ComputeHITS": true,
-        "HITSTimeout": pr_ns,
-        "HITSSkipReason": "",
-        "ComputeCycles": true,
-        "CyclesTimeout": cycles_ns,
-        "MaxCyclesToStore": max_cycles,
-        "CyclesSkipReason": "",
-        "ComputeEigenvector": true,
-        "ComputeCriticalPath": true,
-        "ComputeKCore": true,
-        "ComputeArticulation": true,
-        "ComputeSlack": true,
-    })
+    // Go's `ConfigForSize` is the single source of truth for these values
+    // (pkg/analysis/config.go:98). The hand-rolled tier table this replaced
+    // hard-coded `BetweennessMode: "exact"` and `BetweennessSampleSize: 0` for
+    // every size, so `--robot-priority` reported the wrong analysis shape on
+    // any graph large enough for Go to sample.
+    serde_json::to_value(bv_analysis::analyzer::config_for_size(nodes, 0, 0.0)).unwrap_or_default()
 }
 
 /// Status map for plan/priority (golden-verified): only KCore, Articulation
