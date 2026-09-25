@@ -369,7 +369,9 @@ pub struct App {
     pub agent_prompt_modal: Option<crate::agent_prompt_modal::AgentPromptModal>,
     /// Velocity-comparison overlay inside Sprint view (Go `v` sub-toggle).
     pub show_velocity: bool,
-    /// Theme for consistent styling.
+    /// Theme for consistent styling. Resolved from `--theme` > `BV_THEME` >
+    /// `~/.config/bv/config.yaml` > auto — call
+    /// [`App::apply_theme_preference`] once after [`App::new`] to install it.
     pub theme: crate::theme::Theme,
     /// Key registry for help display.
     pub key_registry: crate::keybindings::KeyRegistry,
@@ -628,6 +630,18 @@ fn detect_agent_file_for_tui(cwd: &std::path::Path) -> bv_core::agents::detect::
 }
 
 impl App {
+    /// Install the palette for an already-resolved theme preference. Mirrors
+    /// Go's `ui.SetThemeOverride` call as the first statement of the root
+    /// command (cmd/bv/main.go:1766): the preference is process-wide, so it
+    /// only has to be set once, before any view renders.
+    ///
+    /// Note that the current views draw with hardcoded ANSI colors rather than
+    /// reading `self.theme`, so this records the resolved palette without
+    /// changing what is painted. See `crates/bv-tui/src/theme.rs`.
+    pub fn apply_theme_preference(&mut self, pref: Option<crate::theme::ThemePref>) {
+        self.theme = crate::theme::Theme::for_preference(pref);
+    }
+
     pub fn new(issues: Vec<bv_core::model::Issue>) -> Self {
         let issue_map: std::collections::HashMap<String, bv_core::model::Issue> =
             issues.iter().map(|i| (i.id.clone(), i.clone())).collect();
@@ -4360,6 +4374,92 @@ fn render_status_bar(f: &mut Frame, app: &App) {
     f.render_widget(bar, area);
 }
 
+/// Render one view into an off-screen buffer and return it as text, so
+/// `--debug-render` can capture TUI output without entering raw mode or the
+/// alternate screen. Port of Go `(*ui.Model).RenderDebugView`
+/// (pkg/ui/model.go:10570-10586).
+///
+/// Only the panel is rendered — Go never draws the status bar here, it just
+/// reserves the last row by rendering at `height - 1`. `"history"` is
+/// accepted even though the `--debug-render` help text omits it, because Go's
+/// switch does. Any other name returns Go's `Unknown view: <name>` string
+/// verbatim, without touching the buffer.
+pub fn render_debug_view(app: &mut App, view: &str, width: u16, height: u16) -> String {
+    // Go sets m.width/m.height/m.ready before the switch; m.ready has no
+    // Rust counterpart (nothing reads it) and the two size fields are set for
+    // parity with the model's own bookkeeping.
+    app.width = width;
+    app.height = height;
+
+    if !matches!(view, "insights" | "board" | "history") {
+        return format!("Unknown view: {view}");
+    }
+
+    // `height - 1` reserves the status-bar row. saturating_sub keeps a
+    // zero/one-row request from wrapping, which Go's `int` arithmetic would
+    // happily hand to the panel as a negative height.
+    let backend = ratatui::backend::TestBackend::new(width, height.saturating_sub(1));
+    let mut terminal = match ratatui::Terminal::new(backend) {
+        Ok(t) => t,
+        // TestBackend::size never fails and a zero-area buffer is legal, so
+        // this is unreachable in practice; degrade to empty output rather
+        // than panicking inside `--debug-render`.
+        Err(_) => return String::new(),
+    };
+
+    let empty = BTreeMap::new();
+    // A failed draw leaves the backend partially written; TestBackend only
+    // fails if its own size query does, so keep whatever it managed to draw.
+    let _ = terminal.draw(|f| match view {
+        "insights" => {
+            let (pr, bw, hub, auth) = if let Some(ref gm) = app.graph_metrics {
+                (&gm.pagerank, &gm.betweenness, &gm.hubs, &gm.authorities)
+            } else {
+                (&empty, &empty, &empty, &empty)
+            };
+            crate::views::insights::render_insights(f, pr, bw, hub, auth)
+        }
+        "board" => {
+            crate::views::board::render_board(f, app, f.area(), app.board_mode, app.board_column)
+        }
+        _ => match app.history {
+            Some(ref history) => crate::views::history::render_history(f, history, f.area()),
+            None => f.render_widget(
+                ratatui::widgets::Paragraph::new("No history data available (press h to load)"),
+                f.area(),
+            ),
+        },
+    });
+
+    buffer_to_lines(terminal.backend().buffer())
+}
+
+/// Flatten a ratatui buffer to one string per row, newline-joined.
+///
+/// `TestBackend`'s own `buffer_view` (ratatui-core-0.1.2/src/backend/test.rs:45)
+/// is private and `Buffer` only implements `Debug`, so the traversal is
+/// repeated here. No wide-glyph bookkeeping is needed: `Buffer::set_stringn`
+/// resets the cells a multi-column grapheme covers
+/// (ratatui-core-0.1.2/src/buffer/buffer.rs:363-367), and `Cell::symbol`
+/// renders a reset cell as a single space, so concatenating every cell in
+/// reading order lays the text out exactly as it would appear on screen.
+fn buffer_to_lines(buf: &ratatui::buffer::Buffer) -> String {
+    let width = buf.area.width as usize;
+    if width == 0 {
+        return String::new();
+    }
+    let mut out = String::with_capacity(buf.content.len() + buf.area.height as usize);
+    for (i, row) in buf.content.chunks(width).enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        for cell in row {
+            out.push_str(cell.symbol());
+        }
+    }
+    out
+}
+
 /// Run the TUI event loop. Returns when user quits.
 pub fn run_tui(app: &mut App) -> io::Result<()> {
     // Instance lock (Go bv-vrvn)
@@ -5578,6 +5678,181 @@ mod tests {
                 assert!(!app.quit_requested, "esc in a view must not quit");
             }
         }
+    }
+
+    // ── --debug-render (Go pkg/ui/model.go:10570-10586) ──────────────
+
+    #[test]
+    fn debug_render_rejects_an_unknown_view_with_go_wording() {
+        let mut app = make_app(3);
+        assert_eq!(
+            render_debug_view(&mut app, "triage", 40, 10),
+            "Unknown view: triage"
+        );
+        assert_eq!(render_debug_view(&mut app, "", 40, 10), "Unknown view: ");
+    }
+
+    #[test]
+    fn debug_render_accepts_the_three_go_view_names() {
+        let mut app = make_app(3);
+        // "history" is missing from the --debug-render help text but present
+        // in Go's switch (pkg/ui/model.go:10582).
+        for view in ["insights", "board", "history"] {
+            let out = render_debug_view(&mut app, view, 60, 12);
+            assert!(
+                !out.starts_with("Unknown view:"),
+                "{view} should be a known view"
+            );
+            assert!(!out.is_empty(), "{view} rendered nothing");
+        }
+    }
+
+    #[test]
+    fn debug_render_is_case_sensitive_like_go() {
+        let mut app = make_app(1);
+        assert_eq!(
+            render_debug_view(&mut app, "Insights", 40, 10),
+            "Unknown view: Insights"
+        );
+    }
+
+    #[test]
+    fn debug_render_reserves_the_last_row_for_the_status_bar() {
+        let mut app = make_app(3);
+        let out = render_debug_view(&mut app, "insights", 50, 11);
+        // Go renders every view at height-1, so the dump is (height-1) rows
+        // regardless of the requested height.
+        assert_eq!(out.lines().count(), 10, "{out:?}");
+    }
+
+    #[test]
+    fn debug_render_rows_are_exactly_the_requested_width() {
+        let mut app = make_app(3);
+        for width in [1u16, 17, 80] {
+            let out = render_debug_view(&mut app, "board", width, 6);
+            for line in out.lines() {
+                assert_eq!(line.chars().count(), width as usize, "width {width}");
+            }
+        }
+    }
+
+    #[test]
+    fn debug_render_records_the_requested_size_on_the_app() {
+        let mut app = make_app(1);
+        render_debug_view(&mut app, "insights", 123, 45);
+        assert_eq!(app.width, 123);
+        assert_eq!(app.height, 45);
+    }
+
+    #[test]
+    fn debug_render_survives_a_degenerate_height() {
+        let mut app = make_app(1);
+        // Go hands height-1 straight to the panel; a u16 subtraction would
+        // wrap, so height<=1 must not panic.
+        for height in [0u16, 1] {
+            render_debug_view(&mut app, "insights", 20, height);
+        }
+    }
+
+    #[test]
+    fn debug_render_survives_a_zero_width() {
+        let mut app = make_app(1);
+        assert_eq!(render_debug_view(&mut app, "insights", 0, 10), "");
+    }
+
+    #[test]
+    fn debug_render_renders_real_insight_content() {
+        let mut app = make_app(6);
+        app.graph_metrics = Some(GraphMetrics {
+            pagerank: [("T-1".to_string(), 0.9)].into_iter().collect(),
+            betweenness: [("T-2".to_string(), 0.8)].into_iter().collect(),
+            eigenvector: BTreeMap::new(),
+            hubs: BTreeMap::new(),
+            authorities: BTreeMap::new(),
+        });
+        let out = render_debug_view(&mut app, "insights", 100, 20);
+        assert!(out.contains("Bottlenecks"), "{out}");
+        assert!(out.contains("T-2"), "{out}");
+    }
+
+    #[test]
+    fn debug_render_history_without_data_says_so() {
+        let mut app = make_app(1);
+        app.history = None;
+        let out = render_debug_view(&mut app, "history", 60, 12);
+        assert!(out.contains("No history data available"), "{out}");
+    }
+
+    #[test]
+    fn debug_render_does_not_emit_the_status_bar() {
+        // Go renders only the panel for --debug-render and never calls
+        // renderStatusBar, so the footer row must be absent.
+        let mut app = make_app(5);
+        app.current_view = ViewMode::Insights;
+        app.filter_mode = FilterMode::All; // leading status-bar badge: " 📋 ALL "
+        let out = render_debug_view(&mut app, "insights", 100, 20);
+        assert!(!out.contains("\u{1f4cb}"), "status bar leaked:\n{out}");
+
+        // Positive control: the same view through the normal `render` path
+        // paints that badge, and paints it in the very last row — the row
+        // Go's `height-1` reserves. Without this the assertion above could
+        // pass merely because the marker never appears at all.
+        let backend = ratatui::backend::TestBackend::new(100, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let full = buffer_to_lines(terminal.backend().buffer());
+        let last = full.lines().next_back().unwrap();
+        assert!(last.contains("\u{1f4cb}"), "control last row:\n{last}");
+        // ...and the panel is one row taller without the reservation.
+        assert_eq!(full.lines().count(), out.lines().count() + 1);
+    }
+
+    #[test]
+    fn buffer_to_lines_reflows_a_hand_built_buffer() {
+        let area = ratatui::layout::Rect::new(0, 0, 3, 2);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        buf[(0, 0)].set_symbol("a");
+        buf[(1, 0)].set_symbol("b");
+        buf[(2, 0)].set_symbol("c");
+        buf[(0, 1)].set_symbol("d");
+        // Untouched cells render as a single space (Cell::symbol).
+        assert_eq!(buffer_to_lines(&buf), "abc\nd  ");
+    }
+
+    #[test]
+    fn buffer_to_lines_prints_a_wide_grapheme_once() {
+        // Each CJK glyph is two columns wide, so set_stringn stores it in one
+        // cell and resets the cell it covers
+        // (ratatui-core-0.1.2/src/buffer/buffer.rs:363-367). Concatenating
+        // every cell therefore yields one char per column — which a terminal
+        // re-flows to "日本" — instead of printing the glyph twice.
+        let area = ratatui::layout::Rect::new(0, 0, 4, 1);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        buf.set_stringn(
+            0,
+            0,
+            "\u{65e5}\u{672c}",
+            4,
+            ratatui::style::Style::default(),
+        );
+        assert_eq!(buffer_to_lines(&buf), "\u{65e5} \u{672c} ");
+        assert_eq!(buffer_to_lines(&buf).chars().count(), 4);
+    }
+
+    // ── --theme (Go cmd/bv/main.go:1766, 4639-4704) ─────────────────
+
+    #[test]
+    fn apply_theme_preference_installs_the_light_palette() {
+        let mut app = make_app(1);
+        app.apply_theme_preference(Some(crate::theme::ThemePref::Light));
+        assert_eq!(app.theme.bg, crate::theme::Theme::light().bg);
+    }
+
+    #[test]
+    fn apply_theme_preference_defaults_to_the_dark_palette() {
+        let mut app = make_app(1);
+        app.apply_theme_preference(None);
+        assert_eq!(app.theme.bg, crate::theme::Theme::default().bg);
     }
 }
 

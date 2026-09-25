@@ -497,7 +497,7 @@ pub fn report_graph_context(selected: &[Issue], context: &[Issue]) -> Vec<Issue>
 
 /// Go renders an absent `time.Time` field as its zero value, so a record with
 /// no `created_at` still shows a date instead of an empty table cell.
-const GO_ZERO_DATETIME: &str = "0001-01-01 00:00";
+pub(crate) const GO_ZERO_DATETIME: &str = "0001-01-01 00:00";
 const GO_ZERO_DATE: &str = "0001-01-01";
 
 /// Go `t.Format("2006-01-02 15:04")`, rendered in the offset the source
@@ -522,7 +522,7 @@ fn go_date(raw: Option<&str>) -> String {
 /// `10:00`, not the `08:00` its UTC instant would suggest. jiff collapses the
 /// instant to UTC, so re-apply the parsed offset and format the shifted
 /// instant, whose UTC fields are exactly the source's wall clock.
-fn wall_clock(raw: &str) -> Option<jiff::Timestamp> {
+pub(crate) fn wall_clock(raw: &str) -> Option<jiff::Timestamp> {
     let instant = raw.parse::<jiff::Timestamp>().ok()?;
     instant
         .checked_add(jiff::SignedDuration::from_secs(source_offset_seconds(raw)?))

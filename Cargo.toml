@@ -10,6 +10,7 @@ members = [
     "crates/bv-tui",
     "crates/bv-graph-core",
     "crates/bv-update",
+    "crates/bv-recipe",
     "crates/bv",
 ]
 exclude = [

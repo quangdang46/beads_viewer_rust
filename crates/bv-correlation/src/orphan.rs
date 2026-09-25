@@ -13,7 +13,7 @@ use crate::history::{self, HistoryOptions, HistoryReport};
 use jiff::Timestamp;
 use regex::Regex;
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -97,6 +97,10 @@ pub const TIMING_MATCH_WEIGHT: i32 = 30;
 pub const FILE_OVERLAP_BASE_WEIGHT: i32 = 25;
 pub const MENTIONED_BEAD_SCORE: i32 = 35;
 pub const AUTHOR_NEARBY_WEIGHT: i32 = 15;
+
+/// Go's per-hit weight for a registered `--id-pattern` in `checkMessage`
+/// (orphan.go:455) — the same 25 the `bv-` / `bead-` built-ins carry.
+const CUSTOM_ID_PATTERN_WEIGHT: i32 = 25;
 
 /// Go `orphanUsageHints` — documents how the payload is computed.
 const ORPHAN_USAGE_HINTS: &[&str] = &[
@@ -207,139 +211,15 @@ struct OrphanCommit {
 }
 
 // ---------------------------------------------------------------------------
-// File → beads index (Go file_index.go)
+// File -> beads index (Go file_index.go)
 // ---------------------------------------------------------------------------
+//
+// The index itself lives in `file_index.rs`, which ports Go's `FileLookup`
+// in full (build, exact + prefix lookup, glob, co-change). This module used to
+// carry its own reduced copy implementing only the exact-match arm; it is
+// gone, so the crate has a single implementation of the index.
 
-/// Go `BeadReference`, reduced to the fields orphan scoring reads. `last_touch`
-/// only feeds the lookup's sort order.
-#[derive(Debug, Clone)]
-struct BeadReference {
-    bead_id: String,
-    title: String,
-    status: String,
-    last_touch: String,
-}
-
-/// Go `FileLookup`: exact-path index over the correlated commits' file lists.
-#[derive(Debug, Default)]
-struct FileLookup {
-    file_to_beads: HashMap<String, Vec<BeadReference>>,
-    /// BeadID → (title, status), refreshed at lookup time.
-    beads: BTreeMap<String, (String, String)>,
-}
-
-/// Go `normalizePath`.
-fn normalize_path(path: &str) -> String {
-    let normalized = path.replace('\\', "/");
-    let trimmed = normalized.strip_prefix("./").unwrap_or(&normalized);
-    trimmed.trim_end_matches('/').to_string()
-}
-
-/// Go `classifyBeadStatus` — `(bucket, skip)`.
-fn classify_bead_status(status: &str) -> (&'static str, bool) {
-    match status.trim().to_lowercase().as_str() {
-        "tombstone" => ("", true),
-        "closed" => ("closed", false),
-        _ => ("open", false),
-    }
-}
-
-impl FileLookup {
-    /// Go `NewFileLookup` + `BuildFileIndex` — skip tombstoned beads, then map
-    /// every file a correlated commit touched to the beads behind that commit.
-    fn new(report: &HistoryReport) -> Self {
-        let mut by_file: HashMap<String, BTreeMap<String, BeadReference>> = HashMap::new();
-        for (bead_id, h) in &report.histories {
-            let (_, skip) = classify_bead_status(&h.status);
-            if skip {
-                continue;
-            }
-            for commit in h.commits.iter().flatten() {
-                for file in &commit.files {
-                    let entry = by_file
-                        .entry(normalize_path(&file.path))
-                        .or_default()
-                        .entry(bead_id.clone())
-                        .or_insert_with(|| BeadReference {
-                            bead_id: bead_id.clone(),
-                            title: h.title.clone(),
-                            status: h.status.clone(),
-                            last_touch: commit.timestamp.clone(),
-                        });
-                    if ts_cmp_str(&commit.timestamp, &entry.last_touch)
-                        == std::cmp::Ordering::Greater
-                    {
-                        entry.last_touch = commit.timestamp.clone();
-                    }
-                }
-            }
-        }
-        let mut lookup = FileLookup {
-            file_to_beads: by_file
-                .into_iter()
-                .map(|(path, refs)| (path, refs.into_values().collect()))
-                .collect(),
-            beads: report
-                .histories
-                .iter()
-                .map(|(id, h)| (id.clone(), (h.title.clone(), h.status.clone())))
-                .collect(),
-        };
-        // Go relies on the comparator, not iteration order; sort once so the
-        // per-lookup sort below is a no-op for already-ordered input.
-        for refs in lookup.file_to_beads.values_mut() {
-            sort_bead_refs(refs);
-        }
-        lookup
-    }
-
-    /// Go `LookupByFile` exact-match arm, returned as `(open, closed)`.
-    fn lookup_by_file(&self, path: &str) -> (Vec<BeadReference>, Vec<BeadReference>) {
-        let (mut open, mut closed) = (Vec::new(), Vec::new());
-        let Some(refs) = self.file_to_beads.get(&normalize_path(path)) else {
-            return (open, closed);
-        };
-        for r in refs {
-            let (title, status) = self
-                .beads
-                .get(&r.bead_id)
-                .cloned()
-                .unwrap_or_else(|| (r.title.clone(), r.status.clone()));
-            let (bucket, skip) = classify_bead_status(&status);
-            if skip {
-                continue;
-            }
-            let mut refreshed = r.clone();
-            refreshed.title = title;
-            refreshed.status = status;
-            if bucket == "closed" {
-                closed.push(refreshed);
-            } else {
-                open.push(refreshed);
-            }
-        }
-        sort_bead_refs(&mut open);
-        sort_bead_refs(&mut closed);
-        (open, closed)
-    }
-}
-
-/// Go `sortBeadRefs` — most recently touched first, bead ID breaking ties.
-fn sort_bead_refs(refs: &mut [BeadReference]) {
-    refs.sort_by(|a, b| {
-        ts_cmp_str(&b.last_touch, &a.last_touch).then_with(|| a.bead_id.cmp(&b.bead_id))
-    });
-}
-
-/// String-ordered timestamp comparison (RFC3339 instants compare correctly
-/// once parsed; unparseable values fall back to lexical order so the sort
-/// stays total).
-fn ts_cmp_str(a: &str, b: &str) -> std::cmp::Ordering {
-    match (history::parse_ts(a), history::parse_ts(b)) {
-        (Some(a), Some(b)) => a.cmp(&b),
-        _ => a.cmp(b),
-    }
-}
+use crate::file_index::FileLookup;
 
 // ---------------------------------------------------------------------------
 // Detector (Go orphan.go)
@@ -529,8 +409,8 @@ impl<'a> OrphanDetector<'a> {
             return;
         }
         for file in &candidate.files {
-            let (open, closed) = self.file_lookup.lookup_by_file(file);
-            for r in open.into_iter().chain(closed) {
+            let lookup = self.file_lookup.lookup_by_file(file);
+            for r in lookup.open_beads.into_iter().chain(lookup.closed_beads) {
                 candidate.signals.push(OrphanSignalHit {
                     signal: SIGNAL_FILES,
                     details: format!("Touches {file} (linked to {})", r.bead_id),
@@ -557,7 +437,17 @@ impl<'a> OrphanDetector<'a> {
         bead_scores: &mut BTreeMap<String, ProbableBeadBuilder>,
     ) {
         let msg = candidate.message.to_lowercase();
-        let (total, details) = message_suspicion(&candidate.message);
+        let (mut total, mut details) = message_suspicion(&candidate.message);
+        // Custom ID patterns (--id-pattern, #188) count as strong ID signals,
+        // matched against the original-case message since the pattern is
+        // user-supplied, and they join the same weight total and detail list the
+        // built-in patterns feed (Go orphan.go:449-457).
+        for re in custom_id_patterns() {
+            if let Some(m) = re.find(&candidate.message) {
+                total += CUSTOM_ID_PATTERN_WEIGHT;
+                details.push(m.as_str().to_string());
+            }
+        }
         if total > 0 {
             candidate.signals.push(OrphanSignalHit {
                 signal: SIGNAL_MESSAGE,
@@ -732,11 +622,11 @@ impl<'a> OrphanDetector<'a> {
     }
 }
 
-/// Go `CustomIDPatterns` — registered from the `--id-pattern` flag (Go
-/// `SetCustomIDPatterns`, main.go:1782). No Rust handler registers them, so the
-/// list is empty, exactly as it is in Go when the flag is absent.
-fn custom_id_patterns() -> &'static [Regex] {
-    &[]
+/// Go `CustomIDPatterns` — the `--id-pattern` registrations (Go
+/// `SetCustomIDPatterns`, main.go:1782). Empty exactly as it is in Go when the
+/// flag is absent.
+fn custom_id_patterns() -> Vec<Regex> {
+    crate::explicit::custom_id_patterns()
 }
 
 /// Go `checkMessage`'s custom-pattern pass: the bead IDs a message names via a
@@ -1127,6 +1017,143 @@ mod tests {
         assert_eq!(ids, vec!["bv-ab12cd34"]);
     }
 
+    /// A one-bead report whose ID is in a custom tracker's format, so the
+    /// `--id-pattern` path is the only thing that can name it.
+    fn custom_id_report() -> HistoryReport {
+        let bead_id = "zzq-a1b2c".to_string();
+        let mut histories = BTreeMap::new();
+        histories.insert(
+            bead_id.clone(),
+            BeadHistory {
+                bead_id: bead_id.clone(),
+                title: "Flush ordering".to_string(),
+                status: "open".to_string(),
+                events: vec![event(&bead_id, "2026-01-10T00:00:00Z")],
+                milestones: BeadMilestones {
+                    created: None,
+                    claimed: Some(event(&bead_id, "2026-01-10T00:00:00Z")),
+                    closed: None,
+                    reopened: None,
+                },
+                commits: Some(vec![]),
+                cycle_time: None,
+                last_author: "Ada".to_string(),
+            },
+        );
+        let commit_index = build_commit_index(&histories);
+        HistoryReport {
+            generated_at: "2026-01-25T00:00:00Z".to_string(),
+            data_hash: "deadbeefcafe".to_string(),
+            git_range: "limit 500".to_string(),
+            latest_commit_sha: String::new(),
+            window: HistoryWindow {
+                revision: String::new(),
+                limit: 500,
+                since: None,
+                until: None,
+                commits: 0,
+            },
+            stats: HistoryStats {
+                total_beads: 1,
+                beads_with_commits: 0,
+                total_commits: 0,
+                unique_authors: 0,
+                avg_commits_per_bead: 0.0,
+                avg_cycle_time_days: None,
+                method_distribution: BTreeMap::new(),
+                strategies: None,
+                feedback_applied: None,
+            },
+            histories,
+            commit_index,
+            causal_history: None,
+        }
+    }
+
+    fn message_only_candidate(message: &str) -> OrphanCandidate {
+        OrphanCandidate {
+            sha: "abc123def456".to_string(),
+            short_sha: "abc123d".to_string(),
+            message: message.to_string(),
+            author: "Ada".to_string(),
+            author_email: "ada@example.com".to_string(),
+            timestamp: "2026-01-12T00:00:00Z".to_string(),
+            files: vec!["src/app.rs".to_string()],
+            suspicion_score: 0,
+            probable_beads: Vec::new(),
+            signals: Vec::new(),
+        }
+    }
+
+    /// Go `TestOrphanDetector_CustomIDPatternMatchesProbableBead` (#188): a
+    /// registered `--id-pattern` adds its 25 to the message weight *and* credits
+    /// the bead it names, so a tracker whose IDs carry no numeric suffix still
+    /// links. No built-in pattern here can see `zzq-a1b2c` — only the
+    /// registration can.
+    #[test]
+    fn custom_id_pattern_scores_message_and_names_the_bead() {
+        let _serialized = crate::explicit::custom_patterns_lock();
+        crate::explicit::set_custom_id_patterns(vec![Regex::new(r"\bzzq-[a-z0-9]{5}\b").unwrap()]);
+
+        let report = custom_id_report();
+        let now = ts("2026-01-25T00:00:00Z");
+        let detector = OrphanDetector::new(Path::new("."), &report, now);
+        let mut candidate = message_only_candidate("fix flush ordering for zzq-a1b2c");
+        let mut bead_scores: BTreeMap<String, ProbableBeadBuilder> = BTreeMap::new();
+        detector.check_message(&mut candidate, &mut bead_scores);
+
+        // "fix" (10) + the custom hit (25) = 35, at the cap.
+        assert_eq!(candidate.signals.len(), 1);
+        assert_eq!(candidate.signals[0].signal, SIGNAL_MESSAGE);
+        assert_eq!(candidate.signals[0].weight, 35);
+        assert_eq!(
+            candidate.signals[0].details,
+            "Message patterns: fix, zzq-a1b2c"
+        );
+
+        let builder = bead_scores
+            .get("zzq-a1b2c")
+            .expect("custom-pattern bead ID is scored");
+        assert_eq!(builder.score, MENTIONED_BEAD_SCORE);
+    }
+
+    /// With no registration the same message scores only its built-in "fix"
+    /// signal and names no bead — Go's behavior when `--id-pattern` is absent.
+    #[test]
+    fn no_custom_id_pattern_leaves_custom_formats_unseen() {
+        let _serialized = crate::explicit::custom_patterns_lock();
+        crate::explicit::set_custom_id_patterns(Vec::new());
+
+        let report = custom_id_report();
+        let now = ts("2026-01-25T00:00:00Z");
+        let detector = OrphanDetector::new(Path::new("."), &report, now);
+        let mut candidate = message_only_candidate("fix flush ordering for zzq-a1b2c");
+        let mut bead_scores: BTreeMap<String, ProbableBeadBuilder> = BTreeMap::new();
+        detector.check_message(&mut candidate, &mut bead_scores);
+
+        assert_eq!(candidate.signals.len(), 1);
+        assert_eq!(candidate.signals[0].weight, 10);
+        assert!(bead_scores.is_empty());
+    }
+
+    /// A pattern with a capture group yields group 1, per Go's `checkMessage`
+    /// custom pass (orphan.go:479-489). Go hands the raw group to
+    /// `scoreMentionedBead` without normalizing — unlike the explicit matcher,
+    /// which lowercases through `normalizeBeadID` — and the bead lookup is
+    /// case-insensitive either way.
+    #[test]
+    fn custom_id_pattern_capture_group_one_is_the_id() {
+        let _serialized = crate::explicit::custom_patterns_lock();
+        crate::explicit::set_custom_id_patterns(vec![
+            Regex::new(r"(?i)ticket\s+(zzt-[a-z]{3})\b").unwrap()
+        ]);
+
+        assert_eq!(
+            custom_id_matches("board polish, ticket ZZT-PBB done"),
+            vec!["ZZT-PBB"]
+        );
+    }
+
     #[test]
     fn walks_the_same_window_the_correlation_index_covered() {
         let report = synthetic_report();
@@ -1152,6 +1179,9 @@ mod tests {
         report: &HistoryReport,
         now: Timestamp,
     ) -> Vec<OrphanCandidate> {
+        // `checkMessage` reads the process-global `--id-pattern` registry, so
+        // serialize against any sibling test that registers patterns.
+        let _serialized = crate::explicit::custom_patterns_lock();
         let detector = OrphanDetector::new(Path::new("."), report, now);
         let mut scored: Vec<OrphanCandidate> = orphans
             .iter()

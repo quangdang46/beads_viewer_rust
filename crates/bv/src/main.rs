@@ -233,6 +233,44 @@ fn main() -> ExitCode {
 
     let presence = validation::Presence::from_args(&args);
 
+    // Go main.go:1768-1783 registers `--id-pattern` BEFORE the modifier rules
+    // are validated and before any correlation work, so both explicit matching
+    // and orphan detection learn non-default ID formats. A pattern that does
+    // not compile is `Invalid --id-pattern %q: %v` at exit 2 — previously the
+    // flag was accepted and silently ignored, so a typo looked like it worked.
+    let id_patterns: Vec<String> = {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < args.len() {
+            let a = &args[i];
+            if a == "--id-pattern" {
+                if let Some(v) = args.get(i + 1) {
+                    out.push(v.clone());
+                }
+                i += 2;
+                continue;
+            }
+            if let Some(v) = a.strip_prefix("--id-pattern=") {
+                out.push(v.to_string());
+            }
+            i += 1;
+        }
+        out
+    };
+    if !id_patterns.is_empty() {
+        let mut compiled = Vec::with_capacity(id_patterns.len());
+        for p in &id_patterns {
+            match regex::Regex::new(p) {
+                Ok(re) => compiled.push(re),
+                Err(e) => {
+                    eprintln!("Invalid --id-pattern {p:?}: {e}");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+        bv_correlation::explicit::set_custom_id_patterns(compiled);
+    }
+
     // Validation order mirrors Go: modifier-requires then exclusive primaries.
     let mut violations = validation::validate_modifier_requires(&presence);
     violations.extend(validation::validate_exclusive_primaries(&presence));
@@ -248,19 +286,70 @@ fn main() -> ExitCode {
             Some((rule.name, value))
         })
         .collect();
+    // Go main.go:1894-1896 — an enum violation is `Error: %v` and exit 1, the
+    // same as a modifier-requires violation at :1890-1893. Neither path prints
+    // a Usage line.
     if let Some(err) = flags::validate_enum_flags(&enum_supplied) {
         eprintln!("Error: {}", err.message());
-        eprintln!("Usage: bvr --robot-help  (full robot surface arrives with dispatch phase)");
-        return ExitCode::from(2);
+        return ExitCode::from(1);
     }
 
     if !violations.is_empty() {
         for v in &violations {
             eprintln!("Error: {v}");
         }
-        eprintln!("Usage: bvr --robot-help  (full robot surface arrives with dispatch phase)");
         return ExitCode::from(1);
     }
+
+    // Go main.go:1937-1944 — `--db` is the TOP of the discovery chain
+    // ("--db flag > BEADS_DB env > BEADS_DIR env > auto-discovery", the
+    // priority comment at :1936). `get_beads_dir` already reads
+    // BEADS_DB_ENV first (bv-core/src/discovery.rs:168-197), so publishing the
+    // absolute path into the environment is the whole integration. Applied
+    // before any load: a bad path must fail the way Go fails it rather than
+    // being silently ignored in favour of the local .beads.
+    if let Some(db) = flag_value(&args, "db").filter(|v| !v.is_empty()) {
+        match std::path::absolute(db) {
+            Ok(abs) => std::env::set_var(bv_core::discovery::BEADS_DB_ENV, abs),
+            Err(e) => {
+                eprintln!("Error resolving --db path: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+    // Go main.go:1946-1949 — `--no-cache` is an env publish, not a switch the
+    // CLI consumes: it sets BV_NO_CACHE=1 so the analysis and correlation disk
+    // caches are bypassed. Today it is behaviour-neutral because neither cache
+    // is constructed outside tests, but the flag must be correct the moment
+    // they are.
+    if presence.has("no-cache") {
+        std::env::set_var("BV_NO_CACHE", "1");
+    }
+    // Go main.go:2777-2786 — the scoping flags are captured here and applied
+    // once inside `scopeLoadedIssues`, so every robot handler, every export and
+    // the TUI see the same narrowed issue set. Recorded from the REWRITTEN argv
+    // so `-l` / `-r` are visible.
+    set_scope_flags(
+        flag_value(&args, "label").unwrap_or_default().to_string(),
+        flag_value(&args, "recipe").unwrap_or_default().to_string(),
+        flag_value(&args, "repo").unwrap_or_default().to_string(),
+    );
+    FORCE_FULL_ANALYSIS.store(
+        presence.has("force-full-analysis"),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    // Go main.go:2619-2631 — auto-discovery of a workspace config only runs
+    // when `--workspace` and `--as-of` are both empty; an explicit path is
+    // loaded verbatim at main.go:2678-2721 and stamped SourceKind="workspace".
+    if let Some(ws) = flag_value(&args, "workspace")
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        set_workspace_override(std::path::PathBuf::from(ws));
+    }
+    // Go main.go:1766 — the theme warning precedes EVERY dispatch, robot
+    // commands included, so it runs here rather than on the TUI path.
+    warn_unknown_theme(&args);
 
     // Self-update (Go: --check-update / --update-dry-run / --update / --rollback).
     if presence.has("check-update") {
@@ -387,9 +476,23 @@ fn main() -> ExitCode {
             "dot" => bv_export::graph_export::generate_dot(&issues, None),
             "mermaid" => bv_export::graph_export::generate_mermaid_graph(&issues),
             "html" => {
+                // Go main.go:3491-3503 — on the interactive/HTML branch an
+                // empty `--graph-title` falls back to `filepath.Base(cwd)`
+                // ("project" if that is unavailable). The STATIC branch at
+                // main.go:3543 passes the raw string with no such default, so
+                // this fallback deliberately lives only here.
+                let title = flag_value(&args, "graph-title")
+                    .map(str::to_string)
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_else(|| {
+                        cwd.file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .filter(|n| !n.is_empty())
+                            .unwrap_or_else(|| "project".to_string())
+                    });
                 let mermaid = bv_export::graph_export::generate_mermaid_graph(&issues);
                 format!(
-                    "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<title>Beads Graph</title>\n<script src=\"https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js\"></script>\n<script>mermaid.initialize({{startOnLoad:true}});</script>\n</head>\n<body>\n<h1>Beads Dependency Graph</h1>\n<pre class=\"mermaid\">\n{mermaid}</pre>\n</body>\n</html>\n"
+                    "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<title>{title}</title>\n<script src=\"https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js\"></script>\n<script>mermaid.initialize({{startOnLoad:true}});</script>\n</head>\n<body>\n<h1>{title}</h1>\n<pre class=\"mermaid\">\n{mermaid}</pre>\n</body>\n</html>\n"
                 )
             }
             _ => serde_json::to_string_pretty(&serde_json::json!({
@@ -404,8 +507,23 @@ fn main() -> ExitCode {
         let out = if output_path.is_empty() {
             format!("beads_graph.{fmt}")
         } else {
-            output_path
+            output_path.clone()
         };
+        // Go main.go:3091 — pre-export hooks wrap every export, gated on
+        // `!*noHooks`. The DEFAULT path (no flag) is the one that matters: Go
+        // runs the hooks, so skipping them unconditionally was a divergence
+        // in the common case, not just behind `--no-hooks`.
+        if let Err(e) = run_export_hooks(
+            presence.has("no-hooks"),
+            &cwd,
+            &out,
+            &fmt,
+            issues.len(),
+            true,
+        ) {
+            eprintln!("Error running pre-export hooks: {e}");
+            return ExitCode::from(1);
+        }
         match std::fs::write(&out, &content) {
             Ok(_) => {
                 println!("Exported {} issues to {} ({fmt})", issues.len(), out);
@@ -417,6 +535,10 @@ fn main() -> ExitCode {
             }
         }
     }
+
+    // Go main.go:2031 — `robotShowToonStats = *toonStats || TOON_STATS=1`.
+    // Only the TOON encoder reads it, so the flag is a no-op in JSON mode.
+    set_show_toon_stats(presence.has("stats") || std::env::var("TOON_STATS").as_deref() == Ok("1"));
 
     // Format validation (Go: exit 2 on invalid)
     if presence.has("format") {
@@ -457,6 +579,28 @@ fn main() -> ExitCode {
         .map(|(_, v)| v.clone())
     {
         return run_save_baseline(&desc);
+    }
+
+    // Go main.go:2564-2577 — handled before any issue load, per the comment at
+    // :2547-2548, so `--baseline-info` works in a repo with no `.beads`.
+    if presence.has("baseline-info") {
+        return run_baseline_info();
+    }
+
+    // Go main.go:4012-4100. Dispatched well above the TUI fallthrough: without
+    // a handler the flag reached the interactive launcher and hung forever.
+    if presence.has("emit-script") {
+        return run_emit_script(&args);
+    }
+
+    // Go main.go:3878-3911 and :3915-4007. Neither flag has a
+    // modifier-requires rule in Go, so they are legal standing alone. Both
+    // previously fell through to the TUI and blocked.
+    if let Some(path) = flag_value(&args, "priority-brief").filter(|v| !v.is_empty()) {
+        return run_priority_brief(path);
+    }
+    if let Some(dir) = flag_value(&args, "agent-brief").filter(|v| !v.is_empty()) {
+        return run_agent_brief(dir);
     }
 
     // Correlation-family dispatch (Phase 3e).
@@ -533,7 +677,7 @@ fn main() -> ExitCode {
         return run_robot_file_beads(&args);
     }
     if presence.has("robot-file-hotspots") {
-        return run_robot_file_hotspots();
+        return run_robot_file_hotspots(&args);
     }
     if presence.has("robot-file-relations") {
         return run_robot_file_relations(&args);
@@ -704,12 +848,15 @@ th {{ background: #44475a; }}
             return ExitCode::from(1);
         }
         let root = std::path::PathBuf::from(&dir);
+        // Go main.go:3051 — `runPreviewServer(*previewPages, !*previewNoLiveReload)`,
+        // so the flag negates into the library's `livereload_enabled` argument.
+        let livereload = !args.iter().any(|a| a == "--no-live-reload");
         match bv_export::preview::start_preview(
             &root,
             |port| {
                 println!("Preview serving at http://127.0.0.1:{port} (Ctrl+C to stop)");
             },
-            true,
+            livereload,
         ) {
             Ok(()) => {
                 std::thread::sleep(std::time::Duration::MAX);
@@ -751,9 +898,47 @@ th {{ background: #44475a; }}
 
     // Interactive TUI: no robot flags present.
     let cwd = std::env::current_dir().unwrap_or_default();
+    // Go main.go:4493-4500 — the background-mode rollout. The mutual-exclusion
+    // check is TUI-path only: it sits after every `dispatchRobotFlagOrExit`
+    // call, which is why Go's own e2e test still exits 0 for
+    // `--background-mode --robot-triage`. Both flags only publish an env var
+    // that `bv_tui::App::new` reads.
+    if presence.has("background-mode") && presence.has("no-background-mode") {
+        eprintln!("Error: --background-mode and --no-background-mode are mutually exclusive");
+        return ExitCode::from(2);
+    }
+    if presence.has("background-mode") {
+        std::env::set_var("BV_BACKGROUND_MODE", "1");
+    } else if presence.has("no-background-mode") {
+        std::env::set_var("BV_BACKGROUND_MODE", "0");
+    }
+
+    // Go main.go:4639-4666 — an explicitly passed but unrecognized `--theme`
+    // value warns and resolves to auto rather than silently falling through
+    // to a lower-precedence source. This is the only externally visible part
+    // of the theme contract: the palette itself lives in `bv_tui::theme`.
+    //
+    // The palette application is a `bv_tui` concern and only reachable from the
+    // TUI path, but the WARNING is not: main.go:1766 is the first statement of
+    // the root command, so Go emits it for EVERY invocation, robot commands
+    // included. It therefore has to run before dispatch, not down here.
+    warn_unknown_theme(&args);
+
+    // Go main.go:2678-2721 — an explicit `--workspace <path>` is used verbatim
+    // and takes the place of auto-discovery (which main.go:2619-2631 only runs
+    // when both `--workspace` and `--as-of` are empty). Go main.go:2805-2807
+    // then stamps SourceKind="workspace" / SourcePath=<flag> on the source
+    // metadata.
+    let explicit_workspace = flag_value(&args, "workspace")
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from);
 
     // Workspace mode: .bv/workspace.yaml found → aggregate multi-repo load
-    if let Some(ws_path) = bv_core::workspace::find_workspace_config(&cwd) {
+    let workspace_config = explicit_workspace
+        .clone()
+        .or_else(|| bv_core::workspace::find_workspace_config(&cwd));
+    if let Some(ws_path) = workspace_config {
         let ws_root = ws_path
             .parent()
             .and_then(|p| p.parent())
@@ -768,6 +953,9 @@ th {{ background: #44475a; }}
                     .filter(|r| r.error.is_none())
                     .map(|r| r.repo_name.clone())
                     .collect();
+                // Go main.go:2792 — the TUI receives the SCOPED set, same as
+                // every robot consumer and every export.
+                let (issues, _) = apply_scope(&issues);
                 eprintln!(
                     "Workspace: loaded {} issues from {} repos — launching TUI",
                     issues.len(),
@@ -785,6 +973,8 @@ th {{ background: #44475a; }}
 
     match bv_core::discovery::load_issues_from_repo(&cwd) {
         Ok((issues, _)) => {
+            // Go main.go:2792 — the TUI is scoped like everything else.
+            let (issues, _) = apply_scope(&issues);
             eprintln!("Loaded {} issues — launching TUI", issues.len());
             let mut app = bv_tui::App::new(issues.clone());
             launch_tui(&mut app, &issues)
@@ -942,35 +1132,41 @@ fn load_issues_auto(
     load_issues_auto_meta(cwd, as_of).map(|(i, h, c, _)| (i, h, c))
 }
 
+/// The UNSCOPED loader, for the one consumer that needs it. Go captures
+/// `issuesForSearch := issues` at main.go:2770 — BEFORE `scopeLoadedIssues`
+/// runs at :2786 — so the search index is built over the whole source while
+/// only the scoped set is ranked. Every other consumer goes through the scoped
+/// loader.
+fn load_issues_auto_unscoped(
+    cwd: &std::path::Path,
+    as_of: Option<&str>,
+) -> Result<(Vec<bv_core::model::Issue>, String, Option<String>), String> {
+    load_issues_auto_meta_raw(cwd, as_of).map(|(i, h, c, _)| (i, h, c))
+}
+
+/// The active `--label` / `--recipe` / `--repo` scoping flags, recorded once in
+/// `main` from the REWRITTEN argv. Go threads these through the RobotContext
+/// (robot_registry.go:261-268) and applies them once at main.go:2786.
+///
+/// Reading `std::env::args()` here instead would miss the `-l` / `-r` aliases,
+/// which `argv::rewrite_args` (crates/bv/src/argv.rs:24) expands into their
+/// long spellings only in the rewritten vector — so `-l tui` and `--label tui`
+/// would produce different scopes.
+static SCOPE_FLAGS: std::sync::OnceLock<[String; 3]> = std::sync::OnceLock::new();
+
+fn set_scope_flags(label: String, recipe: String, repo: String) {
+    let _ = SCOPE_FLAGS.set([label, recipe, repo]);
+}
+
 /// Envelope for a command that already loaded `issues` — derives the source
 /// provenance from the current directory so callers do not thread `cwd`.
-/// The active `--label` / `--recipe` / `--repo` scoping flags, read straight
-/// from argv so the envelope can publish them. Go threads these through the
-/// RobotContext (robot_registry.go:261-268); the envelope helper has no
-/// context, so it reads the process arguments.
+/// The active scoping flags are published by the envelope so a caller can see
+/// which scope produced the payload.
 fn active_scope_flags() -> (String, String, String) {
-    let args: Vec<String> = std::env::args().collect();
-    let value_of = |names: &[&str]| -> String {
-        let mut i = 0;
-        while i < args.len() {
-            let a = &args[i];
-            for n in names {
-                if a == n {
-                    return args.get(i + 1).cloned().unwrap_or_default();
-                }
-                if let Some(v) = a.strip_prefix(&format!("{n}=")) {
-                    return v.to_string();
-                }
-            }
-            i += 1;
-        }
-        String::new()
-    };
-    (
-        value_of(&["--label"]),
-        value_of(&["--recipe"]),
-        value_of(&["--repo"]),
-    )
+    SCOPE_FLAGS
+        .get()
+        .map(|s| (s[0].clone(), s[1].clone(), s[2].clone()))
+        .unwrap_or_default()
 }
 
 /// Go's top-level `label_scope` / `label_context` payload keys.
@@ -1031,6 +1227,42 @@ fn apply_label_scope(issues: &[bv_core::model::Issue]) -> Vec<bv_core::model::Is
     out
 }
 
+/// Apply the active scope flags to a freshly loaded issue set, in Go's order:
+/// `--repo` first (main.go:4874-4885, which also recomputes `DataHash` over
+/// the filtered set), then `--label` (main.go:4887-4902).
+///
+/// Go applies both once, inside `scopeLoadedIssues` (main.go:2786), so every
+/// consumer downstream — each robot handler, each export, the TUI — analyses
+/// the same narrowed set. Applying the filter at a few call sites instead left
+/// `--label` decorative on the majority of handlers while the envelope still
+/// advertised it.
+fn apply_repo_scope(issues: &[bv_core::model::Issue]) -> Vec<bv_core::model::Issue> {
+    let (_label, _recipe, repo) = active_scope_flags();
+    if repo.is_empty() {
+        return issues.to_vec();
+    }
+    bv_core::repo_filter::filter_by_repo(issues, &repo)
+}
+
+/// Every loader routes through this so the scope is applied exactly once,
+/// exactly where Go applies it (`scopeLoadedIssues`, main.go:2786).
+///
+/// The returned `Option<String>` is a `DataHash` override, and Go's two
+/// scopes treat it differently (main.go:4883-4885 vs :4901): a `--repo` filter
+/// RE-hashes the repo-filtered source, while a `--label` filter leaves the
+/// loader's hash alone and only sets `DataHashMatchesIssues = false`. Getting
+/// that backwards would change the `data_hash` on every `--label` golden.
+fn apply_scope(issues: &[bv_core::model::Issue]) -> (Vec<bv_core::model::Issue>, Option<String>) {
+    let (_label, _recipe, repo) = active_scope_flags();
+    let repo_scoped = apply_repo_scope(issues);
+    let hash_override = if repo.is_empty() {
+        None
+    } else {
+        Some(bv_core::data_hash::compute_data_hash(&repo_scoped))
+    };
+    (apply_label_scope(&repo_scoped), hash_override)
+}
+
 fn full_envelope_for(data_hash: &str, issues: &[bv_core::model::Issue]) -> serde_json::Value {
     let source = source_meta_for(issues);
     full_envelope_json_with_source(data_hash, Some(&source), issues)
@@ -1059,7 +1291,30 @@ fn source_meta_for(issues: &[bv_core::model::Issue]) -> SourceMeta {
 
 /// Go `RobotContext` loader — returns the issues, their hash, the resolved
 /// `--as-of` commit, and the source provenance the envelope reports.
+///
+/// This is the SCOPED loader: it applies `--repo` then `--label` exactly where
+/// Go's `scopeLoadedIssues` does (main.go:2786, body at :4870-4902), so every
+/// robot handler, export and the TUI analyse the same narrowed set. The
+/// `SourceMeta` still describes the full loaded source, which is what Go's
+/// `source_authority` reports.
 fn load_issues_auto_meta(
+    cwd: &std::path::Path,
+    as_of: Option<&str>,
+) -> Result<
+    (
+        Vec<bv_core::model::Issue>,
+        String,
+        Option<String>,
+        SourceMeta,
+    ),
+    String,
+> {
+    let (issues, hash, commit, source) = load_issues_auto_meta_raw(cwd, as_of)?;
+    let (issues, hash_override) = apply_scope(&issues);
+    Ok((issues, hash_override.unwrap_or(hash), commit, source))
+}
+
+fn load_issues_auto_meta_raw(
     cwd: &std::path::Path,
     as_of: Option<&str>,
 ) -> Result<
@@ -1099,7 +1354,12 @@ fn load_issues_auto_meta(
             },
         ));
     }
-    if let Some(ws_path) = bv_core::workspace::find_workspace_config(cwd) {
+    // Go main.go:2678 — an explicit `--workspace` wins over discovery.
+    let explicit_ws = workspace_override().map(std::path::Path::to_path_buf);
+    let ws_candidate = explicit_ws
+        .clone()
+        .or_else(|| bv_core::workspace::find_workspace_config(cwd));
+    if let Some(ws_path) = ws_candidate {
         let ws_root = ws_path
             .parent()
             .and_then(|p| p.parent())
@@ -1123,6 +1383,14 @@ fn load_issues_auto_meta(
                         skipped: 0,
                     },
                 ));
+            }
+            Err(e) if explicit_ws.is_some() => {
+                // Go main.go:2678-2721 loads the EXPLICIT path and reports a
+                // failed source (loaded 0 / failed 1, claim_safe false) rather
+                // than quietly reading a different repository. Falling back to
+                // the local `.beads` here made the envelope claim a healthy,
+                // claim-safe source for a path the caller never asked for.
+                return Err(format!("loading workspace {}: {e}", ws_path.display()));
             }
             Err(e) => eprintln!("workspace load failed, falling back: {e}"),
         }
@@ -1408,6 +1676,47 @@ fn recommendations_top_n(recs: &[bv_analysis::impact::IssueImpact]) -> Vec<serde
 /// Shared by `top_picks` and `quick_wins`: Go derives both from the same
 /// `claimableIDs` set, so a deferred/draft/blocked bead must never appear in
 /// either (issue #199). Checking only `status == "open"` is not enough.
+/// Go `resolveNotReadyLabels` (robot_registry.go:2073-2090) — the
+/// `--robot-not-ready-labels` flag, else `BV_ROBOT_NOT_READY_LABELS`,
+/// comma-split, trimmed, empties dropped. An empty set disables the gate, so
+/// this is a no-op unless the flag or env var is configured.
+fn resolve_not_ready_labels() -> Vec<String> {
+    // robot_registry.go:2075-2079 — the FLAG wins over the env var, and only
+    // when it is non-blank. The flag has no short alias, so raw argv is
+    // equivalent to the rewritten vector here.
+    let argv: Vec<String> = std::env::args().collect();
+    let flag_raw = argv
+        .iter()
+        .position(|a| a == "--robot-not-ready-labels")
+        .and_then(|i| argv.get(i + 1))
+        .filter(|v| !v.trim().is_empty())
+        .cloned();
+    let raw =
+        flag_raw.unwrap_or_else(|| std::env::var("BV_ROBOT_NOT_READY_LABELS").unwrap_or_default());
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Go `hasAnyLabel` (pkg/analysis/triage.go:1208-1220) — case-insensitive,
+/// whitespace-trimmed membership. Returns false for an empty `wanted`, so an
+/// unconfigured not-ready set never excludes anything.
+fn has_any_label(issue_labels: &[String], wanted: &[String]) -> bool {
+    if wanted.is_empty() || issue_labels.is_empty() {
+        return false;
+    }
+    issue_labels.iter().any(|have| {
+        let have = have.trim().to_lowercase();
+        wanted.iter().any(|w| have == w.trim().to_lowercase())
+    })
+}
+
 fn triage_claimable(
     r: &bv_analysis::impact::IssueImpact,
     issue_by_id: &std::collections::HashMap<&str, &bv_core::model::Issue>,
@@ -1423,6 +1732,13 @@ fn triage_claimable(
         if !bv_analysis::open_blockers(issue_by_id, &issue.id).is_empty() {
             return false;
         }
+        // Go triage.go:1200 — `!hasAnyLabel(rec.Labels, notReadyLabels)` is
+        // the final conjunct of `isClaimableRecommendation`, so a
+        // graph-ready-but-not-work-ready bead is excluded from top picks,
+        // triage-by-track and triage-by-label alike.
+        if has_any_label(&issue.labels, &resolve_not_ready_labels()) {
+            return false;
+        }
     }
     true
 }
@@ -1434,18 +1750,18 @@ fn run_robot_triage() -> ExitCode {
     // SourceMeta, and re-deriving it via source_meta_for() is what hard-codes
     // errors/skipped to zero — making claim_safe unconditionally true.
     let (loaded, _hash, as_of_commit, loaded_source) =
-        match load_issues_auto_meta(&cwd, as_of.as_deref()) {
+        match load_issues_auto_meta_raw(&cwd, as_of.as_deref()) {
             Ok(x) => x,
             Err(e) => {
                 eprintln!("Error: {e}");
                 return ExitCode::from(1);
             }
         };
-    // --label narrows the analysis to the label's subgraph (Go
-    // scopeLoadedIssues, main.go:4870-4900), while the envelope keeps
+    // `--repo` then `--label` narrow the analysis at the same point Go does
+    // (scopeLoadedIssues, main.go:2786 / :4870-4902), while the envelope keeps
     // describing the loaded file.
-    let loaded_hash = _hash.clone();
-    let issues = apply_label_scope(&loaded);
+    let (issues, hash_override) = apply_scope(&loaded);
+    let loaded_hash = hash_override.unwrap_or_else(|| _hash.clone());
     if issues.is_empty() {
         println!(
             "{{\"generated_at\":\"{}\",\"data_hash\":\"empty\",\"triage\":{{}}}}",
@@ -1766,6 +2082,76 @@ fn run_robot_triage() -> ExitCode {
     let mut payload = full_envelope_for(&data_hash, &loaded);
     payload["output_format"] = serde_json::json!(env.output_format);
     payload["version"] = serde_json::json!(GO_APP_VERSION);
+
+    // Go robot_registry.go:2232-2234 — `--brief` is an EARLY RETURN that
+    // replaces the whole triage payload, before `meta`/`status`/
+    // `project_health`/`commands`/`usage_hints`/`feedback` are ever assembled.
+    // One branch covers all three triage primaries because they share
+    // `handleRobotTriage` (robot_registry.go:1671-1679).
+    if std::env::args().any(|a| a == "--brief") {
+        let brief_recs: Vec<serde_json::Value> = out
+            .recommendations
+            .iter()
+            .map(|r| {
+                // Go `briefTriageRecommendation` (robot_registry.go:2276-2284):
+                // id, title, status, assignee(omitempty), score, unblocks,
+                // blocked_by, actions — and no TopN slice, so this is the full
+                // list, not `recommendations_top_n`.
+                let assignee = issue_by_id
+                    .get(r.id.as_str())
+                    .map(|i| i.assignee.clone())
+                    .unwrap_or_default();
+                let mut o = serde_json::Map::new();
+                o.insert("id".into(), serde_json::json!(r.id));
+                o.insert("title".into(), serde_json::json!(r.title));
+                o.insert("status".into(), serde_json::json!(r.status));
+                if !assignee.is_empty() {
+                    o.insert("assignee".into(), serde_json::json!(assignee));
+                }
+                o.insert("score".into(), serde_json::json!(r.score));
+                if !r.unblocks_ids.is_empty() {
+                    o.insert("unblocks".into(), serde_json::json!(r.unblocks_ids));
+                }
+                if !r.blocked_by.is_empty() {
+                    o.insert("blocked_by".into(), serde_json::json!(r.blocked_by));
+                }
+                o.insert(
+                    "actions".into(),
+                    r.actions.clone().unwrap_or(serde_json::Value::Null),
+                );
+                serde_json::Value::Object(o)
+            })
+            .collect();
+        let mut brief = payload.clone();
+        let obj = brief.as_object_mut().expect("envelope is an object");
+        for key in ["triage", "usage_hints", "label_scope", "label_context"] {
+            obj.remove(key);
+        }
+        obj.insert("brief".into(), serde_json::json!(true));
+        obj.insert(
+            "quick_ref".into(),
+            serde_json::json!({
+                "open_count": out.quick_ref.open_count,
+                "actionable_count": out.quick_ref.actionable_count,
+                "blocked_count": out.quick_ref.blocked_count,
+                "in_progress_count": out.quick_ref.in_progress_count,
+                "not_closed_count": out.quick_ref.not_closed_count,
+                "not_actionable_count": out.quick_ref.not_actionable_count,
+                "top_picks": top_picks,
+            }),
+        );
+        obj.insert("recommendations".into(), serde_json::json!(brief_recs));
+        if !quick_wins.is_empty() {
+            obj.insert("quick_wins".into(), serde_json::json!(quick_wins));
+        }
+        if !blockers_to_clear.is_empty() {
+            obj.insert(
+                "blockers_to_clear".into(),
+                serde_json::json!(blockers_to_clear),
+            );
+        }
+        return emit_json(&brief);
+    }
     let triage_body = serde_json::json!({
         "meta": meta,
         "status": triage_status.to_json_map(),
@@ -1917,6 +2303,74 @@ fn output_format() -> &'static str {
     }
 }
 
+/// Go `robotShowToonStats` (main.go:2031): `--stats` or `TOON_STATS=1`. The
+/// value is only consulted by the TOON encoder, so the flag is a deliberate
+/// no-op in JSON mode (main.go:7560-7565 picks the JSON encoder unless the
+/// format is "toon").
+static SHOW_TOON_STATS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn set_show_toon_stats(on: bool) {
+    SHOW_TOON_STATS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn show_toon_stats() -> bool {
+    SHOW_TOON_STATS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Go `estimateTokens` (main.go:7603-7610) — a coarse `/4` heuristic over the
+/// trimmed byte length. `len()` on a Go string counts UTF-8 BYTES, so this
+/// must be `len()` on the `&str`, never `chars().count()`.
+fn estimate_tokens(s: &str) -> usize {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return 0;
+    }
+    trimmed.len().div_ceil(4)
+}
+
+/// Go main.go:2678 — an explicit `--workspace <path>` replaces auto-discovery.
+/// Recorded once from the REWRITTEN argv in `main` so the robot loaders can
+/// honour it without threading `args` through every call site.
+static WORKSPACE_OVERRIDE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+fn set_workspace_override(path: std::path::PathBuf) {
+    let _ = WORKSPACE_OVERRIDE.set(path);
+}
+
+fn workspace_override() -> Option<&'static std::path::Path> {
+    WORKSPACE_OVERRIDE.get().map(|p| p.as_path())
+}
+
+/// Go main.go:1535 — `--force-full-analysis` swaps `ConfigForSize` for
+/// `FullAnalysisConfig` (pkg/analysis/config.go:230-254) in every handler that
+/// publishes an `analysis_config`, flipping the skipped metrics to computed.
+/// Recorded once in `main` so the config emitters stay pure.
+static FORCE_FULL_ANALYSIS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn force_full_analysis() -> bool {
+    FORCE_FULL_ANALYSIS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Go `canonicalTheme` + `effectiveThemePreference` (main.go:4639-4666): an
+/// explicitly passed but unrecognized `--theme` value warns on stderr and
+/// resolves to auto-detection instead of silently falling through to a
+/// lower-precedence source. Accepts only light/dark/auto, case- and
+/// whitespace-insensitively.
+fn warn_unknown_theme(args: &[String]) {
+    let Some(theme) = flag_value(args, "theme") else {
+        return;
+    };
+    if !matches!(
+        theme.trim().to_lowercase().as_str(),
+        "light" | "dark" | "auto"
+    ) {
+        eprintln!(
+            "Warning: unknown --theme value {theme:?} (expected light, dark, or auto); using auto-detection"
+        );
+    }
+}
+
 fn run_save_baseline(desc: &str) -> ExitCode {
     match capture_baseline() {
         Err(e) => {
@@ -1947,6 +2401,134 @@ fn run_save_baseline(desc: &str) -> ExitCode {
             }
         }
     }
+}
+
+/// Handle `--baseline-info` (Go main.go:2564-2577). Deliberately runs BEFORE
+/// any issue load — the comment at main.go:2547-2548 says so — so it works in
+/// a repo with no `.beads` at all.
+fn run_baseline_info() -> ExitCode {
+    let path = std::path::Path::new(BASELINE_PATH);
+    if !path.exists() {
+        println!("No baseline found.");
+        println!("Create one with: bv --save-baseline \"description\"");
+        return ExitCode::from(0);
+    }
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) => {
+            eprintln!("Error loading baseline: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let doc: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error loading baseline: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    // Go `Baseline.Summary()` (pkg/baseline/baseline.go:170-213), field for
+    // field. Every field is read defensively: Rust's own writer
+    // (`run_save_baseline`) emits empty `commit_sha`/`branch` and no
+    // `commit_message`/`top_metrics`, while a Go-written baseline has all of
+    // them, so the Commit/Message/Top-PageRank sections are legitimately empty
+    // for one and populated for the other.
+    let created = doc
+        .get("created_at")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    println!("Baseline created: {}", go_rfc1123(created));
+
+    let sha = doc
+        .get("commit_sha")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if !sha.is_empty() {
+        let short = &sha[..sha.len().min(8)];
+        match doc.get("branch").and_then(|v| v.as_str()) {
+            Some(b) if !b.is_empty() => println!("Commit: {short} ({b})"),
+            _ => println!("Commit: {short}"),
+        }
+        if let Some(msg) = doc
+            .get("commit_message")
+            .and_then(|v| v.as_str())
+            .filter(|m| !m.is_empty())
+        {
+            println!("Message: {msg}");
+        }
+    }
+    let description = doc
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if !description.is_empty() {
+        println!("Note: {description}");
+    }
+    let num = |key: &str| {
+        doc.get("stats")
+            .and_then(|s| s.get(key))
+            .and_then(|v| v.as_i64())
+    };
+    let density = doc
+        .get("stats")
+        .and_then(|s| s.get("density"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    println!(
+        "\nGraph: {} nodes, {} edges (density: {:.4})",
+        num("node_count").unwrap_or(0),
+        num("edge_count").unwrap_or(0),
+        density
+    );
+    println!(
+        "Status: {} open, {} blocked, {} closed",
+        num("open_count").unwrap_or(0),
+        num("blocked_count").unwrap_or(0),
+        num("closed_count").unwrap_or(0)
+    );
+    println!(
+        "Actionable: {} | Cycles: {}",
+        num("actionable_count").unwrap_or(0),
+        num("cycle_count").unwrap_or(0)
+    );
+    // baseline.go:204-212 — at most 5 PageRank rows.
+    if let Some(rows) = doc
+        .get("top_metrics")
+        .and_then(|t| t.get("pagerank"))
+        .and_then(|v| v.as_array())
+        .filter(|rows| !rows.is_empty())
+    {
+        print!("\nTop PageRank:\n");
+        for row in rows.iter().take(5) {
+            let id = row.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+            let value = row.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            println!("  {id}: {value:.4}");
+        }
+    }
+    ExitCode::from(0)
+}
+
+/// Render an RFC3339 timestamp the way Go's `time.RFC1123` layout does:
+/// `Mon, 02 Jan 2006 15:04:05 MST`.
+fn go_rfc1123(rfc3339: &str) -> String {
+    let Ok(ts) = rfc3339.parse::<jiff::Timestamp>() else {
+        return rfc3339.to_string();
+    };
+    let zoned = ts.to_zoned(jiff::tz::TimeZone::UTC);
+    let dt = zoned.datetime();
+    let weekday = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"][dt.weekday() as usize % 7];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    format!(
+        "{weekday}, {:02} {} {:04} {:02}:{:02}:{:02} UTC",
+        dt.day(),
+        MONTHS[(dt.month() - 1) as usize],
+        dt.year(),
+        dt.hour(),
+        dt.minute(),
+        dt.second()
+    )
 }
 
 /// Handle `--check-update` (Go bv-182): report whether a newer release exists.
@@ -2891,6 +3473,10 @@ fn load_and_analyze() -> Result<AnalysisTuple, ExitCode> {
             return Err(ExitCode::from(1));
         }
     };
+    // Go main.go:2786 — `--repo` then `--label` narrow the set before any
+    // handler analyses it, and a `--repo` filter re-hashes the narrowed source
+    // (main.go:4883-4884).
+    let (issues, hash_override) = apply_scope(&issues);
     if issues.is_empty() {
         println!(
             "{{\"generated_at\":\"{}\",\"data_hash\":\"empty\",\"error\":\"no issues loaded\"}}",
@@ -2898,7 +3484,7 @@ fn load_and_analyze() -> Result<AnalysisTuple, ExitCode> {
         );
         return Err(ExitCode::from(0));
     }
-    let data_hash = bv_core::data_hash::compute_data_hash(&issues);
+    let data_hash = hash_override.unwrap_or_else(|| bv_core::data_hash::compute_data_hash(&issues));
     let g = std::sync::Arc::new(bv_analysis::build_graph(&issues));
     let p1 = bv_analysis::analyze_phase1(&g);
     let budget = bv_analysis::AnalysisBudget {
@@ -2990,7 +3576,43 @@ fn full_envelope_json_with_source(
 }
 
 fn emit_json(v: &serde_json::Value) -> ExitCode {
-    println!("{}", go_json_string(v));
+    let encoded = go_json_string(v);
+    println!("{encoded}");
+    // Go toonRobotEncoder.Encode (main.go:7519-7536) writes the `[stats]`
+    // estimate to stderr after serializing and before emitting. Gating on
+    // `output_format() == "toon"` reproduces Go's gate for free: Rust already
+    // downgrades OUTPUT_FORMAT to "json" when `tru` is missing
+    // (main.go:2040-2042 equivalent), which is exactly the condition under
+    // which Go never selects the encoder that owns this block.
+    if show_toon_stats() && output_format() == "toon" {
+        let json_tokens = estimate_tokens(&encoded);
+        // `encode_payload` (bv-robot/src/envelope.rs:362-367) documents that the
+        // TOON encoder emits byte-identical compact JSON apart from the
+        // `output_format` marker, so today this equals `json_tokens` and the
+        // saving is 0 — Go's `same size` branch. Computed rather than
+        // hard-coded so a genuinely re-encoding TOON path changes the line by
+        // itself.
+        let toon_tokens = estimate_tokens(&encoded);
+        // Go main.go:7531 — signed, so a negative value means TOON is the
+        // larger encoding for this payload.
+        let savings = if json_tokens > 0 {
+            ((1.0 - toon_tokens as f64 / json_tokens as f64) * 100.0) as i64
+        } else {
+            0
+        };
+        match savings.cmp(&0) {
+            std::cmp::Ordering::Greater => eprintln!(
+                "[stats] JSON≈{json_tokens} tok, TOON≈{toon_tokens} tok (TOON {savings}% smaller)"
+            ),
+            std::cmp::Ordering::Less => eprintln!(
+                "[stats] JSON≈{json_tokens} tok, TOON≈{toon_tokens} tok (TOON {}% larger; JSON is the smaller encoding for this payload)",
+                -savings
+            ),
+            std::cmp::Ordering::Equal => eprintln!(
+                "[stats] JSON≈{json_tokens} tok, TOON≈{toon_tokens} tok (same size)"
+            ),
+        }
+    }
     ExitCode::from(0)
 }
 
@@ -3168,7 +3790,10 @@ fn load_full() -> Result<AnalysisResultFull, ExitCode> {
             }
         }
     };
-    let data_hash = bv_core::data_hash::compute_data_hash(&issues);
+    // Go main.go:2786 — scope before analysis; `--repo` re-hashes
+    // (main.go:4883-4884), `--label` keeps the loader's hash (:4901).
+    let (issues, hash_override) = apply_scope(&issues);
+    let data_hash = hash_override.unwrap_or_else(|| bv_core::data_hash::compute_data_hash(&issues));
     let g = std::sync::Arc::new(bv_analysis::build_graph(&issues));
     let p1 = bv_analysis::analyze_phase1(&g);
     let budget = bv_analysis::AnalysisBudget {
@@ -3205,6 +3830,13 @@ fn to_id_map(
 
 /// Go `ConfigForSize` JSON shape (ns timeouts) — golden-verified per tier.
 fn insights_analysis_config(nodes: usize) -> serde_json::Value {
+    // Go main.go:1676 wires `--force-full-analysis` into this handler's
+    // config, and robot_registry.go:1972-1987 publishes `stats.Config` from
+    // it, so the override has to reach the emitted object.
+    if force_full_analysis() {
+        return serde_json::to_value(bv_analysis::analyzer::full_analysis_config())
+            .unwrap_or_default();
+    }
     let (
         timeout_ns,
         mode,
@@ -3308,10 +3940,17 @@ fn top_items_go(
 }
 
 fn run_robot_insights() -> ExitCode {
-    let all = match load_full() {
-        Ok(x) => x,
-        Err(code) => return code,
-    };
+    match build_robot_insights() {
+        Ok(payload) => emit_json(&payload),
+        Err(code) => code,
+    }
+}
+
+/// The `--robot-insights` payload, split out from the dispatch wrapper so
+/// `--agent-brief` can embed the same document in its bundle (Go main.go:3943
+/// writes the identical insights object).
+fn build_robot_insights() -> Result<serde_json::Value, ExitCode> {
+    let all = load_full()?;
     let (issues, hash, p1, status, g, phase2) = all;
 
     let pr_obj = to_id_map(&g, &bv_graph_core::pagerank_default(&g));
@@ -3533,7 +4172,7 @@ fn run_robot_insights() -> ExitCode {
         "BV_INSIGHTS_MAP_LIMIT=50 bv --robot-insights - Reduce map sizes",
     ]);
 
-    emit_json(&payload)
+    Ok(payload)
 }
 
 /// Go `TopWhatIfDeltas` (priority.go bv-83) — per-issue what-if deltas with
@@ -4376,6 +5015,13 @@ fn generate_advanced_insights(
 /// `--robot-plan` variant: KCore/Articulation/Slack only, everything else
 /// skipped with "not computed for --robot-plan".
 fn plan_analysis_config(nodes: usize) -> serde_json::Value {
+    // Go main.go:1676 — `--force-full-analysis` REPLACES the plan-specific
+    // trimmed config outright (robot_registry.go:860), so both the emitted
+    // `analysis_config` and the `status` map flip from skipped to computed.
+    if force_full_analysis() {
+        return serde_json::to_value(bv_analysis::analyzer::full_analysis_config())
+            .unwrap_or_default();
+    }
     // Go ConfigForSize timeout tiers (ns) — golden-verified per fixture size.
     let (bt_ns, pr_ns, cycles_ns, max_cycles, sample) = match nodes {
         n if n < 100 => (
@@ -4421,7 +5067,16 @@ fn priority_analysis_config(nodes: usize) -> serde_json::Value {
     // hard-coded `BetweennessMode: "exact"` and `BetweennessSampleSize: 0` for
     // every size, so `--robot-priority` reported the wrong analysis shape on
     // any graph large enough for Go to sample.
-    serde_json::to_value(bv_analysis::analyzer::config_for_size(nodes, 0, 0.0)).unwrap_or_default()
+    //
+    // Go main.go:1728 substitutes `FullAnalysisConfig` when
+    // `--force-full-analysis` is set (config.go:230-254), which is what makes
+    // the published config and the `status` map flip from skipped to computed.
+    let report = if force_full_analysis() {
+        bv_analysis::analyzer::full_analysis_config()
+    } else {
+        bv_analysis::analyzer::config_for_size(nodes, 0, 0.0)
+    };
+    serde_json::to_value(report).unwrap_or_default()
 }
 
 /// Status map for plan/priority (golden-verified): only KCore, Articulation
@@ -4442,11 +5097,11 @@ fn plan_priority_status(g: &bv_graph_core::DiGraph) -> serde_json::Value {
     let plan_skip = |reason: &str| bv_analysis::analyzer::StatusEntry::skipped(reason);
     serde_json::json!({
         "PageRank": plan_skip(""),
-        "Betweenness": plan_skip("not computed for --robot-plan"),
+        "Betweenness": plan_skip(if force_full_analysis() { "" } else { "not computed for --robot-plan" }),
         "Eigenvector": plan_skip(""),
-        "HITS": plan_skip("not computed for --robot-plan"),
+        "HITS": plan_skip(if force_full_analysis() { "" } else { "not computed for --robot-plan" }),
         "Critical": plan_skip(""),
-        "Cycles": plan_skip("not computed for --robot-plan"),
+        "Cycles": plan_skip(if force_full_analysis() { "" } else { "not computed for --robot-plan" }),
         "KCore": bv_analysis::analyzer::StatusEntry::computed(kcore_ms),
         "Articulation": bv_analysis::analyzer::StatusEntry::computed(art_ms),
         "Slack": bv_analysis::analyzer::StatusEntry::computed(slack_ms),
@@ -5488,6 +6143,18 @@ fn run_robot_priority(args: &[String]) -> ExitCode {
         .position(|a| a == "--robot-by-assignee")
         .and_then(|i| args.get(i + 1))
         .cloned();
+    // Go robot_registry.go:941-943 — `--robot-min-confidence` filters the
+    // scored recommendation list (not the issue set) and only bites when the
+    // value is strictly positive. robot_registry.go:964-968 does the same for
+    // `--robot-max-results`, guarding on `> 0` so 0 keeps the default of 10.
+    let min_confidence: Option<f64> = flag_value(args, "robot-min-confidence")
+        .filter(|v| !v.trim().is_empty())
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| *v > 0.0);
+    let max_results: usize = flag_value(args, "robot-max-results")
+        .and_then(|v| go_parse_int_base0(v).ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(10) as usize;
 
     let (issues, _hash, _p1, status, _g) = match load_and_analyze() {
         Ok(x) => x,
@@ -5514,6 +6181,11 @@ fn run_robot_priority(args: &[String]) -> ExitCode {
         let id = r["issue_id"].as_str()?;
         issues.iter().find(|i| i.id == id)
     };
+    // Go runs the confidence test first in the same `continue` chain as the
+    // label and assignee tests (robot_registry.go:940-968).
+    if let Some(floor) = min_confidence {
+        recommendations.retain(|r| r["confidence"].as_f64().unwrap_or(0.0) >= floor);
+    }
     if let Some(label) = by_label.as_deref().filter(|v| !v.is_empty()) {
         recommendations.retain(|r| {
             rec_issue(r)
@@ -5547,7 +6219,7 @@ fn run_robot_priority(args: &[String]) -> ExitCode {
                     .cmp(b["issue_id"].as_str().unwrap_or_default())
             })
     });
-    recommendations.truncate(10);
+    recommendations.truncate(max_results);
 
     let mut payload = full_envelope_for(&hash, &issues);
     payload["analysis_config"] = priority_analysis_config(g.len());
@@ -5596,8 +6268,13 @@ fn run_robot_priority(args: &[String]) -> ExitCode {
         "what_if.unblocks": "Number of issues directly waiting on this one",
     });
     // Go echoes the active scoping modifiers into `filters`
-    // (robot-priority handlers build it from by_label / by_assignee).
-    let mut filters = serde_json::json!({"max_results": 10});
+    // (robot-priority handlers build it from min_confidence / by_label /
+    // by_assignee). robot_registry.go:1019-1021 emits min_confidence only
+    // when the flag was set above zero.
+    let mut filters = serde_json::json!({"max_results": max_results});
+    if let Some(v) = min_confidence {
+        filters["min_confidence"] = serde_json::json!(v);
+    }
     if let Some(v) = by_label.as_deref().filter(|v| !v.is_empty()) {
         filters["by_label"] = serde_json::json!(v);
     }
@@ -5608,8 +6285,11 @@ fn run_robot_priority(args: &[String]) -> ExitCode {
     payload["summary"] = serde_json::json!({
         "total_issues": issues.len(),
         "recommendations": recommendations.len(),
+        // Go robot_registry.go:973-977 counts `rec.Confidence >= 0.7`, not the
+        // impact score — the two are different quantities and the emitted
+        // filter above refers to the confidence one.
         "high_confidence": recommendations.iter()
-            .filter(|r| r["impact_score"].as_f64().unwrap_or(0.0) > 0.5)
+            .filter(|r| r["confidence"].as_f64().unwrap_or(0.0) >= 0.7)
             .count(),
     });
     payload["usage_hints"] = serde_json::json!([
@@ -5738,18 +6418,19 @@ fn run_robot_alerts() -> ExitCode {
     let want_type = arg_value(&["--alert-type"]);
     let want_label = arg_value(&["--alert-label"]);
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (loaded, hash, _as_of_commit) = match load_issues_auto(&cwd, None) {
+    let (loaded, hash, _as_of_commit) = match load_issues_auto_unscoped(&cwd, None) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
             return ExitCode::from(1);
         }
     };
-    // --label narrows the analysis to the label's subgraph before the drift
-    // baseline is captured, as Go's scopeLoadedIssues does (main.go:4870-4900).
-    // The envelope keeps describing the *loaded* source, so source_authority and
+    // `--label` / `--repo` narrow the set before the drift baseline is
+    // captured, as Go's scopeLoadedIssues does (main.go:4870-4900), while the
+    // envelope keeps describing the *loaded* source so source_authority and
     // authority_hash still report the whole file.
-    let issues = apply_label_scope(&loaded);
+    let (issues, hash_override) = apply_scope(&loaded);
+    let hash = hash_override.unwrap_or(hash);
     // Go (robot_registry.go:1158-1186) compares the live graph against the
     // saved baseline at `.bv/baseline.json`, falling back to comparing the
     // current stats against themselves when no baseline exists. Passing the
@@ -5805,34 +6486,16 @@ fn run_robot_alerts() -> ExitCode {
 
     // Go robot-alerts embeds the full RobotEnvelope (output_format+version)
     // and provides non-empty usage hints.
-    // Go robot-alerts embeds the full RobotEnvelope and filters the computed
-    // alerts before emitting them (robot_registry.go:1190-1215): exact match on
-    // severity and type, then a case-insensitive label match against the
-    // alert's label and its detail substrings.
-    let filtered_alerts: Vec<serde_json::Value> = result
+    // Go robot-alerts embeds the full RobotEnvelope (output_format+version)
+    // and filters the computed alerts before emitting them. The filter itself
+    // is applied to the fully chained set further down, because Go runs it
+    // over `driftResult.Alerts` AFTER `Calculate` has already appended
+    // checkPotentialDuplicate (drift.go:300) and checkPriorityMismatch
+    // (:301) — so the proactive families are filterable too, which the emitted
+    // usage hints at robot_registry.go:1240 already advertise.
+    let drift_alerts: Vec<serde_json::Value> = result
         .alerts
         .iter()
-        .filter(|a| {
-            want_severity
-                .as_deref()
-                .map(|w| format!("{:?}", a.severity).to_lowercase() == w.to_lowercase())
-                .unwrap_or(true)
-        })
-        .filter(|a| {
-            want_type
-                .as_deref()
-                .map(|w| format!("{:?}", a.alert_type).to_lowercase() == w.to_lowercase())
-                .unwrap_or(true)
-        })
-        .filter(|a| match want_label.as_deref() {
-            None => true,
-            Some(want) => {
-                let want = want.to_lowercase();
-                let is_label = !a.label.is_empty() && a.label.to_lowercase() == want;
-                let in_details = a.details.iter().any(|d| d.to_lowercase().contains(&want));
-                is_label || in_details
-            }
-        })
         .map(|a| serde_json::to_value(a).unwrap_or_default())
         .collect();
     let mut payload = full_envelope_for(&hash, &loaded);
@@ -5934,11 +6597,63 @@ fn run_robot_alerts() -> ExitCode {
     // Go appends the proactive alerts after staleness (drift.go:288 runs
     // checkStaleness, then :300 potential duplicate and :301 priority
     // mismatch), so both land at the end.
-    let all_alerts: Vec<serde_json::Value> = filtered_alerts
+    let all_alerts: Vec<serde_json::Value> = drift_alerts
         .iter()
         .cloned()
         .chain(duplicate_alerts)
         .chain(priority_alerts)
+        .collect();
+    // Go robot_registry.go:1189-1218 — the three filters, in that order, over
+    // the complete post-Calculate alert set. Severity and type compare the
+    // wire string against the raw flag value with NO case folding
+    // (`string(alert.Severity) != *cfg.AlertSeverity`), so `WARNING` matches
+    // nothing. Each guard is `strings.TrimSpace(flag) != ""`.
+    let want_severity = want_severity.filter(|v| !v.trim().is_empty());
+    let want_type = want_type.filter(|v| !v.trim().is_empty());
+    let all_alerts: Vec<serde_json::Value> = all_alerts
+        .into_iter()
+        .filter(|a| match want_severity.as_deref() {
+            Some(w) => a.get("severity").and_then(|v| v.as_str()) == Some(w),
+            None => true,
+        })
+        .filter(|a| match want_type.as_deref() {
+            Some(w) => a.get("type").and_then(|v| v.as_str()) == Some(w),
+            None => true,
+        })
+        .filter(|a| match want_label.as_deref().map(str::trim) {
+            None | Some("") => true,
+            Some(want) => {
+                // robot_registry.go:1196-1218 — the PLURAL `Labels` slice first
+                // (pkg/drift/drift.go:86 populates it for stale_issue,
+                // blocking_cascade, potential_duplicate and priority_mismatch),
+                // then the singular Label, then a substring over Details.
+                let want = want.to_lowercase();
+                let in_labels = a
+                    .get("labels")
+                    .and_then(|v| v.as_array())
+                    .map(|ls| {
+                        ls.iter()
+                            .filter_map(|l| l.as_str())
+                            .any(|l| l.to_lowercase() == want)
+                    })
+                    .unwrap_or(false);
+                let in_label = a
+                    .get("label")
+                    .and_then(|v| v.as_str())
+                    .map(|l| !l.is_empty() && l.to_lowercase() == want)
+                    .unwrap_or(false);
+                let in_details = a
+                    .get("details")
+                    .and_then(|v| v.as_array())
+                    .map(|ds| {
+                        ds.iter()
+                            .filter_map(|d| d.as_str())
+                            .any(|d| d.to_lowercase().contains(&want))
+                    })
+                    .unwrap_or(false);
+                in_labels || in_label || in_details
+            }
+        })
         .collect();
     payload["alerts"] = serde_json::to_value(&all_alerts).unwrap_or_default();
     // Go emits `skipped_checks` alongside the alerts so a check that did not
@@ -6189,6 +6904,103 @@ fn flag_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     None
 }
 
+/// Go `strconv.underscoreOK` — an underscore must follow a digit or a base
+/// prefix and must itself be followed by one, so `1_000` and `0x_10` parse
+/// while `_10`, `10_` and `1__0` are all syntax errors.
+fn go_underscore_ok(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    // Go tracks the last character class it saw: '^' at the start, '0' for a
+    // digit or a base prefix, '_' for an underscore, '!' for anything else.
+    let mut saw = b'^';
+    let mut i = 0;
+    let mut hex = false;
+    if bytes.len() >= 2
+        && bytes[0] == b'0'
+        && matches!(bytes[1].to_ascii_lowercase(), b'b' | b'o' | b'x')
+    {
+        i = 2;
+        saw = b'0';
+        hex = bytes[1].eq_ignore_ascii_case(&b'x');
+    }
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c.is_ascii_digit() || (hex && (b'a'..=b'f').contains(&c.to_ascii_lowercase())) {
+            saw = b'0';
+        } else if c == b'_' {
+            if saw != b'0' {
+                return false;
+            }
+            saw = b'_';
+        } else {
+            if saw == b'_' {
+                return false;
+            }
+            saw = b'!';
+        }
+        i += 1;
+    }
+    saw != b'_'
+}
+
+/// Go `strconv.ParseInt(s, 0, 64)` — the conversion pflag runs for every
+/// `flag.Int` value (`intValue.Set` calls it with base 0). Go's base-0 literal
+/// rules reach the wire, so they are reproduced rather than approximated: an
+/// optional sign, an optional `0b`/`0o`/`0x` base prefix or a bare leading `0`
+/// for octal, and underscores allowed only where `go_underscore_ok` permits.
+///
+/// The returned error is Go's own `NumError` wording, which is exactly what
+/// `main.go:4549` prints after pflag's `invalid argument %q for %q flag: %v`.
+fn go_parse_int_base0(raw: &str) -> Result<i64, String> {
+    let syntax = || format!("strconv.ParseInt: parsing {raw:?}: invalid syntax");
+    let out_of_range = || format!("strconv.ParseInt: parsing {raw:?}: value out of range");
+
+    let body = raw.strip_prefix(['+', '-']).unwrap_or(raw);
+    if body.is_empty() || !go_underscore_ok(body) {
+        return Err(syntax());
+    }
+
+    // The prefix is stripped only after the underscore check. The default
+    // branch consumes the leading `0` on its own, so `--search-limit 0` is a
+    // valid zero and only fails later at Go's `limit <= 0` fallback.
+    let (radix, digits) = if let Some(rest) = body.strip_prefix('0') {
+        // A `0b`/`0o`/`0x` prefix only counts when a digit follows it: Go
+        // requires `len(s) >= 3`, so a bare `0x` falls through to the octal
+        // default and is then a digit error, i.e. invalid syntax.
+        let (prefix, tail) = rest.split_at(1.min(rest.len()));
+        match prefix.as_bytes().first().map(u8::to_ascii_lowercase) {
+            Some(b'b') if !tail.is_empty() => (2, tail),
+            Some(b'o') if !tail.is_empty() => (8, tail),
+            Some(b'x') if !tail.is_empty() => (16, tail),
+            _ => (8, rest),
+        }
+    } else {
+        (10, body)
+    };
+
+    let cleaned: String = digits.chars().filter(|c| *c != '_').collect();
+    if cleaned.is_empty() {
+        return Ok(0);
+    }
+    let magnitude = u64::from_str_radix(&cleaned, radix).map_err(|e| {
+        if *e.kind() == std::num::IntErrorKind::PosOverflow {
+            out_of_range()
+        } else {
+            syntax()
+        }
+    })?;
+    if raw.starts_with('-') {
+        if magnitude > 1u64 << 63 {
+            return Err(out_of_range());
+        }
+        Ok((magnitude as i64).wrapping_neg())
+    } else {
+        if magnitude > i64::MAX as u64 {
+            return Err(out_of_range());
+        }
+        Ok(magnitude as i64)
+    }
+}
+
 fn search_flag(args: &[String], name: &str) -> Option<String> {
     let long = format!("--{name}");
     let with_eq = format!("--{name}=");
@@ -6304,9 +7116,8 @@ const SEARCH_ZERO_WEIGHTS: bv_search::hybrid::Weights = bv_search::hybrid::Weigh
 };
 
 /// A `resolveSearchConfig` failure. Go reports every one of these through
-/// `resolveSearchConfig` and exits 1 (`go`); only an unknown
-/// `--search-preset` is reported as a usage error with exit 2, the one
-/// documented divergence (see `run_robot_search`).
+/// `resolveSearchConfig` and exits 1 — `main.go:2833` is the only exit site
+/// for `applySearchConfigOverrides` errors, an unknown preset included.
 struct SearchConfigError {
     message: String,
     exit_code: u8,
@@ -6317,13 +7128,6 @@ impl SearchConfigError {
         Self {
             message,
             exit_code: 1,
-        }
-    }
-
-    fn usage(message: String) -> Self {
-        Self {
-            message,
-            exit_code: 2,
         }
     }
 }
@@ -6416,12 +7220,10 @@ fn search_apply_config_overrides(
     if !preset_flag.is_empty() {
         let name = preset_flag.to_lowercase();
         if bv_search::hybrid::get_preset(&name).is_none() {
-            // The one deliberate divergence from Go: Rust names the flag the
-            // user typed, lists the valid presets, and exits 2. Go exits 1
-            // with a bare `unknown preset %q`.
-            return Err(SearchConfigError::usage(format!(
-                "unknown --search-preset {preset_flag:?} (expected one of default, bug-hunting, sprint-planning, impact-first, text-only)"
-            )));
+            // Go presets.go:63 formats the name it was handed, and
+            // search_output.go:111 hands it the LOWERCASED flag, so
+            // `--search-preset BOGUS` reports `bogus`. main.go:2833 exits 1.
+            return Err(SearchConfigError::go(format!("unknown preset {name:?}")));
         }
         cfg.preset = name.clone();
         if name == "text-only" {
@@ -7119,11 +7921,9 @@ fn search_ranking_hash(identity: &SearchRankingIdentity<'_>) -> String {
 /// `robotSearchOutput` struct in Go's field order. `--search QUERY` is
 /// required (modifier-requires table), `--search-limit` caps results at 10.
 ///
-/// One deliberate deviation: an unknown `--search-preset` exits 2 and names the
-/// flag, where Go exits 1 with a bare preset name — the repo's exit-code
-/// contract puts usage errors at 2 and `crates/bv/tests/cli_behavior.rs` pins
-/// the Rust wording. Everything else in this function copies Go's text and
-/// behaviour.
+/// One deliberate deviation: an unknown `--search-preset` is a
+/// `resolveSearchConfig` error in both, so it exits 1 with Go's
+/// `unknown preset "name"` wording (presets.go:63) in both.
 fn run_robot_search(args: &[String]) -> ExitCode {
     let query = search_flag(args, "search").unwrap_or_default();
     if query.trim().is_empty() {
@@ -7153,6 +7953,26 @@ fn run_robot_search(args: &[String]) -> ExitCode {
         }
     };
 
+    // Go main.go:2887 — `--search-limit` defaults to 10 and a non-positive
+    // value falls back to it. The value itself is a pflag `flag.Int`, so Go
+    // rejects a non-integer during flag parsing (`main.go:4548`, exit 1) with
+    // pflag's `invalid argument %q for %q flag: %v`. `--robot-max-results` is
+    // NOT an alias: Go consumes it in exactly one place, the robot-priority
+    // handler at robot_registry.go:971, and never in robot-search
+    // (robot_registry.go:1603), so `--robot-max-results 2` still publishes
+    // `"limit":10` there.
+    let limit = match search_flag(args, "search-limit") {
+        Some(raw) => match go_parse_int_base0(&raw) {
+            Ok(v) if v > 0 => v as usize,
+            Ok(_) => 10,
+            Err(detail) => {
+                eprintln!("invalid argument {raw:?} for \"--search-limit\" flag: {detail}");
+                return ExitCode::from(1);
+            }
+        },
+        None => 10,
+    };
+
     let embed_cfg = search_embedding_config_from_env();
     let dim = match search_embedder_dim(&embed_cfg) {
         Ok(dim) => dim,
@@ -7173,7 +7993,7 @@ fn run_robot_search(args: &[String]) -> ExitCode {
     };
     let as_of = search_flag(args, "as-of").filter(|s| !s.is_empty());
     let (issues_for_search, hash, as_of_commit) =
-        match load_issues_auto(&project_dir, as_of.as_deref()) {
+        match load_issues_auto_unscoped(&project_dir, as_of.as_deref()) {
             Ok(x) => x,
             Err(e) => {
                 eprintln!("Error: {e}");
@@ -7185,7 +8005,7 @@ fn run_robot_search(args: &[String]) -> ExitCode {
     // while the ranked candidates are the scoped set's core issues, so a
     // `--label` search indexes everything but only ranks the label.
     let (label, _recipe, _repo) = active_scope_flags();
-    let scoped_issues = apply_label_scope(&issues_for_search);
+    let scoped_issues = apply_label_scope(&apply_repo_scope(&issues_for_search));
     let (candidate_ids, _all_ids) =
         bv_analysis::label_health::label_scope_ids(&label, &issues_for_search);
     let candidates: std::collections::BTreeSet<String> = candidate_ids.iter().cloned().collect();
@@ -7249,14 +8069,8 @@ fn run_robot_search(args: &[String]) -> ExitCode {
 
     let query_vec = bv_search::embedder::hash_embed(&query, dim);
 
-    // Go main.go:2887 — `--search-limit` defaults to 10 and a non-positive
-    // value falls back to it. `--robot-max-results` is a Rust-side alias the
-    // help text advertises; Go applies it elsewhere, never to the search limit.
-    let limit = search_flag(args, "search-limit")
-        .or_else(|| search_flag(args, "robot-max-results"))
-        .and_then(|v| v.trim().parse::<i64>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(10) as usize;
+    // Parsed above, next to the other flag values, so a malformed
+    // `--search-limit` fails before any index work like Go's flag parse does.
     let hybrid_mode = cfg.mode == "hybrid";
     // Hybrid widens the candidate pool so the re-ranker has something to
     // reorder; short queries widen it further (Go `HybridCandidateLimit`).
@@ -7674,7 +8488,11 @@ fn run_robot_related(args: &[String]) -> ExitCode {
         })
         .collect();
     related.sort_by(|a, b| b["weight"].as_u64().cmp(&a["weight"].as_u64()));
-    related.truncate(max_results);
+    // Go related.go:216-218 — the cap is guarded by `MaxResults > 0`, so
+    // `--related-max-results 0` means UNLIMITED rather than "emit nothing".
+    if max_results > 0 && related.len() > max_results {
+        related.truncate(max_results);
+    }
 
     let mut payload = full_envelope_for(&hash, &issues);
     payload["bead_id"] = serde_json::json!(bead_id);
@@ -7690,12 +8508,15 @@ fn run_robot_impact_network(args: &[String]) -> ExitCode {
         .and_then(|i| args.get(i + 1))
         .cloned()
         .unwrap_or_default();
+    // Go main.go:1590 registers `--network-depth` with default 2, and
+    // robot_registry.go:3386-3390 clamps the result to 1..3. The old default
+    // of 1 made an unflagged run a strict subgraph of Go's.
     let depth: usize = args
         .iter()
         .position(|a| a == "--network-depth")
         .and_then(|i| args.get(i + 1))
         .and_then(|s| s.parse().ok())
-        .unwrap_or(1)
+        .unwrap_or(2)
         .clamp(1, 3);
 
     let cwd = std::env::current_dir().unwrap_or_default();
@@ -7858,11 +8679,33 @@ fn run_robot_burndown(args: &[String]) -> ExitCode {
 
 /// Go `robot-forecast` — `--robot-forecast [--forecast-sprint <id>]`.
 fn run_robot_forecast(args: &[String]) -> ExitCode {
-    let target_sprint_id = args
-        .iter()
-        .position(|a| a == "--forecast-sprint")
-        .and_then(|i| args.get(i + 1))
-        .cloned();
+    // Go robot_registry.go:1447-1464 — `--forecast-sprint` is OPTIONAL. When
+    // blank, `sprintBeadIDs` stays nil and the guard at :1482 never fires, so
+    // the forecast covers every candidate. Substituting the ACTIVE sprint
+    // (which this handler used to do) narrowed the scope to one sprint and
+    // hard-failed whenever no sprint was active.
+    let sprint_filter: Option<String> = flag_value(args, "forecast-sprint")
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+    let label_filter: Option<String> = flag_value(args, "forecast-label")
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+    // Go robot_registry.go:1489-1492 — 0 and negatives fall back to 1.
+    let agents: i64 = flag_value(args, "forecast-agents")
+        .and_then(|v| go_parse_int_base0(v).ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(1);
+    // robot_registry.go:1511-1514 — `all` forecasts every candidate; anything
+    // else must name an issue that survived the scope filters, or it is a hard
+    // failure (robot_registry.go:1536), not a silent omission.
+    let target: String = flag_value(args, "robot-forecast")
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("all")
+        .to_string();
+
     let cwd = std::env::current_dir().unwrap_or_default();
     let (issues, hash, _as_of_commit) = match load_issues_auto(&cwd, None) {
         Ok(x) => x,
@@ -7871,53 +8714,491 @@ fn run_robot_forecast(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let sprints = match bv_core::sprint::load_sprints(&cwd) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            return ExitCode::from(1);
-        }
-    };
-    let target = if let Some(id) = &target_sprint_id {
-        sprints.iter().find(|s| &s.id == id)
-    } else {
-        sprints.iter().find(|s| s.is_active())
-    };
-    let Some(sprint) = target else {
-        eprintln!(
-            "No {} sprint found",
-            if target_sprint_id.is_some() {
-                "matching"
-            } else {
-                "active"
+    // robot_registry.go:1449-1462 — a missing sprint (or a load failure) is
+    // `Sprint not found: <id>` on stderr, exit 1.
+    let sprint_bead_ids: Option<std::collections::HashSet<String>> = match &sprint_filter {
+        None => None,
+        Some(id) => {
+            let ids = bv_core::sprint::load_sprints(&cwd)
+                .ok()
+                .and_then(|sprints| {
+                    sprints.into_iter().find(|s| &s.id == id).map(|s| {
+                        s.bead_ids
+                            .into_iter()
+                            .collect::<std::collections::HashSet<String>>()
+                    })
+                });
+            match ids {
+                Some(ids) => Some(ids),
+                None => {
+                    eprintln!("Sprint not found: {id}");
+                    return ExitCode::from(1);
+                }
             }
-        );
-        return ExitCode::from(1);
-    };
-    let now = robot_now();
-    let forecast = bv_core::sprint::estimate_forecast(sprint, &issues, now);
-    let mut payload = full_envelope_for(&hash, &issues);
-    payload["sprint"] = serde_json::to_value(sprint).unwrap_or_default();
-    match forecast {
-        Some(f) => {
-            payload["forecast"] = serde_json::to_value(&f).unwrap_or_default();
         }
-        None => {
-            payload["forecast"] = serde_json::json!(null);
-            payload["message"] =
-                serde_json::json!("all sprint issues are closed — no forecast needed");
+    };
+
+    if target != "all"
+        && !issues.iter().any(|i| {
+            i.id == target
+                && label_filter
+                    .as_deref()
+                    .is_none_or(|l| i.labels.iter().any(|x| x == l))
+                && sprint_bead_ids
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(&i.id))
+        })
+    {
+        eprintln!("Issue not found in selected forecast scope: {target}");
+        return ExitCode::from(1);
+    }
+
+    let out = bv_core::sprint::compute_forecast_output(
+        &issues,
+        sprint_bead_ids.as_ref(),
+        label_filter.as_deref(),
+        agents,
+        robot_now(),
+    );
+    // Go robot_registry.go:1571-1589 — agents/filters/forecast_count/forecasts/
+    // summary are merged at the ENVELOPE TOP LEVEL, not nested under a
+    // `forecast` key.
+    let mut payload = full_envelope_for(&hash, &issues);
+    let obj = payload.as_object_mut().expect("envelope is an object");
+    for (k, v) in serde_json::to_value(&out)
+        .unwrap_or_default()
+        .as_object()
+        .cloned()
+        .unwrap_or_default()
+    {
+        obj.insert(k, v);
+    }
+    // robot_registry.go:1576-1578 echoes the literal flag string, which is why
+    // the sprint's own id is used rather than an arbitrary member of the set.
+    if let Some(id) = &sprint_filter {
+        if let Some(filters) = payload["filters"].as_object_mut() {
+            filters.insert("sprint".into(), serde_json::json!(id));
         }
     }
     emit_json(&payload)
 }
 
+/// Go `--emit-script` (main.go:4011-4100): write a shell script to stdout and
+/// exit 0. Registered but previously unhandled, so the flag fell through to
+/// the TUI launcher and blocked forever in any TTY.
+///
+/// Go computes triage with `TriageOptions{Readiness, CandidateIDs}` and NO
+/// `Weights`, so this is independent of the feedback store.
+fn run_emit_script(args: &[String]) -> ExitCode {
+    // Go main.go:4019-4022 — 0 AND negatives collapse to 5, not to an empty
+    // list. `.max(1)` would be wrong.
+    let limit = flag_value(args, "script-limit")
+        .and_then(|v| go_parse_int_base0(v).ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(5) as usize;
+    // Go main.go:4032-4040 — `fish` and `zsh` get ONLY the shebang; the default
+    // (and any unrecognised value) also gets `set -euo pipefail`.
+    let format = flag_value(args, "script-format").unwrap_or("bash");
+
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let (loaded, hash, _as_of_commit, loaded_source) = match load_issues_auto_meta_raw(&cwd, None) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let (issues, hash_override) = apply_scope(&loaded);
+    let data_hash = hash_override.unwrap_or(hash);
+    if issues.is_empty() {
+        println!(
+            "{{\"generated_at\":\"{}\",\"data_hash\":\"empty\",\"error\":\"no issues loaded\"}}",
+            jiff_now()
+        );
+        return ExitCode::from(0);
+    }
+    let g = std::sync::Arc::new(bv_analysis::analyzer::build_graph(&issues));
+    let out = bv_analysis::triage::build_triage(&issues, &g, robot_now());
+
+    let total = out.recommendations.len();
+    let recs: Vec<&bv_analysis::impact::IssueImpact> =
+        out.recommendations.iter().take(limit).collect();
+    let claim_shell = |r: &bv_analysis::impact::IssueImpact| -> Option<String> {
+        r.actions
+            .as_ref()
+            .and_then(|a| a.get("claim"))
+            .and_then(|c| c.get("shell"))
+            .and_then(|s| s.as_str())
+            .map(str::to_string)
+    };
+    let show_shell = |r: &bv_analysis::impact::IssueImpact| -> Option<String> {
+        r.actions
+            .as_ref()
+            .and_then(|a| a.get("show"))
+            .and_then(|c| c.get("shell"))
+            .and_then(|s| s.as_str())
+            .map(str::to_string)
+    };
+
+    let mut sb = String::new();
+    match format {
+        "fish" => sb.push_str("#!/usr/bin/env fish\n"),
+        "zsh" => sb.push_str("#!/usr/bin/env zsh\n"),
+        _ => {
+            sb.push_str("#!/usr/bin/env bash\n");
+            sb.push_str("set -euo pipefail\n");
+        }
+    }
+    sb.push_str(&format!(
+        "# Generated by bv --emit-script at {}\n",
+        jiff_now()
+    ));
+    sb.push_str(&format!("# Data hash: {data_hash}\n"));
+    let authority = source_authority(&loaded_source, &data_hash);
+    sb.push_str(&format!(
+        "# Source authority: {}\n",
+        go_json_string(&serde_json::to_value(&authority).unwrap_or_default())
+    ));
+    sb.push_str(&format!(
+        "# Top {} recommendations from {total} actionable items\n",
+        recs.len()
+    ));
+    sb.push_str("#\n");
+    sb.push_str("# Usage: source this script or run it directly\n");
+    sb.push_str(
+        "# Commands show recommendations; claim comments appear only for proven candidates\n",
+    );
+    sb.push_str("#\n\n");
+
+    if recs.is_empty() {
+        sb.push_str("echo 'No actionable recommendations available'\n");
+        sb.push_str("exit 0\n");
+    } else {
+        for (i, rec) in recs.iter().enumerate() {
+            // Go's `strings.NewReplacer("\n", " ", "\r", " ")` on the two
+            // comment lines — a title or reason containing a newline would
+            // otherwise end the comment and the remainder would run as shell.
+            let flatten = |s: &str| s.replace(['\n', '\r'], " ");
+            sb.push_str(&format!(
+                "# {}. {} (score: {:.3})\n",
+                i + 1,
+                flatten(&format!("{}: {}", rec.id, rec.title)),
+                rec.score
+            ));
+            if let Some(reason) = rec.reasons.first() {
+                sb.push_str(&format!("#    Reason: {}\n", flatten(reason)));
+            }
+            if !rec.unblocks_ids.is_empty() {
+                sb.push_str(&format!(
+                    "#    Unblocks: {} downstream items\n",
+                    rec.unblocks_ids.len()
+                ));
+            }
+            // Go main.go:4072 — `strings.ReplaceAll(shell, "\n", "\n# ")`.
+            if let Some(shell) = claim_shell(rec) {
+                sb.push_str(&format!("# To claim: {}\n", shell.replace('\n', "\n# ")));
+            }
+            match show_shell(rec) {
+                Some(shell) => {
+                    sb.push_str(&shell);
+                    sb.push('\n');
+                }
+                None => sb.push_str("# No verified live tracker route\n"),
+            }
+            sb.push('\n');
+        }
+        sb.push_str("# === Quick Actions ===\n");
+        sb.push_str("# To claim the top pick:\n");
+        if let Some(shell) = claim_shell(recs[0]) {
+            sb.push_str(&format!("# {}\n", shell.replace('\n', "\n# ")));
+        }
+        sb.push_str("#\n");
+        sb.push_str("# To claim all listed items (uncomment to enable):\n");
+        for rec in &recs {
+            if let Some(shell) = claim_shell(rec) {
+                sb.push_str(&format!("# {}\n", shell.replace('\n', "\n# ")));
+            }
+        }
+    }
+    // Go main.go:4098 — `fmt.Print`, so no trailing newline is appended.
+    print!("{sb}");
+    ExitCode::from(0)
+}
+
+/// Recompute triage and return the `triage` body plus the provenance the
+/// brief writers need. Go does the same recomputation inside each handler
+/// (main.go:3880 for `--priority-brief`, :3932 for `--agent-brief`) rather
+/// than reusing the `--robot-triage` payload, so this is deliberately a
+/// separate pass and not a refactor of `run_robot_triage`.
+struct BriefTriage {
+    body: serde_json::Value,
+    envelope: serde_json::Value,
+    issue_count: usize,
+    claims_proven: bool,
+}
+
+fn compute_brief_triage() -> Result<BriefTriage, ExitCode> {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let (loaded, hash, _as_of_commit, loaded_source) = match load_issues_auto_meta_raw(&cwd, None) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return Err(ExitCode::from(1));
+        }
+    };
+    let (issues, hash_override) = apply_scope(&loaded);
+    let data_hash = hash_override.unwrap_or(hash);
+    if issues.is_empty() {
+        eprintln!("Error: no issues loaded");
+        return Err(ExitCode::from(1));
+    }
+    let g = std::sync::Arc::new(bv_analysis::analyzer::build_graph(&issues));
+    let out = bv_analysis::triage::build_triage(&issues, &g, robot_now());
+    let authority = source_authority(&loaded_source, &data_hash);
+    let claims_proven = authority.claim_safe;
+
+    // `GeneratePriorityBriefFromTriageJSON` unmarshals Go's anonymous
+    // `TriageResult` (pkg/export/markdown.go:747-800) and reads only
+    // meta.generated_at, quick_ref's four counts, the recommendation list and
+    // the two derived lists. The document never reads `status`,
+    // `project_health`, `commands` or the `actions` block, so this stays a
+    // projection of `build_triage` rather than a second copy of the full
+    // `--robot-triage` body.
+    let body = serde_json::json!({
+        // Go `TriageMeta` (pkg/analysis/triage.go:57-62) — the generator prints
+        // `version` and `issue_count` in its header line
+        // (pkg/export/markdown.go:~760), so both must be populated.
+        "meta": {
+            "version": GO_APP_VERSION,
+            "generated_at": jiff_now(),
+            "issue_count": issues.len(),
+        },
+        "quick_ref": {
+            "open_count": out.quick_ref.open_count,
+            "actionable_count": out.quick_ref.actionable_count,
+            "blocked_count": out.quick_ref.blocked_count,
+            "in_progress_count": out.quick_ref.in_progress_count,
+        },
+        "recommendations": serde_json::to_value(&out.recommendations).unwrap_or_default(),
+        "quick_wins": Vec::<serde_json::Value>::new(),
+        "blockers_to_clear": Vec::<serde_json::Value>::new(),
+    });
+    let mut envelope = full_envelope_for(&data_hash, &loaded);
+    envelope["output_format"] = serde_json::json!(output_format());
+    envelope["version"] = serde_json::json!(GO_APP_VERSION);
+    Ok(BriefTriage {
+        body,
+        envelope,
+        issue_count: issues.len(),
+        claims_proven,
+    })
+}
+
+/// Go `--priority-brief <path>` (main.go:3878-3911). Writes the markdown brief
+/// and exits 0. Previously registered with no handler, so the flag fell
+/// through to the TUI and blocked forever.
+fn run_priority_brief(path: &str) -> ExitCode {
+    let t = match compute_brief_triage() {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    println!("Generating priority brief to {path}...");
+    let triage_json = go_json_string(&t.body).into_bytes();
+    let config = bv_export::priority_brief::PriorityBriefConfig {
+        data_hash: t
+            .envelope
+            .get("data_hash")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        ..Default::default()
+    };
+    let mut brief = match bv_export::priority_brief::generate_priority_brief_from_triage_json(
+        &triage_json,
+        &config,
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Error generating priority brief: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    // Go main.go:3900-3902 — the readiness-provisional banner when the source
+    // is not claim-safe.
+    if !t.claims_proven {
+        brief = "> Readiness is provisional because source data is incomplete or stale. Restore the affected sources before claiming work.\n\n".to_string() + &brief;
+    }
+    if let Err(e) = std::fs::write(path, brief.as_bytes()) {
+        eprintln!("Error writing priority brief: {e}");
+        return ExitCode::from(1);
+    }
+    println!("Done! Priority brief saved to {path}");
+    ExitCode::from(0)
+}
+
+/// Go `--agent-brief <dir>` (main.go:3915-4007). Writes the five-file bundle
+/// and exits 0. Go lists `meta.json` in its own file list.
+fn run_agent_brief(dir: &str) -> ExitCode {
+    println!("Generating agent brief bundle to {dir}/...");
+    let t = match compute_brief_triage() {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        eprintln!("Error creating directory: {e}");
+        return ExitCode::from(1);
+    }
+    // triage.json — the triage body under the full robot envelope,
+    // MarshalIndent 2-space (Go main.go:3921-3941).
+    let mut triage_payload = t.envelope.clone();
+    if let (Some(obj), Some(body)) = (triage_payload.as_object_mut(), t.body.as_object()) {
+        for (k, v) in body {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+    let write = |name: &str, content: &str| -> Result<(), std::io::Error> {
+        std::fs::write(std::path::Path::new(dir).join(name), content)
+    };
+    if let Err(e) = write(
+        "triage.json",
+        &serde_json::to_string_pretty(&triage_payload).unwrap_or_default(),
+    ) {
+        eprintln!("Error writing triage.json: {e}");
+        return ExitCode::from(1);
+    }
+    println!("  → triage.json");
+
+    // insights.json — the same document `--robot-insights` emits.
+    let insights = match build_robot_insights() {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    if let Err(e) = write(
+        "insights.json",
+        &serde_json::to_string_pretty(&insights).unwrap_or_default(),
+    ) {
+        eprintln!("Error writing insights.json: {e}");
+        return ExitCode::from(1);
+    }
+    println!("  → insights.json");
+
+    // brief.md — the same generator as --priority-brief, with Go's own
+    // (shorter) banner wording.
+    let triage_json = go_json_string(&t.body).into_bytes();
+    let config = bv_export::priority_brief::PriorityBriefConfig {
+        data_hash: t
+            .envelope
+            .get("data_hash")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        ..Default::default()
+    };
+    let mut brief = match bv_export::priority_brief::generate_priority_brief_from_triage_json(
+        &triage_json,
+        &config,
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Error generating brief: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if !t.claims_proven {
+        brief = "> Readiness is provisional; inspect source_authority in triage.json before claiming work.\n\n".to_string() + &brief;
+    }
+    if let Err(e) = write("brief.md", &brief) {
+        eprintln!("Error writing brief.md: {e}");
+        return ExitCode::from(1);
+    }
+    println!("  → brief.md");
+
+    if let Err(e) = write("helpers.md", bv_export::agent_brief::generate_jq_helpers()) {
+        eprintln!("Error writing helpers.md: {e}");
+        return ExitCode::from(1);
+    }
+    println!("  → helpers.md");
+
+    let meta = bv_export::agent_brief::build_agent_brief_meta(&t.envelope, t.issue_count);
+    if let Err(e) = write(
+        "meta.json",
+        &serde_json::to_string_pretty(&meta).unwrap_or_default(),
+    ) {
+        eprintln!("Error writing meta.json: {e}");
+        return ExitCode::from(1);
+    }
+    println!("  → meta.json");
+
+    println!("\nDone! Agent brief bundle saved to {dir}/");
+    ExitCode::from(0)
+}
+
+/// Go runs the export hooks around every export (main.go:3091 for the report
+/// path, main.go:4432 for `--export-pages`), gated on `!*noHooks`. This is the
+/// shared wrapper both call sites use; without it the DEFAULT path already
+/// diverged, because Go runs pre/post-export hooks and Rust ran nothing.
+///
+/// Go `Loader` reads `.bv/hooks.yaml` (pkg/hooks/config.go:99) and `Executor`
+/// spawns each hook honouring `timeout_secs` and the `on_error` policy
+/// (Fail | Continue, executor.go:296).
+fn run_export_hooks(
+    no_hooks: bool,
+    cwd: &std::path::Path,
+    export_path: &str,
+    export_format: &str,
+    issue_count: usize,
+    phase_pre: bool,
+) -> Result<(), String> {
+    if no_hooks {
+        return Ok(());
+    }
+    let mut loader = bv_export::hooks::Loader::new(cwd);
+    if let Err(e) = loader.load() {
+        // A malformed hooks.yaml is a configuration error in Go's loader, but
+        // Go also tolerates a missing file (HasHooks is false). Only surface
+        // a real parse failure.
+        return Err(format!("{e}"));
+    }
+    if !loader.has_hooks() {
+        return Ok(());
+    }
+    for w in loader.warnings() {
+        eprintln!("Warning: {w}");
+    }
+    let ctx = bv_export::hooks::ExportContext {
+        export_path: export_path.to_string(),
+        export_format: export_format.to_string(),
+        issue_count,
+        timestamp: jiff::Timestamp::now(),
+    };
+    let mut exec = bv_export::hooks::Executor::new(loader.config(), ctx);
+    let res = if phase_pre {
+        exec.run_pre_export()
+    } else {
+        exec.run_post_export()
+    };
+    res.map_err(|e| format!("{e}"))
+}
+
 /// Go `robot-capacity` — `--robot-capacity [--capacity-label <label>]`.
 fn run_robot_capacity(args: &[String]) -> ExitCode {
-    let label = args
-        .iter()
-        .position(|a| a == "--capacity-label")
-        .and_then(|i| args.get(i + 1))
-        .cloned();
+    // Go robot_registry.go:3543-3554 — an exact label match narrows the
+    // candidate set, and :3559-3566 then applies the open filter
+    // UNCONDITIONALLY on top, so a label never re-admits closed work. The
+    // hand-rolled filter this replaces put the closed test in the `else`
+    // branch only, so `--capacity-label cli` reported three CLOSED issues as
+    // open.
+    let label: Option<String> = flag_value(args, "capacity-label")
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+    // Go robot_registry.go:3569-3572 — default 1, and only a strictly positive
+    // value takes effect. This is the sole divisor in the completion model
+    // (`serialMinutes + parallelMinutes/agents`, robot_registry.go:3621).
+    let agents: i64 = flag_value(args, "agents")
+        .and_then(|v| go_parse_int_base0(v).ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(1);
     let cwd = std::env::current_dir().unwrap_or_default();
     let (issues, hash, _as_of_commit) = match load_issues_auto(&cwd, None) {
         Ok(x) => x,
@@ -7926,42 +9207,21 @@ fn run_robot_capacity(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let filtered: Vec<&bv_core::model::Issue> = if let Some(ref lbl) = label {
-        issues
-            .iter()
-            .filter(|i| i.labels.iter().any(|l| l == lbl))
-            .collect()
-    } else {
-        issues.iter().filter(|i| !i.status.is_closed()).collect()
-    };
-    let open_count = filtered.len();
-    let blocked_count = filtered
-        .iter()
-        .filter(|i| i.status == bv_core::model::Status::Blocked)
-        .count();
-    let in_progress = filtered
-        .iter()
-        .filter(|i| i.status == bv_core::model::Status::InProgress)
-        .count();
-    let avg_priority: f64 = if open_count > 0 {
-        filtered.iter().map(|i| i.priority as f64).sum::<f64>() / open_count as f64
-    } else {
-        0.0
-    };
-    let estimated_minutes: i64 = filtered.iter().filter_map(|i| i.estimated_minutes).sum();
+    // `calculate_capacity` (sprint.rs:816) already applies the label filter
+    // (:828-830) and the closed filter (:841) as two independent, correctly
+    // ordered steps, and its `CapacityOutput` (sprint.rs:783-797) matches Go's
+    // emit struct at robot_registry.go:3651-3682 field for field.
+    let out = bv_core::sprint::calculate_capacity(&issues, agents, label.as_deref());
     let mut payload = full_envelope_for(&hash, &issues);
-    payload["capacity"] = serde_json::json!({
-        "open_count": open_count,
-        "blocked_count": blocked_count,
-        "in_progress_count": in_progress,
-        "avg_priority": avg_priority,
-        "estimated_minutes": estimated_minutes,
-        "label_filter": label,
-    });
-    payload["usage_hints"] = serde_json::json!([
-        "This is a simplified capacity snapshot. Go's robot-capacity uses a more \
-         complex simulation with historical velocity data (see plan doc §11).",
-    ]);
+    let obj = payload.as_object_mut().expect("envelope is an object");
+    for (k, v) in serde_json::to_value(&out)
+        .unwrap_or_default()
+        .as_object()
+        .cloned()
+        .unwrap_or_default()
+    {
+        obj.insert(k, v);
+    }
     emit_json(&payload)
 }
 
@@ -8110,7 +9370,14 @@ fn run_robot_file_beads(args: &[String]) -> ExitCode {
 }
 
 /// Go `handleRobotFileHotspots` — `--robot-file-hotspots`.
-fn run_robot_file_hotspots() -> ExitCode {
+fn run_robot_file_hotspots(args: &[String]) -> ExitCode {
+    // Go main.go:1566 registers `--hotspots-limit` with default 10, threaded
+    // through robot_registry.go:3946-3949 into `GetHotspots`, whose
+    // `limit <= 0 || limit > len(counts)` guard (file_index.go:370) makes 0
+    // mean "every hotspot" rather than "none".
+    let hotspots_limit: i64 = flag_value(args, "hotspots-limit")
+        .and_then(|raw| go_parse_int_base0(raw).ok())
+        .unwrap_or(10);
     let cwd = std::env::current_dir().unwrap_or_default();
     let (_issues, hash, report) = match load_correlation_report(&cwd) {
         Ok(x) => x,
@@ -8147,7 +9414,13 @@ fn run_robot_file_hotspots() -> ExitCode {
             .cmp(&a["bead_count"].as_u64())
             .then_with(|| a["path"].as_str().cmp(&b["path"].as_str()))
     });
-    hotspots.truncate(20);
+    // Go file_index.go:370 — `limit <= 0 || limit > len(counts) { limit = len(counts) }`.
+    let limit = if hotspots_limit <= 0 || hotspots_limit as usize > hotspots.len() {
+        hotspots.len()
+    } else {
+        hotspots_limit as usize
+    };
+    hotspots.truncate(limit);
     let mut payload = full_envelope_for(&hash, &_issues);
     payload["hotspots"] = serde_json::Value::Array(hotspots);
     emit_json(&payload)
@@ -8194,7 +9467,19 @@ fn run_robot_file_relations(args: &[String]) -> ExitCode {
             .cmp(&a["co_change_count"].as_u64())
             .then_with(|| a["path"].as_str().cmp(&b["path"].as_str()))
     });
-    related.truncate(20);
+    // Go main.go:1572 registers `--relations-limit` with default 10, threaded
+    // through robot_registry.go:3013-3015 into `GetRelatedFiles`, whose
+    // `limit <= 0 { limit = 10 }` guard (file_index.go:487-489) makes 0 fall
+    // back to 10 rather than yielding an empty list.
+    let relations_limit: i64 = flag_value(args, "relations-limit")
+        .and_then(|raw| go_parse_int_base0(raw).ok())
+        .unwrap_or(10);
+    let relations_limit = if relations_limit > 0 {
+        relations_limit
+    } else {
+        10
+    } as usize;
+    related.truncate(relations_limit);
     let mut payload = full_envelope_for(&hash, &_issues);
     payload["path"] = serde_json::json!(path);
     payload["related_files"] = serde_json::Value::Array(related);
@@ -8610,26 +9895,45 @@ fn run_robot_label_attention() -> ExitCode {
     let result =
         bv_analysis::label_health::compute_label_attention_scores(&issues, &cfg, robot_now());
     let mut payload = full_envelope_for(&hash, &issues);
-    // Go's --attention-limit defaults to 5 (main.go:1494). Read the flag when
-    // given and apply it to the emitted list, not just to the reported limit.
-    let attention_limit: usize = {
+    // Go robot_registry.go:1793-1799 — the flag defaults to 5 (main.go:1494),
+    // and a non-positive value means "unset" rather than "emit nothing", so it
+    // is re-clamped to 5 before the `limit > len(Labels)` bound. The parse is
+    // signed so `0` and `-3` reach that clamp, and a non-integer is the
+    // pflag parse error `main.go:4548` reports at exit 1 rather than a silent
+    // fall back to the default.
+    let raw_attention_limit: Option<String> = {
         let args: Vec<String> = std::env::args().collect();
         let mut found = None;
         let mut i = 0;
         while i < args.len() {
             let a = &args[i];
             if a == "--attention-limit" {
-                found = args.get(i + 1).and_then(|v| v.trim().parse::<usize>().ok());
+                found = args.get(i + 1).cloned();
                 break;
             }
             if let Some(v) = a.strip_prefix("--attention-limit=") {
-                found = v.trim().parse::<usize>().ok();
+                found = Some(v.to_string());
                 break;
             }
             i += 1;
         }
-        found.unwrap_or(5)
+        found
     };
+    let attention_limit: i64 = match &raw_attention_limit {
+        Some(raw) => match go_parse_int_base0(raw) {
+            Ok(v) => v,
+            Err(detail) => {
+                eprintln!("invalid argument {raw:?} for \"--attention-limit\" flag: {detail}");
+                return ExitCode::from(1);
+            }
+        },
+        None => 5,
+    };
+    let attention_limit = if attention_limit > 0 {
+        attention_limit
+    } else {
+        5
+    } as usize;
     let effective_limit = result.labels.len().min(attention_limit);
     payload["limit"] = serde_json::json!(effective_limit);
     payload["total_labels"] = serde_json::json!(result.total_labels);

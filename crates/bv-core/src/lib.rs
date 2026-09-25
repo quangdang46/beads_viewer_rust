@@ -11,7 +11,10 @@ pub mod data_hash;
 pub mod discovery;
 pub mod fingerprint;
 pub mod loader;
+pub mod repo_filter;
 pub mod sqlite;
 pub mod tracker;
 
 pub mod workspace;
+
+pub use repo_filter::filter_by_repo;

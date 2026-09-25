@@ -228,10 +228,13 @@ fn robot_burndown_no_active_sprint_exits_one() {
 
 #[test]
 fn robot_capacity_runs_without_crashing() {
+    // Go robot_registry.go:3651-3682 emits the fields at the envelope TOP
+    // LEVEL; there is no nested `capacity` object and no `open_count` key.
     let (code, stdout, _) = run_at_repo_root(&["--robot-capacity"]);
     assert_eq!(code, 0);
-    assert!(stdout.contains("\"capacity\""));
-    assert!(stdout.contains("\"open_count\""));
+    assert!(stdout.contains("\"open_issue_count\""), "{stdout}");
+    assert!(stdout.contains("\"agents\""), "{stdout}");
+    assert!(!stdout.contains("\"capacity\":"), "{stdout}");
 }
 
 #[test]
@@ -269,7 +272,10 @@ fn robot_search_missing_query_caught_by_modifier_requires() {
 }
 
 #[test]
-fn robot_search_unknown_preset_exits_two() {
+fn robot_search_unknown_preset_exits_one() {
+    // Go presets.go:63 reports `unknown preset %q` for the LOWERCASED name and
+    // main.go:2833 exits 1 — it is a resolveSearchConfig failure, not a usage
+    // error.
     let (code, _, stderr) = run_at_repo_root(&[
         "--robot-search",
         "--search",
@@ -277,10 +283,26 @@ fn robot_search_unknown_preset_exits_two() {
         "--search-mode",
         "hybrid",
         "--search-preset",
-        "bogus-preset",
+        "BOGUS-PRESET",
     ]);
-    assert_eq!(code, 2);
-    assert!(stderr.contains("unknown --search-preset"), "{stderr}");
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains(r#"unknown preset "bogus-preset""#),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn robot_search_non_integer_limit_is_a_flag_parse_error() {
+    // pflag owns integer flags, so a non-integer never reaches the handler:
+    // main.go:4548 prints `invalid argument %q for %q flag: %v` and exits 1.
+    let (code, _, stderr) =
+        run_at_repo_root(&["--robot-search", "--search", "x", "--search-limit", "abc"]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains(r#"invalid argument "abc" for "--search-limit" flag: strconv.ParseInt: parsing "abc": invalid syntax"#),
+        "{stderr}"
+    );
 }
 
 /// A minimal beads repo with one labelled issue, for the scoping tests below.

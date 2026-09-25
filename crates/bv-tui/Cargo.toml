@@ -21,3 +21,4 @@ bv-search = { path = "../bv-search" }
 bv-update = { path = "../bv-update" }
 arboard = "3"
 nucleo-matcher = "0.3"
+serde_yaml_ng = "0.10"

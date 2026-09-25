@@ -380,9 +380,7 @@ fn rust_output_matches_frozen_go_goldens() {
 /// the field being dropped out of laziness).
 #[test]
 fn source_authority_digests_are_host_independent() {
-    use bv_robot::envelope::{
-        authority_hash, scope_hash, RobotSourceAuthority, RobotSourceReport,
-    };
+    use bv_robot::envelope::{authority_hash, scope_hash, RobotSourceAuthority, RobotSourceReport};
 
     let at = |p: &str| {
         authority_hash(&RobotSourceAuthority {
@@ -395,21 +393,31 @@ fn source_authority_digests_are_host_independent() {
     };
 
     // Deterministic: the same logical source digests identically every run.
-    assert_eq!(at("/repo/.beads/issues.jsonl"), at("/repo/.beads/issues.jsonl"));
+    assert_eq!(
+        at("/repo/.beads/issues.jsonl"),
+        at("/repo/.beads/issues.jsonl")
+    );
 
     // Path-sensitive: two hosts reading the same *logical* data from their
     // own absolute paths produce different digests. This is precisely why
     // comparing authority_hash across machines is meaningless.
-    assert_ne!(at("/Users/someone/Projects/repo/.beads/issues.jsonl"),
-               at("C:\\Users\\ADMIN\\Documents\\Projects\\repo\\.beads\\issues.jsonl"));
+    assert_ne!(
+        at("/Users/someone/Projects/repo/.beads/issues.jsonl"),
+        at("C:\\Users\\ADMIN\\Documents\\Projects\\repo\\.beads\\issues.jsonl")
+    );
 
     // scope_hash is a pure function of its five inputs.
     let base = scope_hash("l", "r", "repo", "dh", &["a".to_string()]);
     assert_eq!(base, scope_hash("l", "r", "repo", "dh", &["a".to_string()]));
-    assert_ne!(base, scope_hash("l2", "r", "repo", "dh", &["a".to_string()]));
+    assert_ne!(
+        base,
+        scope_hash("l2", "r", "repo", "dh", &["a".to_string()])
+    );
 
     // 64 lowercase hex chars, matching Go's v0.25.0 digest width (the
     // v0.20.0 form truncated to 16 and is no longer the contract).
     assert_eq!(base.len(), 64);
-    assert!(base.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
+    assert!(base
+        .chars()
+        .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
 }

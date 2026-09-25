@@ -758,10 +758,19 @@ fn builtin_patterns() -> Vec<(Regex, u8)> {
 }
 
 impl IdRegexes {
+    /// Go `NewExplicitMatcher` — `DefaultPatterns()`, i.e. the built-ins followed
+    /// by whatever `--id-pattern` registered (#188). Built fresh per extraction
+    /// so a registration made at CLI startup is always picked up.
     fn new() -> Self {
-        Self {
-            patterns: builtin_patterns(),
-        }
+        let mut patterns = builtin_patterns();
+        let next = patterns.len() as u8;
+        patterns.extend(
+            crate::explicit::custom_id_patterns()
+                .into_iter()
+                .enumerate()
+                .map(|(i, r)| (r, next.wrapping_add(i as u8))),
+        );
+        Self { patterns }
     }
 
     /// Go `ExtractIDsFromMessage` — patterns in order, first match per
@@ -802,7 +811,7 @@ pub struct IdMatch {
 }
 
 /// Go `normalizeBeadID`.
-fn normalize_bead_id(id: &str) -> String {
+pub(crate) fn normalize_bead_id(id: &str) -> String {
     if !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()) {
         return format!("bv-{id}");
     }
@@ -810,7 +819,7 @@ fn normalize_bead_id(id: &str) -> String {
 }
 
 /// Go `classifyMatch`.
-fn classify_match(raw: &str) -> &'static str {
+pub(crate) fn classify_match(raw: &str) -> &'static str {
     let lower = raw.to_lowercase();
     if lower.contains("close") {
         "closes"
@@ -2000,6 +2009,7 @@ mod tests {
 
     #[test]
     fn id_extraction_prefers_first_pattern_and_normalizes() {
+        let _serialized = crate::explicit::custom_patterns_lock();
         let re = IdRegexes::new();
         let ids = re.extract("closes PROJ-1 and beads-42");
         let got: Vec<&str> = ids.iter().map(|m| m.id.as_str()).collect();
@@ -2010,8 +2020,41 @@ mod tests {
 
     #[test]
     fn generic_pattern_does_not_truncate_hash_ids() {
+        let _serialized = crate::explicit::custom_patterns_lock();
         let re = IdRegexes::new();
         assert!(re.extract("bv-8a4r").is_empty());
+    }
+
+    /// Go `TestCustomIDPatterns_*` (#188) through the `--robot-history` path:
+    /// `NewExplicitMatcher` reads `DefaultPatterns()`, so a registered pattern
+    /// lands in the same ordered list as the built-ins and feeds the same
+    /// dedup + confidence handling.
+    #[test]
+    fn explicit_matcher_reads_registered_custom_patterns() {
+        let _serialized = crate::explicit::custom_patterns_lock();
+
+        crate::explicit::set_custom_id_patterns(Vec::new());
+        assert!(IdRegexes::new()
+            .extract("fix flush ordering (zzq-a1b2c)")
+            .is_empty());
+
+        crate::explicit::set_custom_id_patterns(vec![Regex::new(r"\bzzq-[a-z0-9]{5}\b").unwrap()]);
+        let ids = IdRegexes::new().extract("fix flush ordering (zzq-a1b2c)");
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0].id, "zzq-a1b2c");
+        assert_eq!(ids[0].match_type, "generic");
+        assert!((explicit_confidence("generic", 1) - 0.90).abs() < 1e-9);
+
+        // Capture group 1 wins over the whole match, and the built-ins still
+        // take precedence for an ID they already name.
+        crate::explicit::set_custom_id_patterns(vec![
+            Regex::new(r"(?i)ticket\s+(zzt-[a-z]{3})\b").unwrap()
+        ]);
+        let ids = IdRegexes::new().extract("board polish, ticket ZZT-PBB done");
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0].id, "zzt-pbb");
+
+        crate::explicit::set_custom_id_patterns(Vec::new());
     }
 
     #[test]

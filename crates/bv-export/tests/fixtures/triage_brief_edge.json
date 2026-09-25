@@ -1,0 +1,99 @@
+{
+  "meta": {
+    "version": "1.0.0",
+    "generated_at": "2026-08-22T14:06:52Z",
+    "phase2_ready": true,
+    "issue_count": 7
+  },
+  "status": "ignored-by-brief",
+  "quick_ref": {
+    "open_count": 7,
+    "actionable_count": 4,
+    "blocked_count": 2,
+    "in_progress_count": 1,
+    "not_actionable": 3,
+    "top_picks": [
+      { "id": "E-1", "title": "pick one", "score": 0.9, "reasons": ["r"], "unblocks": 2 }
+    ]
+  },
+  "recommendations": [
+    {
+      "id": "E-1",
+      "title": "exact bucket boundaries",
+      "type": "bug",
+      "status": "open",
+      "priority": 0,
+      "score": 0.125,
+      "action": "fix",
+      "reasons": [],
+      "breakdown": { "pagerank_norm": 0.0, "betweenness_norm": 0.25, "time_to_impact_norm": 1.0 }
+    },
+    {
+      "id": "E-2",
+      "title": "héllo wörld — emojies 🐛🐛🐛 and CJK 日本語テキストです",
+      "type": "feature",
+      "status": "open",
+      "priority": 1,
+      "score": 0.005,
+      "action": "build",
+      "reasons": ["exactly-thirty-runes: héllo wörld 🐛 emoji mixed"],
+      "breakdown": { "pagerank_norm": 0.249, "betweenness_norm": 0.5, "time_to_impact_norm": 0.749 }
+    },
+    {
+      "id": "E-3",
+      "title": "A title that is definitely longer than twenty five runes in total length",
+      "type": "task",
+      "status": "in_progress",
+      "priority": 2,
+      "score": 0.9949999,
+      "action": "continue",
+      "reasons": ["a reason that runs well past thirty runes so the ellipsis shows up in the table"],
+      "breakdown": { "pagerank_norm": 0.75, "betweenness_norm": 0.999, "time_to_impact_norm": -0.2 }
+    },
+    {
+      "id": "E-4",
+      "title": "out of range gauges",
+      "type": "epic",
+      "status": "blocked",
+      "priority": 3,
+      "score": 1.005,
+      "action": "unblock",
+      "reasons": ["short"],
+      "breakdown": { "pagerank_norm": 1.5, "betweenness_norm": 0.1, "time_to_impact_norm": 0.9999999 }
+    },
+    {
+      "id": "E-5",
+      "title": "unknown type falls through to the bullet",
+      "type": "not-a-real-type",
+      "status": "open",
+      "priority": 4,
+      "score": 123.456,
+      "action": "triage",
+      "reasons": ["first reason wins", "second reason is ignored"],
+      "breakdown": { "pagerank_norm": 0.4999, "betweenness_norm": 0.49999, "time_to_impact_norm": 0.5 }
+    },
+    {
+      "id": "E-6",
+      "title": "chore with a break in the reason",
+      "type": "chore",
+      "status": "open",
+      "priority": 5,
+      "score": 0.0,
+      "action": "cleanup",
+      "reasons": ["exactly-thirty-runes: héllo wörld 🐛 emoji mixed"],
+      "breakdown": { "pagerank_norm": 0.125, "betweenness_norm": 0.375, "time_to_impact_norm": 0.625 }
+    }
+  ],
+  "quick_wins": [
+    { "id": "W-1", "title": "one liner", "score": 0.9, "reason": "tiny" },
+    { "id": "W-2", "title": "a quick win title that exceeds the thirty rune truncation limit for sure", "score": 0.8, "reason": "a quick win reason that also exceeds forty runes of text" },
+    { "id": "W-3", "title": "emoji 🐛 win", "score": 0.7, "reason": "another reason that is definitely longer than forty runes to force truncation" },
+    { "id": "W-4", "title": "fourth is dropped by the limit of three", "score": 0.6, "reason": "dropped" }
+  ],
+  "blockers_to_clear": [
+    { "id": "B-1", "title": "actionable blocker", "unblocks_count": 7, "actionable": true },
+    { "id": "B-2", "title": "a blocker title longer than thirty runes for the truncation path", "unblocks_count": 0, "actionable": false },
+    { "id": "B-3", "title": "third", "unblocks_count": -3, "actionable": true },
+    { "id": "B-4", "title": "fourth is dropped by the limit of three", "unblocks_count": 1, "actionable": false }
+  ]
+}

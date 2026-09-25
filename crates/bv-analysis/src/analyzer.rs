@@ -109,6 +109,12 @@ pub struct AnalysisBudget {
     /// Per-metric override from BV_PHASE2_TIMEOUT_S (seconds).
     pub override_secs: Option<u64>,
     pub skip_phase2: bool,
+    /// Go's `analyzer.SetConfig(analysis.FullAnalysisConfig())` — what
+    /// `--force-full-analysis` installs. The tier thresholds above still
+    /// describe `ConfigForSize`, so this flag is what makes every accessor
+    /// below report the [`full_analysis_config`] answer instead of the
+    /// size-derived one.
+    pub force_full: bool,
 }
 
 impl Default for AnalysisBudget {
@@ -120,6 +126,7 @@ impl Default for AnalysisBudget {
             density: 0.0,
             override_secs: None,
             skip_phase2: false,
+            force_full: false,
         }
     }
 }
@@ -130,6 +137,11 @@ impl AnalysisBudget {
         if let Some(s) = self.override_secs {
             return Duration::from_secs(s);
         }
+        if self.force_full {
+            // FullAnalysisConfig gives every timeout-raced metric the same
+            // 30s budget (Go config.go:234, :237, :240, :243).
+            return Duration::from_secs(30);
+        }
         match nodes {
             n if n < self.small_threshold => Duration::from_secs(2),
             n if n < self.medium_threshold => Duration::from_millis(500),
@@ -139,6 +151,10 @@ impl AnalysisBudget {
     }
 
     pub fn max_cycles(&self, nodes: usize) -> usize {
+        if self.force_full {
+            // Go config.go:244 — MaxCyclesToStore: 10000.
+            return 10000;
+        }
         match nodes {
             n if n < self.small_threshold => 1000,
             n if n < self.medium_threshold => 100,
@@ -149,11 +165,14 @@ impl AnalysisBudget {
 
     /// Whether cycles should be skipped entirely (Go: XL always skips).
     pub fn skip_cycles(&self, nodes: usize) -> bool {
-        nodes >= self.xl_threshold
+        !self.force_full && nodes >= self.xl_threshold
     }
 
     /// Whether HITS should be skipped for this graph (Go: skip when XL + dense).
     pub fn skip_hits(&self, nodes: usize) -> bool {
+        if self.force_full {
+            return false;
+        }
         // XL (>2000 nodes) AND density >= 0.001 -> skip HITS.
         nodes >= self.xl_threshold && self.density >= 0.001
     }
@@ -161,6 +180,10 @@ impl AnalysisBudget {
     /// Whether betweenness should use approximate mode (Go: approx when dense).
     /// Returns `(use_approx, skip)` where skip means don't compute at all.
     pub fn betweenness_mode(&self, nodes: usize) -> (bool, bool) {
+        if self.force_full {
+            // BetweennessExact and ComputeBetweenness: true (Go config.go:232-233).
+            return (false, false);
+        }
         if nodes >= self.xl_threshold {
             // XL: always approximate (Go parity).
             (true, false)
@@ -255,6 +278,80 @@ pub struct AnalysisConfigReport {
     pub compute_articulation: bool,
     #[serde(rename = "ComputeSlack")]
     pub compute_slack: bool,
+}
+
+/// A metric the configuration turns off, and why — Go `SkippedMetric`
+/// (pkg/analysis/config.go:345-349).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkippedMetric {
+    pub name: &'static str,
+    pub reason: &'static str,
+}
+
+impl Default for AnalysisConfigReport {
+    /// Go's zero `AnalysisConfig`: every metric off, every timeout zero, every
+    /// betweenness mode empty. `config_for_size` and `full_analysis_config` are
+    /// the constructors for a usable configuration.
+    fn default() -> Self {
+        Self {
+            compute_betweenness: false,
+            betweenness_timeout_ns: 0,
+            betweenness_skip_reason: "",
+            betweenness_mode: "",
+            betweenness_sample_size: 0,
+            betweenness_is_approximate: false,
+            compute_page_rank: false,
+            page_rank_timeout_ns: 0,
+            page_rank_skip_reason: "",
+            compute_hits: false,
+            hits_timeout_ns: 0,
+            hits_skip_reason: "",
+            compute_cycles: false,
+            cycles_timeout_ns: 0,
+            max_cycles_to_store: 0,
+            cycles_skip_reason: "",
+            compute_eigenvector: false,
+            compute_critical_path: false,
+            compute_kcore: false,
+            compute_articulation: false,
+            compute_slack: false,
+        }
+    }
+}
+
+impl AnalysisConfigReport {
+    /// The metrics this configuration skips, in Go's order (Betweenness,
+    /// PageRank, HITS, Cycles) — Go `AnalysisConfig.SkippedMetrics`
+    /// (pkg/analysis/config.go:314-343). The startup profile report prints the
+    /// names; the recommendation engine tests the list's emptiness.
+    pub fn skipped_metrics(&self) -> Vec<SkippedMetric> {
+        let mut skipped = Vec::new();
+        if !self.compute_betweenness {
+            skipped.push(SkippedMetric {
+                name: "Betweenness",
+                reason: self.betweenness_skip_reason,
+            });
+        }
+        if !self.compute_page_rank {
+            skipped.push(SkippedMetric {
+                name: "PageRank",
+                reason: self.page_rank_skip_reason,
+            });
+        }
+        if !self.compute_hits {
+            skipped.push(SkippedMetric {
+                name: "HITS",
+                reason: self.hits_skip_reason,
+            });
+        }
+        if !self.compute_cycles {
+            skipped.push(SkippedMetric {
+                name: "Cycles",
+                reason: self.cycles_skip_reason,
+            });
+        }
+        skipped
+    }
 }
 
 const NS_PER_SEC: i64 = 1_000_000_000;
@@ -400,6 +497,119 @@ pub fn config_for_size(node_count: usize, edge_count: usize, density: f64) -> An
     }
 }
 
+/// Go `FullAnalysisConfig` (pkg/analysis/config.go:230) — byte port.
+///
+/// Every metric enabled regardless of graph size, exact betweenness forced,
+/// and a 30s budget on each of the four timeout-raced metrics instead of the
+/// sub-second tier budgets `config_for_size` hands out. This is the config
+/// `--force-full-analysis` swaps in at each of its six call sites (Go
+/// cmd/bv/robot_registry.go:860, :927, :1861; cmd/bv/main.go:3575, :3654,
+/// :4984) — it is a config override, not a cache switch.
+///
+/// `BetweennessSampleSize` and `BetweennessIsApproximate` are left unset in
+/// Go, so they land on Go's zero values here too. `ApplyEnvOverrides`
+/// (config.go:369) is not applied by this function for the same reason
+/// `config_for_size` does not apply it: the `BV_SKIP_PHASE2` and
+/// `BV_PHASE2_TIMEOUT_S` knobs live on [`AnalysisBudget`], which is what
+/// drives the actual computation.
+pub fn full_analysis_config() -> AnalysisConfigReport {
+    AnalysisConfigReport {
+        compute_betweenness: true,
+        betweenness_timeout_ns: 30 * NS_PER_SEC,
+        betweenness_skip_reason: "",
+        betweenness_mode: "exact",
+        betweenness_sample_size: 0,
+        betweenness_is_approximate: false,
+        compute_page_rank: true,
+        page_rank_timeout_ns: 30 * NS_PER_SEC,
+        page_rank_skip_reason: "",
+        compute_hits: true,
+        hits_timeout_ns: 30 * NS_PER_SEC,
+        hits_skip_reason: "",
+        compute_cycles: true,
+        cycles_timeout_ns: 30 * NS_PER_SEC,
+        max_cycles_to_store: 10000,
+        cycles_skip_reason: "",
+        compute_eigenvector: true,
+        compute_critical_path: true,
+        compute_kcore: true,
+        compute_articulation: true,
+        compute_slack: true,
+    }
+}
+
+/// Detailed timing profile of a synchronous analysis pass — port of Go
+/// `StartupProfile` (pkg/analysis/graph.go:27-61), populated by
+/// [`analyze_with_profile`].
+///
+/// Every timing serializes as an integer count of nanoseconds because that is
+/// how Go's `time.Duration` marshals, and the `--profile-startup` JSON compares
+/// the emitted document shape. Field order is Go's struct order.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct StartupProfile {
+    // Data characteristics
+    pub node_count: usize,
+    pub edge_count: usize,
+    pub density: f64,
+
+    // Phase 1 timings
+    /// Analyzer construction. Go's `runProfileStartup` overwrites this after
+    /// the fact with the time `NewAnalyzer` spent (cmd/bv/main.go:5000); the
+    /// analysis pass itself never sets it.
+    #[serde(serialize_with = "ser_duration_ns")]
+    pub build_graph: Duration,
+    #[serde(serialize_with = "ser_duration_ns")]
+    pub degree: Duration,
+    #[serde(serialize_with = "ser_duration_ns")]
+    pub topo_sort: Duration,
+    #[serde(rename = "phase1_total", serialize_with = "ser_duration_ns")]
+    pub phase1: Duration,
+
+    // Phase 2 timings (zero if skipped)
+    #[serde(serialize_with = "ser_duration_ns")]
+    pub pagerank: Duration,
+    #[serde(rename = "pagerank_timeout")]
+    pub pagerank_timeout: bool,
+    #[serde(serialize_with = "ser_duration_ns")]
+    pub betweenness: Duration,
+    #[serde(rename = "betweenness_timeout")]
+    pub betweenness_timeout: bool,
+    #[serde(serialize_with = "ser_duration_ns")]
+    pub eigenvector: Duration,
+    #[serde(serialize_with = "ser_duration_ns")]
+    pub hits: Duration,
+    #[serde(rename = "hits_timeout")]
+    pub hits_timeout: bool,
+    #[serde(rename = "critical_path", serialize_with = "ser_duration_ns")]
+    pub critical_path: Duration,
+    #[serde(serialize_with = "ser_duration_ns")]
+    pub cycles: Duration,
+    #[serde(rename = "cycles_timeout")]
+    pub cycles_timeout: bool,
+    /// One stored representative per cyclic component.
+    pub cycle_count: usize,
+    #[serde(serialize_with = "ser_duration_ns")]
+    pub kcore: Duration,
+    #[serde(serialize_with = "ser_duration_ns")]
+    pub articulation: Duration,
+    #[serde(serialize_with = "ser_duration_ns")]
+    pub slack: Duration,
+    #[serde(rename = "phase2_total", serialize_with = "ser_duration_ns")]
+    pub phase2: Duration,
+
+    // Configuration used
+    pub config: AnalysisConfigReport,
+
+    // Totals
+    #[serde(serialize_with = "ser_duration_ns")]
+    pub total: Duration,
+}
+
+/// Go marshals `time.Duration` as an int64 count of nanoseconds.
+fn ser_duration_ns<S: serde::Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_i64(i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+}
+
 /// Phase 1 results — always available immediately.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Phase1Stats {
@@ -487,7 +697,14 @@ pub fn build_graph(issues: &[bv_core::model::Issue]) -> DiGraph {
 
 /// Phase 1: degrees + topo + density (sync, cheap).
 pub fn analyze_phase1(g: &DiGraph) -> Phase1Stats {
+    phase1_timed(g).0
+}
+
+/// [`analyze_phase1`] plus the two sub-phase timings Go's
+/// `computePhase1WithProfile` records (graph.go:1934-1964).
+fn phase1_timed(g: &DiGraph) -> (Phase1Stats, Duration, Duration) {
     let n = g.len();
+    let degree_start = Instant::now();
     let mut out_degree = BTreeMap::new();
     let mut in_degree = BTreeMap::new();
     for idx in 0..n {
@@ -495,6 +712,9 @@ pub fn analyze_phase1(g: &DiGraph) -> Phase1Stats {
         out_degree.insert(id.clone(), g.out_degree(idx));
         in_degree.insert(id, g.in_degree(idx));
     }
+    let degree = degree_start.elapsed();
+
+    let topo_start = Instant::now();
     // Go: `sorted, err := topo.Sort(a.g)` then walks the slice backwards
     // (graph.go:1950-1954). gonum's topo.Sort is Tarjan-SCC based, so a Kahn
     // order here is valid but ordered differently; the insights field has to
@@ -507,14 +727,20 @@ pub fn analyze_phase1(g: &DiGraph) -> Phase1Stats {
             .map(|&idx| g.node_id(idx).unwrap_or_default().to_string())
             .collect()
     });
-    Phase1Stats {
-        out_degree,
-        in_degree,
-        topological_order,
-        density: g.density(),
-        node_count: n,
-        edge_count: g.edge_count(),
-    }
+    let topo_sort = topo_start.elapsed();
+
+    (
+        Phase1Stats {
+            out_degree,
+            in_degree,
+            topological_order,
+            density: g.density(),
+            node_count: n,
+            edge_count: g.edge_count(),
+        },
+        degree,
+        topo_sort,
+    )
 }
 
 fn idx_to_score_map(g: &DiGraph, scores: Vec<f64>) -> BTreeMap<String, f64> {
@@ -771,6 +997,382 @@ pub fn recommend_sample_size(nodes: usize) -> usize {
 /// Critical path node list convenience (max height nodes).
 pub fn critical_path(g: &DiGraph) -> Vec<usize> {
     critical_path_nodes(g)
+}
+
+/// Go `stateFromTiming` (pkg/analysis/graph.go:229-238).
+fn state_from_timing(enabled: bool, timed_out: bool) -> &'static str {
+    if !enabled {
+        "skipped"
+    } else if timed_out {
+        "timeout"
+    } else {
+        "computed"
+    }
+}
+
+/// Go `emptyGraphMetricStatus` (pkg/analysis/graph.go:240-254). k-core and
+/// articulation share a computation, so either switch marks both computed.
+fn empty_graph_metric_status(config: &AnalysisConfigReport) -> MetricStatus {
+    let kcore = config.compute_kcore || config.compute_articulation;
+    let articulation = config.compute_articulation || config.compute_kcore;
+    let entry = |on: bool| StatusEntry {
+        state: state_from_timing(on, false).to_string(),
+        ..Default::default()
+    };
+    MetricStatus {
+        page_rank: entry(config.compute_page_rank),
+        betweenness: entry(config.compute_betweenness),
+        eigenvector: entry(config.compute_eigenvector),
+        hits: entry(config.compute_hits),
+        critical: entry(config.compute_critical_path),
+        cycles: entry(config.compute_cycles),
+        kcore: entry(kcore),
+        articulation: entry(articulation),
+        slack: entry(config.compute_slack),
+    }
+}
+
+/// Go `betweennessReason` (pkg/analysis/graph.go:256-264).
+fn betweenness_reason(config: &AnalysisConfigReport) -> &'static str {
+    if !config.betweenness_skip_reason.is_empty() {
+        return config.betweenness_skip_reason;
+    }
+    if config.betweenness_mode == "approximate" {
+        return "approximate";
+    }
+    ""
+}
+
+/// Convert a Go nanosecond timeout to a `Duration`, clamping the pathological
+/// negative values a hand-edited config could carry the way Go's negative
+/// `time.NewTimer` duration would fire immediately.
+fn timeout_from_ns(ns: i64) -> Duration {
+    Duration::from_nanos(ns.max(0) as u64)
+}
+
+/// Synchronous analysis that records per-phase timing — port of Go
+/// `Analyzer.AnalyzeWithProfile` (pkg/analysis/graph.go:1877-1932).
+///
+/// Unlike [`analyze_phase2_blocking`], which derives every decision from the
+/// node-count tier through an [`AnalysisBudget`], this entry point is driven by
+/// an explicit [`AnalysisConfigReport`], exactly as Go's profiled pass is driven
+/// by the `AnalysisConfig` the caller handed it. That is what lets
+/// `--force-full-analysis` reach the profile (Go `FullAnalysisConfig`), whose
+/// 30s budgets and 10000-cycle cap no size tier ever produces.
+///
+/// `build_graph` is left at zero: Go's `runProfileStartup` overwrites it with
+/// the time `NewAnalyzer` spent before it calls this (cmd/bv/main.go:4978-5000),
+/// so the caller owns that one field.
+pub fn analyze_with_profile(
+    g: std::sync::Arc<DiGraph>,
+    config: &AnalysisConfigReport,
+) -> (GraphAnalysis, StartupProfile) {
+    let total_start = Instant::now();
+    let node_count = g.len();
+    let edge_count = g.edge_count();
+    let mut profile = StartupProfile {
+        node_count,
+        edge_count,
+        config: *config,
+        ..Default::default()
+    };
+    let mut out = GraphAnalysis::default();
+
+    // Go graph.go:1906-1912 — an empty graph still returns a ready stats value,
+    // with every metric reported from the configuration alone.
+    if node_count == 0 {
+        out.status = empty_graph_metric_status(config);
+        profile.total = total_start.elapsed();
+        return (out, profile);
+    }
+
+    let phase1_start = Instant::now();
+    let (phase1, degree, topo_sort) = phase1_timed(&g);
+    profile.degree = degree;
+    profile.topo_sort = topo_sort;
+    profile.phase1 = phase1_start.elapsed();
+    profile.density = phase1.density;
+    out.phase1 = phase1.clone();
+
+    let phase2_start = Instant::now();
+    analyze_phase2_with_profile(&g, config, &phase1, &mut out, &mut profile);
+    profile.phase2 = phase2_start.elapsed();
+    profile.total = total_start.elapsed();
+
+    (out, profile)
+}
+
+/// Go `computePhase2WithProfile` (pkg/analysis/graph.go:1967-2361).
+fn analyze_phase2_with_profile(
+    g: &std::sync::Arc<DiGraph>,
+    config: &AnalysisConfigReport,
+    phase1: &Phase1Stats,
+    out: &mut GraphAnalysis,
+    profile: &mut StartupProfile,
+) {
+    let n = g.len();
+    // Go accumulates every metric into locals and publishes `stats.status` only
+    // at the end (graph.go:2320-2360), so the intermediate writes are not made
+    // here either.
+    // Go requires a complete topological order before the two order-dependent
+    // metrics run (graph.go:2013, :2110): a cyclic graph leaves the order nil.
+    let topo_order = phase1
+        .topological_order
+        .as_ref()
+        .filter(|order| order.len() == n);
+
+    // --- PageRank (graph.go:1993-2044) ---
+    if config.compute_page_rank {
+        let t0 = Instant::now();
+        let gc = std::sync::Arc::clone(g);
+        match run_with_timeout(timeout_from_ns(config.page_rank_timeout_ns), move || {
+            pagerank_default(&gc)
+        }) {
+            Ok(pr) => {
+                out.page_rank = Some(idx_to_score_map(g, pr));
+            }
+            Err(()) => {
+                profile.pagerank_timeout = true;
+                // Go's uniform fallback keeps downstream normalization fed with
+                // a full map instead of an empty one (graph.go:2005-2009).
+                let uniform = 1.0 / n as f64;
+                let fallback = (0..n)
+                    .map(|i| (g.node_id(i).unwrap_or_default().to_string(), uniform))
+                    .collect();
+                out.page_rank = Some(fallback);
+            }
+        }
+        profile.pagerank = t0.elapsed();
+    }
+
+    // --- Betweenness (graph.go:2046-2106) ---
+    let mut betweenness_sample_used = 0usize;
+    if config.compute_betweenness {
+        let t0 = Instant::now();
+        let sample = config.betweenness_sample_size;
+        if config.betweenness_mode == "approximate" && sample > 0 {
+            betweenness_sample_used = sample;
+            let gc = std::sync::Arc::clone(g);
+            match run_with_timeout(timeout_from_ns(config.betweenness_timeout_ns), move || {
+                betweenness_approx(&gc, sample, Some(1))
+            }) {
+                Ok(bw) => {
+                    out.betweenness = Some(idx_to_score_map(g, bw));
+                }
+                Err(()) => {
+                    profile.betweenness_timeout = true;
+                }
+            }
+        } else {
+            let gc = std::sync::Arc::clone(g);
+            match run_with_timeout(timeout_from_ns(config.betweenness_timeout_ns), move || {
+                betweenness(&gc)
+            }) {
+                Ok(bw) => {
+                    out.betweenness = Some(idx_to_score_map(g, bw));
+                }
+                Err(()) => {
+                    profile.betweenness_timeout = true;
+                }
+            }
+        }
+        profile.betweenness = t0.elapsed();
+    }
+
+    // --- Eigenvector (graph.go:2108-2116) ---
+    // Go calls this one inline with no timeout race, and `StartupProfile` has no
+    // eigenvector-timeout field to report into, so the direct call is what
+    // reproduces the document.
+    if config.compute_eigenvector {
+        let t0 = Instant::now();
+        let ev = crate::algorithms::eigenvector::eigenvector_default(g);
+        out.eigenvector = Some(idx_to_score_map(g, ev));
+        profile.eigenvector = t0.elapsed();
+    }
+
+    // --- HITS (graph.go:2118-2158) ---
+    if config.compute_hits && g.edge_count() > 0 {
+        let t0 = Instant::now();
+        let gc = std::sync::Arc::clone(g);
+        match run_with_timeout(timeout_from_ns(config.hits_timeout_ns), move || {
+            hits_default(&gc)
+        }) {
+            Ok(h) => {
+                out.hubs = Some(idx_to_score_map(g, h.hubs));
+                out.authorities = Some(idx_to_score_map(g, h.authorities));
+            }
+            Err(()) => {
+                profile.hits_timeout = true;
+            }
+        }
+        profile.hits = t0.elapsed();
+    }
+
+    // --- Critical path (graph.go:2160-2180) ---
+    let mut critical_unavailable = "";
+    if config.compute_critical_path {
+        let t0 = Instant::now();
+        if topo_order.is_some() {
+            let heights = critical_path_heights(g);
+            out.critical_path_score = Some(idx_to_score_map(g, heights));
+        } else {
+            critical_unavailable =
+                "dependency graph contains a cycle; topological order unavailable";
+        }
+        profile.critical_path = t0.elapsed();
+    }
+
+    // --- Cycles (graph.go:2182-2253) ---
+    // `truncation_note` carries Go's "truncated to N of M cycle
+    // representatives" suffix, which is only built when the cap actually bit.
+    let mut truncation_note = String::new();
+    if config.compute_cycles {
+        let t0 = Instant::now();
+        let scc = tarjan_scc(g);
+        if scc.has_cycles {
+            let cap = if config.max_cycles_to_store == 0 {
+                100
+            } else {
+                config.max_cycles_to_store
+            };
+            // Go stores one representative per cyclic component (graph_cycles.go:27-41)
+            // and keeps the pre-limit count so it can report truncation without
+            // implying every simple cycle in an SCC was enumerated.
+            let found = crate::algorithms::cycles::enumerate_cycles_with_info(g, cap);
+            profile.cycle_count = scc.cycle_count;
+            if found.truncated {
+                truncation_note = format!(
+                    "truncated to {} of {} cycle representatives",
+                    found.cycles.len(),
+                    profile.cycle_count
+                );
+            }
+            out.cycles = Some(
+                found
+                    .cycles
+                    .into_iter()
+                    .map(|c| {
+                        c.into_iter()
+                            .map(|i| g.node_id(i).unwrap_or_default().to_string())
+                            .collect()
+                    })
+                    .collect(),
+            );
+        } else {
+            // An acyclic graph computed its cycles metric successfully and
+            // found none — the same `Some(empty)` the unprofiled pass reports.
+            out.cycles = Some(Vec::new());
+        }
+        profile.cycles = t0.elapsed();
+    }
+
+    // --- k-core + articulation (graph.go:2262-2268) ---
+    // Go computes the pair inside one timed window and reports the whole
+    // duration on KCore, leaving Articulation at zero. The Rust port keeps the
+    // two algorithms separate but times them as one window so the emitted
+    // numbers mean the same thing.
+    let mut kcore_ran = false;
+    if config.compute_kcore || config.compute_articulation {
+        let t0 = Instant::now();
+        if config.compute_kcore {
+            let gc = std::sync::Arc::clone(g);
+            let cores = kcore(&gc);
+            out.core_number = Some(
+                cores
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, v)| (g.node_id(i).unwrap_or_default().to_string(), v))
+                    .collect(),
+            );
+        }
+        if config.compute_articulation {
+            let gc = std::sync::Arc::clone(g);
+            out.articulation = Some(
+                crate::algorithms::articulation::articulation_points(&gc)
+                    .into_iter()
+                    .map(|i| g.node_id(i).unwrap_or_default().to_string())
+                    .collect(),
+            );
+        }
+        profile.kcore = t0.elapsed();
+        kcore_ran = true;
+    }
+
+    // --- Slack (graph.go:2270-2278) ---
+    let mut slack_unavailable = "";
+    if config.compute_slack {
+        let t0 = Instant::now();
+        if topo_order.is_some() {
+            out.slack = Some(idx_to_score_map(g, crate::algorithms::slack::slack(g)));
+        } else {
+            slack_unavailable = "dependency graph contains a cycle; topological order unavailable";
+        }
+        profile.slack = t0.elapsed();
+    }
+
+    // Go graph.go:2320-2360 — the status snapshot is built from the config
+    // switches and the recorded timeouts, not from what each branch happened to
+    // store. A few entries carry a reason the branch above discovered.
+    let articulation_ran = config.compute_articulation || config.compute_kcore;
+    let mut cycles_reason = config.cycles_skip_reason.to_string();
+    if !truncation_note.is_empty() {
+        if !cycles_reason.is_empty() {
+            cycles_reason.push_str("; ");
+        }
+        cycles_reason.push_str(&truncation_note);
+    }
+    let entry = |on: bool, timed_out: bool, elapsed: Duration| StatusEntry {
+        state: state_from_timing(on, timed_out).to_string(),
+        ms: ms_total(elapsed),
+        ..Default::default()
+    };
+    let mut critical = entry(config.compute_critical_path, false, profile.critical_path);
+    if config.compute_critical_path && !critical_unavailable.is_empty() {
+        critical.state = "skipped".into();
+        critical.reason = critical_unavailable.to_string();
+    }
+    let mut slack = entry(config.compute_slack, false, profile.slack);
+    if config.compute_slack && !slack_unavailable.is_empty() {
+        slack.state = "skipped".into();
+        slack.reason = slack_unavailable.to_string();
+    }
+    out.status = MetricStatus {
+        page_rank: entry(
+            config.compute_page_rank,
+            profile.pagerank_timeout,
+            profile.pagerank,
+        ),
+        betweenness: StatusEntry {
+            state: state_from_timing(config.compute_betweenness, profile.betweenness_timeout)
+                .to_string(),
+            reason: betweenness_reason(config).to_string(),
+            // Go reports `actualBetweennessSample`, which only becomes non-zero
+            // when the approximate branch actually ran.
+            sample: betweenness_sample_used,
+            ms: ms_total(profile.betweenness),
+        },
+        eigenvector: entry(config.compute_eigenvector, false, profile.eigenvector),
+        hits: StatusEntry {
+            state: state_from_timing(config.compute_hits, profile.hits_timeout).to_string(),
+            reason: config.hits_skip_reason.to_string(),
+            sample: 0,
+            ms: ms_total(profile.hits),
+        },
+        critical,
+        cycles: StatusEntry {
+            state: state_from_timing(config.compute_cycles, profile.cycles_timeout).to_string(),
+            reason: cycles_reason,
+            sample: 0,
+            ms: ms_total(profile.cycles),
+        },
+        kcore: entry(kcore_ran, false, profile.kcore),
+        articulation: entry(articulation_ran, false, profile.articulation),
+        slack,
+    };
+}
+
+fn ms_total(d: Duration) -> f64 {
+    d.as_secs_f64() * 1000.0
 }
 
 #[cfg(test)]
@@ -1087,5 +1689,598 @@ mod config_for_size_tests {
         // Cycles flip off exactly at the XL boundary.
         assert!(config_for_size(1999, 0, 0.0).compute_cycles);
         assert!(!config_for_size(2000, 0, 0.0).compute_cycles);
+    }
+}
+
+#[cfg(test)]
+mod full_analysis_config_tests {
+    use super::*;
+    use serde_json::Value;
+    use std::time::Duration;
+
+    const THIRTY_SEC_NS: i64 = 30_000_000_000;
+
+    /// Go config.go:232-252, field by field. Every value below is transcribed
+    /// from that literal; the serialized key set is checked separately so a
+    /// field Go does not emit can never sneak in.
+    fn expected_go_json() -> Value {
+        serde_json::json!({
+            "ComputeBetweenness": true,
+            "BetweennessTimeout": THIRTY_SEC_NS,
+            "BetweennessSkipReason": "",
+            "BetweennessMode": "exact",
+            "BetweennessSampleSize": 0,
+            "BetweennessIsApproximate": false,
+            "ComputePageRank": true,
+            "PageRankTimeout": THIRTY_SEC_NS,
+            "PageRankSkipReason": "",
+            "ComputeHITS": true,
+            "HITSTimeout": THIRTY_SEC_NS,
+            "HITSSkipReason": "",
+            "ComputeCycles": true,
+            "CyclesTimeout": THIRTY_SEC_NS,
+            "MaxCyclesToStore": 10000,
+            "CyclesSkipReason": "",
+            "ComputeEigenvector": true,
+            "ComputeCriticalPath": true,
+            "ComputeKCore": true,
+            "ComputeArticulation": true,
+            "ComputeSlack": true,
+        })
+    }
+
+    #[test]
+    fn serialized_config_equals_go_literal() {
+        let got = serde_json::to_value(full_analysis_config()).expect("serializes");
+        let want = expected_go_json();
+        let got_obj = got.as_object().expect("object");
+        let want_obj = want.as_object().expect("object");
+        assert_eq!(got_obj.len(), want_obj.len(), "field count");
+        for (k, wv) in want_obj {
+            assert_eq!(got_obj.get(k), Some(wv), "field {k}");
+        }
+        for k in got_obj.keys() {
+            assert!(want_obj.contains_key(k), "extra field {k} Go does not emit");
+        }
+    }
+
+    #[test]
+    fn field_order_matches_go_struct_order() {
+        // Go serializes AnalysisConfig positionally (pkg/analysis/config.go:12).
+        let got: Vec<String> = serde_json::to_value(full_analysis_config())
+            .expect("serializes")
+            .as_object()
+            .expect("object")
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(
+            got,
+            expected_go_json()
+                .as_object()
+                .expect("object")
+                .keys()
+                .cloned()
+                .collect::<Vec<String>>()
+        );
+    }
+
+    #[test]
+    fn every_metric_is_enabled_and_no_skip_reason_is_set() {
+        let c = full_analysis_config();
+        assert!(c.compute_betweenness);
+        assert!(c.compute_page_rank);
+        assert!(c.compute_hits);
+        assert!(c.compute_cycles);
+        assert!(c.compute_eigenvector);
+        assert!(c.compute_critical_path);
+        assert!(c.compute_kcore);
+        assert!(c.compute_articulation);
+        assert!(c.compute_slack);
+        assert_eq!(c.betweenness_skip_reason, "");
+        assert_eq!(c.page_rank_skip_reason, "");
+        assert_eq!(c.hits_skip_reason, "");
+        assert_eq!(c.cycles_skip_reason, "");
+    }
+
+    #[test]
+    fn betweenness_is_forced_exact_with_zero_sample() {
+        let c = full_analysis_config();
+        assert_eq!(c.betweenness_mode, "exact");
+        // Go leaves BetweennessSampleSize / BetweennessIsApproximate unset.
+        assert_eq!(c.betweenness_sample_size, 0);
+        assert!(!c.betweenness_is_approximate);
+    }
+
+    #[test]
+    fn all_four_timeouts_are_thirty_seconds_and_cycles_cap_is_10000() {
+        let c = full_analysis_config();
+        assert_eq!(c.betweenness_timeout_ns, THIRTY_SEC_NS);
+        assert_eq!(c.page_rank_timeout_ns, THIRTY_SEC_NS);
+        assert_eq!(c.hits_timeout_ns, THIRTY_SEC_NS);
+        assert_eq!(c.cycles_timeout_ns, THIRTY_SEC_NS);
+        assert_eq!(c.max_cycles_to_store, 10000);
+    }
+
+    /// The whole point of the flag: a graph that `ConfigForSize` would throttle
+    /// or disable gets the identical full config at every size. Sizes and
+    /// densities below straddle every tier and both density cutoffs
+    /// (config.go:181, :217) that the tiered config reacts to.
+    #[test]
+    fn force_full_config_ignores_size_and_density() {
+        for nodes in [0usize, 1, 12, 99, 121, 499, 600, 1999, 2500, 100_000] {
+            for density in [0.0f64, 0.0008, 0.0025, 0.0099, 0.01, 0.02, 0.9] {
+                let b = full_budget(density);
+                assert!(
+                    b.timeout_for(nodes) == Duration::from_secs(30)
+                        && !b.skip_cycles(nodes)
+                        && !b.skip_hits(nodes)
+                        && b.betweenness_mode(nodes) == (false, false)
+                        && b.max_cycles(nodes) == 10000,
+                    "tier {nodes}/{density} escaped the forced full config"
+                );
+            }
+        }
+    }
+
+    // --- AnalysisBudget::force_full: the computation-side half of
+    // `analyzer.SetConfig(FullAnalysisConfig())`. ---
+
+    fn full_budget(density: f64) -> AnalysisBudget {
+        AnalysisBudget {
+            density,
+            force_full: true,
+            ..AnalysisBudget::default()
+        }
+    }
+
+    #[test]
+    fn force_full_budget_reports_thirty_second_timeouts() {
+        for nodes in [0usize, 12, 121, 600, 2500, 100_000] {
+            assert_eq!(
+                full_budget(0.0).timeout_for(nodes),
+                Duration::from_secs(30),
+                "{nodes} nodes"
+            );
+        }
+    }
+
+    #[test]
+    fn force_full_budget_matches_the_config_it_advertises() {
+        // The ns the config advertises and the Duration the analyzer enforces
+        // are the same budget expressed twice; they must not drift. One
+        // `timeout_for` feeds all four timeout-raced metrics, so checking it
+        // against the shared 30_000_000_000 covers Betweenness/PageRank/HITS/
+        // Cycles together.
+        let c = full_analysis_config();
+        let b = full_budget(0.5);
+        let thirty = Duration::from_secs(30);
+        assert_eq!(b.betweenness_mode(2500), (false, false));
+        assert_eq!(b.timeout_for(2500), thirty);
+        assert_eq!(c.betweenness_timeout_ns, 30_000_000_000);
+        assert_eq!(
+            b.timeout_for(2500).as_nanos() as i64,
+            c.betweenness_timeout_ns
+        );
+        assert_eq!(b.max_cycles(2500), c.max_cycles_to_store);
+    }
+
+    #[test]
+    fn force_full_budget_never_skips_cycles_or_hits() {
+        for nodes in [2500usize, 2501, 100_000] {
+            for density in [0.0f64, 0.0009, 0.001, 0.01, 0.5] {
+                let b = full_budget(density);
+                assert!(!b.skip_cycles(nodes), "cycles skipped at {nodes}/{density}");
+                assert!(!b.skip_hits(nodes), "HITS skipped at {nodes}/{density}");
+            }
+        }
+    }
+
+    #[test]
+    fn force_full_budget_uses_exact_betweenness_everywhere() {
+        for nodes in [0usize, 12, 600, 2500, 100_000] {
+            for density in [0.0f64, 0.005, 0.02, 0.5] {
+                assert_eq!(
+                    full_budget(density).betweenness_mode(nodes),
+                    (false, false),
+                    "betweenness not exact at {nodes}/{density}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn force_full_budget_cycles_cap_is_10000_at_every_size() {
+        for nodes in [0usize, 12, 121, 600, 2500, 100_000] {
+            assert_eq!(full_budget(0.0).max_cycles(nodes), 10000);
+        }
+    }
+
+    /// Default (flag absent) must be byte-identical to before this change —
+    /// every golden was captured without `--force-full-analysis`.
+    #[test]
+    fn default_budget_is_unaffected() {
+        let b = AnalysisBudget::default();
+        assert!(!b.force_full);
+        assert_eq!(b.timeout_for(12), Duration::from_secs(2));
+        assert_eq!(b.timeout_for(121), Duration::from_millis(500));
+        assert_eq!(b.timeout_for(600), Duration::from_millis(300));
+        assert_eq!(b.timeout_for(2500), Duration::from_millis(200));
+        assert_eq!(b.max_cycles(12), 1000);
+        assert_eq!(b.max_cycles(121), 100);
+        assert_eq!(b.max_cycles(600), 50);
+        assert_eq!(b.max_cycles(2500), 10);
+        assert!(!b.skip_cycles(1999));
+        assert!(b.skip_cycles(2000));
+        // Default density 0.0 — a sparse XL graph still runs HITS.
+        assert!(!b.skip_hits(2500));
+        let dense_xl = AnalysisBudget {
+            density: 0.01,
+            ..AnalysisBudget::default()
+        };
+        assert!(dense_xl.skip_hits(2500));
+        assert_eq!(b.betweenness_mode(2500), (true, false));
+        assert_eq!(b.betweenness_mode(600), (true, false));
+        assert_eq!(b.betweenness_mode(12), (false, false));
+        let dense_large = AnalysisBudget {
+            density: 0.02,
+            ..AnalysisBudget::default()
+        };
+        assert_eq!(dense_large.betweenness_mode(600), (false, true));
+    }
+
+    /// Go ApplyEnvOverrides (config.go:373-401) runs *after* the
+    /// FullAnalysisConfig literal, so BV_PHASE2_TIMEOUT_S still wins over the
+    /// 30s budgets, and BV_SKIP_PHASE2 still wins over everything.
+    #[test]
+    fn env_overrides_still_win_over_force_full() {
+        let b = AnalysisBudget {
+            override_secs: Some(7),
+            force_full: true,
+            ..AnalysisBudget::default()
+        };
+        assert_eq!(b.timeout_for(2500), Duration::from_secs(7));
+    }
+}
+
+#[cfg(test)]
+mod startup_profile_tests {
+    use super::*;
+    use serde_json::Value;
+
+    /// A dependency chain FIX-1 -> FIX-2 -> ... -> FIX-n, i.e. FIX-k depends on
+    /// FIX-(k+1) so the graph is acyclic and has a topological order.
+    fn chain(n: usize) -> DiGraph {
+        let mut g = DiGraph::with_capacity(n, n.saturating_sub(1));
+        for i in 1..=n {
+            g.add_node(&format!("FIX-{i}"));
+        }
+        for j in 0..n.saturating_sub(1) {
+            g.add_edge(j, j + 1);
+        }
+        g
+    }
+
+    /// Two issues that block each other: no topological order exists, so Go
+    /// leaves TopologicalOrder nil and the two order-dependent metrics report a
+    /// skip reason.
+    fn cycle() -> DiGraph {
+        let mut g = DiGraph::with_capacity(2, 2);
+        g.add_node("a");
+        g.add_node("b");
+        g.add_edge(0, 1);
+        g.add_edge(1, 0);
+        g
+    }
+
+    /// Every Phase-2 metric on with 30s budgets — the shape
+    /// --force-full-analysis --profile-startup produces.
+    fn all_on() -> AnalysisConfigReport {
+        full_analysis_config()
+    }
+
+    #[test]
+    fn startup_profile_json_key_order_matches_go_struct_order() {
+        // Go graph.go:27-61 declares the fields in this order and
+        // encoding/json preserves struct order.
+        let raw = serde_json::to_string(&StartupProfile {
+            config: all_on(),
+            ..Default::default()
+        })
+        .expect("serializes");
+        let expected = [
+            "\"node_count\"",
+            "\"edge_count\"",
+            "\"density\"",
+            "\"build_graph\"",
+            "\"degree\"",
+            "\"topo_sort\"",
+            "\"phase1_total\"",
+            "\"pagerank\"",
+            "\"pagerank_timeout\"",
+            "\"betweenness\"",
+            "\"betweenness_timeout\"",
+            "\"eigenvector\"",
+            "\"hits\"",
+            "\"hits_timeout\"",
+            "\"critical_path\"",
+            "\"cycles\"",
+            "\"cycles_timeout\"",
+            "\"cycle_count\"",
+            "\"kcore\"",
+            "\"articulation\"",
+            "\"slack\"",
+            "\"phase2_total\"",
+            "\"config\"",
+            "\"total\"",
+        ];
+        let mut at = 0usize;
+        for key in expected {
+            let found = raw[at..]
+                .find(key)
+                .unwrap_or_else(|| panic!("{key} missing or out of order in {raw}"));
+            at += found + key.len();
+        }
+        // And nothing extra.
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v.as_object().unwrap().len(), expected.len());
+    }
+
+    #[test]
+    fn startup_profile_durations_serialize_as_nanosecond_integers() {
+        // Go marshals time.Duration as an int64 nanosecond count, so
+        // --profile-startup --profile-json emits integers, never floats.
+        let profile = StartupProfile {
+            build_graph: Duration::from_millis(2),
+            pagerank: Duration::from_nanos(1234),
+            total: Duration::from_micros(1500),
+            config: all_on(),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&profile).expect("serializes");
+        assert_eq!(v["build_graph"], Value::from(2_000_000i64));
+        assert_eq!(v["pagerank"], Value::from(1234i64));
+        assert_eq!(v["total"], Value::from(1_500_000i64));
+        assert_eq!(v["pagerank_timeout"], Value::from(false));
+        assert_eq!(v["cycle_count"], Value::from(0));
+    }
+
+    #[test]
+    fn analyze_with_profile_populates_every_phase_timing() {
+        let g = chain(12);
+        let (out, profile) = analyze_with_profile(std::sync::Arc::new(g), &all_on());
+
+        assert_eq!(profile.node_count, 12);
+        assert_eq!(profile.edge_count, 11);
+        assert!((profile.density - 11.0 / (12.0 * 11.0)).abs() < 1e-12);
+        assert_eq!(profile.config, all_on());
+
+        // Go's runProfileStartup owns BuildGraph (it times NewAnalyzer itself
+        // and overwrites the field), so the analysis pass leaves it zero.
+        assert_eq!(profile.build_graph, Duration::ZERO);
+
+        // The phase aggregates and the two centralities do enough work on a
+        // 12-node chain to clear any plausible clock granularity. The cheaper
+        // per-metric timings are only checked for being recorded, because
+        // `Instant` can report a zero delta for a sub-tick operation on
+        // Windows and a test that demands `> 0` there is flaky, not strict.
+        for (name, d) in [
+            ("phase1", profile.phase1),
+            ("phase2", profile.phase2),
+            ("total", profile.total),
+            ("pagerank", profile.pagerank),
+            ("betweenness", profile.betweenness),
+        ] {
+            assert!(d > Duration::ZERO, "{name} was never timed");
+        }
+        // Total brackets both phases.
+        assert!(profile.total >= profile.phase1);
+        assert!(profile.total >= profile.phase2);
+
+        // No metric timed out or was skipped on a 12-node chain.
+        assert!(!profile.pagerank_timeout);
+        assert!(!profile.betweenness_timeout);
+        assert!(!profile.hits_timeout);
+        assert!(!profile.cycles_timeout);
+        assert_eq!(profile.cycle_count, 0);
+        assert_eq!(out.status.page_rank.state, "computed");
+        assert_eq!(out.status.critical.state, "computed");
+        assert_eq!(out.status.slack.state, "computed");
+        assert!(out.page_rank.is_some());
+        assert!(out.betweenness.is_some());
+        assert_eq!(out.cycles, Some(Vec::new()));
+    }
+
+    #[test]
+    fn analyze_with_profile_results_match_the_unprofiled_pass() {
+        // The profiled pass is a different code path from
+        // analyze_phase1 + analyze_phase2_blocking; it exists only to add
+        // timings, so it must not change a single score.
+        let g = chain(20);
+        let arc = std::sync::Arc::new(g);
+        let (profiled, _) = analyze_with_profile(std::sync::Arc::clone(&arc), &all_on());
+        let (status, phase2) =
+            analyze_phase2_blocking(std::sync::Arc::clone(&arc), &AnalysisBudget::default());
+        assert_eq!(profiled.page_rank, phase2.page_rank);
+        assert_eq!(profiled.betweenness, phase2.betweenness);
+        assert_eq!(profiled.eigenvector, phase2.eigenvector);
+        assert_eq!(profiled.hubs, phase2.hubs);
+        assert_eq!(profiled.authorities, phase2.authorities);
+        assert_eq!(profiled.critical_path_score, phase2.critical_path_score);
+        assert_eq!(profiled.core_number, phase2.core_number);
+        assert_eq!(profiled.articulation, phase2.articulation);
+        assert_eq!(profiled.slack, phase2.slack);
+        assert_eq!(profiled.cycles, phase2.cycles);
+        for (a, b) in [
+            (&profiled.status.page_rank, &status.page_rank),
+            (&profiled.status.betweenness, &status.betweenness),
+            (&profiled.status.eigenvector, &status.eigenvector),
+            (&profiled.status.hits, &status.hits),
+            (&profiled.status.critical, &status.critical),
+            (&profiled.status.cycles, &status.cycles),
+            (&profiled.status.kcore, &status.kcore),
+            (&profiled.status.articulation, &status.articulation),
+            (&profiled.status.slack, &status.slack),
+        ] {
+            assert_eq!(a.state, b.state);
+        }
+    }
+
+    #[test]
+    fn analyze_with_profile_empty_graph_reports_status_from_config_alone() {
+        // Go graph.go:1906-1912 short-circuits before Phase 1.
+        let config = all_on();
+        let (out, profile) = analyze_with_profile(std::sync::Arc::new(DiGraph::default()), &config);
+        assert_eq!(profile.node_count, 0);
+        assert_eq!(profile.edge_count, 0);
+        // Go still stamps `profile.Total = time.Since(totalStart)` on the
+        // short-circuit path (graph.go:1911), so it is small but not zero.
+        assert!(profile.total > Duration::ZERO);
+        assert_eq!(profile.phase1, Duration::ZERO);
+        assert_eq!(profile.phase2, Duration::ZERO);
+        assert_eq!(out.status.page_rank.state, "computed");
+        assert_eq!(out.status.betweenness.state, "computed");
+        assert_eq!(out.status.critical.state, "computed");
+    }
+
+    #[test]
+    fn analyze_with_profile_empty_graph_with_nothing_enabled_is_all_skipped() {
+        let (out, _) = analyze_with_profile(
+            std::sync::Arc::new(DiGraph::default()),
+            &AnalysisConfigReport::default(),
+        );
+        for state in [
+            &out.status.page_rank.state,
+            &out.status.betweenness.state,
+            &out.status.eigenvector.state,
+            &out.status.hits.state,
+            &out.status.critical.state,
+            &out.status.cycles.state,
+            &out.status.kcore.state,
+            &out.status.articulation.state,
+            &out.status.slack.state,
+        ] {
+            assert_eq!(state, "skipped");
+        }
+    }
+
+    #[test]
+    fn analyze_with_profile_honours_disabled_metrics() {
+        // Go gates every metric on its config switch (graph.go:1993, :2046,
+        // :2118, :2160, :2182, :2262, :2270): a disabled metric leaves its
+        // timing at zero and reports "skipped".
+        let config = AnalysisConfigReport {
+            compute_cycles: false,
+            cycles_skip_reason: "graph too large (>2000 nodes)",
+            ..all_on()
+        };
+        let (out, profile) = analyze_with_profile(std::sync::Arc::new(chain(8)), &config);
+        assert_eq!(profile.cycles, Duration::ZERO);
+        assert_eq!(profile.cycle_count, 0);
+        assert_eq!(out.cycles, None);
+        assert_eq!(out.status.cycles.state, "skipped");
+        assert_eq!(out.status.cycles.reason, "graph too large (>2000 nodes)");
+        // The other metrics still ran.
+        assert!(profile.pagerank > Duration::ZERO);
+        assert_eq!(out.status.page_rank.state, "computed");
+    }
+
+    #[test]
+    fn analyze_with_profile_cyclic_graph_skips_order_dependent_metrics() {
+        // Go graph.go:2160-2180 and :2270-2278 both bail when the topological
+        // order is unavailable, and record why. The timing fields stay
+        // unasserted here: on this path the work is a two-node check, which can
+        // legitimately measure as a zero delta.
+        let (out, profile) = analyze_with_profile(std::sync::Arc::new(cycle()), &all_on());
+        assert_eq!(out.critical_path_score, None);
+        assert_eq!(out.slack, None);
+        assert_eq!(out.status.critical.state, "skipped");
+        assert_eq!(
+            out.status.critical.reason,
+            "dependency graph contains a cycle; topological order unavailable"
+        );
+        assert_eq!(out.status.slack.state, "skipped");
+        assert_eq!(
+            out.status.slack.reason,
+            "dependency graph contains a cycle; topological order unavailable"
+        );
+        assert!(profile.cycle_count > 0, "a 2-cycle has a cyclic component");
+    }
+
+    #[test]
+    fn analyze_with_profile_uses_the_configured_betweenness_mode() {
+        let approx = AnalysisConfigReport {
+            betweenness_mode: "approximate",
+            betweenness_sample_size: 5,
+            ..all_on()
+        };
+        let (out, profile) = analyze_with_profile(std::sync::Arc::new(chain(20)), &approx);
+        assert!(!profile.betweenness_timeout);
+        assert_eq!(out.status.betweenness.state, "computed");
+        assert_eq!(out.status.betweenness.reason, "approximate");
+        assert_eq!(out.status.betweenness.sample, 5);
+        assert!(out.betweenness.is_some());
+
+        // Exact mode reports no approximation reason and no sample.
+        let (out, _) = analyze_with_profile(std::sync::Arc::new(chain(20)), &all_on());
+        assert_eq!(out.status.betweenness.reason, "");
+        assert_eq!(out.status.betweenness.sample, 0);
+    }
+
+    #[test]
+    fn analyze_with_profile_reports_a_zero_timeout_as_immediate_failure() {
+        // A zero ns budget cannot elapse, so the metric reports the timeout
+        // state Go would reach, and PageRank still gets its uniform fallback.
+        let starved = AnalysisConfigReport {
+            page_rank_timeout_ns: 0,
+            ..all_on()
+        };
+        let (out, profile) = analyze_with_profile(std::sync::Arc::new(chain(8)), &starved);
+        assert!(profile.pagerank_timeout);
+        assert_eq!(out.status.page_rank.state, "timeout");
+        let pr = out
+            .page_rank
+            .expect("Go's uniform fallback keeps the map full");
+        assert_eq!(pr.len(), 8);
+        for v in pr.values() {
+            assert!((v - 0.125).abs() < 1e-12, "{v}");
+        }
+    }
+
+    #[test]
+    fn skipped_metrics_matches_go_order_and_reasons() {
+        // Go config.go:314-343 checks the four switches in this order.
+        let xl = config_for_size(2500, 5000, 0.01);
+        let skipped: Vec<(&str, &str)> = xl
+            .skipped_metrics()
+            .iter()
+            .map(|s| (s.name, s.reason))
+            .collect();
+        assert_eq!(
+            skipped,
+            vec![
+                ("HITS", "graph too large and dense"),
+                ("Cycles", "graph too large (>2000 nodes)"),
+            ]
+        );
+        assert!(full_analysis_config().skipped_metrics().is_empty());
+        assert!(config_for_size(12, 11, 0.0).skipped_metrics().is_empty());
+    }
+
+    #[test]
+    fn analysis_config_default_is_go_zero_value() {
+        let c = AnalysisConfigReport::default();
+        assert!(!c.compute_betweenness);
+        assert!(!c.compute_page_rank);
+        assert!(!c.compute_hits);
+        assert!(!c.compute_cycles);
+        assert!(!c.compute_eigenvector);
+        assert!(!c.compute_critical_path);
+        assert!(!c.compute_kcore);
+        assert!(!c.compute_articulation);
+        assert!(!c.compute_slack);
+        assert_eq!(c.betweenness_timeout_ns, 0);
+        assert_eq!(c.max_cycles_to_store, 0);
+        assert_eq!(c.skipped_metrics().len(), 4);
     }
 }

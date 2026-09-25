@@ -2,6 +2,55 @@
 //! builtin ID patterns, match classification, confidence calculation.
 
 use regex::Regex;
+use std::collections::HashSet;
+#[cfg(test)]
+use std::sync::{Mutex, MutexGuard};
+use std::sync::{OnceLock, RwLock};
+
+/// Go `customIDPatterns` (explicit.go:34-39) — the package global the
+/// `--id-pattern` flag writes to. Guarded by an RwLock per the shared-state
+/// convention; writes happen once at CLI startup.
+static CUSTOM_ID_PATTERNS: OnceLock<RwLock<Vec<Regex>>> = OnceLock::new();
+
+fn custom_id_patterns_slot() -> &'static RwLock<Vec<Regex>> {
+    CUSTOM_ID_PATTERNS.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+/// Go `SetCustomIDPatterns` — registers extra bead ID patterns used alongside
+/// the built-ins by every message-based ID matcher (explicit matching, orphan
+/// detection), so trackers whose IDs carry no numeric suffix work (#188).
+/// Patterns may capture the ID in group 1; a pattern with no capture group
+/// matches the ID as the whole expression.
+pub fn set_custom_id_patterns(patterns: Vec<Regex>) {
+    *custom_id_patterns_slot()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = patterns;
+}
+
+/// Go `CustomIDPatterns` — the registered patterns in registration order, empty
+/// when `--id-pattern` was not passed.
+pub fn custom_id_patterns() -> Vec<Regex> {
+    custom_id_patterns_slot()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// Serializes tests against the process-global registry above. The runner is
+/// parallel, so without this a registration in one test leaks into a sibling
+/// test's fixture. Hold it in any test that registers patterns, and in any test
+/// that reaches them through a `custom_id_patterns()` caller.
+///
+/// The guard is a plain `Mutex` and so is not reentrant: a test must either
+/// take this itself and call the registry readers directly, or use a helper
+/// that takes it — never both on one call path.
+#[cfg(test)]
+pub(crate) fn custom_patterns_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Match classification (Go matchType strings).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,6 +61,9 @@ pub enum MatchKind {
     Bracket,
     Refs,
     Bead,
+    /// Go's `classifyMatch` "generic" — the raw match named no keyword and no
+    /// project prefix, so it earns no confidence bonus.
+    Generic,
 }
 
 /// Go: `CalculateConfidence` — exact bonus/penalty table.
@@ -24,7 +76,8 @@ pub fn calculate_confidence(match_kind: Option<MatchKind>, total_matches: usize)
         Some(MatchKind::Bracket) => base += 0.02,
         Some(MatchKind::Refs) => base += 0.01,
         Some(MatchKind::Bead) => base += 0.03,
-        None => {}
+        // `Generic` is Go's catch-all "generic" and, like `None`, earns no bonus.
+        Some(MatchKind::Generic) | None => {}
     }
     if total_matches > 1 {
         base -= 0.02 * (total_matches - 1) as f64;
@@ -44,6 +97,10 @@ pub struct IdPatterns {
     pub bv: Regex,
     /// generic UPPERCASE-PREFIX-N
     pub generic: Regex,
+    /// Go `DefaultPatterns` tail — the patterns registered via
+    /// [`set_custom_id_patterns`] (`--id-pattern`, #188). Empty by default; use
+    /// [`IdPatterns::with_custom`] to carry them.
+    pub custom: Vec<Regex>,
 }
 
 impl Default for IdPatterns {
@@ -57,6 +114,21 @@ impl Default for IdPatterns {
             bead: Regex::new(r"(?i)\bbeads[-_](\d+)\b").unwrap(),
             bv: Regex::new(r"(?i)\bbv[-_](\d+)\b").unwrap(),
             generic: Regex::new(r"\b([A-Z]{2,10}-\d+)\b").unwrap(),
+            custom: Vec::new(),
+        }
+    }
+}
+
+impl IdPatterns {
+    /// Go `NewExplicitMatcherWithPatterns` — the built-ins plus an explicit
+    /// pattern list, which is what Go's `DefaultPatterns` yields once
+    /// [`set_custom_id_patterns`] has run. `Default` deliberately stays
+    /// built-ins-only: a `Default` that read the process-global would make every
+    /// `IdPatterns::default()` caller depend on CLI flag state.
+    pub fn with_custom(custom: Vec<Regex>) -> Self {
+        Self {
+            custom,
+            ..Self::default()
         }
     }
 }
@@ -114,6 +186,35 @@ pub fn find_mentions(message: &str, patterns: &IdPatterns) -> Vec<IdMention> {
         });
     }
 
+    // Custom patterns (--id-pattern, #188) close out the list, so they are the
+    // tail of Go's `DefaultPatterns` and share its extraction rule: capture
+    // group 1 when the pattern has one, else the whole match. Go keeps the
+    // *first* ID it finds for a given value, and the built-ins are evaluated
+    // first, so a custom match may introduce an ID but never reclassify one the
+    // built-ins already named.
+    let mut seen_ids: HashSet<String> = out.iter().map(|m| m.bead_id.clone()).collect();
+    for re in &patterns.custom {
+        for caps in re.captures_iter(message) {
+            let Some(whole) = caps.get(0) else { continue };
+            let raw = caps
+                .get(1)
+                .map(|g| g.as_str())
+                .filter(|g| !g.is_empty())
+                .unwrap_or_else(|| whole.as_str());
+            if raw.is_empty() {
+                continue;
+            }
+            let bead_id = crate::history::normalize_bead_id(raw);
+            if !seen_ids.insert(bead_id.clone()) {
+                continue;
+            }
+            out.push(IdMention {
+                bead_id,
+                kind: match_kind(crate::history::classify_match(whole.as_str())),
+            });
+        }
+    }
+
     // Dedup by (id), keeping the strongest kind per id.
     let mut seen: std::collections::HashMap<String, MatchKind> = std::collections::HashMap::new();
     let mut deduped = Vec::new();
@@ -133,12 +234,28 @@ pub fn find_mentions(message: &str, patterns: &IdPatterns) -> Vec<IdMention> {
     deduped
 }
 
+/// Go `classifyMatch`'s string, narrowed to [`MatchKind`].
+fn match_kind(match_type: &str) -> MatchKind {
+    match match_type {
+        "closes" => MatchKind::Closes,
+        "fixes" => MatchKind::Fixes,
+        "resolves" => MatchKind::Resolves,
+        "bracket" => MatchKind::Bracket,
+        "refs" => MatchKind::Refs,
+        "bead" => MatchKind::Bead,
+        _ => MatchKind::Generic,
+    }
+}
+
+/// Strength ordering used by the dedup above. `Generic` ranks lowest because a
+/// custom pattern only ever names an ID no built-in claimed.
 fn kind_rank(k: MatchKind) -> u8 {
     match k {
         MatchKind::Closes | MatchKind::Fixes | MatchKind::Resolves => 4,
         MatchKind::Bracket => 3,
         MatchKind::Bead => 2,
         MatchKind::Refs => 1,
+        MatchKind::Generic => 0,
     }
 }
 
@@ -188,5 +305,73 @@ mod tests {
     fn no_mentions_clean_message() {
         let p = IdPatterns::default();
         assert!(find_mentions("just a regular commit", &p).is_empty());
+    }
+
+    #[test]
+    fn generic_kind_earns_no_confidence_bonus() {
+        assert!(close(
+            calculate_confidence(Some(MatchKind::Generic), 1),
+            0.90
+        ));
+        assert_eq!(match_kind("generic"), MatchKind::Generic);
+        assert_eq!(match_kind("closes"), MatchKind::Closes);
+        assert_eq!(match_kind("fixes"), MatchKind::Fixes);
+        assert_eq!(match_kind("resolves"), MatchKind::Resolves);
+        assert_eq!(match_kind("bracket"), MatchKind::Bracket);
+        assert_eq!(match_kind("refs"), MatchKind::Refs);
+        assert_eq!(match_kind("bead"), MatchKind::Bead);
+    }
+
+    /// Go `TestCustomIDPatterns_NoCaptureGroup` (#188) — no capture group, so
+    /// the whole match is the ID, lowercased by `normalizeBeadID`.
+    #[test]
+    fn custom_pattern_without_capture_group_matches_whole_expression() {
+        let p = IdPatterns::with_custom(vec![Regex::new(r"\bzzq-[a-z0-9]{5}\b").unwrap()]);
+        let mentions = find_mentions("fix flush ordering (zzq-a1b2c)", &p);
+        let hit = mentions
+            .iter()
+            .find(|m| m.bead_id == "zzq-a1b2c")
+            .expect("custom id");
+        // `zzq-a1b2c` trips none of the classifyMatch keyword/prefix rules, so
+        // it lands on "generic" — no confidence bonus, exactly as in Go.
+        assert_eq!(hit.kind, MatchKind::Generic);
+        assert!(close(calculate_confidence(Some(hit.kind), 1), 0.90));
+    }
+
+    /// Go `TestCustomIDPatterns_WithCaptureGroup` (#188) — capture group 1 is the
+    /// ID even when the surrounding match text is longer.
+    #[test]
+    fn custom_pattern_prefers_capture_group_one() {
+        let p =
+            IdPatterns::with_custom(vec![Regex::new(r"(?i)ticket\s+(zzt-[a-z]{3})\b").unwrap()]);
+        let mentions = find_mentions("board polish, ticket ZZT-PBB done", &p);
+        assert!(mentions.iter().any(|m| m.bead_id == "zzt-pbb"));
+    }
+
+    /// Custom patterns close out the list, so they may add an ID but never
+    /// reclassify one a built-in already claimed — Go keeps the first ID it
+    /// finds for a value, and the built-ins are evaluated first.
+    #[test]
+    fn custom_pattern_does_not_reclassify_a_builtin_id() {
+        let p = IdPatterns::with_custom(vec![Regex::new(r"\bzzq-[a-z0-9]{5}\b").unwrap()]);
+        let mentions = find_mentions("refs zzq-a1b2c then closes zzq-a1b2c", &p);
+        assert_eq!(mentions.len(), 1);
+        assert_eq!(mentions[0].bead_id, "zzq-a1b2c");
+    }
+
+    /// Go `TestCustomIDPatterns_DefaultsUnaffectedWhenEmpty` (#188) — the
+    /// built-ins and the empty-registration case are unchanged.
+    #[test]
+    fn registry_round_trips_and_defaults_to_empty() {
+        let _serialized = custom_patterns_lock();
+        set_custom_id_patterns(Vec::new());
+        assert!(custom_id_patterns().is_empty());
+        let bare = find_mentions("fix flush ordering (zzq-a1b2c)", &IdPatterns::default());
+        assert!(bare.is_empty(), "no registration, no custom-form ID");
+
+        set_custom_id_patterns(vec![Regex::new(r"x-[0-9a-f]{4}").unwrap()]);
+        assert_eq!(custom_id_patterns().len(), 1);
+        set_custom_id_patterns(Vec::new());
+        assert!(custom_id_patterns().is_empty());
     }
 }

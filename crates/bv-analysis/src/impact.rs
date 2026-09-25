@@ -522,8 +522,20 @@ pub struct ImpactInputs<'a> {
     pub now: jiff::Timestamp,
 }
 
-/// Score all open issues, ranked by score desc then ID asc (Go tie-break).
+/// Score all open issues, ranked by score desc then ID asc (Go tie-break) with
+/// the documented default factor weights.
 pub fn compute_impact_scores(inputs: &ImpactInputs) -> Vec<IssueImpact> {
+    compute_impact_scores_with_weights(inputs, crate::scoring::default_weights())
+}
+
+/// Score all open issues with caller-supplied factor weights — the Rust
+/// counterpart of Go's `w := a.Weights()` lookup at priority.go:252, which
+/// reads the defaults unless feedback (or another caller) installed adjusted
+/// weights via `Analyzer.SetWeights`.
+pub fn compute_impact_scores_with_weights(
+    inputs: &ImpactInputs,
+    w: crate::scoring::Weights,
+) -> Vec<IssueImpact> {
     // Compute median estimated_minutes once (Go parity: computeMedianEstimatedMinutes).
     let median_minutes = compute_median_estimated_minutes(inputs.issues);
 
@@ -570,14 +582,14 @@ pub fn compute_impact_scores(inputs: &ImpactInputs) -> Vec<IssueImpact> {
 
         let risk_expl = risk_explanation(&risk);
         let b = Breakdown {
-            pagerank: pr_norm * super::scoring::WEIGHT_PAGE_RANK,
-            betweenness: bw_norm * super::scoring::WEIGHT_BETWEENNESS,
-            blocker_ratio: blocker_norm * super::scoring::WEIGHT_BLOCKER_RATIO,
-            staleness: staleness_norm * super::scoring::WEIGHT_STALENESS,
-            priority_boost: prio_norm * super::scoring::WEIGHT_PRIORITY_BOOST,
-            time_to_impact: tti_norm * super::scoring::WEIGHT_TIME_TO_IMPACT,
-            urgency: urgency_norm * super::scoring::WEIGHT_URGENCY,
-            risk: risk.composite_risk * super::scoring::WEIGHT_RISK,
+            pagerank: pr_norm * w.pagerank,
+            betweenness: bw_norm * w.betweenness,
+            blocker_ratio: blocker_norm * w.blocker_ratio,
+            staleness: staleness_norm * w.staleness,
+            priority_boost: prio_norm * w.priority_boost,
+            time_to_impact: tti_norm * w.time_to_impact,
+            urgency: urgency_norm * w.urgency,
+            risk: risk.composite_risk * w.risk,
             pagerank_norm: pr_norm,
             betweenness_norm: bw_norm,
             blocker_ratio_norm: blocker_norm,

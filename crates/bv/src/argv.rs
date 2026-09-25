@@ -750,6 +750,12 @@ fn flag_takes_value(tok: &str) -> bool {
     }
     // Boolean switches listed in the Go flag registry never consume the next
     // token. Everything else in the registry is a string/number flag.
+    //
+    // `cpu-profile` is deliberately absent: Go declares it as a string flag
+    // (`flag.String("cpu-profile", "", ...)` at cmd/bv/main.go:1460, wired into
+    // cobra via AddFlagSet at :518), so `--cpu-profile out.pprof` swallows the
+    // path. Listing it here made `unconsumed_positional` report that path as an
+    // unknown command and exit 1 before any profiling could start.
     !matches!(
         name,
         "help"
@@ -763,8 +769,8 @@ fn flag_takes_value(tok: &str) -> bool {
             | "force-full-analysis"
             | "profile-startup"
             | "profile-json"
-            | "cpu-profile"
             | "check-update"
+            | "baseline-info"
     )
 }
 
@@ -838,6 +844,41 @@ mod tests {
     fn bool_flag_does_not_swallow_next() {
         let args = rewrite_args(&s(&["--brief", "version"]));
         assert_eq!(unconsumed_positional(&args).as_deref(), Some("version"));
+    }
+
+    /// `--cpu-profile` is a Go `flag.String` (cmd/bv/main.go:1460), so the
+    /// output path is its value. Treating it as a boolean made
+    /// `bv --cpu-profile out.pprof` report the path as an unknown command and
+    /// exit 1 (cmd/bv accepts the form and writes the profile there).
+    #[test]
+    fn cpu_profile_takes_a_value() {
+        for argv in [
+            vec!["--cpu-profile", "out.pprof"],
+            vec!["--cpu-profile", "out.pprof", "--robot-triage"],
+            // `--flag=value` already carried its own value.
+            vec!["--cpu-profile=out.pprof"],
+        ] {
+            let args = rewrite_args(&s(&argv));
+            assert_eq!(
+                unconsumed_positional(&args),
+                None,
+                "expected {argv:?} to be fully consumed"
+            );
+        }
+    }
+
+    /// `--baseline-info` is a Go `flag.Bool` (cmd/bv/main.go:1542), so it
+    /// never consumes the following token. Without it in the boolean list,
+    /// `bv --baseline-info foo` swallowed `foo` instead of rejecting it with
+    /// `unknown command "foo" for "bv"`.
+    #[test]
+    fn baseline_info_is_a_boolean_switch() {
+        let args = rewrite_args(&s(&["--baseline-info", "foo"]));
+        assert_eq!(unconsumed_positional(&args).as_deref(), Some("foo"));
+        // `--baseline-info=value` is meaningless for a bool but must still not
+        // be treated as consuming a following positional.
+        let args = rewrite_args(&s(&["--baseline-info=true", "bar"]));
+        assert_eq!(unconsumed_positional(&args).as_deref(), Some("bar"));
     }
 
     #[test]

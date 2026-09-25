@@ -7,8 +7,12 @@ authors.workspace = true
 
 [dependencies]
 bv-core = { path = "../bv-core" }
+bv-analysis = { path = "../bv-analysis" }
+bv-correlation = { path = "../bv-correlation" }
+png = "0.18"
 jiff = { workspace = true }
 tiny-http = { version = "0.12", package = "tiny_http" }
 thiserror = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 serde = { workspace = true }
+serde_yaml_ng = "0.10"

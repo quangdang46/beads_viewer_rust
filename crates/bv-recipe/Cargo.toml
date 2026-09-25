@@ -1,0 +1,13 @@
+[package]
+name = "bv-recipe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+bv-core = { path = "../bv-core" }
+bv-correlation = { path = "../bv-correlation" }
+serde = { workspace = true }
+serde_yaml_ng = "0.10"
+jiff = { workspace = true }

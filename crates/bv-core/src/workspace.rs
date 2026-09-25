@@ -1,7 +1,7 @@
 //! Multi-repo workspace support — port of Go `pkg/workspace/types.go`.
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkspaceConfig {
@@ -70,6 +70,10 @@ pub struct Defaults {
 }
 
 /// Find workspace config by walking up from `dir` to root.
+///
+/// Go `workspace.FindWorkspaceConfig` (`pkg/workspace/types.go:194-220`): a bare
+/// upward walk for `.bv/workspace.yaml`, with no `.beads` gate. The gate lives
+/// one level up in [`discover_workspace_config`], exactly as it does in Go.
 pub fn find_workspace_config(dir: &Path) -> Option<PathBuf> {
     let mut current = dir.to_path_buf();
     loop {
@@ -82,7 +86,27 @@ pub fn find_workspace_config(dir: &Path) -> Option<PathBuf> {
         }
     }
 }
-use std::path::PathBuf;
+
+/// Pick a workspace config for auto-discovery, honouring the `.beads` gate.
+///
+/// Go `discoverWorkspaceConfig` (`cmd/bv/main.go:9969-9981`): resolve the
+/// tracker dir first — `GetBeadsDir("")` walks BEADS_DB → BEADS_DIR →
+/// `<cwd>/.beads` → the worktree's main-repo `.beads`
+/// (`pkg/loader/loader.go:202-243`) — and give up on workspace mode the moment
+/// that resolves to a real directory. The `is_dir` check is load-bearing
+/// because `GetBeadsDir` returns the unresolved path when nothing is there
+/// (`pkg/loader/loader.go:240-243`). Only when no `.beads` is reachable does
+/// the upward walk run. A present `.beads` always wins, so a nested single repo
+/// inside a workspace keeps its own view unless `--workspace` overrides it
+/// (`cmd/bv/main.go:2624-2631`).
+pub fn discover_workspace_config(dir: &Path) -> Option<PathBuf> {
+    if let Ok(beads_dir) = crate::discovery::get_beads_dir(dir) {
+        if beads_dir.is_dir() {
+            return None;
+        }
+    }
+    find_workspace_config(dir)
+}
 
 /// Load and validate a workspace config.
 pub fn load_workspace(path: &Path) -> Result<WorkspaceConfig, String> {
@@ -385,6 +409,97 @@ repos:
         let config: WorkspaceConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(config.repos.len(), 2);
         assert_eq!(config.repos[0].path, "services/api");
+    }
+}
+
+#[cfg(test)]
+mod discover_tests {
+    use super::*;
+
+    /// The gate consults the full tracker-dir chain (Go
+    /// `loader.GetBeadsDir("")`, `pkg/loader/loader.go:202-243`), so these
+    /// fixtures only mean something when BEADS_DB/BEADS_DIR are unset.
+    fn tracker_dir_env_is_default() -> bool {
+        std::env::var("BEADS_DB").is_err() && std::env::var("BEADS_DIR").is_err()
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("bvr_ws_discover_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".bv")).unwrap();
+        std::fs::write(dir.join(".bv").join("workspace.yaml"), "repos: []\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn discovers_workspace_when_no_beads_dir_is_reachable() {
+        if !tracker_dir_env_is_default() {
+            return;
+        }
+        let root = scratch("no_beads");
+        let found = discover_workspace_config(&root);
+        assert_eq!(found, Some(root.join(".bv").join("workspace.yaml")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn discovers_workspace_from_a_nested_directory() {
+        if !tracker_dir_env_is_default() {
+            return;
+        }
+        let root = scratch("nested");
+        let nested = root.join("services").join("api");
+        std::fs::create_dir_all(&nested).unwrap();
+        let found = discover_workspace_config(&nested);
+        assert_eq!(found, Some(root.join(".bv").join("workspace.yaml")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_present_beads_dir_wins_over_a_workspace_config() {
+        // Go `discoverWorkspaceConfig` returns "" (main.go:9971-9974) as soon as
+        // `GetBeadsDir("")` resolves to a real directory, so a repo holding both
+        // `.beads/` and `.bv/workspace.yaml` stays single-repo. The bare walk-up
+        // still finds the config, which is why the two are separate functions.
+        if !tracker_dir_env_is_default() {
+            return;
+        }
+        let root = scratch("both");
+        std::fs::create_dir_all(root.join(".beads")).unwrap();
+        assert_eq!(discover_workspace_config(&root), None);
+        assert_eq!(
+            find_workspace_config(&root),
+            Some(root.join(".bv").join("workspace.yaml"))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_beads_file_is_not_a_beads_dir() {
+        // The gate is `info.IsDir()` (main.go:9972), not mere existence: a
+        // `.beads` that is a file must not shadow the workspace.
+        if !tracker_dir_env_is_default() {
+            return;
+        }
+        let root = scratch("beads_file");
+        std::fs::write(root.join(".beads"), "not a directory").unwrap();
+        let found = discover_workspace_config(&root);
+        assert_eq!(found, Some(root.join(".bv").join("workspace.yaml")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_workspace_config_stays_none() {
+        if !tracker_dir_env_is_default() {
+            return;
+        }
+        let root =
+            std::env::temp_dir().join(format!("bvr_ws_discover_empty_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(discover_workspace_config(&root), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 

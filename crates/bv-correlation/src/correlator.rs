@@ -111,7 +111,9 @@ pub fn correlate(
     issues: &[Issue],
     commits: &[CommitInfo],
 ) -> BTreeMap<String, Vec<CorrelatedCommit>> {
-    let patterns = IdPatterns::default();
+    // Go `NewExplicitMatcher` reads `DefaultPatterns()` — built-ins plus
+    // whatever `--id-pattern` registered (#188).
+    let patterns = IdPatterns::with_custom(crate::explicit::custom_id_patterns());
     let by_id: BTreeMap<&str, &Issue> = issues.iter().map(|i| (i.id.as_str(), i)).collect();
     let mut report: BTreeMap<String, Vec<CorrelatedCommit>> = BTreeMap::new();
 
@@ -336,6 +338,19 @@ mod tests {
         }
     }
 
+    /// The custom-pattern registry is process-global (Go-shaped), so a test that
+    /// only reads it must take [`custom_patterns_lock`] to keep a sibling test's
+    /// `--id-pattern` registration out of its fixtures. A test that registers
+    /// patterns already holds the lock and calls [`correlate`] directly — the
+    /// guard is not reentrant, so the two must not be combined.
+    fn correlate_serialized(
+        issues: &[Issue],
+        commits: &[CommitInfo],
+    ) -> BTreeMap<String, Vec<CorrelatedCommit>> {
+        let _serialized = crate::explicit::custom_patterns_lock();
+        correlate(issues, commits)
+    }
+
     #[test]
     fn explicit_mention_correlates_regardless_of_author() {
         let issues = vec![issue(
@@ -352,7 +367,7 @@ mod tests {
             "fixes PROJ-1",
             &["a.rs"],
         )];
-        let report = correlate(&issues, &commits);
+        let report = correlate_serialized(&issues, &commits);
         let hits = report.get("PROJ-1").expect("correlated");
         assert_eq!(hits.len(), 1);
         assert!(hits[0].methods.contains(&"explicit_id"));
@@ -384,7 +399,7 @@ mod tests {
                 &["db.rs"],
             ),
         ];
-        let report = correlate(&issues, &commits);
+        let report = correlate_serialized(&issues, &commits);
         let hits = report.get("PROJ-2").expect("correlated");
         assert_eq!(hits.len(), 1, "only alice's commit should correlate");
         assert!(hits[0].methods.contains(&"temporal_author"));
@@ -406,7 +421,7 @@ mod tests {
             "unrelated",
             &["x.rs"],
         )];
-        let report = correlate(&issues, &commits);
+        let report = correlate_serialized(&issues, &commits);
         assert!(!report.contains_key("PROJ-3"));
     }
 
@@ -426,7 +441,48 @@ mod tests {
             "unrelated work",
             &["y.rs"],
         )];
-        let report = correlate(&issues, &commits);
+        let report = correlate_serialized(&issues, &commits);
         assert!(!report.contains_key("PROJ-4"));
+    }
+
+    /// End to end for the correlator-backed commands: Go's `NewExplicitMatcher`
+    /// reads `DefaultPatterns()`, so a bead whose ID only a registered
+    /// `--id-pattern` can see is correlated anyway (#188).
+    #[test]
+    fn custom_id_pattern_correlates_a_non_numeric_id() {
+        let _serialized = crate::explicit::custom_patterns_lock();
+
+        let issues = vec![issue(
+            "zzq-a1b2c",
+            "flush ordering",
+            "",
+            "2026-01-01T00:00:00Z",
+            None,
+        )];
+        let commits = vec![commit(
+            "sha6",
+            "2026-01-02T00:00:00Z",
+            "anyone",
+            "fix flush ordering for zzq-a1b2c",
+            &["a.rs"],
+        )];
+
+        crate::explicit::set_custom_id_patterns(Vec::new());
+        let report = correlate(&issues, &commits);
+        assert!(report.is_empty(), "no built-in pattern sees zzq-a1b2c");
+
+        crate::explicit::set_custom_id_patterns(vec![
+            regex::Regex::new(r"\bzzq-[a-z0-9]{5}\b").unwrap()
+        ]);
+        let report = correlate(&issues, &commits);
+        let hits = report
+            .get("zzq-a1b2c")
+            .expect("correlated by custom pattern");
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].methods.contains(&"explicit_id"));
+        // classifyMatch calls the raw match "generic", so no keyword bonus.
+        assert!((hits[0].confidence - 0.90).abs() < 1e-9);
+
+        crate::explicit::set_custom_id_patterns(Vec::new());
     }
 }

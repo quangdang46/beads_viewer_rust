@@ -16,6 +16,11 @@ pub enum ValidationError {
     },
     #[error("only one primary command allowed (found {count}: {found})")]
     ExclusivePrimaries { count: usize, found: String },
+    /// Go rejects `--watch-export` alongside `--as-of` before any export runs
+    /// (cmd/bv/main.go:1903-1906): watching would re-export the snapshot
+    /// repeatedly instead of exporting the one fixed ref the user asked for.
+    #[error("--watch-export cannot be combined with --as-of; omit --watch-export to export a fixed historical snapshot.")]
+    WatchExportWithAsOf,
     /// Enum-value check happens at clap parse time (Phase 3c wiring).
     #[allow(dead_code)]
     #[error("invalid value for --{flag}: {value}")]
@@ -88,6 +93,13 @@ pub fn validate_modifier_requires(present: &Presence) -> Vec<ValidationError> {
 }
 
 /// Validate exclusive primary groups. Returns violation when >1 primary set.
+///
+/// Also carries the `--watch-export`/`--as-of` cross-flag rejection, which Go
+/// runs as a separate check immediately after the primary-group one
+/// (cmd/bv/main.go:1898-1906). It lives here so `main` stays the only caller:
+/// the check has to fire before the export-pages handler writes anything, and
+/// folding it into an already-dispatched validation pass is what keeps it
+/// ordered correctly without a second call site.
 pub fn validate_exclusive_primaries(present: &Presence) -> Vec<ValidationError> {
     let mut group_counts: HashMap<&str, Vec<&str>> = HashMap::new();
     for f in ROBOT_PRIMARIES {
@@ -105,6 +117,9 @@ pub fn validate_exclusive_primaries(present: &Presence) -> Vec<ValidationError> 
                 found: names.join(", "),
             });
         }
+    }
+    if present.has("watch-export") && present.has("as-of") {
+        violations.push(ValidationError::WatchExportWithAsOf);
     }
     violations
 }
@@ -180,5 +195,35 @@ mod tests {
     #[test]
     fn unrelated_modifiers_ignored() {
         assert!(check(&["bvr", "--robot-insights", "--format", "toon"]).is_empty());
+    }
+
+    /// Go rejects `--watch-export` together with `--as-of` (cmd/bv/main.go:1903-1906,
+    /// exit 1) instead of exporting a snapshot it would then re-watch. Either
+    /// flag alone stays valid.
+    #[test]
+    fn watch_export_conflicts_with_as_of() {
+        let v = check(&[
+            "bvr",
+            "--export-pages",
+            "out",
+            "--watch-export",
+            "--as-of",
+            "HEAD",
+        ]);
+        assert!(
+            v.iter()
+                .any(|e| matches!(e, ValidationError::WatchExportWithAsOf)),
+            "expected the watch-export/as-of conflict, got {v:?}"
+        );
+        // The recovery advice is the whole point of the message.
+        assert_eq!(
+            v.iter()
+                .find(|e| matches!(e, ValidationError::WatchExportWithAsOf))
+                .map(|e| e.to_string()),
+            Some("--watch-export cannot be combined with --as-of; omit --watch-export to export a fixed historical snapshot.".to_string())
+        );
+
+        assert!(check(&["bvr", "--export-pages", "out", "--watch-export"]).is_empty());
+        assert!(check(&["bvr", "--export-pages", "out", "--as-of", "HEAD"]).is_empty());
     }
 }
