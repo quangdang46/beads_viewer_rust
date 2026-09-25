@@ -370,7 +370,24 @@ pub fn compute_risk_signals(
     let churn = compute_activity_churn(issue, now);
     let cross_repo = compute_cross_repo_risk(issue, issues);
     let status_risk = compute_status_risk(issue, now);
-    let composite = fan_variance * 0.30 + churn * 0.30 + cross_repo * 0.20 + status_risk * 0.20;
+    // Go writes this as one expression (risk.go:85-88):
+    //   FanVariance*w.FanVariance + ActivityChurn*w.ActivityChurn
+    //     + CrossRepoRisk*w.CrossRepoRisk + StatusRisk*w.StatusRisk
+    // and its compiler contracts each `mul + add` into a single FMA. Rust does
+    // not contract, so the unrounded product sum lands on 0.2 exactly where Go
+    // lands on 0.19999999999999998 — and `generateRiskExplanation` tests
+    // `CompositeRisk < 0.2` (risk.go:269), so one ULP flips the verdict from
+    // "Low risk - stable dependency structure" to "Moderate risk" and changes
+    // every triage recommendation's breakdown.
+    //
+    // `mul_add` is the single-rounding form on every platform, matching the
+    // FMADDD the Go binary actually emits. Same principle as the HITS
+    // normalisation in bv-graph-core, applied in the other direction: there Go
+    // fused and Rust did not, and here Go fuses and Rust did not.
+    let composite = status_risk.mul_add(
+        0.20,
+        cross_repo.mul_add(0.20, churn.mul_add(0.30, fan_variance.mul_add(0.30, 0.0))),
+    );
     RiskSignals {
         fan_variance,
         activity_churn: churn,
