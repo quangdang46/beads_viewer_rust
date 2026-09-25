@@ -72,6 +72,18 @@ pub struct FileLookup {
     co_change: CoChangeMatrix,
 }
 
+/// Go `FileHotspot` — a file that has been touched by many beads.
+///
+/// Field order matches Go's declaration (file_index.go:378-383), which is the
+/// wire order of each `--robot-file-hotspots` entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FileHotspot {
+    pub file_path: String,
+    pub total_beads: usize,
+    pub open_beads: usize,
+    pub closed_beads: usize,
+}
+
 /// Go `normalizePath`.
 ///
 /// Strips exactly one leading `./` and exactly one trailing `/`. Go uses
@@ -287,6 +299,67 @@ impl FileLookup {
     /// Go `GetStats`.
     pub fn stats(&self) -> FileIndexStats {
         self.index.stats
+    }
+
+    /// Go `GetHotspots` — files touched by the most beads (conflict zones).
+    ///
+    /// Bead counting uses the same `classify_bead_status` on the *current*
+    /// status from `beads` as [`Self::lookup_by_file`], so the three robot
+    /// surfaces built on this index cannot disagree (Go #184). Tombstoned
+    /// beads are not counted, and a file whose every bead is skipped is
+    /// omitted entirely.
+    ///
+    /// `limit` is Go's `int`, kept signed so its guard is a literal port:
+    /// `limit <= 0 || limit > len(counts)` means "every hotspot", so both 0
+    /// and a negative value mean *all*, not none.
+    pub fn get_hotspots(&self, limit: i64) -> Vec<FileHotspot> {
+        let mut counts: Vec<FileHotspot> = Vec::new();
+        for (path, refs) in &self.index.file_to_beads {
+            let mut open_count = 0usize;
+            let mut closed_count = 0usize;
+            for reference in refs {
+                // The status recorded at index time may be stale; the report is
+                // the authority.
+                let status = self
+                    .beads
+                    .get(&reference.bead_id)
+                    .map_or(reference.status.as_str(), |(_, status)| status.as_str());
+                let (bucket, skip) = classify_bead_status(status);
+                if skip {
+                    continue;
+                }
+                if bucket == "closed" {
+                    closed_count += 1;
+                } else {
+                    open_count += 1;
+                }
+            }
+            let total = open_count + closed_count;
+            if total == 0 {
+                continue;
+            }
+            counts.push(FileHotspot {
+                file_path: path.clone(),
+                total_beads: total,
+                open_beads: open_count,
+                closed_beads: closed_count,
+            });
+        }
+
+        // Count descending; path breaks ties for deterministic output.
+        counts.sort_by(|a, b| {
+            b.total_beads
+                .cmp(&a.total_beads)
+                .then_with(|| a.file_path.cmp(&b.file_path))
+        });
+
+        let limit = if limit <= 0 || limit > counts.len() as i64 {
+            counts.len()
+        } else {
+            limit as usize
+        };
+        counts.truncate(limit);
+        counts
     }
 
     /// Go `GetRelatedFiles` — files that frequently co-change with `file_path`.

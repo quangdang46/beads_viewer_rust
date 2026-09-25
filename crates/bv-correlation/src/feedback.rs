@@ -7,24 +7,46 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CorrelationFeedback {
     pub commit_sha: String,
     pub bead_id: String,
     #[serde(rename = "feedback_at")]
     pub feedback_at: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    /// Go's tag is `json:"feedback_by"` with no `omitempty`, so the key is
+    /// always present even when empty — it is the default `--correlation-by`
+    /// fallback's companion in `--robot-explain-correlation`'s `feedback` object.
+    #[serde(default)]
     pub feedback_by: String,
     /// confirm | reject | ignore
     #[serde(rename = "type")]
     pub feedback_type: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    /// Go's tag is `json:"reason"` with no `omitempty` either.
+    #[serde(default)]
     pub reason: String,
     #[serde(default)]
     pub original_conf: f64,
 }
 
 pub const FEEDBACK_FILE: &str = "correlation_feedback.jsonl";
+
+/// Go `FeedbackStats` — aggregate statistics about correlation feedback.
+///
+/// Field order matches Go's struct declaration (types.go:304-312), which is the
+/// wire order of `--robot-correlation-stats`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct FeedbackStats {
+    pub total_feedback: usize,
+    pub confirmed: usize,
+    pub rejected: usize,
+    pub ignored: usize,
+    /// `confirmed / (confirmed + rejected)`; `0.0` when no decision was made.
+    pub accuracy_rate: f64,
+    /// Mean `original_conf` over confirmations; `0.0` when there are none.
+    pub avg_confirm_conf: f64,
+    /// Mean `original_conf` over rejections; `0.0` when there are none.
+    pub avg_reject_conf: f64,
+}
 
 /// Append-only feedback store.
 pub struct FeedbackStore {
@@ -84,6 +106,60 @@ impl FeedbackStore {
             None
         };
         (confirmed, rejected, ignored, accuracy)
+    }
+
+    /// Go `sortedFeedbackLocked` — the store's values in semantic key order
+    /// `(commit_sha, bead_id)`. Go sorts before aggregating so the float sums in
+    /// [`Self::get_stats`] do not depend on Go map iteration order; this is the
+    /// same guarantee.
+    pub fn sorted_feedback(&self) -> Vec<CorrelationFeedback> {
+        let mut all: Vec<CorrelationFeedback> = self.load_all().into_values().collect();
+        all.sort_by(|a, b| {
+            a.commit_sha
+                .cmp(&b.commit_sha)
+                .then_with(|| a.bead_id.cmp(&b.bead_id))
+        });
+        all
+    }
+
+    /// Go `FeedbackStore.GetStats` — the whole `--robot-correlation-stats` body.
+    ///
+    /// Go reports `0.0`, not "absent", for the rate and the two averages when
+    /// their denominators are zero, so every field is a plain `f64` here too.
+    pub fn get_stats(&self) -> FeedbackStats {
+        let mut stats = FeedbackStats::default();
+        let mut confirm_sum = 0.0f64;
+        let mut reject_sum = 0.0f64;
+
+        for fb in self.sorted_feedback() {
+            stats.total_feedback += 1;
+            match fb.feedback_type.as_str() {
+                "confirm" => {
+                    stats.confirmed += 1;
+                    confirm_sum += fb.original_conf;
+                }
+                "reject" => {
+                    stats.rejected += 1;
+                    reject_sum += fb.original_conf;
+                }
+                "ignore" => stats.ignored += 1,
+                // Go's switch has no default: an unrecognised type still counts
+                // toward TotalFeedback and lands in none of the three buckets.
+                _ => {}
+            }
+        }
+
+        let decisions = stats.confirmed + stats.rejected;
+        if decisions > 0 {
+            stats.accuracy_rate = stats.confirmed as f64 / decisions as f64;
+        }
+        if stats.confirmed > 0 {
+            stats.avg_confirm_conf = confirm_sum / stats.confirmed as f64;
+        }
+        if stats.rejected > 0 {
+            stats.avg_reject_conf = reject_sum / stats.rejected as f64;
+        }
+        stats
     }
 }
 

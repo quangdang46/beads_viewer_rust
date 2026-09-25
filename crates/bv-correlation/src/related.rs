@@ -48,16 +48,43 @@ pub struct RelatedWorkBead {
 }
 
 /// Every related bead, grouped by relationship type.
+///
+/// The four category fields are `Option` because Go's struct tags carry no
+/// `omitempty` and each finder returns a *nil* slice from its main path
+/// (`var results []RelatedWorkBead`, related.go:173/245/367/425) while its
+/// early return hands back a non-nil `[]RelatedWorkBead{}` (related.go:150).
+/// `encoding/json` renders nil as `null` and empty-non-nil as `[]`, so the
+/// distinction is observable: a bead with no related work serializes with
+/// `"concurrent": null`, not `"concurrent": []`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RelatedWorkResult {
     pub target_bead_id: String,
     pub target_title: String,
-    pub file_overlap: Vec<RelatedWorkBead>,
-    pub commit_overlap: Vec<RelatedWorkBead>,
-    pub dependency_cluster: Vec<RelatedWorkBead>,
-    pub concurrent: Vec<RelatedWorkBead>,
+    pub file_overlap: Option<Vec<RelatedWorkBead>>,
+    pub commit_overlap: Option<Vec<RelatedWorkBead>>,
+    pub dependency_cluster: Option<Vec<RelatedWorkBead>>,
+    pub concurrent: Option<Vec<RelatedWorkBead>>,
     pub total_related: usize,
     pub generated_at: String,
+}
+
+impl RelatedWorkResult {
+    /// A category list with Go's nil accumulator read as empty. Go's `len`
+    /// and `range` over a nil slice both behave as zero-length, so this is
+    /// what every Go call site of the four categories sees.
+    pub fn category(list: &Option<Vec<RelatedWorkBead>>) -> &[RelatedWorkBead] {
+        list.as_deref().unwrap_or(&[])
+    }
+}
+
+/// Collapse a finished finder result the way Go's nil slice does: an empty
+/// accumulator is `None` (JSON `null`), anything else is `Some`.
+fn nil_when_empty(results: Vec<RelatedWorkBead>) -> Option<Vec<RelatedWorkBead>> {
+    if results.is_empty() {
+        None
+    } else {
+        Some(results)
+    }
 }
 
 /// Go `RelatedWorkOptions`.
@@ -131,18 +158,19 @@ pub fn find_related_work_at(
     seen.insert(target_id.to_string());
 
     let file_overlap = find_file_overlap(report, &target_files, file_lookup, opts, &seen);
-    seen.extend(file_overlap.iter().map(|b| b.bead_id.clone()));
+    seen.extend(file_overlap.iter().flatten().map(|b| b.bead_id.clone()));
 
     let commit_overlap = find_commit_overlap(report, target_id, &target_commits, opts, &seen);
-    seen.extend(commit_overlap.iter().map(|b| b.bead_id.clone()));
+    seen.extend(commit_overlap.iter().flatten().map(|b| b.bead_id.clone()));
 
-    // The dependency detector is skipped entirely without a graph.
+    // The dependency detector is skipped entirely without a graph; Go leaves
+    // the field at its `[]RelatedWorkBead{}` initializer (related.go:87).
     let dependency_cluster = if opts.dependency_graph.is_some() {
         let found = find_dependency_cluster(report, target_id, opts, &seen);
-        seen.extend(found.iter().map(|b| b.bead_id.clone()));
+        seen.extend(found.iter().flatten().map(|b| b.bead_id.clone()));
         found
     } else {
-        Vec::new()
+        Some(Vec::new())
     };
 
     let concurrent = find_concurrent(report, target_id, target, opts, &seen, now);
@@ -150,16 +178,26 @@ pub fn find_related_work_at(
     Some(RelatedWorkResult {
         target_bead_id: target_id.to_string(),
         target_title: target.title.clone(),
-        total_related: file_overlap.len()
-            + commit_overlap.len()
-            + dependency_cluster.len()
-            + concurrent.len(),
+        total_related: file_overlap.iter().flatten().count()
+            + commit_overlap.iter().flatten().count()
+            + dependency_cluster.iter().flatten().count()
+            + concurrent.iter().flatten().count(),
         file_overlap,
         commit_overlap,
         dependency_cluster,
         concurrent,
-        generated_at: now.to_string(),
+        generated_at: rfc3339_seconds(now),
     })
+}
+
+/// Go's `RelatedWorkResult.GeneratedAt` is a `time.Time`, and `encoding/json`
+/// marshals `time.Time` as RFC3339 at **second** precision. `Timestamp`'s
+/// `Display` keeps the sub-second component, so the raw `to_string()` renders
+/// `2026-08-22T14:07:01.790741Z` where Go renders `2026-08-22T14:07:01Z`.
+fn rfc3339_seconds(now: Timestamp) -> String {
+    Timestamp::from_second(now.as_second())
+        .map(|ts| ts.to_string())
+        .unwrap_or_else(|_| now.to_string())
 }
 
 /// Go `findFileOverlap` — beads touching the same files as the target.
@@ -176,9 +214,9 @@ fn find_file_overlap(
     file_lookup: &FileLookup,
     opts: &RelatedWorkOptions,
     seen: &HashSet<String>,
-) -> Vec<RelatedWorkBead> {
+) -> Option<Vec<RelatedWorkBead>> {
     if target_files.is_empty() {
-        return Vec::new();
+        return Some(Vec::new());
     }
 
     // beadID → shared files. Iteration order here is the hash-set's, but the
@@ -241,7 +279,7 @@ fn find_file_overlap(
 
     sort_related_results(&mut results);
     truncate_to_max(&mut results, opts.max_results);
-    results
+    nil_when_empty(results)
 }
 
 /// Go `findCommitOverlap` — beads sharing commits with the target.
@@ -251,9 +289,9 @@ fn find_commit_overlap(
     target_commits: &HashSet<String>,
     opts: &RelatedWorkOptions,
     seen: &HashSet<String>,
-) -> Vec<RelatedWorkBead> {
+) -> Option<Vec<RelatedWorkBead>> {
     if target_commits.is_empty() {
-        return Vec::new();
+        return Some(Vec::new());
     }
 
     let mut shared_count: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -304,7 +342,7 @@ fn find_commit_overlap(
 
     sort_related_results(&mut results);
     truncate_to_max(&mut results, opts.max_results);
-    results
+    nil_when_empty(results)
 }
 
 /// Go `findDependencyCluster` — beads within two hops of the target in the
@@ -314,9 +352,9 @@ fn find_dependency_cluster(
     target_id: &str,
     opts: &RelatedWorkOptions,
     seen: &HashSet<String>,
-) -> Vec<RelatedWorkBead> {
+) -> Option<Vec<RelatedWorkBead>> {
     let Some(graph) = &opts.dependency_graph else {
-        return Vec::new();
+        return Some(Vec::new());
     };
 
     // beadID → hop distance.
@@ -381,7 +419,7 @@ fn find_dependency_cluster(
 
     sort_related_results(&mut results);
     truncate_to_max(&mut results, opts.max_results);
-    results
+    nil_when_empty(results)
 }
 
 /// Go `findConcurrent` — beads active in the same time window as the target.
@@ -397,9 +435,9 @@ fn find_concurrent(
     opts: &RelatedWorkOptions,
     seen: &HashSet<String>,
     now: Timestamp,
-) -> Vec<RelatedWorkBead> {
+) -> Option<Vec<RelatedWorkBead>> {
     let Some((target_start, target_end)) = activity_window(target, now) else {
-        return Vec::new();
+        return Some(Vec::new());
     };
 
     // Widened by the concurrency window on both sides.
@@ -451,7 +489,7 @@ fn find_concurrent(
 
     sort_related_results(&mut results);
     truncate_to_max(&mut results, opts.max_results);
-    results
+    nil_when_empty(results)
 }
 
 /// The window a bead was active in: created (else first commit) through closed
@@ -785,7 +823,7 @@ mod tests {
         let report = sample_report();
         let opts = default_related_work_options();
         let result = find_related_work_at(&report, "bd-1", &opts, now()).unwrap();
-        let overlap = &result.file_overlap;
+        let overlap = RelatedWorkResult::category(&result.file_overlap);
         assert_eq!(overlap.len(), 1, "only bd-2 shares files: {overlap:?}");
         assert_eq!(overlap[0].bead_id, "bd-2");
         assert_eq!(overlap[0].relation_type, RelationType::FileOverlap);
@@ -796,17 +834,32 @@ mod tests {
     }
 
     #[test]
+    fn generated_at_is_rfc3339_at_second_precision() {
+        // Go marshals `GeneratedAt time.Time` through encoding/json, which
+        // drops the sub-second component. A nanosecond-precision `now` must
+        // still render as a whole second.
+        let with_nanos: Timestamp = "2026-01-05T00:00:00.790741Z".parse().unwrap();
+        let result = find_related_work_at(
+            &sample_report(),
+            "bd-1",
+            &default_related_work_options(),
+            with_nanos,
+        )
+        .unwrap();
+        assert_eq!(result.generated_at, "2026-01-05T00:00:00Z");
+    }
+
+    #[test]
     fn tombstones_are_never_related_even_with_include_closed() {
         let report = sample_report();
         let mut opts = default_related_work_options();
         opts.include_closed = true;
         let result = find_related_work_at(&report, "bd-1", &opts, now()).unwrap();
-        let every_bead = result
-            .file_overlap
+        let every_bead = RelatedWorkResult::category(&result.file_overlap)
             .iter()
-            .chain(&result.commit_overlap)
-            .chain(&result.dependency_cluster)
-            .chain(&result.concurrent)
+            .chain(RelatedWorkResult::category(&result.commit_overlap))
+            .chain(RelatedWorkResult::category(&result.dependency_cluster))
+            .chain(RelatedWorkResult::category(&result.concurrent))
             .map(|b| b.bead_id.as_str())
             .collect::<Vec<_>>();
         assert!(!every_bead.contains(&"bd-4"), "{every_bead:?}");
@@ -851,18 +904,17 @@ mod tests {
 
         let mut opts = default_related_work_options();
         let without = find_related_work_at(&report, "t-1", &opts, now()).unwrap();
-        assert!(!without
-            .file_overlap
+        assert!(!RelatedWorkResult::category(&without.file_overlap)
             .iter()
-            .chain(&without.concurrent)
+            .chain(RelatedWorkResult::category(&without.concurrent))
             .any(|b| b.bead_id == "c-1"));
 
         opts.include_closed = true;
         let with = find_related_work_at(&report, "t-1", &opts, now()).unwrap();
         assert!(
-            with.file_overlap
+            RelatedWorkResult::category(&with.file_overlap)
                 .iter()
-                .chain(&with.concurrent)
+                .chain(RelatedWorkResult::category(&with.concurrent))
                 .any(|b| b.bead_id == "c-1"),
             "include_closed should surface c-1"
         );
@@ -875,7 +927,9 @@ mod tests {
         // Default floor of 20 keeps bd-2 (relevance 100).
         let result =
             find_related_work_at(&report, "bd-1", &default_related_work_options(), now()).unwrap();
-        assert!(result.file_overlap.iter().any(|b| b.bead_id == "bd-2"));
+        assert!(RelatedWorkResult::category(&result.file_overlap)
+            .iter()
+            .any(|b| b.bead_id == "bd-2"));
 
         // The gate is `relevance < min_relevance`, so a floor equal to a
         // candidate's score keeps it; 101 is what actually drops everything.
@@ -883,19 +937,25 @@ mod tests {
         strict.min_relevance = 100;
         let at_100 = find_related_work_at(&report, "bd-1", &strict, now()).unwrap();
         assert!(
-            at_100.file_overlap.iter().any(|b| b.bead_id == "bd-2"),
+            RelatedWorkResult::category(&at_100.file_overlap)
+                .iter()
+                .any(|b| b.bead_id == "bd-2"),
             "100 < 100 is false"
         );
 
         strict.min_relevance = 101;
         let over_100 = find_related_work_at(&report, "bd-1", &strict, now()).unwrap();
         assert!(
-            over_100.file_overlap.is_empty(),
+            RelatedWorkResult::category(&over_100.file_overlap).is_empty(),
             "{:?}",
             over_100.file_overlap
         );
         // Concurrency (relevance 30 base) drops at the default floor too.
-        assert!(over_100.concurrent.is_empty(), "{:?}", over_100.concurrent);
+        assert!(
+            RelatedWorkResult::category(&over_100.concurrent).is_empty(),
+            "{:?}",
+            over_100.concurrent
+        );
     }
 
     #[test]
@@ -906,7 +966,7 @@ mod tests {
         let result =
             find_related_work_at(&report, "bd-1", &default_related_work_options(), now()).unwrap();
         assert!(
-            result.commit_overlap.is_empty(),
+            RelatedWorkResult::category(&result.commit_overlap).is_empty(),
             "{:?}",
             result.commit_overlap
         );
@@ -980,11 +1040,11 @@ mod tests {
             ("d-1".to_string(), vec!["d-2".to_string()]),
         ]));
         let result = find_related_work_at(&report, "bd-1", &opts, now()).unwrap();
-        let scored: Vec<(&str, i64, &str)> = result
-            .dependency_cluster
-            .iter()
-            .map(|b| (b.bead_id.as_str(), b.relevance, b.reason.as_str()))
-            .collect();
+        let scored: Vec<(&str, i64, &str)> =
+            RelatedWorkResult::category(&result.dependency_cluster)
+                .iter()
+                .map(|b| (b.bead_id.as_str(), b.relevance, b.reason.as_str()))
+                .collect();
         assert!(
             scored.contains(&("d-1", 80, "Direct dependency")),
             "{scored:?}"
@@ -1008,7 +1068,9 @@ mod tests {
         )]));
         let result = find_related_work_at(&report, "bd-1", &opts, now()).unwrap();
         assert!(
-            result.dependency_cluster.iter().any(|b| b.bead_id == "d-3"),
+            RelatedWorkResult::category(&result.dependency_cluster)
+                .iter()
+                .any(|b| b.bead_id == "d-3"),
             "{:?}",
             result.dependency_cluster
         );
@@ -1025,8 +1087,7 @@ mod tests {
         )]));
         let result = find_related_work_at(&report, "bd-1", &opts, now()).unwrap();
         assert_eq!(
-            result
-                .dependency_cluster
+            RelatedWorkResult::category(&result.dependency_cluster)
                 .iter()
                 .map(|b| (b.bead_id.as_str(), b.relevance, b.reason.as_str()))
                 .collect::<Vec<_>>(),
@@ -1039,7 +1100,7 @@ mod tests {
         let report = sample_report();
         let result =
             find_related_work_at(&report, "bd-1", &default_related_work_options(), now()).unwrap();
-        assert!(result.dependency_cluster.is_empty());
+        assert!(RelatedWorkResult::category(&result.dependency_cluster).is_empty());
     }
 
     #[test]
@@ -1053,10 +1114,10 @@ mod tests {
         let result = find_related_work_at(&report, "bd-1", &opts, now()).unwrap();
         assert_eq!(
             result.total_related,
-            result.file_overlap.len()
-                + result.commit_overlap.len()
-                + result.dependency_cluster.len()
-                + result.concurrent.len()
+            RelatedWorkResult::category(&result.file_overlap).len()
+                + RelatedWorkResult::category(&result.commit_overlap).len()
+                + RelatedWorkResult::category(&result.dependency_cluster).len()
+                + RelatedWorkResult::category(&result.concurrent).len()
         );
     }
 
@@ -1071,10 +1132,11 @@ mod tests {
         let result = find_related_work_at(&report, "bd-1", &opts, now()).unwrap();
         // bd-2 overlaps bd-1 on files, so the dependency detector must not
         // re-claim it.
-        assert!(result.file_overlap.iter().any(|b| b.bead_id == "bd-2"));
+        assert!(RelatedWorkResult::category(&result.file_overlap)
+            .iter()
+            .any(|b| b.bead_id == "bd-2"));
         assert!(
-            !result
-                .dependency_cluster
+            !RelatedWorkResult::category(&result.dependency_cluster)
                 .iter()
                 .any(|b| b.bead_id == "bd-2"),
             "bd-2 already claimed by file_overlap"
@@ -1093,10 +1155,10 @@ mod tests {
         opts.max_results = 1;
         let result = find_related_work_at(&report, "bd-1", &opts, now()).unwrap();
         for category in [
-            &result.file_overlap,
-            &result.commit_overlap,
-            &result.dependency_cluster,
-            &result.concurrent,
+            RelatedWorkResult::category(&result.file_overlap),
+            RelatedWorkResult::category(&result.commit_overlap),
+            RelatedWorkResult::category(&result.dependency_cluster),
+            RelatedWorkResult::category(&result.concurrent),
         ] {
             assert!(category.len() <= 1, "{category:?}");
         }

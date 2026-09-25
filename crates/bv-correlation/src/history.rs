@@ -61,9 +61,17 @@ fn is_false(b: &bool) -> bool {
 }
 
 impl HistoryCommit {
-    /// Go `CorrelatedCommit.AllMethods`.
-    fn all_methods(&self) -> &[String] {
-        &self.methods
+    /// Go `CorrelatedCommit.AllMethods` — every method that matched this
+    /// (commit, bead) pair, falling back to the primary `method` when the
+    /// multi-method list is empty.
+    pub fn all_methods(&self) -> Vec<&str> {
+        if !self.methods.is_empty() {
+            return self.methods.iter().map(String::as_str).collect();
+        }
+        if self.method.is_empty() {
+            return Vec::new();
+        }
+        vec![self.method]
     }
 }
 
@@ -1627,10 +1635,14 @@ pub fn build_commit_index(histories: &BTreeMap<String, BeadHistory>) -> CommitIn
 /// Go `calculateStats` — note `avg_commits_per_bead` divides *unique* commits
 /// by beads-with-commits, and the method distribution counts a multi-method
 /// commit once per method.
+///
+/// `feedback` is Go's `*FeedbackApplied`: `None` when no feedback store was
+/// attached (the field is then omitted from the JSON), `Some` once one was —
+/// including a store that matched nothing, which still reports three zeros.
 pub fn calculate_stats(
     histories: &BTreeMap<String, BeadHistory>,
     strategies: Vec<StrategyRun>,
-    feedback: FeedbackApplied,
+    feedback: Option<FeedbackApplied>,
 ) -> HistoryStats {
     let mut stats = HistoryStats {
         total_beads: histories.len() as i64,
@@ -1641,7 +1653,7 @@ pub fn calculate_stats(
         avg_cycle_time_days: None,
         method_distribution: BTreeMap::new(),
         strategies: Some(strategies),
-        feedback_applied: Some(feedback),
+        feedback_applied: feedback,
     };
     let mut authors: BTreeSet<&str> = BTreeSet::new();
     let mut unique_commits: BTreeSet<&str> = BTreeSet::new();
@@ -1656,7 +1668,10 @@ pub fn calculate_stats(
             unique_commits.insert(commit.sha.as_str());
             authors.insert(commit.author.as_str());
             for method in commit.all_methods() {
-                *stats.method_distribution.entry(method.clone()).or_default() += 1;
+                *stats
+                    .method_distribution
+                    .entry(method.to_string())
+                    .or_default() += 1;
             }
             if commit.confirmed {
                 *stats
@@ -1761,6 +1776,79 @@ fn find_latest_commit_sha(events: &[BeadEvent], commits: &[HistoryCommit]) -> St
     latest_sha
 }
 
+/// Go `(*Correlator).applyFeedback` (correlator.go:701-748) — consult the
+/// store for every (commit, bead) pair in `histories`:
+///
+/// - `reject` drops the commit from that bead, and hence from the commit index
+///   and the stats built afterwards;
+/// - `confirm` pins the confidence to 1.0, marks the commit confirmed, and
+///   appends `; confirmed by feedback (<by>)` to its reason;
+/// - `ignore` leaves the commit untouched but is counted.
+///
+/// Runs *before* anything derives from the commit lists. Go returns `nil` when
+/// no store is attached; the caller turns that into `None` here, which is the
+/// only difference between the two `FeedbackApplied` shapes.
+pub fn apply_feedback(
+    histories: &mut BTreeMap<String, BeadHistory>,
+    all: &std::collections::HashMap<(String, String), crate::feedback::CorrelationFeedback>,
+) -> FeedbackApplied {
+    let mut applied = FeedbackApplied::default();
+    for (bead_id, history) in histories.iter_mut() {
+        let Some(commits) = history.commits.as_ref() else {
+            continue;
+        };
+        if commits.is_empty() {
+            continue;
+        }
+        let mut kept: Vec<HistoryCommit> = Vec::with_capacity(commits.len());
+        let mut changed = false;
+        for commit in commits {
+            let Some(fb) = all.get(&(commit.sha.clone(), bead_id.clone())) else {
+                kept.push(commit.clone());
+                continue;
+            };
+            match fb.feedback_type.as_str() {
+                "reject" => {
+                    applied.rejected += 1;
+                    changed = true;
+                    continue;
+                }
+                "confirm" => {
+                    applied.confirmed += 1;
+                    changed = true;
+                    let mut commit = commit.clone();
+                    commit.confidence = 1.0;
+                    commit.confirmed = true;
+                    commit.reason = format!(
+                        "{}; confirmed by feedback ({})",
+                        commit.reason, fb.feedback_by
+                    );
+                    kept.push(commit);
+                }
+                "ignore" => {
+                    applied.ignored += 1;
+                    kept.push(commit.clone());
+                }
+                // Go's switch has no default arm, so an unrecognised type is
+                // counted in nothing and the commit is kept as-is.
+                _ => kept.push(commit.clone()),
+            }
+        }
+        if !changed {
+            continue;
+        }
+        // Go recomputes LastAuthor from the surviving commits, falling back to
+        // the last event when a rejection emptied the list.
+        history.last_author = kept
+            .last()
+            .map(|c| c.author.clone())
+            .or_else(|| history.events.last().map(|e| e.author.clone()))
+            .unwrap_or_default();
+        history.commits = Some(kept);
+    }
+    applied
+}
+
 /// Go `assembleReport` — the working-tree half: histories, index, stats, and
 /// the scalar metadata the envelope and output struct carry.
 #[allow(clippy::too_many_arguments)]
@@ -1770,19 +1858,36 @@ pub fn assemble_report(
     art: HistoryArtifact,
     generated_at: String,
 ) -> HistoryReport {
+    assemble_report_with_feedback(beads, opts, art, generated_at, None)
+}
+
+/// Go `assembleReport` on a correlator built by `WithFeedbackStore` — the
+/// variant every read path in `cmd/bv` uses, so a stored confirm/reject
+/// actually shapes histories, the commit index and the stats.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_report_with_feedback(
+    beads: &[BeadInfo],
+    opts: &HistoryOptions,
+    art: HistoryArtifact,
+    generated_at: String,
+    feedback_store: Option<&crate::feedback::FeedbackStore>,
+) -> HistoryReport {
     let mut histories = build_histories(beads, &art.events, &art.commits);
     merge_strategy_commits(&mut histories, beads, &art);
+
+    // Honor stored confirm/reject feedback before anything derives from the
+    // commit lists (index, stats).
+    let feedback_applied = feedback_store.map(|store| {
+        let all = store.load_all();
+        apply_feedback(&mut histories, &all)
+    });
 
     if !opts.bead_id.is_empty() {
         histories.retain(|id, _| id == &opts.bead_id);
     }
 
     let commit_index = build_commit_index(&histories);
-    let stats = calculate_stats(
-        &histories,
-        art.strategies.clone(),
-        FeedbackApplied::default(),
-    );
+    let stats = calculate_stats(&histories, art.strategies.clone(), feedback_applied);
     let git_range = describe_git_range(opts);
     let data_hash = hash_beads(beads);
     let mut latest_commit_sha = find_latest_commit_sha(&art.events, &art.commits);
@@ -1819,6 +1924,29 @@ pub fn build_history_report(
 ) -> Result<HistoryReport, String> {
     let art = extract_history_artifact(repo, opts, beads_file)?;
     Ok(assemble_report(beads, opts, art, generated_at))
+}
+
+/// Go `NewCorrelator(dir, beadsPath).WithFeedbackStore(store).GenerateReportCached(...)`
+/// — the correlator every read path in `cmd/bv` is built with
+/// (robot_registry.go:2700-2714). `beads_file` is the resolved
+/// `correlation_feedback.jsonl` path, threaded through unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn build_history_report_with_feedback(
+    repo: &Path,
+    beads: &[BeadInfo],
+    opts: &HistoryOptions,
+    beads_file: Option<&str>,
+    generated_at: String,
+    feedback_store: Option<&crate::feedback::FeedbackStore>,
+) -> Result<HistoryReport, String> {
+    let art = extract_history_artifact(repo, opts, beads_file)?;
+    Ok(assemble_report_with_feedback(
+        beads,
+        opts,
+        art,
+        generated_at,
+        feedback_store,
+    ))
 }
 
 /// Go `Scorer.FilterHistoriesByConfidence` — drop commits below the floor, then
@@ -2395,7 +2523,7 @@ mod tests {
                 last_author: String::new(),
             },
         );
-        let stats = calculate_stats(&histories, Vec::new(), FeedbackApplied::default());
+        let stats = calculate_stats(&histories, Vec::new(), None);
         assert_eq!(stats.total_beads, 3);
         assert_eq!(stats.beads_with_commits, 2);
         assert_eq!(
