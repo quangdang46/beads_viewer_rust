@@ -449,6 +449,7 @@ pub fn build_graph(issues: &[bv_core::model::Issue]) -> DiGraph {
     for i in &sorted {
         g.add_node(&i.id);
     }
+    let mut edges: Vec<(usize, usize)> = Vec::with_capacity(sorted.len() * 2);
     for i in &sorted {
         let from = match g.node_idx(&i.id) {
             Some(x) => x,
@@ -463,9 +464,23 @@ pub fn build_graph(issues: &[bv_core::model::Issue]) -> DiGraph {
             if let Some(to) = g.node_idx(&target) {
                 // Go keeps self-loops (gonum SetEdge accepts them); they
                 // participate in out-degree and cycle detection there.
-                g.add_edge(from, to);
+                edges.push((from, to));
             }
         }
+    }
+    // Go's `buildCachedAdjacency` sorts every node's neighbour list before the
+    // Brandes walk (betweenness_approx.go:59, :70), and `network.Betweenness`
+    // consumes the same gonum graph. Successor order is not cosmetic: the BFS
+    // stack order follows it, and the delta accumulation is floating point, so
+    // an unsorted list changes the per-node scores. Measured on
+    // large_cyclic_600, 473 of 600 nodes differ between insertion order and
+    // target-index order.
+    //
+    // Node indices are already id-sorted (see above), so sorting by target
+    // index is exactly Go's `sort.Ints(neighbors)`.
+    edges.sort_by_key(|&(from, to)| (from, to));
+    for (from, to) in edges {
+        g.add_edge(from, to);
     }
     g
 }
