@@ -1251,6 +1251,20 @@ pub fn flag_is_string(name: &str) -> bool {
     ROBOT_PRIMARIES.iter().find(is_str).is_some() || MODIFIER_FLAGS.iter().find(is_str).is_some()
 }
 
+/// The declared kind of a registered flag, or `None` when the name is not in
+/// the registry. Go's `flag` package decides whether a flag consumes the next
+/// argv element from its own registration (`flag.BoolFlag` set or not), so the
+/// missing-argument check has to read the same table rather than guess from the
+/// spelling.
+pub fn flag_kind(name: &str) -> Option<FlagKind> {
+    let target = name.trim_start_matches('-');
+    ROBOT_PRIMARIES
+        .iter()
+        .chain(MODIFIER_FLAGS.iter())
+        .find(|f| f.name == target)
+        .map(|f| f.kind)
+}
+
 pub fn flag_names() -> Vec<&'static str> {
     let mut names: Vec<&'static str> = ROBOT_PRIMARIES.iter().map(|f| f.name).collect();
     names.extend(MODIFIER_FLAGS.iter().map(|f| f.name));

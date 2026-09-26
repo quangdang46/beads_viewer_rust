@@ -13,7 +13,9 @@ pub mod version;
 pub use github::{Asset, Release, UpdateInfo};
 pub use prefs::{load_preferences, Preferences};
 pub use update::{perform_rollback, perform_update, UpdateResult};
-pub use version::{compare_versions, current_version, is_dev_version, is_newer_than_current};
+pub use version::{
+    compare_versions, current_version, is_dev_version, is_newer_than_current, APP_VERSION,
+};
 
 /// GitHub repo hosting bvr releases.
 pub const REPO_OWNER: &str = "quangdang46";

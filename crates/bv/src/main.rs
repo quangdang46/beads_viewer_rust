@@ -1128,6 +1128,14 @@ fn main() -> ExitCode {
         }
         Some(ExitCode::from(1))
     };
+    // Go's `flag.Parse` runs before any of the validation stages below, so a
+    // value-taking flag with nothing to consume is reported ahead of a
+    // modifier-requires violation — `--search-limit` alone is a missing
+    // argument, not a missing `--search`.
+    if let Some(v) = validation::validate_flag_arguments(&args) {
+        eprintln!("{v}");
+        return ExitCode::from(1);
+    }
     if let Some(v) = validation::validate_modifier_requires_with(&presence, Some(&args)) {
         eprintln!("Error: {v}");
         return ExitCode::from(1);
@@ -4386,7 +4394,12 @@ const BASELINE_PATH: &str = ".bv/baseline.json";
 /// Application version Go bv reports in robot envelopes (`pkg/version`
 /// fallback, pinned at parity commit 18afafa). Byte-parity with frozen
 /// goldens requires emitting Go's version string, not the Rust crate's.
-const GO_APP_VERSION: &str = "v0.25.0";
+///
+/// One constant, shared with `bv_update::current_version` and therefore with
+/// `--check-update` and the TUI update modal: Go resolves a single
+/// `version.Version` (version.go:22-52) and every consumer reads it, so the
+/// envelope and `--check-update` cannot disagree.
+const GO_APP_VERSION: &str = bv_update::APP_VERSION;
 
 /// Output format for the current invocation, set from `--format`. Go tracks
 /// this in the package-level `robotOutputFormat` and stamps it into every

@@ -372,9 +372,26 @@ fn robot_sprint_show_unknown_sprint_exits_one() {
 
 #[test]
 fn robot_burndown_no_active_sprint_exits_one() {
-    let (code, _, stderr) = run_at_repo_root(&["--robot-burndown"]);
+    // The sprint selector is a required value: Go's flag package rejects a bare
+    // `--robot-burndown` before the command runs, verified against the oracle.
+    // Passing it explicitly is what reaches the no-sprint path.
+    let (code, _, stderr) = run_at_repo_root(&["--robot-burndown", "current"]);
     assert_eq!(code, 1);
     assert!(stderr.contains("No active sprint found"), "{stderr}");
+}
+
+#[test]
+fn robot_burndown_without_value_reports_the_missing_argument() {
+    let (code, _, stderr) = run_at_repo_root(&["--robot-burndown"]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("flag needs an argument: --robot-burndown"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("No active sprint found"),
+        "the flag error must replace the sprint lookup: {stderr}"
+    );
 }
 
 #[test]

@@ -25,6 +25,47 @@ pub enum ValidationError {
     #[allow(dead_code)]
     #[error("invalid value for --{flag}: {value}")]
     BadEnum { flag: String, value: String },
+    /// Go's `flag` package refuses a value-taking flag that has nothing left to
+    /// consume, and `enrichFlagParseError` (cmd/bv/main.go:1269-1271) appends the
+    /// recovery line. Rust accepted the bare flag instead and ran the command
+    /// with an empty value — `--export-md` with no argument wrote `report.md`.
+    #[error("flag needs an argument: --{flag}\nUse --{flag} VALUE. Run `bv --help` for all flags or `bv --robot-help` for agent-focused docs.")]
+    MissingFlagArgument { flag: String },
+}
+
+/// Go `flag.Parse` (stdlib), restricted to the one rule Rust was missing: a
+/// non-boolean flag written without `=` must have an argv element left to
+/// consume. Go takes that element unconditionally — even one that looks like
+/// another flag, which is how `--export-md --format json` ends with `json` as a
+/// positional "unknown command" — and only errors when nothing follows.
+///
+/// Returns the first offending flag, because Go's parse stops there.
+pub fn validate_flag_arguments(args: &[String]) -> Option<ValidationError> {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        // Go stops flag parsing at the first non-flag word and treats the rest
+        // as positional arguments.
+        if !arg.starts_with('-') || arg == "-" || arg == "--" {
+            return None;
+        }
+        let (name, has_inline_value) = match arg.split_once('=') {
+            Some((n, _)) => (n, true),
+            None => (arg.as_str(), false),
+        };
+        let kind = crate::flags::flag_kind(name);
+        let is_bool = matches!(kind, None | Some(crate::flags::FlagKind::Bool));
+        if !is_bool && !has_inline_value {
+            if i + 1 >= args.len() {
+                return Some(ValidationError::MissingFlagArgument {
+                    flag: name.trim_start_matches('-').to_string(),
+                });
+            }
+            i += 1; // the next element is consumed as the value
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Which flags are present in the parsed invocation. Owns its strings —

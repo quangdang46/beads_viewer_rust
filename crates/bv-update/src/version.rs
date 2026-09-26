@@ -8,16 +8,27 @@
 //! treats two unparseable versions as EQUAL so callers fail closed instead of
 //! announcing a bogus update.
 
+/// The application version, matching Go's hardcoded `pkg/version` fallback
+/// (version.go:18).
+///
+/// Go resolves `version.Version` from ldflags, then build info, then this
+/// constant, and every consumer — `bv --version`, the `version` field in every
+/// robot envelope, `--check-update`, the TUI's update modal — reads that one
+/// value. Rust has no equivalent injection point, so the fallback *is* the
+/// resolved version.
+///
+/// It is deliberately not `CARGO_PKG_VERSION`. That is the workspace's own
+/// semver, which has no relationship to the Go release this port tracks: the
+/// two disagreed, so `bvr --check-update` announced `v0.2.0` while the same
+/// binary's envelope reported `v0.25.0` and `bv --check-update` said
+/// `v0.25.0`.
+pub const APP_VERSION: &str = "v0.25.0";
+
 /// Current binary version, normalized with a `v` prefix (e.g. `v0.1.7`).
-/// Mirrors Go's `version.Version` (ldflags → buildinfo → hardcoded fallback);
-/// for Rust the crate version is stamped at compile time so it is never empty.
+/// Mirrors Go's `version.Version`; see [`APP_VERSION`] for why the crate's own
+/// version is not the answer.
 pub fn current_version() -> String {
-    let v = env!("CARGO_PKG_VERSION").trim();
-    if v.strip_prefix('v').is_some() {
-        v.to_string()
-    } else {
-        format!("v{v}")
-    }
+    APP_VERSION.to_string()
 }
 
 /// Markers Go treats as "local build, never advertise an update"
