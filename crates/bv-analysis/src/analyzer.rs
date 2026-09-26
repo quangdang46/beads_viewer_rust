@@ -86,7 +86,7 @@ pub struct MetricStatus {
 /// Go's `strconv.ParseInt(value, 10, 64)` and Rust's `i64::from_str` accept
 /// the same language — an optional sign then at least one digit, with no
 /// underscores and no base prefix — so the two agree on every input.
-fn source_date_epoch_active() -> bool {
+pub fn source_date_epoch_active() -> bool {
     std::env::var("SOURCE_DATE_EPOCH")
         .ok()
         .map(|v| v.trim().parse::<i64>().is_ok())
@@ -104,7 +104,7 @@ fn source_date_epoch_active() -> bool {
 /// self-loop through and report the metric as computed where Go skips it. The
 /// scan below is what closes that gap; [`build_graph`] keeps self-loops, so
 /// they really do reach here.
-fn topological_order_available(g: &DiGraph) -> bool {
+pub fn topological_order_available(g: &DiGraph) -> bool {
     let n = g.len();
     if topological_sort_gonum(g).map(|o| o.len() == n) != Some(true) {
         return false;
@@ -1083,7 +1083,7 @@ pub fn critical_path(g: &DiGraph) -> Vec<usize> {
 
 /// Go's reason for an order-dependent metric it could not run
 /// (pkg/analysis/graph.go:2177 and :2274).
-const CYCLE_UNAVAILABLE_REASON: &str =
+pub const CYCLE_UNAVAILABLE_REASON: &str =
     "dependency graph contains a cycle; topological order unavailable";
 
 /// Go `stateFromTiming` (pkg/analysis/graph.go:229-238).

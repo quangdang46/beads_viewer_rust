@@ -4000,31 +4000,33 @@ fn run_robot_triage() -> ExitCode {
     if !history_status.is_empty() {
         meta["history_status"] = serde_json::json!(history_status);
     }
-    // Go parity: clear reason on all skipped entries except betweenness.
+    // Go's `statusEntry.MarshalJSON` (pkg/analysis/graph.go:131-147) drops
+    // `reason` only when the string is empty, so clearing is how Rust reproduces
+    // Go's *absent* key rather than a way of erasing a reason Go emits.
+    //
+    // For `--robot-triage` every skipped metric is one Go never attempted:
+    // `TriageConfig` (config.go:260-277) sets Compute{Cycles,CriticalPath,
+    // Eigenvector,HITS,KCore,Articulation,Slack} = false, and
+    // `stateFromTiming` (graph.go:229-238) returns a bare "skipped" for a
+    // disabled metric with no reason. Verified against the oracle on
+    // small_chain: all seven emit `{"state":"skipped"}` and nothing else.
+    //
+    // Betweenness is deliberately left alone — `betweennessReason`
+    // (graph.go:256-264) returns "approximate", which Go does emit.
     let mut triage_status = out.metric_status.clone();
-    if triage_status.page_rank.state == "skipped" {
-        triage_status.page_rank.reason.clear();
-    }
-    if triage_status.eigenvector.state == "skipped" {
-        triage_status.eigenvector.reason.clear();
-    }
-    if triage_status.hits.state == "skipped" {
-        triage_status.hits.reason.clear();
-    }
-    if triage_status.critical.state == "skipped" {
-        triage_status.critical.reason.clear();
-    }
-    if triage_status.cycles.state == "skipped" {
-        triage_status.cycles.reason.clear();
-    }
-    if triage_status.kcore.state == "skipped" {
-        triage_status.kcore.reason.clear();
-    }
-    if triage_status.articulation.state == "skipped" {
-        triage_status.articulation.reason.clear();
-    }
-    if triage_status.slack.state == "skipped" {
-        triage_status.slack.reason.clear();
+    for entry in [
+        &mut triage_status.page_rank,
+        &mut triage_status.eigenvector,
+        &mut triage_status.hits,
+        &mut triage_status.critical,
+        &mut triage_status.cycles,
+        &mut triage_status.kcore,
+        &mut triage_status.articulation,
+        &mut triage_status.slack,
+    ] {
+        if entry.state == "skipped" {
+            entry.reason.clear();
+        }
     }
     let mut payload = full_envelope_for(&data_hash, &loaded);
     payload["output_format"] = serde_json::json!(env.output_format);
@@ -6673,35 +6675,13 @@ fn build_robot_insights() -> Result<serde_json::Value, ExitCode> {
 
     let mut payload = full_envelope_for(&hash, &issues);
     payload["analysis_config"] = insights_analysis_config(g.len());
-    // Go parity: only "approximate" reason is non-empty for skipped entries.
-    // All other skipped metrics emit {"state":"skipped"} without reason field.
-    let mut fixed_status = status.clone();
-    if fixed_status.page_rank.state == "skipped" {
-        fixed_status.page_rank.reason.clear();
-    }
-    if fixed_status.betweenness.state != "computed" { /* keep reason for approx */ }
-    if fixed_status.eigenvector.state == "skipped" {
-        fixed_status.eigenvector.reason.clear();
-    }
-    if fixed_status.hits.state == "skipped" {
-        fixed_status.hits.reason.clear();
-    }
-    if fixed_status.critical.state == "skipped" {
-        fixed_status.critical.reason.clear();
-    }
-    // NOT cleared, unlike the siblings above: Go keeps the cycles skip reason.
-    // On an XL graph cycle detection never runs, and "graph too large (>2000
-    // nodes)" is the only thing telling a reader the absence of cycles is
-    // unknown rather than observed. Clearing it asserted a clean DAG.
-    if fixed_status.kcore.state == "skipped" {
-        fixed_status.kcore.reason.clear();
-    }
-    if fixed_status.articulation.state == "skipped" {
-        fixed_status.articulation.reason.clear();
-    }
-    if fixed_status.slack.state == "skipped" {
-        fixed_status.slack.reason.clear();
-    }
+    // Go's `statusEntry.MarshalJSON` (pkg/analysis/graph.go:131-147) omits
+    // `reason` only when it is empty, and every Go site that sets
+    // `State: "skipped"` fills the reason in the same literal — so the analyzer
+    // already produces exactly Go's shape and nothing is cleared here. The
+    // reasoning for the sibling `--robot-triage` block applies verbatim; see
+    // the comment there for why clearing was wrong.
+    let fixed_status = status.clone();
     payload["status"] = fixed_status.to_json_map();
     // Go declares LabelScope/LabelContext directly after Status
     // (robot_registry.go:1970-1986).
@@ -7749,11 +7729,26 @@ fn plan_priority_status(g: &bv_graph_core::DiGraph) -> serde_json::Value {
     let articulation = bv_analysis::algorithms::articulation::articulation_points(g);
     let art_ms = t1.elapsed().as_secs_f64() * 1000.0;
     let t2 = std::time::Instant::now();
-    let slack = bv_analysis::algorithms::slack::slack(g);
+    // Go gates Slack on the same Phase 1 topological order (graph.go:2271):
+    // when the order does not cover every issue the metric is skipped and the
+    // cyclic graph is named as the reason. Computing it anyway would report a
+    // longest-path value for a graph that has no longest path.
+    let order_available = bv_analysis::analyzer::topological_order_available(g);
+    let slack = order_available.then(|| bv_analysis::algorithms::slack::slack(g));
     let slack_ms = t2.elapsed().as_secs_f64() * 1000.0;
     let _ = (kcore, articulation, slack);
 
     let plan_skip = |reason: &str| bv_analysis::analyzer::StatusEntry::skipped(reason);
+    // Go zeroes every `ms` under SOURCE_DATE_EPOCH (main.go:1190-1202), and
+    // `statusEntry.MarshalJSON` drops the key at zero, so a pinned-clock
+    // document carries none. Measured durations are not reproducible.
+    let ms = |v: f64| {
+        if bv_analysis::analyzer::source_date_epoch_active() {
+            0.0
+        } else {
+            v
+        }
+    };
     serde_json::json!({
         "PageRank": plan_skip(""),
         "Betweenness": plan_skip(if force_full_analysis() { "" } else { "not computed for --robot-plan" }),
@@ -7761,9 +7756,13 @@ fn plan_priority_status(g: &bv_graph_core::DiGraph) -> serde_json::Value {
         "HITS": plan_skip(if force_full_analysis() { "" } else { "not computed for --robot-plan" }),
         "Critical": plan_skip(""),
         "Cycles": plan_skip(if force_full_analysis() { "" } else { "not computed for --robot-plan" }),
-        "KCore": bv_analysis::analyzer::StatusEntry::computed(kcore_ms),
-        "Articulation": bv_analysis::analyzer::StatusEntry::computed(art_ms),
-        "Slack": bv_analysis::analyzer::StatusEntry::computed(slack_ms),
+        "KCore": bv_analysis::analyzer::StatusEntry::computed(ms(kcore_ms)),
+        "Articulation": bv_analysis::analyzer::StatusEntry::computed(ms(art_ms)),
+        "Slack": if order_available {
+            bv_analysis::analyzer::StatusEntry::computed(ms(slack_ms))
+        } else {
+            plan_skip(bv_analysis::analyzer::CYCLE_UNAVAILABLE_REASON)
+        },
     })
 }
 
