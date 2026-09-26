@@ -36,3 +36,9 @@ pprof = { version = "0.15.0", features = ["protobuf-codec"] }
 # Go's `pprof.StartCPUProfile` gzips what it writes; pprof-rs hands back a bare
 # `Profile` and leaves serialization to the caller, so the gzip wrapper is ours.
 flate2 = "1"
+# `--robot-history-timeout-ms` bounds the git-history prologue of robot triage
+# with the same shape Go uses: the report is built on its own thread and the
+# caller selects the result against a deadline. A channel plus `recv_timeout`
+# is the sync stand-in for Go's `select` on `resCh` vs `histCtx.Done()`, and is
+# this repo's established per-metric timeout pattern (no tokio, per AGENTS.md).
+crossbeam-channel = { workspace = true }

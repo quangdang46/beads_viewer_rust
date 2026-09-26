@@ -212,6 +212,7 @@ dependencies = [
  "bv-tui",
  "bv-update",
  "clap",
+ "crossbeam-channel",
  "flate2",
  "jiff",
  "pprof",

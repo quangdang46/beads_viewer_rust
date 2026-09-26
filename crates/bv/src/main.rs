@@ -3153,6 +3153,140 @@ fn triage_claimable(
     true
 }
 
+/// Go `defaultRobotHistoryTimeout` (robot_registry.go:2021) — the budget for
+/// the git-history correlation prologue of --robot-triage / --robot-next.
+const DEFAULT_ROBOT_HISTORY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Go `robotHistoryShutdownGrace` (robot_registry.go:2025) — how long a
+/// timed-out triage invocation waits for the abandoned report thread before
+/// returning, so a directly spawned, context-killed git child gets a bounded
+/// chance to be reaped before this short-lived process exits.
+const ROBOT_HISTORY_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Go `maxRobotHistoryTimeoutMillis` (robot_registry.go:2029) —
+/// `math.MaxInt64 / int64(time.Millisecond)`, i.e. the largest millisecond
+/// count that still fits in a `time.Duration` (9223372036854).
+const MAX_ROBOT_HISTORY_TIMEOUT_MILLIS: i64 = i64::MAX / 1_000_000;
+
+/// Go `robotHistoryTimeoutFromMilliseconds` (robot_registry.go:2035).
+///
+/// Saturates rather than wrapping: a millisecond count past the range of
+/// `time.Duration` would multiply out to a NEGATIVE duration, and Go's bounded
+/// path treats `timeout > 0` as the only case that installs a deadline — so an
+/// overflow would silently become unbounded instead of "very long". Returns
+/// `None` for a negative input, which is the out-of-range case of the Go
+/// `(time.Duration, bool)` pair.
+fn robot_history_timeout_from_millis(ms: i64) -> Option<std::time::Duration> {
+    if ms < 0 {
+        return None;
+    }
+    if ms > MAX_ROBOT_HISTORY_TIMEOUT_MILLIS {
+        // Go returns `time.Duration(math.MaxInt64)` here.
+        return Some(std::time::Duration::from_nanos(u64::MAX));
+    }
+    Some(std::time::Duration::from_millis(ms as u64))
+}
+
+/// Go `resolveRobotHistoryTimeout` (robot_registry.go:2049). Precedence: the
+/// `--robot-history-timeout-ms` flag when explicitly set (>= 0), then
+/// `BV_ROBOT_HISTORY_TIMEOUT_MS`, then the 10s default. A resolved `0` disables
+/// the bound entirely (Go's legacy run-to-completion), which is why the caller
+/// must not treat zero as "no budget configured".
+///
+/// The env var is parsed with base 10 (`strconv.ParseInt(envVal, 10, 64)`,
+/// robot_registry.go:2055) — NOT the base-0 rule pflag applies to the flag
+/// itself, so `0x10` is a parse failure in the env and falls through to the
+/// default. An unparsable or negative env value falls through too: Go ignores
+/// the `ok` return and keeps going.
+fn resolve_robot_history_timeout(flag_ms: Option<i64>) -> std::time::Duration {
+    if let Some(ms) = flag_ms {
+        if ms >= 0 {
+            // A >= 0 flag value is always convertible, so the `None` arm is
+            // unreachable here; the default keeps the signature total.
+            return robot_history_timeout_from_millis(ms).unwrap_or(DEFAULT_ROBOT_HISTORY_TIMEOUT);
+        }
+    }
+    if let Ok(env_val) = std::env::var("BV_ROBOT_HISTORY_TIMEOUT_MS") {
+        let env_val = env_val.trim();
+        if !env_val.is_empty() {
+            if let Ok(ms) = env_val.parse::<i64>() {
+                if let Some(d) = robot_history_timeout_from_millis(ms) {
+                    return d;
+                }
+            }
+        }
+    }
+    DEFAULT_ROBOT_HISTORY_TIMEOUT
+}
+
+/// Go `generateTriageHistoryBounded` (robot_registry.go:2107) — the exact call
+/// the budget wraps. Read the Go handler end to end before changing this: the
+/// budget covers ONLY the git-history correlation prologue
+/// (`correlator.GenerateReportCached`), not the `ComputeTriageWithOptionsAndTime`
+/// that consumes the report. Triage scoring is deliberately left unbounded.
+///
+/// The report is built on its own thread while the caller waits against the
+/// budget, mirroring Go's goroutine + `select` on `resCh` vs `histCtx.Done()`.
+/// On timeout the status is "timeout" and the report is dropped, which is the
+/// degradation path Go already had. A zero budget is unbounded, so it is served
+/// by a plain blocking receive rather than a zero-length `recv_timeout` (which
+/// would fire immediately).
+///
+/// This does not claim every internal cache or lock wait inside the report
+/// builder is cancellable; as in Go, the caller simply stops waiting once the
+/// shutdown grace expires, and the thread may finish later.
+fn generate_triage_history_bounded(
+    cwd: &std::path::Path,
+    beads: &[bv_correlation::history::BeadInfo],
+    opts: &bv_correlation::history::HistoryOptions,
+    generated_at: String,
+    timeout: std::time::Duration,
+) -> (Option<bv_correlation::history::HistoryReport>, &'static str) {
+    // Go builds the correlator with the feedback store attached
+    // (`newCorrelatorWithFeedback`, robot_registry.go:2116), so a stored
+    // confirm/reject shapes the report before triage reads it.
+    let store = load_correlation_feedback_store(cwd);
+    let repo = cwd.to_path_buf();
+    let beads = beads.to_vec();
+    let opts = opts.clone();
+
+    let (tx, rx) =
+        crossbeam_channel::bounded::<Result<bv_correlation::history::HistoryReport, String>>(1);
+    std::thread::spawn(move || {
+        // Dropping `tx` on return closes the channel, so a caller that gives up
+        // on the budget sees a disconnected receiver rather than hanging.
+        let _ = tx.send(bv_correlation::history::build_history_report_with_feedback(
+            &repo,
+            &beads,
+            &opts,
+            None,
+            generated_at,
+            store.as_ref(),
+        ));
+    });
+
+    let received = if timeout.is_zero() {
+        // Go only installs a deadline when `timeout > 0`; 0 is unbounded.
+        rx.recv().ok()
+    } else {
+        rx.recv_timeout(timeout).ok()
+    };
+
+    match received {
+        Some(Ok(report)) => (Some(report), "ok"),
+        // The thread finished inside the budget but the build failed.
+        Some(Err(_)) => (None, "error"),
+        // Deadline fired (or the builder panicked and closed the channel):
+        // give the thread the shutdown grace to reap a killed git child, then
+        // report the timeout. Go's second `select` on `resCh` vs
+        // `robotHistoryShutdownGrace` — the result is discarded either way.
+        None => {
+            let _ = rx.recv_timeout(ROBOT_HISTORY_SHUTDOWN_GRACE);
+            (None, "timeout")
+        }
+    }
+}
+
 fn run_robot_triage() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
     let as_of = extract_as_of();
@@ -3434,10 +3568,83 @@ fn run_robot_triage() -> ExitCode {
         .ok()
         .map(|v| v.trim().parse::<i64>().is_ok())
         .unwrap_or(false);
+    // Go registers `--robot-history-timeout-ms` as a pflag `flag.Int`
+    // (main.go:1549), so pflag parses the value during flag parsing: a value
+    // that is not `strconv.ParseInt(s, 0, 64)` is a parse error, not a silent
+    // fall back to the default. Go reports
+    // `invalid argument %q for "--robot-history-timeout-ms" flag: %v` and exits
+    // 1 (main.go:4548-4550). The default is -1, meaning UNSET — a distinct
+    // value from 0, which means unbounded, so the Option has to survive to
+    // `resolve_robot_history_timeout` rather than collapsing to a number here.
+    let history_timeout_ms: Option<i64> = {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        match flag_value(&args, "robot-history-timeout-ms") {
+            Some(raw) => match go_parse_int_base0(raw) {
+                Ok(v) => Some(v),
+                Err(detail) => {
+                    eprintln!(
+                        "invalid argument {raw:?} for \"--robot-history-timeout-ms\" flag: {detail}"
+                    );
+                    return ExitCode::from(1);
+                }
+            },
+            None => None,
+        }
+    };
+    // Go `handleRobotTriage` (robot_registry.go:2157-2190) computes the history
+    // status in this order: an empty string (key omitted) when there is no open
+    // work, "skipped" under a pinned clock, and otherwise whatever the bounded
+    // prologue returned. A failure to locate the work dir, the beads dir or a
+    // valid repository leaves the status EMPTY rather than inventing one, so
+    // the "ok" below is only reachable once the prologue actually ran.
     let history_status = if has_open_issues && source_date_epoch_active {
         "skipped"
     } else if has_open_issues {
-        "ok"
+        // Go's limit dance (robot_registry.go:2173-2179): the correlator
+        // default is 500, `--history-limit` overrides it, and a limit that is
+        // STILL 500 falls back to 200. Reproduced as written — an explicit
+        // `--history-limit 500` is rewritten to 200 too.
+        let mut limit: i64 = 500;
+        if let Some(raw) = history_flag_value("history-limit") {
+            if let Ok(v) = raw.trim().parse::<i64>() {
+                limit = v;
+            }
+        }
+        if limit == 500 {
+            limit = 200;
+        }
+        match validate_correlation_repository(&cwd) {
+            Ok(()) => {
+                let beads: Vec<bv_correlation::history::BeadInfo> = issues
+                    .iter()
+                    .map(|i| bv_correlation::history::BeadInfo {
+                        id: i.id.clone(),
+                        title: i.title.clone(),
+                        status: i.status.as_str().to_string(),
+                    })
+                    .collect();
+                let opts = bv_correlation::history::HistoryOptions {
+                    limit,
+                    ..Default::default()
+                };
+                let budget = resolve_robot_history_timeout(history_timeout_ms);
+                // The report is built under the budget but triage scoring does
+                // not consume it yet: Go passes it as
+                // `TriageOptions{History: ...}` (robot_registry.go:2218) and
+                // `build_triage` has no such parameter. What the flag governs is
+                // the work and its status, and that is wired here.
+                let (_history_report, status) = generate_triage_history_bounded(
+                    &cwd,
+                    &beads,
+                    &opts,
+                    env.generated_at.clone(),
+                    budget,
+                );
+                status
+            }
+            // Go leaves the status empty when `ValidateRepository` fails.
+            Err(_) => "",
+        }
     } else {
         ""
     };
