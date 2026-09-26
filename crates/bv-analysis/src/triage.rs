@@ -289,6 +289,51 @@ fn closed_for_readiness(status: Status) -> bool {
     matches!(status, Status::Closed | Status::Tombstone)
 }
 
+/// Go `computeUnblocks` (plan.go:86-113) — the issues that become *ready* once
+/// `id` lands, sorted.
+///
+/// This is not "everything that depends on `id`". Go walks the graph's
+/// successors and keeps only those passing `isActionableAfterCompletions`,
+/// which requires the dependent to have no unresolved blocker left once `id`
+/// is complete (plan.go:105-108). A dependent that is still gated on something
+/// else, or is itself closed or deferred, is not unblocked by this issue and
+/// must not be counted. Go returns nil outright when the blocker is already
+/// closed (plan.go:93-97): completing it changes no readiness.
+///
+/// Go's `IsCandidate` is the output-eligibility scope, and the CLI only sets a
+/// candidate set for `--repo`/`--label-scope`, so an unscoped run accepts every
+/// loaded issue and the test is omitted here.
+pub fn compute_unblocks(
+    readiness: &Readiness<'_>,
+    g: &bv_graph_core::DiGraph,
+    id: &str,
+    now: jiff::Timestamp,
+) -> Vec<String> {
+    let Some(idx) = g.node_idx(id) else {
+        return Vec::new();
+    };
+    if readiness
+        .issues
+        .get(id)
+        .is_none_or(|i| closed_for_readiness(i.status))
+    {
+        return Vec::new();
+    }
+    let completed: std::collections::BTreeSet<String> = std::iter::once(id.to_string()).collect();
+    let mut unblocks: Vec<String> = g
+        // An edge runs dependent -> dependency (`build_graph`,
+        // analyzer.rs:777-780), so the issues waiting on `id` are its
+        // in-neighbours — the same set Go reaches through `g.To` on the
+        // reversed adjacency it keeps.
+        .predecessors_slice(idx)
+        .iter()
+        .filter_map(|&n| g.node_id(n))
+        .filter(|dependent| readiness.ready_after(dependent, now, Some(&completed)))
+        .collect();
+    unblocks.sort();
+    unblocks
+}
+
 /// Go `readinessIssue` (readiness.go:32-39) — the decision inputs only.
 struct ReadinessIssue<'a> {
     status: Status,
@@ -306,7 +351,7 @@ impl ReadinessIssue<'_> {
 }
 
 /// Go `model.ReadinessIndex` (readiness.go:26-30).
-struct Readiness<'a> {
+pub struct Readiness<'a> {
     issues: std::collections::HashMap<&'a str, ReadinessIssue<'a>>,
     states: std::collections::HashMap<&'a str, DepState>,
     children: std::collections::HashMap<&'a str, Vec<&'a str>>,
@@ -314,7 +359,7 @@ struct Readiness<'a> {
 
 impl<'a> Readiness<'a> {
     /// Go `NewReadinessIndex` (readiness.go:46-77) followed by `compute()`.
-    fn new(issues: &'a [Issue]) -> Self {
+    pub fn new(issues: &'a [Issue]) -> Self {
         let mut r = Readiness {
             issues: std::collections::HashMap::new(),
             states: std::collections::HashMap::new(),

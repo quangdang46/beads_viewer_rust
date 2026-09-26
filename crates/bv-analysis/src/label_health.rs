@@ -535,19 +535,7 @@ pub fn compute_graph_stats(issues: &[Issue]) -> GraphStats {
     // approximate path reproduces Go exactly. Since `BottleneckCount` counts
     // nodes with betweenness > 0 (label_health.go:592-594), using the wrong
     // one inflated it from 176 to 337.
-    let budget = crate::analyzer::AnalysisBudget::for_graph(&g);
-    let n = g.len();
-    let sample = budget.recommend_sample_size(n, g.edge_count());
-    let (approx, skip) = budget.betweenness_mode(n);
-    let bw = if skip {
-        // Go skips the metric on a dense graph and `Betweenness()` then yields
-        // no scores, so every lookup is the zero value.
-        Vec::new()
-    } else if approx {
-        bv_graph_core::algorithms::betweenness::betweenness_approx(&g, sample, Some(1))
-    } else {
-        bv_graph_core::algorithms::betweenness::betweenness(&g)
-    };
+    let bw = crate::analyzer::go_betweenness(&g);
     let cp = bv_graph_core::algorithms::critical_path::critical_path_heights(&g);
     let mut pagerank = BTreeMap::new();
     let mut betweenness = BTreeMap::new();

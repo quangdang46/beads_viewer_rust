@@ -1262,7 +1262,7 @@ fn main() -> ExitCode {
     ) -> Vec<bv_analysis::impact::IssueImpact> {
         let g = bv_analysis::build_graph(issues);
         let pr = bv_graph_core::pagerank_default(&g);
-        let bw = bv_graph_core::betweenness(&g);
+        let bw = bv_analysis::analyzer::go_betweenness(&g);
         let cp = bv_graph_core::critical_path_heights(&g);
         let to_map = |v: &[f64]| -> std::collections::BTreeMap<String, f64> {
             v.iter()
@@ -2219,7 +2219,7 @@ fn insights_map_limit() -> usize {
 fn apply_graph_metrics(app: &mut bv_tui::App, issues: &[bv_core::model::Issue]) {
     let g = bv_analysis::build_graph(issues);
     let pr = bv_graph_core::pagerank_default(&g);
-    let bw = bv_graph_core::betweenness(&g);
+    let bw = bv_analysis::analyzer::go_betweenness(&g);
     let ev = bv_graph_core::eigenvector_default(&g);
     let hits_result = bv_graph_core::hits_default(&g);
 
@@ -6621,18 +6621,7 @@ fn build_robot_insights() -> Result<serde_json::Value, ExitCode> {
     // unconditionally gave `large_cyclic_600` max 184 / 337 non-zero where Go
     // reports 210 / 176, and `xl_2500` max 12 / 124 where Go reports
     // 37.5 / 15.
-    let bw_nodes = g.len();
-    let (use_approx, skip_bw) =
-        bv_analysis::analyzer::AnalysisBudget::default().betweenness_mode(bw_nodes);
-    let bw_sample =
-        bv_analysis::analyzer::AnalysisBudget::default().recommend_sample_size(bw_nodes, 0);
-    let bw_raw: Vec<f64> = if skip_bw {
-        Vec::new()
-    } else if use_approx {
-        bv_graph_core::betweenness_approx(&g, bw_sample, Some(1))
-    } else {
-        bv_graph_core::betweenness(&g)
-    };
+    let bw_raw: Vec<f64> = bv_analysis::analyzer::go_betweenness(&g);
     let mut bw_obj = to_id_map(&g, &bw_raw);
     // gonum Betweenness omits zero-score nodes (endpoints of a DAG chain).
     bw_obj.retain(|_, v| v.as_f64() != Some(0.0));
@@ -8022,26 +8011,6 @@ impl Default for PriorityThresholds {
     }
 }
 
-/// How many issues each issue directly unblocks, keyed by blocker id.
-/// Go's `buildUnblocksMap` feeds the unblocks-count signal.
-fn build_unblocks_map(
-    issues: &[bv_core::model::Issue],
-) -> std::collections::BTreeMap<String, usize> {
-    let mut map = std::collections::BTreeMap::new();
-    for issue in issues {
-        for dep in &issue.dependencies {
-            if !dep.r#type.is_blocking() {
-                continue;
-            }
-            let target = dep.effective_depends_on();
-            if !target.is_empty() {
-                *map.entry(target.to_string()).or_insert(0) += 1;
-            }
-        }
-    }
-    map
-}
-
 /// Go `generateRecommendation` (priority.go:735-869) plus `calculateConfidence`
 /// (priority.go:904). Returns `None` when no signal fires or the derived
 /// priority already matches the current one.
@@ -8049,7 +8018,8 @@ fn build_unblocks_map(
 fn build_priority_recommendation(
     r: &bv_analysis::impact::IssueImpact,
     issue: &bv_core::model::Issue,
-    unblocks_by_id: &std::collections::BTreeMap<String, usize>,
+    readiness: &bv_analysis::triage::Readiness<'_>,
+    g: &bv_graph_core::DiGraph,
     th: &PriorityThresholds,
     issues: &[bv_core::model::Issue],
     cp_height: &std::collections::BTreeMap<String, f64>,
@@ -8064,31 +8034,19 @@ fn build_priority_recommendation(
     let b = &r.breakdown;
     let issue_by_id: std::collections::HashMap<&str, &bv_core::model::Issue> =
         issues.iter().map(|i| (i.id.as_str(), i)).collect();
-    // Go's what-if names the issues this one directly unblocks, capped at 10
-    // in the output; the full list is needed for the days-saved estimate.
-    let mut unblocks_ids: Vec<String> = issues
-        .iter()
-        .filter(|o| {
-            o.dependencies
-                .iter()
-                .any(|d| d.r#type.is_blocking() && d.effective_depends_on() == r.id)
-        })
-        .map(|o| o.id.clone())
-        .collect();
+    // Go names the issues this one directly unblocks, capped at 10 in the
+    // output; the full list is needed for the days-saved estimate. Both this
+    // and the reasoning signal below read the same `computeUnblocks` result
+    // (priority.go:690-693, :963-970) — a dependent only counts once nothing
+    // else is holding it, so this is deliberately not a raw dependency scan.
+    let unblocks_ids = bv_analysis::triage::compute_unblocks(readiness, g, &r.id, robot_now());
     // Go `computeUnblocks` (plan.go:111) finishes with `sort.Strings(unblocks)`
     // over the FULL list, before any capping. Rust's `String: Ord` is byte-wise
     // like Go's, so "TREE-10" precedes "TREE-8" ('1' 0x31 < '8' 0x38) exactly
     // as Go orders it. Sorting the full list — not the MaxUnblockedIDsShown
     // slice — also fixes the order `estimateDaysSaved` sums in (order is
     // irrelevant to the sum, but the cap would otherwise slice unsorted ids).
-    unblocks_ids.sort();
-    let unblocks_count = unblocks_ids
-        .len()
-        .max(unblocks_by_id.get(&r.id).copied().unwrap_or(0));
-    // Go counts dependency-blocked work that becomes ready once this issue
-    // lands (priority.go:963-970). Without the transitive id set here, the
-    // direct unblock count is the available proxy; the transitive cascade is
-    // what count_transitive_unblocks computes separately.
+    let unblocks_count = unblocks_ids.len();
     let blocked_reduction = unblocks_count;
     // Go scales the issue's critical-path height (priority.go:974-980), which
     // is not the pagerank norm.
@@ -8186,38 +8144,93 @@ fn build_priority_recommendation(
         signal_strength += 0.15;
     }
 
-    // No signals = no recommendation needed (priority.go:832).
-    if signals == 0 {
-        return None;
-    }
-
+    // Go `generateRecommendation` (priority.go:735-869) yields a recommendation
+    // that *changes* the priority, or nil. It returns nil three ways — no
+    // signal fired (priority.go:832), the derived priority already matches
+    // (priority.go:840), or confidence sits under the floor (priority.go:712)
+    // — and nil leaves the issue eligible for the synthetic entry Go falls
+    // back to (whatif.go:180-193). So none of the three can return early: the
+    // what-if gate below is the only condition that drops the issue outright.
     let suggested = bv_analysis::scoring::score_to_priority(r.score);
-    if suggested == issue.priority {
-        return None;
-    }
-
-    // Go calculateConfidence (priority.go:904-930).
-    let mut confidence = (signals as f64 / 10.0).min(1.0);
-    confidence += (signal_strength / 2.0).min(0.3);
-    let score_delta = (r.score - bv_analysis::scoring::priority_to_score(issue.priority)).abs();
-    if score_delta >= th.significant_delta {
-        confidence += 0.2;
-    }
-    confidence = confidence.min(1.0);
-
-    // Go drops anything below the confidence floor (priority.go:712).
-    if confidence < th.min_confidence {
-        return None;
-    }
-
-    // Go caps reasoning at three entries for conciseness (bv-83).
-    reasoning.truncate(3);
-
-    let direction = if suggested > issue.priority {
-        "decrease"
+    let changed = if signals == 0 || suggested == issue.priority {
+        None
     } else {
-        "increase"
+        // Go calculateConfidence (priority.go:904-930).
+        let mut confidence = (signals as f64 / 10.0).min(1.0);
+        confidence += (signal_strength / 2.0).min(0.3);
+        let score_delta = (r.score - bv_analysis::scoring::priority_to_score(issue.priority)).abs();
+        if score_delta >= th.significant_delta {
+            confidence += 0.2;
+        }
+        confidence = confidence.min(1.0);
+
+        if confidence < th.min_confidence {
+            None
+        } else {
+            // Go caps reasoning at three entries for conciseness (bv-83).
+            let mut reasoning = reasoning;
+            reasoning.truncate(3);
+            let direction = if suggested > issue.priority {
+                "decrease"
+            } else {
+                "increase"
+            };
+            Some((confidence, direction, reasoning))
+        }
     };
+
+    let transitive = count_transitive_unblocks(&r.id, issues, &issue_by_id);
+    let (confidence, direction, reasoning, suggested) = match changed {
+        Some((confidence, direction, reasoning)) => (confidence, direction, reasoning, suggested),
+        // Go whatif.go:180 — an issue whose priority is not going to change is
+        // still worth reporting when finishing it would actually move the
+        // graph. The gate reads the what-if alone, so it fires for issues that
+        // produced no structural signal at all.
+        None if !unblocks_ids.is_empty() || transitive > 2 => (
+            0.5,
+            "none",
+            // `extractReasoningStrings` (whatif.go:213-218) rebuilds the ranked
+            // reasons as "emoji blurb" — not the structural sentences the
+            // changed path reports.
+            top_reasons(b)
+                .iter()
+                .map(|t| {
+                    format!(
+                        "{} {}",
+                        t["emoji"].as_str().unwrap_or_default(),
+                        t["explanation"].as_str().unwrap_or_default()
+                    )
+                })
+                .collect(),
+            issue.priority,
+        ),
+        None => return None,
+    };
+
+    let what_if = what_if_delta(
+        &unblocks_ids,
+        transitive,
+        blocked_reduction,
+        depth_reduction,
+        issues,
+    );
+    // Go whatif.go:165-169 — the id list is capped for display, so a short
+    // list next to a larger direct count means output truncation, not a
+    // smaller graph effect.
+    let shown_ids = what_if["unblocked_issue_ids"]
+        .as_array()
+        .map_or(0, Vec::len);
+    let capped = shown_ids < unblocks_ids.len();
+    let mut status = serde_json::json!({
+        "computed_at": jiff_now(),
+        "data_hash": "",
+        "phase2_ready": true,
+        "deterministic": true,
+        "capped": capped,
+    });
+    if capped {
+        status["capped_fields"] = serde_json::json!("unblocked_issue_ids");
+    }
 
     Some(serde_json::json!({
         "issue_id": r.id,
@@ -8228,31 +8241,13 @@ fn build_priority_recommendation(
         "confidence": confidence,
         "reasoning": reasoning,
         "direction": direction,
-        "what_if": what_if_delta(
-            &unblocks_ids,
-            count_transitive_unblocks(&r.id, issues, &issue_by_id),
-            blocked_reduction,
-            depth_reduction,
-            issues,
-        ),
+        "what_if": what_if,
         // Go PriorityExplanation (whatif.go:9-21) nests the same what-if delta
         // plus an inline status block alongside the ranked reasons.
         "explanation": {
             "top_reasons": top_reasons(b),
-            "what_if": what_if_delta(
-                &unblocks_ids,
-                count_transitive_unblocks(&r.id, issues, &issue_by_id),
-                blocked_reduction,
-                depth_reduction,
-                issues,
-            ),
-            "status": {
-                "computed_at": jiff_now(),
-                "data_hash": "",
-                "phase2_ready": true,
-                "deterministic": true,
-                "capped": false,
-            },
+            "what_if": what_if,
+            "status": status,
         },
     }))
 }
@@ -8720,9 +8715,8 @@ fn compute_parallel_gain(issues: &[bv_core::model::Issue], limit: usize) -> serd
 fn priority_recommendations(issues: &[bv_core::model::Issue]) -> Vec<serde_json::Value> {
     let g = bv_analysis::build_graph(issues);
     let pr = bv_graph_core::pagerank_default(&g);
-    let bw = bv_graph_core::betweenness(&g);
+    let bw = bv_analysis::analyzer::go_betweenness(&g);
     let cp = bv_graph_core::critical_path_heights(&g);
-
     let pr_map: std::collections::BTreeMap<String, f64> = pr
         .iter()
         .enumerate()
@@ -8780,7 +8774,9 @@ fn priority_recommendations(issues: &[bv_core::model::Issue]) -> Vec<serde_json:
     // weighted breakdown values against ad-hoc constants and hardcoded
     // confidence 1, so it never agreed with the oracle.
     let th = PriorityThresholds::default();
-    let unblocks_by_id = build_unblocks_map(issues);
+    // One readiness index for the whole batch — Go builds it once on the
+    // Analyzer and `computeUnblocks` reads it per issue (plan.go:89-108).
+    let readiness = bv_analysis::triage::Readiness::new(issues);
     let mut recommendations: Vec<serde_json::Value> = Vec::new();
     for r in &impact_results {
         let Some(issue) = issues.iter().find(|i| i.id == r.id) else {
@@ -8789,7 +8785,8 @@ fn priority_recommendations(issues: &[bv_core::model::Issue]) -> Vec<serde_json:
         if let Some(rec) = build_priority_recommendation(
             r,
             issue,
-            &unblocks_by_id,
+            &readiness,
+            &g,
             &th,
             issues,
             &cp_map,
@@ -8798,6 +8795,19 @@ fn priority_recommendations(issues: &[bv_core::model::Issue]) -> Vec<serde_json:
             recommendations.push(rec);
         }
     }
+    // Go `GenerateEnhancedRecommendationsWithThresholds` (whatif.go:200-208)
+    // orders the merged list by impact score and caps it at ten. The
+    // confidence-then-score-then-id ordering in `GenerateRecommendationsFromStats`
+    // (priority.go:720-729) does not survive to the output, because Go rebuilds
+    // those recommendations into a map keyed by issue id (whatif.go:148-151) and
+    // walks the impact scores in their original order instead.
+    recommendations.sort_by(|a, b| {
+        b["impact_score"]
+            .as_f64()
+            .partial_cmp(&a["impact_score"].as_f64())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    recommendations.truncate(10);
     recommendations
 }
 
@@ -8840,10 +8850,11 @@ fn run_robot_priority(args: &[String]) -> ExitCode {
     // implementation of Go's recommendation engine.
     let mut recommendations = priority_recommendations(&issues);
 
-    // Go (priority.go:720) sorts by confidence descending, then impact score,
-    // then issue id, so the ordering is stable across runs.
     // Go filters the scored recommendations, not the issue set
-    // (robot_registry.go:940-951).
+    // (robot_registry.go:940-951). The list arrives already ordered by impact
+    // score and capped at ten (see `priority_recommendations`), and the
+    // registry preserves that order — it truncates to `maxResults` but never
+    // re-sorts, so the confidence ordering in priority.go:720 is not reapplied.
     // The emitted recommendation carries no labels or assignee, so match against
     // the source issue the recommendation names.
     let rec_issue = |r: &serde_json::Value| -> Option<&bv_core::model::Issue> {
@@ -8870,57 +8881,23 @@ fn run_robot_priority(args: &[String]) -> ExitCode {
         });
     }
 
-    recommendations.sort_by(|a, b| {
-        b["confidence"]
-            .as_f64()
-            .partial_cmp(&a["confidence"].as_f64())
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| {
-                b["impact_score"]
-                    .as_f64()
-                    .partial_cmp(&a["impact_score"].as_f64())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then_with(|| {
-                a["issue_id"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .cmp(b["issue_id"].as_str().unwrap_or_default())
-            })
-    });
     recommendations.truncate(max_results);
 
     let mut payload = full_envelope_for(&hash, &issues);
     payload["analysis_config"] = priority_analysis_config(g.len());
     // Real status from phase2 analysis (Go priority uses full config).
-    let priority_status = {
-        let mut s = status.clone();
-        if s.page_rank.state == "skipped" {
-            s.page_rank.reason.clear();
-        }
-        if s.eigenvector.state == "skipped" {
-            s.eigenvector.reason.clear();
-        }
-        if s.hits.state == "skipped" {
-            s.hits.reason.clear();
-        }
-        if s.critical.state == "skipped" {
-            s.critical.reason.clear();
-        }
-        if s.cycles.state == "skipped" {
-            s.cycles.reason.clear();
-        }
-        if s.kcore.state == "skipped" {
-            s.kcore.reason.clear();
-        }
-        if s.articulation.state == "skipped" {
-            s.articulation.reason.clear();
-        }
-        if s.slack.state == "skipped" {
-            s.slack.reason.clear();
-        }
-        s.to_json_map()
-    };
+    // Go's `statusEntry.MarshalJSON` (pkg/analysis/graph.go:131-147) omits
+    // `reason` only when the string is empty, and every Go site that sets
+    // `State: "skipped"` fills the reason in the same literal — so the status
+    // the analyzer already produced is exactly Go's shape and nothing is
+    // cleared here. Clearing it was reading `omitempty` as "skipped implies no
+    // reason", which silently dropped "dependency graph contains a cycle;
+    // topological order unavailable" and "graph too large (>2000 nodes)" — the
+    // only signal that a missing Slack, critical-path or cycle number is
+    // unobservable rather than zero. `--robot-triage` clears for the opposite
+    // reason: its fast config disables those metrics outright, so Go has no
+    // reason to report. See the block there.
+    let priority_status = status.to_json_map();
     payload["status"] = priority_status;
     // Go declares LabelScope/LabelContext directly after Status
     // (robot_registry.go:985-1011).

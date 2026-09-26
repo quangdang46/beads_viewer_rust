@@ -254,7 +254,7 @@ impl AnalysisBudget {
         nodes >= self.xl_threshold && self.density >= 0.001
     }
 
-    /// Whether betweenness should use approximate mode (Go: approx when dense).
+    /// Whether betweenness should use approximate mode (Go: approx when *sparse*).
     /// Returns `(use_approx, skip)` where skip means don't compute at all.
     pub fn betweenness_mode(&self, nodes: usize) -> (bool, bool) {
         if self.force_full {
@@ -265,7 +265,9 @@ impl AnalysisBudget {
             // XL: always approximate (Go parity).
             (true, false)
         } else if nodes >= self.medium_threshold {
-            // Large (500-2000): approximate if density >= 0.01, skip otherwise.
+            // Large (500-2000). Go config.go:180-190 samples a *sparse* large
+            // graph and refuses a dense one outright — density >= 0.01 is the
+            // skip branch, not the sample branch.
             if self.density < 0.01 {
                 (true, false)
             } else {
@@ -295,6 +297,31 @@ impl AnalysisBudget {
         } else {
             200
         }
+    }
+}
+
+/// Betweenness as Go's Phase 2 actually computes it — the value that lands in
+/// `stats.betweenness` (graph.go:2300) and that every downstream consumer reads:
+/// impact scoring (priority.go:231), label health, and the insights document.
+///
+/// `ConfigForSize` (config.go:86-190) picks the algorithm from the node count
+/// and the graph's density rather than always running Brandes — exact below 500
+/// nodes, sampled above it, and skipped outright when a large graph is dense
+/// enough. Calling [`betweenness`] directly answers a different question, so a
+/// caller that wants Go's number wants this instead. Skipping yields an empty
+/// vector because Go's `localBetweenness` is left nil on that path, which every
+/// reader treats as "no scores" rather than "a score of zero".
+pub fn go_betweenness(g: &DiGraph) -> Vec<f64> {
+    let n = g.len();
+    let budget = AnalysisBudget::for_graph(g);
+    let (use_approx, skip) = budget.betweenness_mode(n);
+    if skip {
+        return Vec::new();
+    }
+    if use_approx {
+        betweenness_approx(g, budget.recommend_sample_size(n, g.edge_count()), Some(1))
+    } else {
+        betweenness(g)
     }
 }
 
