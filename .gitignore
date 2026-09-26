@@ -65,3 +65,9 @@ tests/fixtures/small_chain/.beads/.bv.lock
 # Editor/agent scratch backups. Never source; an agent left these mid-edit.
 *.bak
 *.bak2
+
+# Artifacts of the single-dash rewriter bug (fixed in 3ca4ce1): a value like
+# -1e400 was treated as a flag name and an export was written into a directory
+# with that name. Guarded so one can never be committed.
+/--*/
+/-*/
