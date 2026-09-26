@@ -6645,7 +6645,16 @@ fn build_robot_insights() -> Result<serde_json::Value, ExitCode> {
     let cp_obj = to_id_map(&g, &cp_heights);
     let cores = bv_graph_core::kcore(&g);
     let core_obj = to_id_map(&g, &cores.iter().map(|&v| v as f64).collect::<Vec<_>>());
-    let slacks = bv_graph_core::slack(&g);
+    // Go computes Slack from the Phase 1 topological order and only when that
+    // order covers every issue (graph.go:2270-2273); on a cyclic graph
+    // `stats.Slack` is left nil, so the document reports an empty list rather
+    // than a longest-path value for a graph that has no longest path.
+    let slack_unavailable = !bv_analysis::analyzer::topological_order_available(&g);
+    let slacks = if slack_unavailable {
+        Vec::new()
+    } else {
+        bv_graph_core::slack(&g)
+    };
     let slack_obj = to_id_map(&g, &slacks);
     let art_pts = bv_graph_core::algorithms::articulation::articulation_points(&g);
     let mut art_ids: Vec<String> = art_pts
@@ -6740,37 +6749,35 @@ fn build_robot_insights() -> Result<serde_json::Value, ExitCode> {
     // full_stats — exactly Go's 9 fields (mapLimit=200 default).
     let map_limit = insights_map_limit();
     let mut fs = serde_json::Map::new();
-    fs.insert(
-        "pagerank".into(),
-        serde_json::Value::Object(limit_metric_map(pr_obj, map_limit)),
-    );
-    fs.insert(
-        "betweenness".into(),
-        serde_json::Value::Object(limit_metric_map(bw_obj, map_limit)),
-    );
-    fs.insert(
-        "eigenvector".into(),
-        serde_json::Value::Object(limit_metric_map(ev_obj, map_limit)),
-    );
-    fs.insert(
-        "hubs".into(),
-        serde_json::Value::Object(limit_metric_map(hub_obj, map_limit)),
-    );
-    fs.insert(
-        "authorities".into(),
-        serde_json::Value::Object(limit_metric_map(auth_obj, map_limit)),
-    );
-    fs.insert(
-        "critical_path_score".into(),
-        serde_json::Value::Object(limit_metric_map(cp_obj, map_limit)),
-    );
-    fs.insert(
-        "core_number".into(),
-        serde_json::Value::Object(limit_metric_map(core_obj, map_limit)),
-    );
+    for (key, obj) in [
+        ("pagerank", pr_obj),
+        ("betweenness", bw_obj),
+        ("eigenvector", ev_obj),
+        ("hubs", hub_obj),
+        ("authorities", auth_obj),
+        ("critical_path_score", cp_obj),
+        ("core_number", core_obj),
+    ] {
+        fs.insert(
+            key.into(),
+            serde_json::Value::Object(limit_metric_map(obj, map_limit)),
+        );
+    }
+    // Slack is the one metric whose *nil-ness* is load-bearing. Go declares
+    // `var localSlack map[string]float64` and only assigns it when the
+    // topological order covers every issue (graph.go:2270-2273), so on a
+    // cyclic graph `stats.Slack()` hands `limitMaps` a nil map and the
+    // document carries `null`. A metric that ran and found nothing is an
+    // allocated empty map and stays `{}` — critical_path_score on the same
+    // fixture is exactly that case, so this cannot be decided by emptiness
+    // alone.
     fs.insert(
         "slack".into(),
-        serde_json::Value::Object(limit_metric_map(slack_obj, map_limit)),
+        if slack_unavailable {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::Object(limit_metric_map(slack_obj, map_limit))
+        },
     );
     // Go's `limitSlice` (robot_registry.go:1932-1939) caps this list at the
     // same mapLimit as the maps: `in[:limit]`, no sorting.
@@ -7306,6 +7313,10 @@ fn generate_advanced_insights(
             }
         }
     }
+    // Go's gate is `len(topoOrder) != n` (advanced_insights.go:817): a partial
+    // order cannot support an honest longest-path result, because paths
+    // through or downstream of a cycle would be silently omitted.
+    let order_available = topo.len() == n;
     let mut dist = vec![0i64; n];
     let mut pred = vec![-1i64; n];
     for &u in &topo {
@@ -7318,7 +7329,11 @@ fn generate_advanced_insights(
             }
         }
     }
-    let mut path_ends: Vec<(usize, i64)> = (0..n).map(|i| (i, dist[i])).collect();
+    let mut path_ends: Vec<(usize, i64)> = if order_available {
+        (0..n).map(|i| (i, dist[i])).collect()
+    } else {
+        Vec::new()
+    };
     path_ends.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| nodes[a.0].cmp(&nodes[b.0])));
     let mut paths: Vec<serde_json::Value> = Vec::new();
     let mut used_sources: std::collections::HashSet<usize> = std::collections::HashSet::new();
@@ -7379,13 +7394,27 @@ fn generate_advanced_insights(
     let mut k_paths = serde_json::json!({
         // Go's KPathsResult.Limited is the number of representative sources
         // considered (advanced_insights.go:943), not the total path count.
-        "status": feature_status(
-            "available",
-            "",
-            paths.len() >= 5 && total_paths > 5,
-            paths.len() as i64,
-            representative_sources.len() as i64,
-        ),
+        "status": if order_available {
+            feature_status(
+                "available",
+                "",
+                paths.len() >= 5 && total_paths > 5,
+                paths.len() as i64,
+                representative_sources.len() as i64,
+            )
+        } else {
+            // A partial topological order cannot support an honest
+            // longest-path result: paths through or downstream of a cycle
+            // would be silently omitted. Go fails closed and points at the
+            // cycle-break feature (advanced_insights.go:814-822).
+            feature_status(
+                "skipped",
+                "Dependency graph contains a cycle; break cycles before computing critical paths",
+                false,
+                0,
+                0,
+            )
+        },
         "how_to_use": "Representative longest critical paths. Focus on issues appearing in multiple paths.",
     });
     // Go's KPathsResult.Paths is `omitempty` (advanced_insights.go:173), so a
@@ -7562,19 +7591,33 @@ fn generate_advanced_insights(
         let mut edge_freq: std::collections::BTreeMap<(String, String), Vec<i64>> =
             std::collections::BTreeMap::new();
         for (ci, cycle) in cycles.iter().enumerate() {
-            if cycle.len() < 2 || cycle[0] == "CYCLE_DETECTION_TIMEOUT" || cycle[0] == "..." {
+            if cycle.is_empty() {
                 continue;
             }
-            for j in 0..cycle.len() - 1 {
-                edge_freq
-                    .entry((cycle[j].clone(), cycle[j + 1].clone()))
-                    .or_default()
-                    .push(ci as i64);
+            // Go (advanced_insights.go:358-361) drops the two sentinel cycles
+            // the detector can emit in place of a real path.
+            if cycle[0] == "CYCLE_DETECTION_TIMEOUT" || cycle[0] == "..." {
+                continue;
             }
-            edge_freq
-                .entry((cycle[cycle.len() - 1].clone(), cycle[0].clone()))
-                .or_default()
-                .push(ci as i64);
+            // The detector returns closed paths (A,B,C,A) while test and external
+            // callers may supply the compact form (A,B,C). Go normalizes both to
+            // the same edge ring by dropping the repeated tail — closing an
+            // already-closed path would invent A->A — and then skips an edge it
+            // has already recorded for this cycle. Without that second guard a
+            // closed path counted its wrap edge twice, which is what promoted
+            // the self-loop Cyc-33->Cyc-33 to the top of the ranking.
+            let mut node_count = cycle.len();
+            if node_count > 1 && cycle[0] == cycle[node_count - 1] {
+                node_count -= 1;
+            }
+            let mut seen: std::collections::BTreeSet<(String, String)> = Default::default();
+            for j in 0..node_count {
+                let key = (cycle[j].clone(), cycle[(j + 1) % node_count].clone());
+                if !seen.insert(key.clone()) {
+                    continue;
+                }
+                edge_freq.entry(key).or_default().push(ci as i64);
+            }
         }
         let mut ranked: Vec<(&(String, String), &Vec<i64>)> = edge_freq.iter().collect();
         ranked.sort_by(|a, b| {
@@ -7585,12 +7628,21 @@ fn generate_advanced_insights(
         });
         let mut suggestions: Vec<serde_json::Value> = Vec::new();
         for ((from, to), cycs) in ranked.iter().take(5) {
+            // Go `countDependents` (advanced_insights.go:432-445) walks the
+            // dependents that are still open, so a closed dependent does not
+            // count as collateral.
             let collateral = issues
                 .iter()
                 .filter(|i| {
                     i.dependencies
                         .iter()
                         .any(|d| d.r#type.is_blocking() && d.effective_depends_on() == to.as_str())
+                })
+                .filter(|i| {
+                    !matches!(
+                        i.status,
+                        bv_core::model::Status::Closed | bv_core::model::Status::Tombstone
+                    )
                 })
                 .count();
             suggestions.push(serde_json::json!({
@@ -7599,7 +7651,7 @@ fn generate_advanced_insights(
                 "impact": cycs.len(),
                 "collateral": collateral,
                 "in_cycles": cycs,
-                "rationale": "Appears in most cycles; removing minimizes structural damage.",
+                "rationale": "Appears in the most stored cycle records; review collateral before removing this dependency.",
             }));
         }
         let capped = ranked.len() > 5;
@@ -7608,7 +7660,7 @@ fn generate_advanced_insights(
             "suggestions": suggestions,
             "cycle_count": cycles.len(),
             "how_to_use": "Structural fix suggestions. Apply BEFORE working on cycle members.",
-            "advisory": "",
+            "advisory": "Cycle detection stores one representative cycle per cyclic component; review each edge and re-run analysis after a break.",
         })
     };
 
@@ -8548,6 +8600,7 @@ fn compute_parallel_gain(issues: &[bv_core::model::Issue], limit: usize) -> serd
         .collect();
     let active: std::collections::BTreeSet<String> =
         actionable.iter().map(|i| i.id.clone()).collect();
+    let readiness = bv_analysis::triage::Readiness::new(issues);
 
     // Union-find over the open graph (blocking and parent-child edges), counting
     // components that still contain an actionable member.
@@ -8616,35 +8669,34 @@ fn compute_parallel_gain(issues: &[bv_core::model::Issue], limit: usize) -> serd
 
     let mut items: Vec<(String, String, usize, i64, f64, Vec<String>)> = Vec::new();
     for issue in &actionable {
-        // Go `generateParallelGain` (advanced_insights.go:985) uses the same
-        // marginal-unblocks rule as parallel_cut: the issues that become ready
-        // once this one is done, minus the completed node itself. Rust was
-        // measuring a track-count delta instead, which is a different
-        // quantity and admitted far more positive-gain candidates.
-        let mut unblocks: Vec<String> = Vec::new();
-        for o in issues.iter().filter(|o| is_open(o) && o.id != issue.id) {
-            let mut blocks_on_this = false;
-            let mut other_open_blocker = false;
-            for d in o.dependencies.iter().filter(|d| d.r#type.is_blocking()) {
-                let target = d.effective_depends_on();
-                if target == issue.id {
-                    blocks_on_this = true;
-                } else if issues.iter().any(|x| x.id == target && is_open(x)) {
-                    other_open_blocker = true;
-                    break;
-                }
-            }
-            // `other_open_blocker` already excludes issues that were ready
-            // before (Go's `!before[id]`); re-testing has_open_blocker here
-            // would also reject the very node being completed, since it is
-            // still open in the global view.
-            if blocks_on_this && !other_open_blocker {
-                unblocks.push(o.id.clone());
-            }
-        }
+        // Go `generateParallelGain` (advanced_insights.go:1176-1200) simulates
+        // the completion: it takes the issues that become ready afterwards,
+        // rebuilds the active set from the survivors plus those unlocks, and
+        // re-runs the union-find *without* the completed node to get a real
+        // `tracksAfter`. The gain is that recomputed track delta. Deriving it
+        // from the unblock count instead (`unblocks.len() - 1`) measures a
+        // different quantity: on large_cyclic_600 it admitted 2 candidates
+        // where Go's sweep admits 14 and reports 5.
+        let mut completed: std::collections::BTreeSet<String> = Default::default();
+        completed.insert(issue.id.clone());
+        // `computeMarginalUnblocksFromBefore` (advanced_insights.go:570-588)
+        // walks the whole issue set, so an issue already actionable cannot be a
+        // new unlock — that is the `!before[id]` half of the test.
+        let mut unblocks: Vec<String> = issues
+            .iter()
+            .filter(|o| !active.contains(o.id.as_str()))
+            .filter(|o| readiness.ready_after(o.id.as_str(), robot_now(), Some(&completed)))
+            .map(|o| o.id.clone())
+            .collect();
         unblocks.sort();
-        let gain = unblocks.len() as i64 - 1;
-        let tracks_after = tracks_now as i64 + gain;
+        let mut after: std::collections::BTreeSet<String> = active
+            .iter()
+            .filter(|id| id.as_str() != issue.id.as_str())
+            .cloned()
+            .collect();
+        after.extend(unblocks.iter().cloned());
+        let tracks_after = count_tracks(Some(issue.id.as_str()), &after);
+        let gain = tracks_after as i64 - tracks_now as i64;
         if gain <= 0 {
             continue;
         }
@@ -8653,7 +8705,6 @@ fn compute_parallel_gain(issues: &[bv_core::model::Issue], limit: usize) -> serd
         } else {
             0.0
         };
-        let tracks_after = tracks_after as usize;
         items.push((
             issue.id.clone(),
             issue.title.clone(),

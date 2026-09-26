@@ -523,7 +523,7 @@ impl<'a> Readiness<'a> {
     /// Go `ReadinessIndex.ReadyAfter` (readiness.go:223-262) — the bounded
     /// what-if frontier. `completed == None` (Go's empty map) defers to
     /// [`Readiness::ready`].
-    fn ready_after(
+    pub fn ready_after(
         &self,
         id: &str,
         now: jiff::Timestamp,
@@ -974,7 +974,13 @@ pub fn build_triage(issues: &[Issue], g: &DiGraph, now: jiff::Timestamp) -> Tria
     //    mid-chain issue a depth of 1, so the quick-win boost (gated at
     //    depth <= 2) fired far too often and every score past the first link
     //    came out too high.
-    let mut blocker_depths: BTreeMap<String, usize> = BTreeMap::new();
+    // The map holds Go's signed depth, including the -1 that marks a cycle.
+    // Dropping the -1 entries and defaulting the lookup to 0 made every node in
+    // a cycle look like a root: the quick-win gate is `depth <= max && depth >=
+    // 0` (triage.go:1379), so -1 is what excludes a cycle from the boost, and
+    // substituting 0 granted it. On large_cyclic_600 that inflated Cyc-2 by
+    // exactly base_score * 0.15 and reordered the whole list.
+    let mut blocker_depths: BTreeMap<String, i64> = BTreeMap::new();
     for issue in issues {
         if !issue.status.is_open() {
             continue;
@@ -982,9 +988,7 @@ pub fn build_triage(issues: &[Issue], g: &DiGraph, now: jiff::Timestamp) -> Tria
         let mut visited: std::collections::BTreeSet<String> = Default::default();
         let mut memo: BTreeMap<String, i64> = BTreeMap::new();
         let depth = blocker_depth_recursive(&issue.id, issues, &mut visited, &mut memo);
-        if depth >= 0 {
-            blocker_depths.insert(issue.id.clone(), depth as usize);
-        }
+        blocker_depths.insert(issue.id.clone(), depth);
     }
 
     // Go builds the recommendation's graph context here: `UnblocksIDs` from the
@@ -1006,7 +1010,7 @@ pub fn build_triage(issues: &[Issue], g: &DiGraph, now: jiff::Timestamp) -> Tria
         if !rec.blocked_by.is_empty() {
             rec.claimable = false;
         }
-        let blocker_depth = *blocker_depths.get(&rec.id).unwrap_or(&0);
+        let blocker_depth = *blocker_depths.get(&rec.id).unwrap_or(&-1);
         let unblocks = rec.unblocks_ids.len();
         let base_score = rec.score;
 
@@ -1018,9 +1022,12 @@ pub fn build_triage(issues: &[Issue], g: &DiGraph, now: jiff::Timestamp) -> Tria
             0.0
         };
 
-        // Quick-win boost: depth-based factor * base score * weight
+        // Quick-win boost: depth-based factor * base score * weight. Go's gate
+        // is `blockerDepth <= QuickWinMaxDepth && blockerDepth >= 0`
+        // (triage.go:1379); the `>= 0` half is what a `usize` depth could not
+        // express, so it is spelled out here rather than left to the types.
         let quickwin_boost = if rec.status != Status::InProgress.as_str()
-            && blocker_depth <= TRIAGE_QUICKWIN_MAX_DEPTH
+            && (0..=TRIAGE_QUICKWIN_MAX_DEPTH as i64).contains(&blocker_depth)
         {
             let depth_factor =
                 1.0 - blocker_depth as f64 / (TRIAGE_QUICKWIN_MAX_DEPTH as f64 + 1.0);
