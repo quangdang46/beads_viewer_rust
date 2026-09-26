@@ -523,7 +523,31 @@ pub struct GraphStats {
 pub fn compute_graph_stats(issues: &[Issue]) -> GraphStats {
     let g = crate::build_graph(issues);
     let pr = bv_graph_core::algorithms::pagerank::pagerank_default(&g);
-    let bw = bv_graph_core::algorithms::betweenness::betweenness(&g);
+    // Go does not call Brandes directly here. `ComputeAllLabelHealth` builds
+    // its own `Analyzer` and calls `Analyze()` (label_health.go:570-571), which
+    // runs `ConfigForSize` — and that selects *approximate* betweenness for a
+    // large or sparse graph (config.go:180-184), sampling
+    // `RecommendSampleSize(nodeCount, edgeCount)` pivots with seed 1.
+    //
+    // Calling the exact algorithm instead changes the answer, not just its
+    // cost. Measured on large_cyclic_600: exact gives 337 nodes above zero
+    // with max 184 and mean 17.48, where Go reports 176 / 210 / 13.72 — the
+    // approximate path reproduces Go exactly. Since `BottleneckCount` counts
+    // nodes with betweenness > 0 (label_health.go:592-594), using the wrong
+    // one inflated it from 176 to 337.
+    let budget = crate::analyzer::AnalysisBudget::for_graph(&g);
+    let n = g.len();
+    let sample = budget.recommend_sample_size(n, g.edge_count());
+    let (approx, skip) = budget.betweenness_mode(n);
+    let bw = if skip {
+        // Go skips the metric on a dense graph and `Betweenness()` then yields
+        // no scores, so every lookup is the zero value.
+        Vec::new()
+    } else if approx {
+        bv_graph_core::algorithms::betweenness::betweenness_approx(&g, sample, Some(1))
+    } else {
+        bv_graph_core::algorithms::betweenness::betweenness(&g)
+    };
     let cp = bv_graph_core::algorithms::critical_path::critical_path_heights(&g);
     let mut pagerank = BTreeMap::new();
     let mut betweenness = BTreeMap::new();

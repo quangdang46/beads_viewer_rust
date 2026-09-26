@@ -193,6 +193,22 @@ impl Default for AnalysisBudget {
 }
 
 impl AnalysisBudget {
+    /// Go `ConfigForSize(nodeCount, edgeCount)` (pkg/analysis/config.go:86-88):
+    /// the density that drives the sparse/dense branch is
+    /// `edges / (nodes * (nodes - 1))`, the same expression Phase 1 uses.
+    pub fn for_graph(g: &DiGraph) -> AnalysisBudget {
+        let n = g.len() as f64;
+        let density = if n <= 1.0 {
+            0.0
+        } else {
+            g.edge_count() as f64 / (n * (n - 1.0))
+        };
+        AnalysisBudget {
+            density,
+            ..AnalysisBudget::default()
+        }
+    }
+
     /// Timeout for a metric at a given node count (Go ConfigForSize tiers).
     pub fn timeout_for(&self, nodes: usize) -> Duration {
         if let Some(s) = self.override_secs {
