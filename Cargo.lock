@@ -215,6 +215,7 @@ dependencies = [
  "crossbeam-channel",
  "flate2",
  "jiff",
+ "libc",
  "pprof",
  "regex",
  "serde_json",

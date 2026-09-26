@@ -1798,50 +1798,65 @@ fn main() -> ExitCode {
             .unwrap_or_else(|| "Beads Dashboard".to_string());
         let include_closed = args.iter().any(|a| a == "--pages-include-closed");
         let cwd = std::env::current_dir().unwrap_or_default();
-        let (issues, hash, _as_of_commit) = match load_issues_auto(&cwd, None) {
-            Ok(x) => x,
-            Err(e) => {
-                eprintln!("Error: {e}");
-                return ExitCode::from(1);
+
+        // Go main.go:3061-3214 wraps the export in a `doExport` closure with an
+        // `exportCount` captured beside it, so `--watch-export` re-runs the
+        // identical pipeline and can label the run "Re-exporting (change #N)".
+        // The counter is the closure's own state in Go; here it is an argument
+        // because the loop that re-enters it lives in `run_export_watch`.
+        let mut export_count: u32 = 0;
+        let do_export = |export_count: &mut u32| -> Result<(), String> {
+            *export_count += 1;
+            // Go main.go:3066-3071 — the first run announces the export, later
+            // runs are labelled with a wall-clock stamp and their ordinal.
+            if *export_count > 1 {
+                println!(
+                    "\n[{}] Re-exporting (change #{})...",
+                    hhmmss_now(),
+                    *export_count - 1
+                );
+            } else {
+                println!("Exporting static site...");
             }
-        };
 
-        let visible: Vec<&bv_core::model::Issue> = issues
-            .iter()
-            .filter(|i| include_closed || !i.status.is_closed())
-            .collect();
+            let (issues, hash, _as_of_commit) = load_issues_auto(&cwd, None)?;
 
-        let open = visible
-            .iter()
-            .filter(|i| matches!(i.status, bv_core::model::Status::Open))
-            .count();
-        let in_prog = visible
-            .iter()
-            .filter(|i| matches!(i.status, bv_core::model::Status::InProgress))
-            .count();
-        let blocked = visible
-            .iter()
-            .filter(|i| matches!(i.status, bv_core::model::Status::Blocked))
-            .count();
-        let closed = issues.iter().filter(|i| i.status.is_closed()).count();
+            let visible: Vec<&bv_core::model::Issue> = issues
+                .iter()
+                .filter(|i| include_closed || !i.status.is_closed())
+                .collect();
 
-        let mermaid = bv_export::graph_export::generate_mermaid_graph(&issues);
-        let rows: String = visible
-            .iter()
-            .map(|i| {
-                format!(
-                    "<tr><td>{}</td><td>{}</td><td>{}</td><td>P{}</td><td>{}</td></tr>\n",
-                    i.id,
-                    html_escape(&i.title),
-                    i.status.as_str(),
-                    i.priority,
-                    i.issue_type
-                )
-            })
-            .collect();
+            let open = visible
+                .iter()
+                .filter(|i| matches!(i.status, bv_core::model::Status::Open))
+                .count();
+            let in_prog = visible
+                .iter()
+                .filter(|i| matches!(i.status, bv_core::model::Status::InProgress))
+                .count();
+            let blocked = visible
+                .iter()
+                .filter(|i| matches!(i.status, bv_core::model::Status::Blocked))
+                .count();
+            let closed = issues.iter().filter(|i| i.status.is_closed()).count();
 
-        let html = format!(
-            r#"<!DOCTYPE html>
+            let mermaid = bv_export::graph_export::generate_mermaid_graph(&issues);
+            let rows: String = visible
+                .iter()
+                .map(|i| {
+                    format!(
+                        "<tr><td>{}</td><td>{}</td><td>{}</td><td>P{}</td><td>{}</td></tr>\n",
+                        i.id,
+                        html_escape(&i.title),
+                        i.status.as_str(),
+                        i.priority,
+                        i.issue_type
+                    )
+                })
+                .collect();
+
+            let html = format!(
+                r#"<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
@@ -1872,99 +1887,122 @@ th {{ background: #44475a; }}
 </body>
 </html>
 "#
-        );
+            );
 
-        std::fs::create_dir_all(&out_dir).ok();
-        // Go main.go:1624 registers `--pages-include-history` with default
-        // TRUE, and main.go:3178-3190 writes `data/history.json` for the
-        // time-travel scrubber whenever it is on. Rust wrote only index.html,
-        // so the DEFAULT invocation lost the history data — the flag being
-        // unwired was not just an ignored modifier.
-        //
-        // The gate is pflag's boolean, not a `--no-` prefix: Go has no
-        // auto-negation, so the one way to turn this off is
-        // `--pages-include-history=false` (verified against the v0.25.0
-        // oracle). The old test for the string `--no-pages-include-history`
-        // matched neither the bare flag nor Go's real disable spelling, and
-        // silently accepted a token Go rejects. See `argv::go_bool_flag`.
-        let include_history = match argv::go_bool_flag(&args, "pages-include-history", true) {
-            Ok(v) => v,
-            Err(msg) => {
-                eprintln!("Error: {msg}");
-                return ExitCode::from(1);
-            }
-        };
-        if include_history {
-            let beads_file = cwd
-                .join(".beads")
-                .join("issues.jsonl")
-                .to_string_lossy()
-                .to_string();
-            let generated_at = jiff_now();
-            // Go main.go:7088-7095 builds the export's report on a correlator
-            // with the feedback store attached, exactly like the robot paths.
-            match generate_correlation_report(
-                &cwd,
-                &issues,
-                &bv_correlation::history::HistoryOptions {
-                    limit: 500,
-                    ..Default::default()
-                },
-                generated_at.clone(),
-                true,
-            ) {
-                Ok(report) => {
-                    match bv_export::time_travel::generate_history_for_export(
-                        &cwd,
-                        &beads_file,
-                        &report,
-                        &generated_at,
-                    ) {
-                        Ok(history) => {
-                            match serde_json::to_string_pretty(&history) {
-                                Ok(json) => {
-                                    // Go warns and continues on write failure
-                                    // rather than aborting the export.
-                                    if let Err(e) =
-                                        std::fs::create_dir_all(format!("{out_dir}/data"))
-                                    {
-                                        println!("  → Warning: failed to create data dir: {e}");
-                                    } else if let Err(e) =
-                                        std::fs::write(format!("{out_dir}/data/history.json"), json)
-                                    {
-                                        println!("  → Warning: failed to write history.json: {e}");
-                                    } else {
-                                        println!(
-                                            "  → history.json ({} commits)",
-                                            history.commits.len()
-                                        );
+            std::fs::create_dir_all(&out_dir).ok();
+            // Go main.go:1624 registers `--pages-include-history` with default
+            // TRUE, and main.go:3178-3190 writes `data/history.json` for the
+            // time-travel scrubber whenever it is on. Rust wrote only index.html,
+            // so the DEFAULT invocation lost the history data — the flag being
+            // unwired was not just an ignored modifier.
+            //
+            // The gate is pflag's boolean, not a `--no-` prefix: Go has no
+            // auto-negation, so the one way to turn this off is
+            // `--pages-include-history=false` (verified against the v0.25.0
+            // oracle). The old test for the string `--no-pages-include-history`
+            // matched neither the bare flag nor Go's real disable spelling, and
+            // silently accepted a token Go rejects. See `argv::go_bool_flag`.
+            let include_history = argv::go_bool_flag(&args, "pages-include-history", true)?;
+            if include_history {
+                let beads_file = cwd
+                    .join(".beads")
+                    .join("issues.jsonl")
+                    .to_string_lossy()
+                    .to_string();
+                let generated_at = jiff_now();
+                // Go main.go:7088-7095 builds the export's report on a correlator
+                // with the feedback store attached, exactly like the robot paths.
+                match generate_correlation_report(
+                    &cwd,
+                    &issues,
+                    &bv_correlation::history::HistoryOptions {
+                        limit: 500,
+                        ..Default::default()
+                    },
+                    generated_at.clone(),
+                    true,
+                ) {
+                    Ok(report) => {
+                        match bv_export::time_travel::generate_history_for_export(
+                            &cwd,
+                            &beads_file,
+                            &report,
+                            &generated_at,
+                        ) {
+                            Ok(history) => {
+                                match serde_json::to_string_pretty(&history) {
+                                    Ok(json) => {
+                                        // Go warns and continues on write failure
+                                        // rather than aborting the export.
+                                        if let Err(e) =
+                                            std::fs::create_dir_all(format!("{out_dir}/data"))
+                                        {
+                                            println!("  → Warning: failed to create data dir: {e}");
+                                        } else if let Err(e) = std::fs::write(
+                                            format!("{out_dir}/data/history.json"),
+                                            json,
+                                        ) {
+                                            println!(
+                                                "  → Warning: failed to write history.json: {e}"
+                                            );
+                                        } else {
+                                            println!(
+                                                "  → history.json ({} commits)",
+                                                history.commits.len()
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        println!("  → Warning: failed to encode history.json: {e}");
                                     }
                                 }
-                                Err(e) => {
-                                    println!("  → Warning: failed to encode history.json: {e}");
-                                }
+                            }
+                            Err(e) => {
+                                println!("  → Warning: failed to generate history data: {e}");
                             }
                         }
-                        Err(e) => {
-                            println!("  → Warning: failed to generate history data: {e}");
-                        }
+                    }
+                    Err(e) => {
+                        println!("  → Warning: failed to generate history report: {e}");
                     }
                 }
-                Err(e) => {
-                    println!("  → Warning: failed to generate history report: {e}");
-                }
             }
+            std::fs::write(format!("{out_dir}/index.html"), html)
+                .map_err(|e| format!("Error writing {out_dir}/index.html: {e}"))?;
+            // Go main.go:3212 closes every doExport with a wall-clock completion
+            // stamp, including the initial run — the watch banner follows it.
+            println!("✓ Export complete [{}]", hhmmss_now());
+            Ok(())
+        };
+
+        // Go main.go:3216-3219 — the initial export runs before the watcher is
+        // ever created, and a failure exits 1 with `Error: %v` on stderr.
+        if let Err(e) = do_export(&mut export_count) {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
         }
-        match std::fs::write(format!("{out_dir}/index.html"), html) {
-            Ok(_) => {
-                println!("Static site exported to {out_dir}");
-                return ExitCode::from(0);
-            }
-            Err(e) => {
-                eprintln!("Error writing {out_dir}/index.html: {e}");
-                return ExitCode::from(1);
-            }
+
+        // Go main.go:3223 — only now does watch mode take over; without the
+        // flag this falls straight through to the success message.
+        if args.iter().any(|a| a == "--watch-export") {
+            // Watch the file that was actually LOADED, not a hardcoded
+            // `.beads/issues.jsonl`. Go appends `beadsPath` — the discovered
+            // source (main.go:3268) — so `--db`, `BEADS_DB` and auto-discovery
+            // all move the watch target with the load. A fixed path would watch
+            // a file nobody reads and never fire.
+            let source = load_issues_auto_meta(&cwd, None)
+                .map(|(_, _, _, m)| m.path)
+                .unwrap_or_default();
+            let watch_path = if source.is_empty() {
+                cwd.join(".beads").join("issues.jsonl")
+            } else {
+                std::path::PathBuf::from(source)
+            };
+            return run_export_watch(&out_dir, &cwd, &watch_path, &mut export_count, do_export);
         }
+
+        println!("Static site exported to {out_dir}");
+        return ExitCode::from(0);
     }
 
     // Preview pages (Go --preview-pages): export then serve with livereload.
@@ -2505,6 +2543,217 @@ fn source_meta_for(issues: &[bv_core::model::Issue]) -> SourceMeta {
         valid: issues.len(),
         ..Default::default()
     }
+}
+
+/// Go `time.Now().Format("15:04:05")` — the wall clock, local zone.
+///
+/// Deliberately NOT `robot_now_zone()`: that one honours a frozen
+/// `SOURCE_DATE_EPOCH` because Go's robot stamps are reproducible. The export
+/// progress lines come from a bare `time.Now()` in the oracle
+/// (main.go:3067, 3212), so freezing them would be a second, subtler drift.
+fn hhmmss_now() -> String {
+    let zoned = jiff::Timestamp::now()
+        .to_zoned(jiff::tz::TimeZone::try_system().unwrap_or(jiff::tz::TimeZone::UTC));
+    format!(
+        "{:02}:{:02}:{:02}",
+        zoned.hour(),
+        zoned.minute(),
+        zoned.second()
+    )
+}
+
+/// Identity of the watched source: mtime and size, or `(None, None)` when the
+/// file is unreadable.
+///
+/// The unreadable case is a value, not an error, because Go's watcher reports
+/// removal and permission failures on the same channel as a real change
+/// (`watcher.WithOnError` forwards into `mergedChangeCh`, main.go:3284-3292) —
+/// they change which source is authoritative even though the file cannot be
+/// read. Modelling them as a distinct stamp makes a vanished file register as a
+/// change exactly once, and a reappearing one register again.
+fn source_stamp(path: &std::path::Path) -> (Option<std::time::SystemTime>, Option<u64>) {
+    match std::fs::metadata(path) {
+        Ok(m) => (m.modified().ok(), Some(m.len())),
+        Err(_) => (None, None),
+    }
+}
+
+/// Raised by the SIGINT/SIGTERM handler; polled by the watch loop. A handler may
+/// only touch async-signal-safe state, so this is an atomic flag and the loop
+/// does the printing.
+static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn on_stop_signal(_: libc::c_int) {
+    STOP_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Go main.go:3315-3317 — `signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)`.
+///
+/// Installing a handler is what makes the graceful path reachable at all: on the
+/// default disposition Ctrl+C kills the process with 130 before any watch code
+/// runs, so the loop could never print its farewell.
+fn install_stop_handler() {
+    use std::sync::atomic::Ordering;
+    STOP_REQUESTED.store(false, Ordering::SeqCst);
+    // SAFETY: `on_stop_signal` is a plain `extern "C" fn` that only does an
+    // atomic store, which is async-signal-safe. Nothing is allocated, locked
+    // or printed from the handler. The `as *const ()` hop is the documented way
+    // to turn a function item into a `sighandler_t` without a lossy direct
+    // integer cast.
+    unsafe {
+        let handler = on_stop_signal as *const () as libc::sighandler_t;
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGTERM, handler);
+    }
+}
+
+/// Go main.go:3223-3453 — `--watch-export` watch mode.
+///
+/// The coalescing loop (#159 upstream): bursts of file changes collapse into one
+/// export, the window widens adaptively so sustained churn cannot thrash the
+/// CPU, and an unchanged source skips the expensive regeneration entirely.
+///
+/// Sync by construction (AGENTS.md: no tokio). A `std::thread` polls the
+/// source's mtime and pushes into a `crossbeam-channel::bounded(1)` — bounded
+/// and `try_send`, which is the direct analogue of Go's buffered
+/// `mergedChangeCh` and its non-blocking `select`/`default` forwarders
+/// (main.go:3275-3277). The main thread drives the settle window with
+/// `recv_timeout`, the same shape as Go's `select` over `mergedChangeCh`,
+/// `settleC` and `sigCh`.
+fn run_export_watch<F>(
+    out_dir: &str,
+    cwd: &std::path::Path,
+    watch_file: &std::path::Path,
+    export_count: &mut u32,
+    mut do_export: F,
+) -> ExitCode
+where
+    F: FnMut(&mut u32) -> Result<(), String>,
+{
+    use crossbeam_channel::RecvTimeoutError;
+    use std::time::{Duration, Instant};
+
+    // Go main.go:3224-3271 — the banner, verbatim. Go prints the watched file
+    // list here, which is one entry outside workspace mode.
+    println!();
+    println!("Watch mode enabled. Monitoring for changes...");
+    println!("  → Watching: {}", watch_file.display());
+    println!("  → Press Ctrl+C to stop");
+    println!();
+    println!("To preview with auto-refresh, run in another terminal:");
+    println!("  bv --preview-pages {out_dir}");
+    println!();
+
+    install_stop_handler();
+
+    let (tx, rx) = crossbeam_channel::bounded::<()>(1);
+    let poll_path = watch_file.to_path_buf();
+    let mut stamp = source_stamp(&poll_path);
+    std::thread::spawn(move || loop {
+        // 500ms debounce, matching `watcher.WithDebounceDuration(500ms)`
+        // (main.go:3279). Polling mtime stands in for fsnotify: the watched
+        // target is a single JSONL file, so there is no directory-walk
+        // behaviour for the event stream to lose.
+        std::thread::sleep(Duration::from_millis(500));
+        let now = source_stamp(&poll_path);
+        if now != stamp {
+            stamp = now;
+            // Full buffer means a change is already pending and this one
+            // coalesces into it — Go's `default:` arm at main.go:3310.
+            let _ = tx.try_send(());
+        }
+    });
+
+    // Go main.go:3364-3367 — the window floor and ceiling.
+    const WATCH_SETTLE_MIN: Duration = Duration::from_millis(500);
+    const WATCH_SETTLE_MAX: Duration = Duration::from_secs(30);
+
+    // Seeded from the initial export so the first change does not redo
+    // identical work (main.go:3369). A load failure at this point still
+    // yields a stamp, because the initial export already succeeded.
+    let mut last_hash = load_issues_auto(cwd, None)
+        .map(|(_, h, _)| h)
+        .unwrap_or_default();
+
+    let mut settle = WATCH_SETTLE_MIN;
+    // `armSettle()` is called once up front (main.go:3396-3398): a change can
+    // land while the initial bundle is still being written, before any watcher
+    // is attached. `None` models Go's `settleC = nil` — once a settle has
+    // fired the loop stops polling for one and waits for the next change.
+    let mut deadline: Option<Instant> = Some(Instant::now() + settle);
+
+    loop {
+        if STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+            // Go main.go:3446-3448 — the farewell is the one line the loop
+            // emits on shutdown, and the exit is 0, not a signal death code.
+            println!("\nStopping watch mode...");
+            return ExitCode::from(0);
+        }
+
+        // While armed, wait exactly the remainder of the window; while idle,
+        // poll often enough that Ctrl+C feels immediate.
+        let wait = match deadline {
+            Some(d) => d.saturating_duration_since(Instant::now()),
+            None => Duration::from_millis(200),
+        };
+        match rx.recv_timeout(wait) {
+            // Go's `case <-mergedChangeCh: armSettle()` (main.go:3399-3401):
+            // a change inside the quiet window pushes the deadline out rather
+            // than starting a second export.
+            Ok(()) => {
+                deadline = Some(Instant::now() + settle);
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+
+        let Some(armed) = deadline else {
+            // Idle: the wait above was only a stop-flag poll, so loop round.
+            continue;
+        };
+        if Instant::now() < armed {
+            // Woken by a spurious wakeup before the window closed.
+            continue;
+        }
+        deadline = None; // settleC = nil
+
+        // Go main.go:3403-3411 — reload and re-fingerprint. Go compares both a
+        // content hash and an authority hash; the loader's data_hash is the
+        // content half and the only one Rust can observe here, so a source
+        // whose bytes are unchanged is skipped.
+        let fresh = match load_issues_auto(cwd, None) {
+            Ok((_, h, _)) => h,
+            Err(e) => {
+                // Go main.go:3404-3406 — a reload failure is reported and the
+                // loop waits for the next change; it does not exit.
+                println!("  → Error reloading issues: {e}");
+                continue;
+            }
+        };
+        if fresh == last_hash {
+            // Go main.go:3414-3418 — content-identical rewrite, so reset the
+            // window to the floor and export nothing.
+            settle = WATCH_SETTLE_MIN;
+            continue;
+        }
+
+        let started = Instant::now();
+        if let Err(e) = do_export(export_count) {
+            // Go main.go:3423-3426 — a failed export is reported and the loop
+            // keeps watching rather than tearing down the session.
+            println!("  → Export error: {e}");
+            continue;
+        }
+        last_hash = fresh;
+
+        // Go main.go:3430-3437 — adaptive backoff: widen to ~2x the export
+        // cost so sustained churn cannot pin the CPU, clamped to the window
+        // bounds so cheap exports stay responsive.
+        settle = (started.elapsed() * 2).clamp(WATCH_SETTLE_MIN, WATCH_SETTLE_MAX);
+    }
+
+    ExitCode::from(0)
 }
 
 /// Go `RobotContext` loader — returns the issues, their hash, the resolved
