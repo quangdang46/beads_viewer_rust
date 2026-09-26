@@ -57,15 +57,22 @@ pub fn rewrite_args(args: &[String]) -> Vec<String> {
     rewritten
 }
 
-/// Go `rewriteSingleDashLongFlags` (cmd/bv/main.go:533), plus the `-f/-l/-r`
-/// shorthand expansion Go's pflag performs when it parses the result.
+/// Go `rewriteSingleDashLongFlags` (cmd/bv/main.go:533-553), plus the
+/// `-f/-l/-r` shorthand expansion Go's pflag performs when it parses the
+/// result.
 ///
-/// Go consults the live `flag.FlagSet` to decide whether `-foo` names a long
-/// flag; there is no flag set here, so the name shape is used instead: a
-/// single-dash token whose name (up to `=`) is longer than one character and
-/// is made only of `[A-Za-z0-9-]` is a long flag. A one-character name is a
-/// short flag, which is why `-o=json` survives as `-o=json` and becomes a
-/// `--format` alias rather than a doubled-dash flag.
+/// Go decides whether `-foo` names a long flag by asking the registry
+/// (`flags.Lookup(name) == nil`, main.go:548) — never by looking at the shape
+/// of the name. That distinction is load-bearing for every value-taking flag
+/// whose value may be negative: `--relations-threshold -1e400` must reach
+/// pflag as `-1e400` so the value errors are reported against the value, but
+/// a shape-based test would read `1e400` as a flag name and rewrite the value
+/// into `--1e400`, which pflag then rejects as a malformed spelling. The
+/// registry is the only test that keeps the two apart.
+///
+/// A one-character name is a short flag, which is why `-o=json` survives as
+/// `-o=json` and becomes a `--format` alias rather than a doubled-dash flag;
+/// Go reaches the same branch through its `len(name) <= 1` guard.
 fn normalize_flag_spelling(arg: &str) -> String {
     let Some(rest) = arg.strip_prefix('-') else {
         return arg.to_string();
@@ -84,11 +91,7 @@ fn normalize_flag_spelling(arg: &str) -> String {
             return format!("{long}{tail}");
         }
     }
-    if name.len() > 1
-        && rest
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '=')
-    {
+    if name.len() > 1 && crate::flags::flag_lookup(name) {
         return format!("-{arg}");
     }
     arg.to_string()
@@ -878,6 +881,54 @@ mod tests {
     #[test]
     fn single_dash_long_flag_normalized() {
         assert_eq!(rewrite_args(&s(&["-robot-triage"])), s(&["--robot-triage"]));
+    }
+
+    /// Go decides `-foo` is a long flag by asking the registry
+    /// (`flags.Lookup(name) == nil`, main.go:548), never by the shape of the
+    /// name. A value that merely *looks* like a flag must reach the value
+    /// parser untouched, so that `--relations-threshold -1e400` is reported
+    /// against the value instead of being rewritten into the nonsense flag
+    /// `--1e400` (which pflag rejects as a malformed spelling).
+    #[test]
+    fn negative_value_is_not_rewritten_into_a_flag() {
+        for value in [
+            "-1e400", "-Inf", "-1e-400", "-NaN", "-0.5", "-1.5", "-foo", "-a.b", "-a_b", "-1e400x",
+        ] {
+            assert_eq!(
+                rewrite_args(&s(&["--relations-threshold", value])),
+                s(&["--relations-threshold", value]),
+                "value {value} must survive normalization untouched"
+            );
+        }
+    }
+
+    /// The mirror image: a token that *is* a registered flag still gets the
+    /// extra dash, whatever sits on the other side of the `=`.
+    #[test]
+    fn registered_single_dash_flags_are_still_rewritten() {
+        for arg in [
+            "-robot-triage",
+            "-relations-threshold=-1e400",
+            "-db",
+            "-version",
+        ] {
+            assert_eq!(
+                rewrite_args(&s(&[arg])),
+                s(&[&format!("-{arg}")]),
+                "{arg} names a registered flag and must be rewritten"
+            );
+        }
+    }
+
+    /// cobra adds its `--help` flag during `Execute`, i.e. *after*
+    /// `rewriteSingleDashLongFlags` has already consulted the flag set
+    /// (main.go:4546). So `help` is not a registry name at rewrite time and Go
+    /// leaves `-help` for pflag, which answers
+    /// `unknown shorthand flag: 'e' in -elp` (exit 1) rather than printing help.
+    #[test]
+    fn cobra_help_is_absent_from_the_rewrite_registry() {
+        assert_eq!(rewrite_args(&s(&["-help"])), s(&["-help"]));
+        assert_eq!(rewrite_args(&s(&["-h"])), s(&["-h"]));
     }
 
     #[test]

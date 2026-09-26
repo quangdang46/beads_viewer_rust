@@ -1257,6 +1257,21 @@ pub fn flag_names() -> Vec<&'static str> {
     names
 }
 
+/// Whether `name` (a bare long name, no leading dashes) is a registered flag —
+/// the test behind Go's `flags.Lookup(name) == nil` in
+/// `rewriteSingleDashLongFlags` (main.go:548).
+///
+/// The registry is exactly `flag.CommandLine` as `main` builds it before
+/// `newRootCommand` merges it into `cmd.Flags()` (main.go:518). It does *not*
+/// contain cobra's auto `--help` flag: that is added by `InitDefaultHelpFlag`
+/// during `Execute`, after `rewriteSingleDashLongFlags` has already run
+/// (main.go:4546), which is why Go answers `bv -help` with pflag's
+/// `unknown shorthand flag: 'e' in -elp` rather than printing help.
+pub fn flag_lookup(name: &str) -> bool {
+    let known = |f: &FlagDef| f.name == name;
+    ROBOT_PRIMARIES.iter().any(known) || MODIFIER_FLAGS.iter().any(known)
+}
+
 /// Port of pflag `FlagUsagesWrapped` (flag.go:707-778) for one section: the
 /// widest left column sets the description column for every row in it.
 fn flag_usages(rows: &[&HelpFlag]) -> String {
@@ -2330,6 +2345,182 @@ fn go_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `flag_lookup` is the whole basis of
+    /// `argv::normalize_flag_spelling`: a name the registry does not know is
+    /// left alone, which is what keeps a negative value (`-1e400`) from being
+    /// rewritten into a flag. A flag missing from `ROBOT_PRIMARIES` /
+    /// `MODIFIER_FLAGS` would therefore stop being recognized under its
+    /// single-dash spelling, so the registry is pinned against the exact set
+    /// Go's `main` builds into `flag.CommandLine` before `newRootCommand`
+    /// merges it into `cmd.Flags()` (main.go:1458-1583, merged at :518).
+    #[test]
+    fn registry_covers_every_go_command_line_flag() {
+        const GO_FLAGS: &[&str] = &[
+            "agent-brief",
+            "agents",
+            "agents-add",
+            "agents-check",
+            "agents-dry-run",
+            "agents-force",
+            "agents-remove",
+            "agents-update",
+            "alert-label",
+            "alert-type",
+            "as-of",
+            "attention-limit",
+            "background-mode",
+            "baseline-info",
+            "bead-history",
+            "brief",
+            "capacity-label",
+            "check-drift",
+            "check-update",
+            "correlation-by",
+            "correlation-reason",
+            "cpu-profile",
+            "db",
+            "debug-height",
+            "debug-render",
+            "debug-width",
+            "diff-since",
+            "emit-script",
+            "export",
+            "export-format",
+            "export-graph",
+            "export-include-graph",
+            "export-md",
+            "export-pages",
+            "export-template",
+            "feedback-accept",
+            "feedback-ignore",
+            "feedback-reset",
+            "feedback-show",
+            "file-beads-limit",
+            "force-full-analysis",
+            "forecast-agents",
+            "forecast-label",
+            "forecast-sprint",
+            "format",
+            "generate-docs",
+            "graph-depth",
+            "graph-format",
+            "graph-preset",
+            "graph-root",
+            "graph-title",
+            "history-limit",
+            "history-since",
+            "hotspots-limit",
+            "id-pattern",
+            "label",
+            "min-confidence",
+            "network-depth",
+            "no-background-mode",
+            "no-cache",
+            "no-hooks",
+            "no-live-reload",
+            "orphans-min-score",
+            "pages",
+            "pages-include-closed",
+            "pages-include-history",
+            "pages-title",
+            "preview-pages",
+            "priority-brief",
+            "profile-json",
+            "profile-startup",
+            "recipe",
+            "related-include-closed",
+            "related-max-results",
+            "related-min-relevance",
+            "relations-limit",
+            "relations-threshold",
+            "repo",
+            "robot-alerts",
+            "robot-blocker-chain",
+            "robot-burndown",
+            "robot-by-assignee",
+            "robot-by-label",
+            "robot-capabilities",
+            "robot-capacity",
+            "robot-causality",
+            "robot-confirm-correlation",
+            "robot-correlation-stats",
+            "robot-diff",
+            "robot-docs",
+            "robot-drift",
+            "robot-explain-correlation",
+            "robot-file-beads",
+            "robot-file-hotspots",
+            "robot-file-relations",
+            "robot-forecast",
+            "robot-graph",
+            "robot-help",
+            "robot-history",
+            "robot-history-timeout-ms",
+            "robot-impact",
+            "robot-impact-network",
+            "robot-insights",
+            "robot-label-attention",
+            "robot-label-flow",
+            "robot-label-health",
+            "robot-max-results",
+            "robot-metrics",
+            "robot-min-confidence",
+            "robot-next",
+            "robot-not-ready-labels",
+            "robot-orphans",
+            "robot-plan",
+            "robot-priority",
+            "robot-recipes",
+            "robot-reject-correlation",
+            "robot-related",
+            "robot-schema",
+            "robot-search",
+            "robot-sprint-list",
+            "robot-sprint-show",
+            "robot-suggest",
+            "robot-triage",
+            "robot-triage-by-label",
+            "robot-triage-by-track",
+            "rollback",
+            "save-baseline",
+            "schema-command",
+            "script-format",
+            "script-limit",
+            "search",
+            "search-limit",
+            "search-min-score",
+            "search-mode",
+            "search-preset",
+            "search-weights",
+            "severity",
+            "stats",
+            "suggest-bead",
+            "suggest-confidence",
+            "suggest-type",
+            "theme",
+            "update",
+            "update-dry-run",
+            "version",
+            "watch-export",
+            "workspace",
+            "yes",
+        ];
+        for name in GO_FLAGS {
+            assert!(
+                flag_lookup(name),
+                "{name} is in Go's flag.CommandLine but not the registry"
+            );
+        }
+    }
+
+    /// cobra's auto `--help` is the one name that is deliberately *absent*:
+    /// it is added by `InitDefaultHelpFlag` during `Execute`, after
+    /// `rewriteSingleDashLongFlags` has already run (main.go:4546).
+    #[test]
+    fn cobra_help_is_not_in_the_rewrite_registry() {
+        assert!(!flag_lookup("help"));
+    }
 
     /// Independent re-statement of Go's `rootHelpSections` matchers
     /// (main.go:59-206), so `HELP_FLAGS.section` is checked against the Go
