@@ -580,10 +580,98 @@ fn robot_metrics_emits_timing_and_cache_entries() {
     assert!(parsed["timing"].is_array(), "timing must be array");
     assert!(parsed["cache"].is_array(), "cache must be array");
     assert!(parsed["memory"].is_object(), "memory must be object");
-    // Each timing entry has name, count, avg_ms etc.
     let timing = parsed["timing"].as_array().unwrap();
     assert!(!timing.is_empty(), "at least one timing metric");
-    assert_eq!(timing[0]["name"], "cycle_detection");
+}
+
+/// Go `pkg/loader/loader.go:918` wraps the file parse in
+/// `metrics.Timer(metrics.LoaderParse)`, and `AllTimingStats`
+/// (`pkg/metrics/timing.go:252`) appends a metric only when
+/// `m.Count() > 0`. So `--robot-metrics` reports exactly the one metric the
+/// load path instrumented — the 13 other registered names are idle and are
+/// dropped, not reported as zero rows.
+#[test]
+fn robot_metrics_reports_only_instrumented_timing_metrics() {
+    let (code, stdout, _) = run(&["--robot-metrics"]);
+    assert_eq!(code, 0);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
+    let timing = parsed["timing"].as_array().expect("timing array");
+    let names: Vec<&str> = timing
+        .iter()
+        .map(|t| t["name"].as_str().expect("name"))
+        .collect();
+    assert_eq!(names, vec!["loader.parse"], "timing must be Go's one entry");
+    // Go's TimingStats field set (pkg/metrics/timing.go:159).
+    let entry = &timing[0];
+    assert_eq!(entry["count"], 1);
+    for field in ["total_ms", "avg_ms", "max_ms", "min_ms"] {
+        assert!(entry[field].is_number(), "{field} must be numeric: {entry}");
+    }
+    assert!(
+        entry["avg_ms"].as_f64().unwrap() > 0.0,
+        "measured, not stubbed"
+    );
+}
+
+/// Go `pkg/metrics/cache.go:128 AllCacheStats` reports all four registered
+/// caches unconditionally — "a reader of --robot-metrics should see which
+/// caches exist and that they were idle, not an empty list that looks like
+/// 'no caches'". Order is Go's `AllCacheMetrics` order.
+#[test]
+fn robot_metrics_cache_reports_go_registry_in_order() {
+    let (code, stdout, _) = run(&["--robot-metrics"]);
+    assert_eq!(code, 0);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
+    let cache = parsed["cache"].as_array().expect("cache array");
+    let names: Vec<&str> = cache
+        .iter()
+        .map(|c| c["name"].as_str().expect("name"))
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "graph_cache",
+            "triage_cache",
+            "search_cache",
+            "correlation_cache"
+        ],
+        "cache registry must match Go's four, in Go's order"
+    );
+    // Go's CacheStats field set (pkg/metrics/cache.go:94).
+    for entry in cache {
+        for field in ["hits", "misses", "total", "hit_rate"] {
+            assert!(entry[field].is_number(), "{field} must be numeric: {entry}");
+        }
+        assert_eq!(
+            entry["total"].as_u64(),
+            Some(entry["hits"].as_u64().unwrap() + entry["misses"].as_u64().unwrap()),
+            "total must equal hits + misses: {entry}"
+        );
+    }
+}
+
+/// `BV_METRICS=0` disables collection in Go (`pkg/metrics/timing.go:32`),
+/// which leaves `AllTimingStats` empty; `omitempty` on `MetricsOutput.Timing`
+/// then drops the key. `AllCacheStats` is unconditional, so the four caches
+/// still report — as idle rows, not as an absent key.
+#[test]
+fn robot_metrics_omits_timing_when_collection_disabled() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_bvr"))
+        .args(["--robot-metrics"])
+        .env("BV_METRICS", "0")
+        .output()
+        .expect("binary runs");
+    assert_eq!(out.status.code(), Some(0));
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid json");
+    assert!(
+        parsed.get("timing").is_none(),
+        "timing must be omitted, not an empty array: {parsed}"
+    );
+    assert_eq!(
+        parsed["cache"].as_array().map(|c| c.len()),
+        Some(4),
+        "cache registry is reported even with collection disabled"
+    );
 }
 
 /// Issue #5 regression: `--generate-docs` and `--export` are registered flags,

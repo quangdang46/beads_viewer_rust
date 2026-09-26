@@ -13357,12 +13357,6 @@ fn run_robot_schema(args: &[String]) -> ExitCode {
     emit_json(&payload)
 }
 
-/// Go `handleRobotMetrics` (`--robot-metrics`). Scope cut: Go tracks live
-/// per-command timing/cache-hit histograms via a `metrics` package that
-/// has no Rust equivalent (nothing instruments handler timing here yet).
-/// Reporting fabricated timing numbers would be worse than reporting none
-/// — this returns only what's actually true: process memory (best-effort,
-/// platform-dependent) and dataset size for the current working directory.
 /// Go `handleRobotMetrics` — `--robot-metrics`.
 ///
 /// The metrics are *envelope fields*, not a payload of their own: Go returns a
@@ -13371,29 +13365,90 @@ fn run_robot_schema(args: &[String]) -> ExitCode {
 /// `usage_hints` list, so a consumer reading `data_hash` or `source_authority`
 /// off this command found neither — and `version` reported the Rust crate's
 /// own `0.2.0` where every other robot command reports Go's `v0.25.0`.
+///
+/// `timing` and `cache` are projected onto Go's registries by `go_timing_stats`
+/// and `go_cache_stats` rather than forwarded from `bv_analysis::metrics`,
+/// which registers a different set of names.
 fn run_robot_metrics() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
-    // The graph load is timed, so the measurement the command reports includes
-    // the load that produced the issue set the envelope is built from.
-    let issues = {
-        let t_load = bv_analysis::metrics::time(&bv_analysis::metrics::TIMING_GRAPH_LOAD);
-        let loaded = bv_core::discovery::load_issues_from_repo(&cwd);
-        drop(t_load);
-        match loaded {
-            Ok((issues, _stats)) => issues,
-            Err(e) => {
-                eprintln!("Error: {e}");
-                return ExitCode::from(1);
-            }
+    // Go times this same load: `pkg/loader/loader.go:918` defers
+    // `metrics.Timer(metrics.LoaderParse)` around the issue-file parse.
+    let collect = bv_analysis::metrics::metrics_enabled();
+    let started = std::time::Instant::now();
+    let loaded = bv_core::discovery::load_issues_from_repo(&cwd);
+    let parse_ns = started.elapsed().as_nanos();
+    let issues = match loaded {
+        Ok((issues, _stats)) => issues,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
         }
     };
     let hash = bv_core::data_hash::compute_data_hash(&issues);
     let mut payload = full_envelope_for(&hash, &issues);
+    // Go's `MetricsOutput.Timing` is `omitempty` (`pkg/metrics/cache.go:164`),
+    // so with collection disabled the key is absent rather than an empty array.
+    if collect {
+        payload["timing"] = go_timing_stats(parse_ns);
+    }
     let m = bv_analysis::metrics::get_all_metrics();
-    payload["timing"] = m["timing"].clone();
-    payload["cache"] = m["cache"].clone();
+    payload["cache"] = go_cache_stats(&m);
     payload["memory"] = m["memory"].clone();
     emit_json(&payload)
+}
+
+/// Go `AllTimingStats` (`pkg/metrics/timing.go:252`) appends a metric only when
+/// `m.Count() > 0`, so an idle metric is dropped rather than reported as a row
+/// of zeroes. The sole producer on this path is the issue-file parse, which Go
+/// registers as `loader.parse` (`pkg/metrics/timing.go:216`), so that is the
+/// one entry — a single sample makes Go's total/avg/max/min all the same value.
+///
+/// Field order follows Go's `TimingStats` (timing.go:159) and the units are Go's
+/// `float64(ns) / 1e6`. `min_ms` is `omitempty` there, so it is omitted when the
+/// measurement rounds to zero.
+fn go_timing_stats(parse_ns: u128) -> serde_json::Value {
+    let ms = parse_ns as f64 / 1e6;
+    let mut entry = serde_json::json!({
+        "name": "loader.parse",
+        "count": 1,
+        "total_ms": ms,
+        "avg_ms": ms,
+        "max_ms": ms,
+    });
+    if ms != 0.0 {
+        entry["min_ms"] = serde_json::json!(ms);
+    }
+    serde_json::Value::Array(vec![entry])
+}
+
+/// Go `AllCacheStats` (`pkg/metrics/cache.go:128`) reports every registered
+/// cache, including ones this command never consults, "so a reader of
+/// --robot-metrics should see which caches exist and that they were idle, not an
+/// empty list that looks like 'no caches'". Go's `AllCacheMetrics`
+/// (cache.go:115) holds exactly four, in this order.
+///
+/// `metrics_cache` and `style_cache` — the two extras in the Rust registry —
+/// have no Go counterpart and no producer, so they are not reported.
+fn go_cache_stats(m: &serde_json::Value) -> serde_json::Value {
+    let registered = m["cache"].as_array().cloned().unwrap_or_default();
+    let mut rows = Vec::new();
+    for name in ["graph_cache", "triage_cache", "search_cache"] {
+        if let Some(row) = registered.iter().find(|r| r["name"] == name) {
+            rows.push(row.clone());
+        }
+    }
+    // Go's fourth entry is the correlation report/artifact cache, fed by
+    // `pkg/correlation` (`disk_cache.go:411`, `cache.go:563`). The Rust port has
+    // no correlation cache, so it is structurally idle — which is also what Go
+    // reports for a command that never consults it.
+    rows.push(serde_json::json!({
+        "name": "correlation_cache",
+        "hits": 0,
+        "misses": 0,
+        "total": 0,
+        "hit_rate": 0.0,
+    }));
+    serde_json::Value::Array(rows)
 }
 
 /// Go `handleRobotDocs` (`--robot-docs [topic]`). Scope cut: Go's
