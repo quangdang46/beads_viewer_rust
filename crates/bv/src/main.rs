@@ -4634,28 +4634,34 @@ fn go_rfc1123(rfc3339: &str) -> String {
 
 /// Handle `--check-update` (Go bv-182): report whether a newer release exists.
 fn run_check_update() -> ExitCode {
-    report_check_update(bv_update::github::check_for_updates())
+    let mut out = std::io::stdout();
+    let mut err = std::io::stderr();
+    report_check_update(bv_update::github::check_for_updates(), &mut out, &mut err)
 }
 
 /// Reporting half of `--check-update` (Go cmd/bv/main.go:2057-2071), split
 /// from the fetch so the exact output can be asserted without network access.
 fn report_check_update(
     result: Result<Option<bv_update::UpdateInfo>, bv_update::github::FetchError>,
+    out: &mut impl std::io::Write,
+    err: &mut impl std::io::Write,
 ) -> ExitCode {
     match result {
         Err(e) => {
-            eprintln!("Error checking for updates: {e}");
+            let _ = writeln!(err, "Error checking for updates: {e}");
             ExitCode::from(1)
         }
         Ok(None) => {
-            println!(
+            let _ = writeln!(
+                out,
                 "bvr is up to date (version {})",
                 bv_update::current_version()
             );
             ExitCode::from(0)
         }
         Ok(Some(info)) => {
-            println!(
+            let _ = writeln!(
+                out,
                 "New version available: {} (current: {})",
                 info.new_version,
                 bv_update::current_version()
@@ -4663,8 +4669,8 @@ fn report_check_update(
             // Go main.go:2065 labels this line "Release:" — the value is the
             // release *page* URL, so "Download:" was a mislabel that broke any
             // byte comparison of `--check-update` output.
-            println!("Release: {}", info.release_url);
-            println!("\nRun 'bvr --update' to update automatically");
+            let _ = writeln!(out, "Release: {}", info.release_url);
+            let _ = writeln!(out, "\nRun 'bvr --update' to update automatically");
             ExitCode::from(0)
         }
     }
@@ -4672,6 +4678,8 @@ fn report_check_update(
 
 /// Handle `--update-dry-run`: report what an update would fetch/verify/install.
 fn run_update_dry_run() -> ExitCode {
+    let mut out = std::io::stdout();
+    let mut err = std::io::stderr();
     let release = match bv_update::github::get_latest_release() {
         Err(e) => {
             eprintln!("Error fetching release info: {e}");
@@ -4679,24 +4687,29 @@ fn run_update_dry_run() -> ExitCode {
         }
         Ok(r) => r,
     };
-    report_update_dry_run(&release)
+    report_update_dry_run(&release, &mut out, &mut err)
 }
 
 /// Reporting half of `--update-dry-run` (Go cmd/bv/main.go:2074-2105), split
 /// from the fetch so the plan and its failure paths can be asserted offline.
-fn report_update_dry_run(release: &bv_update::Release) -> ExitCode {
+fn report_update_dry_run(
+    release: &bv_update::Release,
+    out: &mut impl std::io::Write,
+    err: &mut impl std::io::Write,
+) -> ExitCode {
     // Go main.go:2083-2086: a version-compare failure is a hard error, not an
     // "already up to date" answer. `is_newer_than_current` collapses the
     // Result to a bool, which is how this path used to disappear.
     let newer = match bv_update::version::check_newer_than_current(&release.tag_name) {
         Ok(n) => n,
         Err(e) => {
-            eprintln!("Cannot compare release versions: {e}");
+            let _ = writeln!(err, "Cannot compare release versions: {e}");
             return ExitCode::from(1);
         }
     };
     if !newer {
-        println!(
+        let _ = writeln!(
+            out,
             "bvr is already up to date (version {})",
             bv_update::current_version()
         );
@@ -4708,28 +4721,34 @@ fn report_update_dry_run(release: &bv_update::Release) -> ExitCode {
     let (asset, checksum) = match bv_update::github::release_assets_for_update(release) {
         Ok(pair) => pair,
         Err(e) => {
-            eprintln!("Latest release cannot be installed automatically: {e}");
+            let _ = writeln!(err, "Latest release cannot be installed automatically: {e}");
             return ExitCode::from(1);
         }
     };
-    println!(
+    let _ = writeln!(
+        out,
         "[dry-run] Would update bvr from {} to {}",
         bv_update::current_version(),
         release.tag_name
     );
-    println!(
+    let _ = writeln!(
+        out,
         "[dry-run] Would download {} ({} bytes) for {}/{}",
         asset.name,
         asset.size,
         std::env::consts::OS,
         std::env::consts::ARCH
     );
-    println!("[dry-run] From: {}", asset.browser_download_url);
-    println!(
+    let _ = writeln!(out, "[dry-run] From: {}", asset.browser_download_url);
+    let _ = writeln!(
+        out,
         "[dry-run] Would verify SHA-256 checksum via {}",
         checksum.name
     );
-    println!("[dry-run] No changes made. Run 'bvr --update' to apply.");
+    let _ = writeln!(
+        out,
+        "[dry-run] No changes made. Run 'bvr --update' to apply."
+    );
     ExitCode::from(0)
 }
 
@@ -4758,6 +4777,42 @@ fn read_update_confirmation(input: &mut impl std::io::BufRead) -> Result<bool, S
         };
     }
     Ok(answer == "y" || answer == "yes")
+}
+
+/// Outcome of Go's `[Y/n]` gate (cmd/bv/main.go:2129-2140).
+#[derive(Debug)]
+enum UpdateConfirmation {
+    Proceed,
+    /// A non-empty, non-`y`/`yes` answer: `Update cancelled`, exit 0.
+    Cancelled,
+    /// main.go:2135-2137: a read failure, EOF included, is exit 1.
+    ReadFailed,
+}
+
+/// Go's `[Y/n]` prompt plus `readUpdateConfirmation` (main.go:2129-2140),
+/// split from `run_update` so all three outcomes are reachable in a test —
+/// in `run_update` itself they sit behind a successful release fetch.
+fn prompt_update_confirmation(
+    version: &str,
+    new_version: &str,
+    input: &mut impl std::io::BufRead,
+    out: &mut impl std::io::Write,
+    err: &mut impl std::io::Write,
+) -> UpdateConfirmation {
+    let _ = write!(out, "Update bvr from {version} to {new_version}? [Y/n]: ");
+    let _ = out.flush();
+    match read_update_confirmation(input) {
+        // main.go:2135-2138 — a failed read, EOF included, is exit 1.
+        Err(e) => {
+            let _ = writeln!(err, "Cannot read update confirmation: {e}");
+            UpdateConfirmation::ReadFailed
+        }
+        Ok(false) => {
+            let _ = writeln!(out, "Update cancelled");
+            UpdateConfirmation::Cancelled
+        }
+        Ok(true) => UpdateConfirmation::Proceed,
+    }
 }
 
 /// Handle `--update` (Go bv-182): confirm unless `--yes`, then self-update.
@@ -4793,24 +4848,20 @@ fn run_update(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     }
     if !args.iter().any(|a| a == "--yes" || a == "-y") {
-        print!(
-            "Update bvr from {} to {}? [Y/n]: ",
-            bv_update::current_version(),
-            release.tag_name
+        let mut out = std::io::stdout();
+        let mut err = std::io::stderr();
+        let version = bv_update::current_version();
+        let confirmation = prompt_update_confirmation(
+            &version,
+            &release.tag_name,
+            &mut std::io::stdin().lock(),
+            &mut out,
+            &mut err,
         );
-        use std::io::Write as _;
-        let _ = std::io::stdout().flush();
-        match read_update_confirmation(&mut std::io::stdin().lock()) {
-            // main.go:2135-2138 — a failed read, EOF included, is exit 1.
-            Err(e) => {
-                eprintln!("Cannot read update confirmation: {e}");
-                return ExitCode::from(1);
-            }
-            Ok(false) => {
-                println!("Update cancelled");
-                return ExitCode::from(0);
-            }
-            Ok(true) => {}
+        match confirmation {
+            UpdateConfirmation::ReadFailed => return ExitCode::from(1),
+            UpdateConfirmation::Cancelled => return ExitCode::from(0),
+            UpdateConfirmation::Proceed => {}
         }
     }
     match bv_update::perform_update(&release, &|line| println!("{line}")) {
@@ -4832,6 +4883,323 @@ fn run_update(args: &[String]) -> ExitCode {
             }
             ExitCode::from(1)
         }
+    }
+}
+
+/// Offline coverage for the self-update CLI paths. Every branch Go reaches
+/// through `GetLatestRelease` / `CheckUpdateAvailable` is unreachable in a
+/// test without a network, so the reporting halves take their data by
+/// argument and these tests drive them directly. Fixtures mirror the shape
+/// `pkg/updater` accepts — an installable release needs a `state: uploaded`
+/// platform archive, a checksum manifest, a `sha256:` digest on both and URLs
+/// pinned to this repo (github.rs:375-463).
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod update_cli_tests {
+    use super::*;
+    use bv_update::github::{platform_asset_names, Asset, Release};
+    use bv_update::{REPO_NAME, REPO_OWNER};
+
+    /// An asset that passes `validate_release_asset` (github.rs:420-464).
+    fn asset(tag: &str, name: &str, size: i64) -> Asset {
+        Asset {
+            name: name.to_string(),
+            browser_download_url: format!(
+                "https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/download/{tag}/{name}"
+            ),
+            size,
+            digest: format!("sha256:{}", "ab".repeat(32)),
+            state: "uploaded".to_string(),
+        }
+    }
+
+    /// A release that `ValidateReleaseForUpdate` accepts on this platform.
+    fn installable_release(tag: &str) -> Release {
+        let names = platform_asset_names(tag);
+        let archive = names
+            .first()
+            .expect("an archive name for this platform")
+            .clone();
+        let checksum = format!("{archive}.sha256");
+        Release {
+            tag_name: tag.to_string(),
+            html_url: format!("https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/tag/{tag}"),
+            draft: false,
+            prerelease: false,
+            assets: vec![asset(tag, &archive, 4096), asset(tag, &checksum, 128)],
+        }
+    }
+
+    /// Capture one reporting call. `report_*` writes only to the writers it
+    /// is handed, so stdout and stderr are separable here even though Go
+    /// picks the stream with `fmt.Printf` / `fmt.Fprintf(os.Stderr, …)`.
+    fn capture_check_update(
+        result: Result<Option<bv_update::UpdateInfo>, bv_update::github::FetchError>,
+    ) -> (ExitCode, String, String) {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = report_check_update(result, &mut out, &mut err);
+        (
+            code,
+            String::from_utf8(out).expect("utf-8 stdout"),
+            String::from_utf8(err).expect("utf-8 stderr"),
+        )
+    }
+
+    fn capture_dry_run(release: &Release) -> (ExitCode, String, String) {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = report_update_dry_run(release, &mut out, &mut err);
+        (
+            code,
+            String::from_utf8(out).expect("utf-8 stdout"),
+            String::from_utf8(err).expect("utf-8 stderr"),
+        )
+    }
+
+    // --- --check-update (main.go:2057-2071) ------------------------------
+
+    /// main.go:2065 labels the release *page* URL "Release:". bvr printed
+    /// "Download:", which broke any byte comparison against the oracle.
+    #[test]
+    fn check_update_available_prints_release_not_download() {
+        let info = bv_update::UpdateInfo {
+            new_version: "v99.0.0".to_string(),
+            release_url: "https://github.com/owner/repo/releases/tag/v99.0.0".to_string(),
+        };
+        let (code, out, err) = capture_check_update(Ok(Some(info)));
+        assert_eq!(code, ExitCode::from(0));
+        assert_eq!(err, "");
+        assert_eq!(
+            out,
+            format!(
+                "New version available: v99.0.0 (current: {})\n\
+                 Release: https://github.com/owner/repo/releases/tag/v99.0.0\n\
+                 \n\
+                 Run 'bvr --update' to update automatically\n",
+                bv_update::current_version()
+            )
+        );
+        assert!(!out.contains("Download:"), "{out}");
+    }
+
+    #[test]
+    fn check_update_up_to_date_exits_zero() {
+        let (code, out, err) = capture_check_update(Ok(None));
+        assert_eq!(code, ExitCode::from(0));
+        assert_eq!(err, "");
+        assert_eq!(
+            out,
+            format!(
+                "bvr is up to date (version {})\n",
+                bv_update::current_version()
+            )
+        );
+    }
+
+    /// main.go:2060-2062: a fetch failure is exit 1, on stderr.
+    #[test]
+    fn check_update_fetch_error_exits_one_on_stderr() {
+        let (code, out, err) =
+            capture_check_update(Err(bv_update::github::FetchError::Network("boom".into())));
+        assert_eq!(code, ExitCode::from(1));
+        assert_eq!(out, "");
+        assert_eq!(err, "Error checking for updates: network error: boom\n");
+    }
+
+    // --- --update-dry-run (main.go:2074-2105) ----------------------------
+
+    /// The plan Go prints, including the ` for {os}/{arch}` clause the Rust
+    /// port had dropped from the download line.
+    #[test]
+    fn dry_run_prints_the_full_plan_with_platform_clause() {
+        let release = installable_release("v99.0.0");
+        let archive = &release.assets[0];
+        let (code, out, err) = capture_dry_run(&release);
+        assert_eq!(code, ExitCode::from(0));
+        assert_eq!(err, "");
+        assert_eq!(
+            out,
+            format!(
+                "[dry-run] Would update bvr from {} to v99.0.0\n\
+                 [dry-run] Would download {} (4096 bytes) for {}/{}\n\
+                 [dry-run] From: {}\n\
+                 [dry-run] Would verify SHA-256 checksum via {}.sha256\n\
+                 [dry-run] No changes made. Run 'bvr --update' to apply.\n",
+                bv_update::current_version(),
+                archive.name,
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+                archive.browser_download_url,
+                archive.name,
+            )
+        );
+    }
+
+    /// main.go:2091-2094 validates *before* printing a plan it could not
+    /// carry out, and exits 1. A draft release proves the gate is present.
+    #[test]
+    fn dry_run_refuses_an_uninstallable_release_before_printing_a_plan() {
+        let mut release = installable_release("v99.0.0");
+        release.draft = true;
+        let (code, out, err) = capture_dry_run(&release);
+        assert_eq!(code, ExitCode::from(1));
+        assert_eq!(out, "");
+        assert_eq!(
+            err,
+            "Latest release cannot be installed automatically: release \"v99.0.0\" is still a draft\n"
+        );
+    }
+
+    /// The same gate covers a release with no checksum manifest — Go's
+    /// `checksums.txt asset is missing` (updater.go:848-852).
+    #[test]
+    fn dry_run_requires_a_checksum_asset() {
+        let mut release = installable_release("v99.0.0");
+        release.assets.pop();
+        let (code, out, err) = capture_dry_run(&release);
+        assert_eq!(code, ExitCode::from(1));
+        assert_eq!(out, "");
+        assert_eq!(
+            err,
+            "Latest release cannot be installed automatically: checksums.txt asset is missing\n"
+        );
+    }
+
+    /// main.go:2083-2086: an unparseable tag is a hard error, not an
+    /// "already up to date" answer. This is the second exit-1 path.
+    #[test]
+    fn dry_run_version_compare_failure_exits_one() {
+        let mut release = installable_release("not-a-version");
+        // Identity validation runs *after* the compare, so a malformed tag
+        // only needs to reach the compare to prove the ordering.
+        release.assets.clear();
+        let (code, out, err) = capture_dry_run(&release);
+        assert_eq!(code, ExitCode::from(1));
+        assert_eq!(out, "");
+        assert!(
+            err.starts_with("Cannot compare release versions: "),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn dry_run_not_newer_exits_zero_before_validating() {
+        let mut release = installable_release("v0.0.1");
+        // An uninstallable older release still answers "already up to date":
+        // the compare short-circuits ahead of the validate gate.
+        release.draft = true;
+        let (code, out, err) = capture_dry_run(&release);
+        assert_eq!(code, ExitCode::from(0));
+        assert_eq!(err, "");
+        assert_eq!(
+            out,
+            format!(
+                "bvr is already up to date (version {})\n",
+                bv_update::current_version()
+            )
+        );
+    }
+
+    // --- the [Y/n] gate (main.go:2129-2140, readUpdateConfirmation 1016) --
+
+    fn confirm(input: &str) -> (UpdateConfirmation, String, String) {
+        let mut reader = std::io::BufReader::new(input.as_bytes());
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let verdict =
+            prompt_update_confirmation("v0.2.0", "v99.0.0", &mut reader, &mut out, &mut err);
+        (
+            verdict,
+            String::from_utf8(out).expect("utf-8 stdout"),
+            String::from_utf8(err).expect("utf-8 stderr"),
+        )
+    }
+
+    #[test]
+    fn confirmation_accepts_y_and_yes() {
+        for answer in ["y\n", "Y\n", "yes\n", "YES\n", " yes \n"] {
+            let (verdict, out, err) = confirm(answer);
+            assert!(
+                matches!(verdict, UpdateConfirmation::Proceed),
+                "{answer:?} -> {verdict:?}"
+            );
+            assert_eq!(err, "", "{answer:?}");
+            assert_eq!(
+                out, "Update bvr from v0.2.0 to v99.0.0? [Y/n]: ",
+                "{answer:?}"
+            );
+        }
+    }
+
+    /// A non-empty answer that is not y/yes is the only "Update cancelled"
+    /// path (main.go:2139-2141), and it exits 0.
+    #[test]
+    fn only_a_non_empty_non_affirmative_answer_cancels() {
+        for answer in ["n\n", "N\n", "no\n", "nope\n", "0\n"] {
+            let (verdict, out, err) = confirm(answer);
+            assert!(
+                matches!(verdict, UpdateConfirmation::Cancelled),
+                "{answer:?} -> {verdict:?}"
+            );
+            assert_eq!(err, "", "{answer:?}");
+            assert_eq!(
+                out, "Update bvr from v0.2.0 to v99.0.0? [Y/n]: Update cancelled\n",
+                "{answer:?}"
+            );
+        }
+    }
+
+    /// main.go:1022-1027: an empty *line* means confirmed, so a bare newline
+    /// proceeds.
+    #[test]
+    fn a_bare_newline_is_a_confirmed_default() {
+        let (verdict, out, err) = confirm("\n");
+        assert!(matches!(verdict, UpdateConfirmation::Proceed));
+        assert_eq!(err, "");
+        assert_eq!(out, "Update bvr from v0.2.0 to v99.0.0? [Y/n]: ");
+    }
+
+    /// main.go:1017-1028: `ReadString('\n')` returns `io.EOF` with the bytes
+    /// it did read, so a final line *without* a newline is a real answer.
+    #[test]
+    fn a_final_line_without_a_newline_is_still_an_answer() {
+        let (verdict, out, err) = confirm("n");
+        assert!(matches!(verdict, UpdateConfirmation::Cancelled), "{out:?}");
+        assert_eq!(err, "");
+        assert_eq!(
+            out,
+            "Update bvr from v0.2.0 to v99.0.0? [Y/n]: Update cancelled\n"
+        );
+    }
+
+    /// main.go:1023-1026: EOF with an *empty* response is an error, not a
+    /// silent confirmation — `bvr --update < /dev/null` must never self-update
+    /// unattended. Printed as main.go:2136 wraps it.
+    #[test]
+    fn eof_with_no_input_is_a_read_error() {
+        let (verdict, out, err) = confirm("");
+        assert!(
+            matches!(verdict, UpdateConfirmation::ReadFailed),
+            "{verdict:?}"
+        );
+        assert_eq!(out, "Update bvr from v0.2.0 to v99.0.0? [Y/n]: ");
+        assert_eq!(
+            err,
+            "Cannot read update confirmation: no update confirmation received\n"
+        );
+    }
+
+    /// Whitespace-only input still reads as empty, so EOF applies and the
+    /// read-error path wins over the bare-newline default.
+    #[test]
+    fn whitespace_only_input_is_a_read_error() {
+        let (verdict, _, err) = confirm("   ");
+        assert!(matches!(verdict, UpdateConfirmation::ReadFailed));
+        assert_eq!(
+            err,
+            "Cannot read update confirmation: no update confirmation received\n"
+        );
     }
 }
 
