@@ -1546,4 +1546,42 @@ mod tests {
             Some("ü".into())
         );
     }
+
+    // --profile-startup is dispatched on presence, not on a value, so this is
+    // the "is a string flag set" question Go's isFlagActive answers. Kept here
+    // with a real test because --cpu-profile (the first string flag that reads
+    // it) needs a sampling backend that is not yet in the tree.
+    #[test]
+    fn string_flag_is_active_only_when_the_value_survives_trimspace() {
+        // Go main.go:479-481: a string flag is active only when
+        // strings.TrimSpace(value) != "". An empty or blank value is INACTIVE,
+        // which is what makes a modifier-requires rule fire for `--db ""`.
+        assert!(!go_string_flag_active(&s(&["--db", ""]), "db"));
+        assert!(!go_string_flag_active(&s(&["--db", "   "]), "db"));
+        assert!(!go_string_flag_active(&s(&["--db="]), "db"));
+        assert!(!go_string_flag_active(&s(&["--other", "x"]), "db"));
+        assert!(go_string_flag_active(&s(&["--db", "/tmp/x"]), "db"));
+        assert!(go_string_flag_active(&s(&["--db=/tmp/x"]), "db"));
+        // A trailing `--db` with nothing after it has no value at all.
+        assert!(!go_string_flag_active(&s(&["--db"]), "db"));
+    }
+
+    #[test]
+    fn string_flag_value_reads_both_spellings() {
+        assert_eq!(
+            go_string_flag_value(&s(&["--db", "/tmp/x"]), "db"),
+            Some("/tmp/x")
+        );
+        assert_eq!(
+            go_string_flag_value(&s(&["--db=/tmp/x"]), "db"),
+            Some("/tmp/x")
+        );
+        // An `=`-form value keeps everything after the first `=`, so a path
+        // containing `=` survives.
+        assert_eq!(
+            go_string_flag_value(&s(&["--db=/tmp/a=b"]), "db"),
+            Some("/tmp/a=b")
+        );
+        assert_eq!(go_string_flag_value(&s(&["--other", "1"]), "db"), None);
+    }
 }

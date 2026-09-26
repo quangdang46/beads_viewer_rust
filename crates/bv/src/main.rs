@@ -272,7 +272,7 @@ fn main() -> ExitCode {
     }
 
     // Validation order mirrors Go: modifier-requires then exclusive primaries.
-    let mut violations = validation::validate_modifier_requires(&presence);
+    let mut violations = validation::validate_modifier_requires_with(&presence, Some(&args));
     violations.extend(validation::validate_exclusive_primaries(&presence));
 
     // Enum-valued flags (--graph-format, --script-format) were registered and
@@ -461,6 +461,51 @@ fn main() -> ExitCode {
 
         // Format inferred from extension (Go: .html interactive, .dot, else json).
         // Note: --graph-format/--graph-depth are robot-graph-only in Go validation.
+        //
+        // Go's STATIC branch (main.go:3541-3555) handles .png/.svg via
+        // `export.SaveGraphSnapshot` with `Preset: *graphPreset`. That branch
+        // was unreachable from this handler, so --graph-preset had nothing to
+        // reach and a .png path silently fell through to the JSON branch.
+        let is_static = {
+            let lower = output_path.to_ascii_lowercase();
+            lower.ends_with(".png") || lower.ends_with(".svg")
+        };
+        if is_static {
+            // Go main.go:1512 defaults this to "compact" and has no enum rule
+            // for it (main.go:1845-1848), so an unrecognised value is
+            // silently compact — the library keeps that, so pass it through.
+            let preset = argv::go_string_flag_value(&args, "graph-preset")
+                .unwrap_or("compact")
+                .to_string();
+            // Go passes the raw `--graph-title` on the static branch, with no
+            // basename fallback — that fallback belongs only to the HTML
+            // branch above (main.go:3491-3503).
+            let title = argv::go_string_flag_value(&args, "graph-title")
+                .unwrap_or_default()
+                .to_string();
+            let export_issues: Vec<bv_core::model::Issue> = issues.clone();
+            let node_count = export_issues.len();
+            let stats = bv_analysis::label_health::compute_graph_stats(&export_issues);
+            if let Err(e) = bv_export::graph_snapshot::save_graph_snapshot(
+                bv_export::graph_snapshot::GraphSnapshotOptions {
+                    path: std::path::PathBuf::from(&output_path),
+                    format: String::new(),
+                    title,
+                    preset,
+                    issues: export_issues,
+                    data_hash: hash.clone(),
+                },
+                Some(&stats),
+            ) {
+                eprintln!("Error exporting graph snapshot: {e}");
+                return ExitCode::from(1);
+            }
+            // Go main.go:3554 — the node count is part of the line.
+            println!(
+                "✓ Graph exported to {output_path} ({node_count} nodes) - tip: use .html for interactive graphs"
+            );
+            return ExitCode::SUCCESS;
+        }
         let fmt = if output_path.ends_with(".html") {
             "html".to_string()
         } else if output_path.ends_with(".dot") {
@@ -10465,7 +10510,8 @@ fn run_robot_file_beads(args: &[String]) -> ExitCode {
     let mut payload = file_index_payload(&issues, &report);
     payload["file_path"] = serde_json::json!(path);
     payload["total_beads"] = serde_json::json!(total_beads);
-    payload["open_beads"] = serde_json::to_value(&result.open_beads).unwrap_or(serde_json::Value::Null);
+    payload["open_beads"] =
+        serde_json::to_value(&result.open_beads).unwrap_or(serde_json::Value::Null);
     payload["closed_beads"] =
         serde_json::to_value(&closed_beads).unwrap_or(serde_json::Value::Null);
     emit_json(&payload)

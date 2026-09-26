@@ -66,10 +66,33 @@ fn format_required(required: &[&str]) -> String {
 }
 
 /// Validate modifier-requires rules. Returns list of violations.
-pub fn validate_modifier_requires(present: &Presence) -> Vec<ValidationError> {
+/// `args` is the raw argv when the caller has it.
+///
+/// Go's rule for a REQUIRED flag is `isFlagActive` (main.go:196-207), and for
+/// a string flag that is `strings.TrimSpace(v) != ""`. `Presence` only records
+/// that the token appeared, so `--diff-since ""` satisfies a
+/// `("robot-diff", &["diff-since"])` rule here while Go rejects the pair as
+/// "not active". Several rows in the table require a *string* flag —
+/// `diff-since`, `search`, `export`, `export-md`, `graph-root` — so this is not
+/// hypothetical.
+///
+/// When `args` is available, string requirements are re-checked with
+/// [`crate::argv::go_string_flag_active`], which is Go's TrimSpace test.
+pub fn validate_modifier_requires_with(
+    present: &Presence,
+    args: Option<&[String]>,
+) -> Vec<ValidationError> {
     let mut violations = Vec::new();
+    let requirement_active = |r: &&str| -> bool {
+        if let Some(a) = args {
+            if crate::flags::flag_is_string(r) && !crate::argv::go_string_flag_active(a, r) {
+                return false;
+            }
+        }
+        present.has(r)
+    };
     for (modifier, required) in MODIFIER_REQUIRES {
-        if present.has(modifier) && !required.iter().any(|r| present.has(r)) {
+        if present.has(modifier) && !required.iter().any(requirement_active) {
             let rendered = format_required(required);
             violations.push(ValidationError::MissingRequirement {
                 modifier: (*modifier).to_string(),
@@ -132,7 +155,7 @@ mod tests {
     fn check(args: &[&str]) -> Vec<ValidationError> {
         let rewritten = rewrite_args(&args.iter().map(|x| x.to_string()).collect::<Vec<_>>());
         let p = Presence::from_args(&rewritten);
-        let mut v = validate_modifier_requires(&p);
+        let mut v = validate_modifier_requires_with(&p, Some(&rewritten));
         v.extend(validate_exclusive_primaries(&p));
         v
     }

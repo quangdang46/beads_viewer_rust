@@ -1237,6 +1237,20 @@ fn wrap(indent: usize, cols: usize, s: &str) -> String {
 
 /// Every long flag name the registry knows about, robot primaries first.
 /// Used by `--generate-docs` to record the accepted surface as an artifact.
+/// Whether `name` is registered as a value-taking string flag.
+///
+/// Go's `isFlagActive` only applies the TrimSpace test to `stringValue` flags
+/// (main.go:199-207); every other kind is "active" on presence. The
+/// modifier-requires rules need this to tell `--diff-since ""` (present, but
+/// not active) from `--diff-since HEAD~5`.
+pub fn flag_is_string(name: &str) -> bool {
+    let target = name.trim_start_matches('-');
+    let is_str = |f: &&FlagDef| {
+        f.name == target && matches!(f.kind, FlagKind::Str | FlagKind::RepeatableStr)
+    };
+    ROBOT_PRIMARIES.iter().find(is_str).is_some() || MODIFIER_FLAGS.iter().find(is_str).is_some()
+}
+
 pub fn flag_names() -> Vec<&'static str> {
     let mut names: Vec<&'static str> = ROBOT_PRIMARIES.iter().map(|f| f.name).collect();
     names.extend(MODIFIER_FLAGS.iter().map(|f| f.name));
