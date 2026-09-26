@@ -12407,13 +12407,14 @@ fn run_robot_sprint_show(args: &[String]) -> ExitCode {
     emit_json(&payload)
 }
 
-/// Go `robot-burndown` — `--robot-burndown [--burndown-sprint <id>]`.
+/// Go `robot-burndown` — `--robot-burndown <sprint-id|current>`.
 fn run_robot_burndown(args: &[String]) -> ExitCode {
-    let target_sprint_id = args
-        .iter()
-        .position(|a| a == "--burndown-sprint")
-        .and_then(|i| args.get(i + 1))
-        .cloned();
+    // Go reads the selector from the `--robot-burndown` flag's own value
+    // (robot_registry.go:1380-1383). There is no separate `--burndown-sprint`
+    // flag in Go at all; the previous Rust handler invented one, so a named
+    // sprint passed to `--robot-burndown` was silently discarded and the run
+    // fell through to the active-sprint lookup.
+    let target = flag_value(args, "robot-burndown").unwrap_or_default();
     let cwd = std::env::current_dir().unwrap_or_default();
     let (issues, hash, _as_of_commit) = match load_issues_auto(&cwd, None) {
         Ok(x) => x,
@@ -12429,20 +12430,21 @@ fn run_robot_burndown(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let target = if let Some(id) = &target_sprint_id {
-        sprints.iter().find(|s| &s.id == id)
-    } else {
+    // Go's two branches (robot_registry.go:1386-1407): "current" means the
+    // active sprint and reports "No active sprint found"; anything else is a
+    // sprint ID and reports "Sprint not found: <id>". Collapsing them made a
+    // typo'd sprint look like an empty sprint list.
+    let resolved = if target == "current" {
         sprints.iter().find(|s| s.is_active())
+    } else {
+        sprints.iter().find(|s| s.id == target)
     };
-    let Some(sprint) = target else {
-        eprintln!(
-            "No {} sprint found",
-            if target_sprint_id.is_some() {
-                "matching"
-            } else {
-                "active"
-            }
-        );
+    let Some(sprint) = resolved else {
+        if target == "current" {
+            eprintln!("No active sprint found");
+        } else {
+            eprintln!("Sprint not found: {target}");
+        }
         return ExitCode::from(1);
     };
     let now = robot_now();

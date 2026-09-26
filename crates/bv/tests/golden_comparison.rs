@@ -402,12 +402,29 @@ fn canonical(v: &Value) -> String {
 ///   large_cyclic_600____robot_{triage,plan,insights,priority,suggest,alerts,label_health}
 ///   xl_2500____robot_{priority,alerts,label_health}
 ///
-/// So the number is unchanged at 11, but its composition is: the three corpus
-/// defects left the diff set and the pre-existing selfrepo baseline was
-/// masking nine non-selfrepo algorithmic divergences that are real port work.
-/// Those are owned by the analysis/label_health streams. This constant must
-/// not be raised, and should be lowered as each of those eleven lands.
-const GOLDEN_GATE_BASELINE_FAILS: usize = 11;
+///
+/// 2026-09-27: every one of those eleven has landed, and the constant drops
+/// from 11 to 9. What is left is nine `selfrepo` cases, and the harness can
+/// only classify three of them automatically:
+///
+///   selfrepo____robot_triage / _next / _plan / _insights / _priority /
+///   _suggest / _alerts / _graph / _label_health
+///
+/// The goldens for these were captured before commit a9df5db changed this
+/// repo's own `.beads/issues.jsonl`, and they read the live repo, so they
+/// encode an issue set that no longer exists. Proof that this is corpus drift
+/// and not a port defect: running the oracle and the installed binary against
+/// the CURRENT data gives 0 diffs for eight of the nine. The ninth,
+/// `selfrepo____robot_triage`, additionally carries a real gap — Rust omits
+/// Go's `feedback` object — so it is not purely a golden problem, and the
+/// number is not 0 until that is ported.
+///
+/// These nine stay in the baseline rather than being reclassified, because the
+/// fixture is the repository itself and the harness has no way to prove the
+/// drift from inside a test. Recapturing the selfrepo goldens at a frozen
+/// commit would move them to CORPUS_DEFECTS and drop this to 0; that needs a
+/// deliberate recapture, not a baseline edit.
+const GOLDEN_GATE_BASELINE_FAILS: usize = 9;
 
 /// Ratchet baseline: number of goldens this corpus provably cannot decide,
 /// counted by [`classify`] and reported by name in the gate summary.
