@@ -8,6 +8,826 @@ mod argv;
 mod flags;
 mod validation;
 
+/// Go `pkg/correlation/network.go` — the bead impact network behind
+/// `--robot-impact-network` (`handleRobotImpactNetwork`,
+/// cmd/bv/robot_registry.go:3330). Ported here rather than in
+/// `bv-correlation::network`, whose simplified edge model this replaces for
+/// the robot command: Go's builder derives nodes from the *history report*
+/// (not the issue set), expands edges from three independent sources —
+/// shared commits, shared files and blocking dependencies — and then derives
+/// clusters, degrees and statistics from the finished edge list.
+///
+/// Every constant and every ordering decision below mirrors the Go source:
+/// `minWeight = 2` in `detectClusters`, the 5-entry `limitStrings` cap on
+/// `details`, the 5-cluster / 10-node caps in `ToResult`, and the
+/// `commonPathPrefix` byte-slicing. Where Go relies on map iteration order it
+/// either sorts the result (`sort.Strings(details)`) or the map is replaced by
+/// a `BTreeMap` that makes the iteration order total.
+mod impact_network {
+    use bv_core::model::Issue;
+    use bv_correlation::history::HistoryReport;
+    use serde_json::{json, Value};
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+
+    /// Go `NetworkEdgeType` constants.
+    const EDGE_SHARED_COMMIT: &str = "shared_commit";
+    const EDGE_SHARED_FILE: &str = "shared_file";
+    const EDGE_DEPENDENCY: &str = "dependency";
+
+    /// Go `latestHistoryActivity` on a bead with no usable timestamp.
+    const GO_ZERO_TIME: &str = "0001-01-01T00:00:00Z";
+
+    /// Go `NetworkEdge` (`json:"from_bead"` / `"to_bead"` / `"edge_type"` /
+    /// `"weight"` / `"details"`).
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct Edge {
+        pub from_bead: String,
+        pub to_bead: String,
+        pub edge_type: &'static str,
+        pub weight: i64,
+        pub details: Vec<String>,
+    }
+
+    impl Edge {
+        pub fn to_json(&self) -> Value {
+            json!({
+                "from_bead": self.from_bead,
+                "to_bead": self.to_bead,
+                "edge_type": self.edge_type,
+                "weight": self.weight,
+                "details": self.details,
+            })
+        }
+    }
+
+    /// Go `NetworkNode`. `connectivity` is never assigned by Go's `BuildAt`,
+    /// so it always serializes as `0`.
+    #[derive(Debug, Clone)]
+    pub struct Node {
+        pub bead_id: String,
+        pub title: String,
+        pub status: String,
+        pub priority: i64,
+        pub last_activity: String,
+        pub degree: i64,
+        pub cluster_id: i64,
+        pub commit_count: i64,
+        pub file_count: i64,
+        pub connectivity: f64,
+    }
+
+    impl Node {
+        pub fn to_json(&self) -> Value {
+            json!({
+                "bead_id": self.bead_id,
+                "title": self.title,
+                "status": self.status,
+                "priority": self.priority,
+                "last_activity": self.last_activity,
+                "degree": self.degree,
+                "cluster_id": self.cluster_id,
+                "commit_count": self.commit_count,
+                "file_count": self.file_count,
+                "connectivity": self.connectivity,
+            })
+        }
+    }
+
+    /// Go `BeadCluster`.
+    #[derive(Debug, Clone, Default)]
+    pub struct Cluster {
+        pub cluster_id: i64,
+        pub bead_ids: Vec<String>,
+        pub label: String,
+        pub internal_edges: i64,
+        pub external_edges: i64,
+        pub internal_connectivity: f64,
+        pub central_bead: String,
+        pub shared_files: Vec<String>,
+        pub total_commits: i64,
+    }
+
+    impl Cluster {
+        pub fn to_json(&self) -> Value {
+            json!({
+                "cluster_id": self.cluster_id,
+                "bead_ids": self.bead_ids,
+                "label": self.label,
+                "internal_edges": self.internal_edges,
+                "external_edges": self.external_edges,
+                "internal_connectivity": self.internal_connectivity,
+                "central_bead": self.central_bead,
+                "shared_files": self.shared_files,
+                "total_commits": self.total_commits,
+            })
+        }
+    }
+
+    /// Go `NetworkStats`.
+    #[derive(Debug, Clone, Default)]
+    pub struct Stats {
+        pub total_nodes: i64,
+        pub total_edges: i64,
+        pub cluster_count: i64,
+        pub avg_degree: f64,
+        pub max_degree: i64,
+        pub density: f64,
+        pub isolated_nodes: i64,
+        pub largest_cluster: i64,
+    }
+
+    impl Stats {
+        pub fn to_json(&self) -> Value {
+            json!({
+                "total_nodes": self.total_nodes,
+                "total_edges": self.total_edges,
+                "cluster_count": self.cluster_count,
+                "avg_degree": self.avg_degree,
+                "max_degree": self.max_degree,
+                "density": self.density,
+                "isolated_nodes": self.isolated_nodes,
+                "largest_cluster": self.largest_cluster,
+            })
+        }
+    }
+
+    /// Go `ImpactNetwork`.
+    #[derive(Debug, Clone)]
+    pub struct Network {
+        pub generated_at: String,
+        pub data_hash: String,
+        pub nodes: BTreeMap<String, Node>,
+        pub edges: Vec<Edge>,
+        pub clusters: Vec<Cluster>,
+        pub stats: Stats,
+    }
+
+    impl Network {
+        pub fn to_json(&self) -> Value {
+            let nodes: serde_json::Map<String, Value> = self
+                .nodes
+                .iter()
+                .map(|(id, node)| (id.clone(), node.to_json()))
+                .collect();
+            json!({
+                "generated_at": self.generated_at,
+                "data_hash": self.data_hash,
+                "nodes": Value::Object(nodes),
+                "edges": self.edges.iter().map(Edge::to_json).collect::<Vec<_>>(),
+                "clusters": self.clusters.iter().map(Cluster::to_json).collect::<Vec<_>>(),
+                "stats": self.stats.to_json(),
+            })
+        }
+    }
+
+    /// Go `ImpactNetworkResult`, minus the envelope fields the handler
+    /// re-derives (`generated_at`, `data_hash`).
+    pub struct Result_ {
+        pub network: Network,
+        pub stats: Stats,
+        pub top_clusters: Vec<Cluster>,
+        pub top_connected: Vec<Node>,
+    }
+
+    /// Go `normalizePath` (file_index.go:770) — backslashes to slashes, then
+    /// strip one leading `./` and one trailing `/`.
+    fn normalize_path(path: &str) -> String {
+        let mut p = path.replace('\\', "/");
+        if let Some(rest) = p.strip_prefix("./") {
+            p = rest.to_string();
+        }
+        if let Some(rest) = p.strip_suffix('/') {
+            p = rest.to_string();
+        }
+        p
+    }
+
+    /// Go `shortSHA` (cocommit.go:636).
+    fn short_sha(sha: &str) -> String {
+        if sha.len() > 7 {
+            sha[..7].to_string()
+        } else {
+            sha.to_string()
+        }
+    }
+
+    /// Go `limitStrings` (related.go:591).
+    fn limit_strings(mut v: Vec<String>, max: usize) -> Vec<String> {
+        v.truncate(max);
+        v
+    }
+
+    /// Go `classifyBeadStatus` (file_index.go:783) reduced to its `skip`
+    /// result — `BuildFileIndex` drops tombstones so every lookup surface
+    /// agrees on the same bead links (#184).
+    fn status_is_skipped(status: &str) -> bool {
+        status.trim().eq_ignore_ascii_case("tombstone")
+    }
+
+    /// Go `BuildFileIndex` (file_index.go:55), reduced to the `FileToBeads`
+    /// membership the shared-file edge expansion consumes. Go orders each
+    /// file's `[]BeadReference` by last touch; the edge keys are canonicalised
+    /// pairs, so the per-file order cannot change the resulting edge set.
+    fn build_file_to_beads(report: &HistoryReport) -> BTreeMap<String, BTreeSet<String>> {
+        let mut index: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (bead_id, history) in &report.histories {
+            if status_is_skipped(&history.status) {
+                continue;
+            }
+            for commit in history.commits.iter().flatten() {
+                for file in &commit.files {
+                    index
+                        .entry(normalize_path(&file.path))
+                        .or_default()
+                        .insert(bead_id.clone());
+                }
+            }
+        }
+        index
+    }
+
+    /// Go `latestHistoryActivity` (network.go:269) — the newest timestamp
+    /// across the four milestones, every event, and every commit. Go compares
+    /// `time.Time` values and keeps the first on a tie; the original string is
+    /// echoed so the emitted instant keeps the report's exact rendering.
+    fn latest_history_activity(history: &bv_correlation::history::BeadHistory) -> String {
+        let mut best: Option<(i128, String)> = None;
+        let mut consider = |raw: &str| {
+            let Ok(ts) = raw.parse::<jiff::Timestamp>() else {
+                return;
+            };
+            let key = ts.as_nanosecond();
+            match &best {
+                Some((cur, _)) if *cur >= key => {}
+                _ => best = Some((key, raw.to_string())),
+            }
+        };
+        for event in [
+            &history.milestones.created,
+            &history.milestones.claimed,
+            &history.milestones.closed,
+            &history.milestones.reopened,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            consider(&event.timestamp);
+        }
+        for event in &history.events {
+            consider(&event.timestamp);
+        }
+        for commit in history.commits.iter().flatten() {
+            consider(&commit.timestamp);
+        }
+        best.map(|(_, s)| s)
+            .unwrap_or_else(|| GO_ZERO_TIME.to_string())
+    }
+
+    /// Go `BuildAt` (network.go:180).
+    pub fn build(report: &HistoryReport, issues: &[Issue], now: &str) -> Network {
+        let mut nodes: BTreeMap<String, Node> = BTreeMap::new();
+        let mut bead_files: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+
+        // Go `buildBeadMaps` (network.go:154) — the reverse index the node
+        // `file_count` and the cluster `shared_files` are computed from. It
+        // runs over every history, tombstones included, unlike `BuildFileIndex`.
+        for (bead_id, history) in &report.histories {
+            let mut files: BTreeSet<String> = BTreeSet::new();
+            for commit in history.commits.iter().flatten() {
+                for file in &commit.files {
+                    files.insert(normalize_path(&file.path));
+                }
+            }
+            bead_files.insert(bead_id.clone(), files);
+        }
+
+        // Go: priority comes from the issue set, defaulting to medium (2).
+        let issue_index: HashMap<&str, &Issue> = issues
+            .iter()
+            .filter(|i| !i.id.is_empty())
+            .map(|i| (i.id.as_str(), i))
+            .collect();
+
+        for (bead_id, history) in &report.histories {
+            let priority = issue_index.get(bead_id.as_str()).map_or(2, |i| i.priority);
+            let node = Node {
+                bead_id: bead_id.clone(),
+                title: history.title.clone(),
+                status: history.status.clone(),
+                priority: i64::from(priority),
+                last_activity: latest_history_activity(history),
+                degree: 0,
+                cluster_id: -1,
+                commit_count: history.commits.iter().flatten().count() as i64,
+                file_count: bead_files.get(bead_id).map_or(0, |f| f.len()) as i64,
+                connectivity: 0.0,
+            };
+            nodes.insert(bead_id.clone(), node);
+        }
+
+        // Go accumulates the three edge families in separate maps and appends
+        // each in sorted-key order. The families never share a key (the edge
+        // type is part of it) and `BuildAt` re-sorts the whole list
+        // afterwards, so one `BTreeMap` keyed by the canonical
+        // (from, to, edge_type) triple is equivalent.
+        let mut edges: BTreeMap<(String, String, &'static str), (i64, Vec<String>)> =
+            BTreeMap::new();
+        let bump =
+            |a: &str,
+             b: &str,
+             ty: &'static str,
+             detail: String,
+             edges: &mut BTreeMap<(String, String, &'static str), (i64, Vec<String>)>| {
+                if a == b {
+                    return;
+                }
+                let (lo, hi) = if a > b { (b, a) } else { (a, b) };
+                let slot = edges
+                    .entry((lo.to_string(), hi.to_string(), ty))
+                    .or_insert_with(|| (0, Vec::new()));
+                slot.0 += 1;
+                slot.1.push(detail);
+            };
+
+        // `addSharedCommitEdges` (network.go:296) — one edge per distinct pair
+        // of beads in every commit's `CommitIndex` membership list, carrying
+        // the short SHA as detail.
+        for (sha, bead_ids) in &report.commit_index {
+            if bead_ids.len() < 2 {
+                continue;
+            }
+            // Go `uniqueSortedStrings`: a hand-built index may repeat a bead
+            // ID, and each commit must contribute once per distinct pair.
+            let unique: Vec<&str> = {
+                let set: BTreeSet<&str> = bead_ids
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                set.into_iter().collect()
+            };
+            for i in 0..unique.len() {
+                for j in (i + 1)..unique.len() {
+                    bump(
+                        unique[i],
+                        unique[j],
+                        EDGE_SHARED_COMMIT,
+                        short_sha(sha),
+                        &mut edges,
+                    );
+                }
+            }
+        }
+
+        // `addSharedFileEdges` (network.go:343) — one edge per distinct pair of
+        // beads touching a file the index holds under two or more beads.
+        for (file_path, beads) in &build_file_to_beads(report) {
+            let refs: Vec<&str> = beads.iter().map(String::as_str).collect();
+            if refs.len() < 2 {
+                continue;
+            }
+            for i in 0..refs.len() {
+                for j in (i + 1)..refs.len() {
+                    bump(
+                        refs[i],
+                        refs[j],
+                        EDGE_SHARED_FILE,
+                        file_path.clone(),
+                        &mut edges,
+                    );
+                }
+            }
+        }
+
+        // `addDependencyEdges` (network.go:386) — explicit blocking links only,
+        // restricted to beads that are already nodes. The detail records the
+        // *declared* direction even though the key is canonicalised.
+        for issue in issues {
+            if issue.id.is_empty() || !nodes.contains_key(&issue.id) {
+                continue;
+            }
+            for dep in &issue.dependencies {
+                if !dep.r#type.is_blocking() {
+                    continue;
+                }
+                let to = dep.depends_on_id.as_str();
+                if to.is_empty() || to == issue.id || !nodes.contains_key(to) {
+                    continue;
+                }
+                bump(
+                    &issue.id,
+                    to,
+                    EDGE_DEPENDENCY,
+                    format!("{} -> {}", issue.id, to),
+                    &mut edges,
+                );
+            }
+        }
+
+        let mut edge_list: Vec<Edge> = edges
+            .into_iter()
+            .map(|((from_bead, to_bead, edge_type), (weight, mut details))| {
+                details.sort();
+                Edge {
+                    from_bead,
+                    to_bead,
+                    edge_type,
+                    weight,
+                    details: limit_strings(details, 5),
+                }
+            })
+            .collect();
+        edge_list.sort_by(|x, y| {
+            x.from_bead
+                .cmp(&y.from_bead)
+                .then_with(|| x.to_bead.cmp(&y.to_bead))
+                .then_with(|| x.edge_type.cmp(y.edge_type))
+        });
+
+        // `recomputeNodeDegrees` (network.go:252) — every edge counts once per
+        // endpoint, even when a pair is joined by several edge types.
+        for edge in &edge_list {
+            if let Some(node) = nodes.get_mut(&edge.from_bead) {
+                node.degree += 1;
+            }
+            if let Some(node) = nodes.get_mut(&edge.to_bead) {
+                node.degree += 1;
+            }
+        }
+
+        let mut network = Network {
+            generated_at: now.to_string(),
+            data_hash: report.data_hash.clone(),
+            nodes,
+            edges: edge_list,
+            clusters: Vec::new(),
+            stats: Stats::default(),
+        };
+        detect_clusters(&mut network, &bead_files, report);
+        calculate_stats(&mut network);
+        network
+    }
+
+    /// Go `detectClusters` (network.go:471) — connected components over edges
+    /// with `weight >= minWeight`, walked from sorted node IDs so the result
+    /// does not depend on hash order. Components smaller than two beads are
+    /// dropped, the survivors are sorted largest-first, and the cluster IDs are
+    /// renumbered afterwards (node IDs follow the renumbering).
+    fn detect_clusters(
+        network: &mut Network,
+        bead_files: &BTreeMap<String, BTreeSet<String>>,
+        report: &HistoryReport,
+    ) {
+        const MIN_WEIGHT: i64 = 2;
+
+        let mut adjacency: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for edge in &network.edges {
+            if edge.weight >= MIN_WEIGHT {
+                adjacency
+                    .entry(edge.from_bead.as_str())
+                    .or_default()
+                    .insert(edge.to_bead.as_str());
+                adjacency
+                    .entry(edge.to_bead.as_str())
+                    .or_default()
+                    .insert(edge.from_bead.as_str());
+            }
+        }
+
+        let node_ids: Vec<String> = network.nodes.keys().cloned().collect();
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut next_id: i64 = 0;
+        for bead_id in &node_ids {
+            if visited.contains(bead_id) {
+                continue;
+            }
+            if adjacency.get(bead_id.as_str()).map_or(0, BTreeSet::len) == 0 {
+                continue;
+            }
+            let mut component: Vec<&str> = Vec::new();
+            let mut stack: Vec<&str> = vec![bead_id.as_str()];
+            while let Some(current) = stack.pop() {
+                if !visited.insert(current.to_string()) {
+                    continue;
+                }
+                component.push(current);
+                if let Some(neighbors) = adjacency.get(current) {
+                    for neighbor in neighbors {
+                        if !visited.contains(*neighbor) {
+                            stack.push(neighbor);
+                        }
+                    }
+                }
+            }
+            if component.len() < 2 {
+                continue;
+            }
+            component.sort_unstable();
+            let cluster = build_cluster(next_id, &component, network, bead_files, report);
+            network.clusters.push(cluster);
+            for bid in &component {
+                if let Some(node) = network.nodes.get_mut(*bid) {
+                    node.cluster_id = next_id;
+                }
+            }
+            next_id += 1;
+        }
+
+        // Go sorts largest-first, breaking ties on the first (sorted) bead ID.
+        network.clusters.sort_by(|a, b| {
+            b.bead_ids
+                .len()
+                .cmp(&a.bead_ids.len())
+                .then_with(|| a.bead_ids[0].cmp(&b.bead_ids[0]))
+        });
+        for (i, cluster) in network.clusters.iter_mut().enumerate() {
+            let old_id = cluster.cluster_id;
+            cluster.cluster_id = i as i64;
+            for bid in &cluster.bead_ids {
+                if let Some(node) = network.nodes.get_mut(bid) {
+                    if node.cluster_id == old_id {
+                        node.cluster_id = i as i64;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Go `buildCluster` (network.go:563).
+    fn build_cluster(
+        id: i64,
+        bead_ids: &[&str],
+        network: &Network,
+        bead_files: &BTreeMap<String, BTreeSet<String>>,
+        report: &HistoryReport,
+    ) -> Cluster {
+        let mut cluster = Cluster {
+            cluster_id: id,
+            bead_ids: bead_ids.iter().map(|s| s.to_string()).collect(),
+            shared_files: Vec::new(),
+            ..Default::default()
+        };
+        let members: HashSet<&str> = bead_ids.iter().copied().collect();
+
+        for edge in &network.edges {
+            let from_in = members.contains(edge.from_bead.as_str());
+            let to_in = members.contains(edge.to_bead.as_str());
+            if from_in && to_in {
+                cluster.internal_edges += 1;
+            } else if from_in || to_in {
+                cluster.external_edges += 1;
+            }
+        }
+
+        let n = bead_ids.len() as i64;
+        let max_edges = n * (n - 1) / 2;
+        if max_edges > 0 {
+            cluster.internal_connectivity = cluster.internal_edges as f64 / max_edges as f64;
+        }
+
+        // Go: the first bead in sorted order wins a tie, because the test is
+        // strictly `>` against a counter that starts at zero.
+        let mut max_degree = 0i64;
+        for bid in bead_ids {
+            let Some(node) = network.nodes.get(*bid) else {
+                continue;
+            };
+            let mut internal_degree = 0i64;
+            for edge in &network.edges {
+                if (edge.from_bead == *bid && members.contains(edge.to_bead.as_str()))
+                    || (edge.to_bead == *bid && members.contains(edge.from_bead.as_str()))
+                {
+                    internal_degree += 1;
+                }
+            }
+            if internal_degree > max_degree {
+                max_degree = internal_degree;
+                cluster.central_bead = (*bid).to_string();
+            }
+            cluster.total_commits += node.commit_count;
+        }
+
+        // Files touched by at least two beads of the cluster.
+        let mut file_count: BTreeMap<&str, usize> = BTreeMap::new();
+        for bid in bead_ids {
+            if let Some(files) = bead_files.get(*bid) {
+                for file in files {
+                    *file_count.entry(file.as_str()).or_insert(0) += 1;
+                }
+            }
+        }
+        cluster.shared_files = file_count
+            .into_iter()
+            .filter(|(_, count)| *count >= 2)
+            .map(|(file, _)| file.to_string())
+            .collect();
+
+        cluster.label = generate_cluster_label(bead_ids, &cluster.shared_files, report);
+        cluster
+    }
+
+    /// Go `generateClusterLabel` (network.go:638) — a common directory prefix
+    /// when one is long enough to be worth printing, else the first bead's
+    /// title truncated to 27 runes plus an ellipsis.
+    fn generate_cluster_label(
+        bead_ids: &[&str],
+        shared_files: &[String],
+        report: &HistoryReport,
+    ) -> String {
+        if !shared_files.is_empty() {
+            let mut prefix = common_path_prefix(shared_files);
+            if !prefix.is_empty() && prefix.len() > 2 {
+                if prefix.ends_with('/') {
+                    prefix.pop();
+                }
+                return prefix;
+            }
+        }
+        if let Some(first) = bead_ids.first() {
+            if let Some(history) = report.histories.get(*first) {
+                let title: Vec<char> = history.title.chars().collect();
+                if title.len() > 30 {
+                    let mut out: String = title[..27].iter().collect();
+                    out.push_str("...");
+                    return out;
+                }
+                return history.title.clone();
+            }
+        }
+        "cluster".to_string()
+    }
+
+    /// Go `commonPathPrefix` (network.go:666). Go slices the strings as bytes,
+    /// so this does too.
+    fn common_path_prefix(files: &[String]) -> String {
+        fn dir_of(path: &[u8]) -> Option<Vec<u8>> {
+            path.iter()
+                .rposition(|&b| b == b'/')
+                .map(|i| path[..=i].to_vec())
+        }
+        if files.is_empty() {
+            return String::new();
+        }
+        let first = files[0].as_bytes();
+        if files.len() == 1 {
+            return match dir_of(first) {
+                Some(p) => String::from_utf8_lossy(&p).into_owned(),
+                None => String::new(),
+            };
+        }
+        let Some(mut prefix) = dir_of(first) else {
+            return String::new();
+        };
+        for file in &files[1..] {
+            let file = file.as_bytes();
+            while !prefix.is_empty() && !file.starts_with(&prefix) {
+                // Shorten to the previous directory boundary, dropping the
+                // trailing slash of the candidate first.
+                let mut search = &prefix[..];
+                if search.last() == Some(&b'/') {
+                    search = &search[..search.len() - 1];
+                }
+                match search.iter().rposition(|&b| b == b'/') {
+                    Some(i) => prefix = search[..=i].to_vec(),
+                    None => prefix = Vec::new(),
+                }
+            }
+        }
+        String::from_utf8_lossy(&prefix).into_owned()
+    }
+
+    /// Go `calculateStats` (network.go:728).
+    fn calculate_stats(network: &mut Network) {
+        let mut total_degree = 0i64;
+        let mut max_degree = 0i64;
+        let mut isolated = 0i64;
+        for node in network.nodes.values() {
+            total_degree += node.degree;
+            if node.degree > max_degree {
+                max_degree = node.degree;
+            }
+            if node.degree == 0 {
+                isolated += 1;
+            }
+        }
+
+        let total_nodes = network.nodes.len() as i64;
+        let total_edges = network.edges.len() as i64;
+        let mut largest_cluster = 0i64;
+        for cluster in &network.clusters {
+            if cluster.bead_ids.len() as i64 > largest_cluster {
+                largest_cluster = cluster.bead_ids.len() as i64;
+            }
+        }
+        let mut avg_degree = 0.0;
+        if total_nodes > 0 {
+            avg_degree = total_degree as f64 / total_nodes as f64;
+        }
+        let mut density = 0.0;
+        if total_nodes > 1 {
+            density = total_edges as f64 / (total_nodes * (total_nodes - 1) / 2) as f64;
+        }
+
+        network.stats = Stats {
+            total_nodes,
+            total_edges,
+            cluster_count: network.clusters.len() as i64,
+            avg_degree,
+            max_degree,
+            density,
+            isolated_nodes: isolated,
+            largest_cluster,
+        };
+    }
+
+    /// Go `GetSubNetwork` (network.go:765) — the beads within `depth` hops of
+    /// `bead_id` plus the edges wholly inside that set, with statistics
+    /// recomputed over the sub-network. Clusters are never carried over.
+    fn get_sub_network(network: &Network, bead_id: &str, depth: i64) -> Network {
+        let depth = depth.clamp(1, 3);
+
+        let mut visited: HashSet<&str> = HashSet::new();
+        let mut bead_set: BTreeSet<&str> = BTreeSet::new();
+        let mut queue: VecDeque<(&str, i64)> = VecDeque::new();
+        queue.push_back((bead_id, 0));
+
+        while let Some((current, level)) = queue.pop_front() {
+            if !visited.insert(current) {
+                continue;
+            }
+            bead_set.insert(current);
+            if level >= depth {
+                continue;
+            }
+            for edge in &network.edges {
+                if edge.from_bead == current && !visited.contains(edge.to_bead.as_str()) {
+                    queue.push_back((edge.to_bead.as_str(), level + 1));
+                }
+                if edge.to_bead == current && !visited.contains(edge.from_bead.as_str()) {
+                    queue.push_back((edge.from_bead.as_str(), level + 1));
+                }
+            }
+        }
+
+        let mut sub = Network {
+            generated_at: network.generated_at.clone(),
+            data_hash: network.data_hash.clone(),
+            nodes: BTreeMap::new(),
+            edges: Vec::new(),
+            clusters: Vec::new(),
+            stats: Stats::default(),
+        };
+        for bid in &bead_set {
+            if let Some(node) = network.nodes.get(*bid) {
+                sub.nodes.insert((*bid).to_string(), node.clone());
+            }
+        }
+        for edge in &network.edges {
+            if bead_set.contains(edge.from_bead.as_str())
+                && bead_set.contains(edge.to_bead.as_str())
+            {
+                sub.edges.push(edge.clone());
+            }
+        }
+        calculate_stats(&mut sub);
+        sub
+    }
+
+    /// Go `ToResult` (network.go:857). `bead_id` empty means the whole
+    /// network; otherwise the sub-network at `depth` is returned and `stats`
+    /// is the sub-network's. `top_clusters` always comes from the full
+    /// network, `top_connected` from whichever network is being returned.
+    pub fn to_result(network: &Network, bead_id: &str, depth: i64) -> Result_ {
+        let (sub, stats) = if bead_id.is_empty() {
+            (Some(network.clone()), network.stats.clone())
+        } else {
+            let sub = get_sub_network(network, bead_id, depth);
+            let stats = sub.stats.clone();
+            (Some(sub), stats)
+        };
+
+        let cluster_limit = 5.min(network.clusters.len());
+        let top_clusters = network.clusters[..cluster_limit].to_vec();
+
+        let source = sub.as_ref().unwrap_or(network);
+        let mut nodes: Vec<Node> = source.nodes.values().cloned().collect();
+        nodes.sort_by(|a, b| {
+            b.degree
+                .cmp(&a.degree)
+                .then_with(|| a.bead_id.cmp(&b.bead_id))
+        });
+        let node_limit = 10.min(nodes.len());
+        let top_connected = nodes[..node_limit].to_vec();
+
+        Result_ {
+            network: sub.unwrap_or_else(|| network.clone()),
+            stats,
+            top_clusters,
+            top_connected,
+        }
+    }
+}
+
 use std::io::Write as _;
 use std::process::ExitCode;
 
@@ -7822,9 +8642,6 @@ fn run_robot_recipes() -> ExitCode {
     emit_json(&payload)
 }
 
-type CorrelationReport =
-    std::collections::BTreeMap<String, Vec<bv_correlation::correlator::CorrelatedCommit>>;
-
 /// Read `--<name>` / `--<name>=<value>` out of the raw argv. Go's `flag`
 /// package accepts both spellings and several Rust handlers already rely on
 /// the `=` form (see `history_flag_value`).
@@ -9981,7 +10798,7 @@ fn run_robot_impact_network(args: &[String]) -> ExitCode {
     // Go main.go:1590 registers `--network-depth` with default 2, and
     // robot_registry.go:3386-3390 clamps the result to 1..3. The old default
     // of 1 made an unflagged run a strict subgraph of Go's.
-    let depth: usize = args
+    let depth: i64 = args
         .iter()
         .position(|a| a == "--network-depth")
         .and_then(|i| args.get(i + 1))
@@ -9990,30 +10807,184 @@ fn run_robot_impact_network(args: &[String]) -> ExitCode {
         .clamp(1, 3);
 
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (issues, hash, report) = match load_correlation_report(&cwd) {
+    // Go: correlation.ValidateRepository runs before the beads file is
+    // located (robot_registry.go:3335-3337).
+    if let Err(e) = validate_correlation_repository(&cwd) {
+        eprintln!("Error: {e}");
+        return ExitCode::from(1);
+    }
+    let (issues, _hash, _as_of_commit) = match load_issues_auto(&cwd, None) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
             return ExitCode::from(1);
         }
     };
-    let network = bv_correlation::network::build_network(&issues, &report);
 
-    let result = if target.is_empty() || target == "all" {
-        network
-    } else {
-        if !network.nodes.contains_key(&target) {
-            eprintln!("Bead not found in network: {target}");
+    // Go: CorrelatorOptions{Limit: 500}, overridden by --history-limit, on a
+    // correlator carrying the feedback store (robot_registry.go:3358-3367).
+    let mut opts = bv_correlation::history::HistoryOptions {
+        limit: 500,
+        ..Default::default()
+    };
+    if let Some(limit) = flag_value(args, "history-limit") {
+        match limit.trim().parse::<i64>() {
+            Ok(v) => opts.limit = v,
+            Err(_) => {
+                eprintln!("Error: invalid --history-limit: {limit}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    let now = jiff_now();
+    let report = match generate_correlation_report(&cwd, &issues, &opts, now.clone(), true) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error: generating history report: {e}");
             return ExitCode::from(1);
         }
-        bv_correlation::network::sub_network(&network, &target, depth)
     };
+    let network = impact_network::build(&report, &issues, &robot_now().to_string());
 
-    let mut payload = full_envelope_for(&hash, &issues);
-    payload["network"] = serde_json::to_value(&result).unwrap_or_default();
-    payload["node_count"] = serde_json::json!(result.nodes.len());
-    payload["edge_count"] = serde_json::json!(result.edges.len());
-    emit_json(&payload)
+    // Go passes the raw flag value through: "all" (and the empty default) mean
+    // the whole network, anything else names a bead (robot_registry.go:3372-3381).
+    let bead_id = if target == "all" { "" } else { target.as_str() };
+    if !bead_id.is_empty() && !network.nodes.contains_key(bead_id) {
+        eprintln!("Bead not found in network: {bead_id}");
+        return ExitCode::from(1);
+    }
+
+    let result = impact_network::to_result(&network, bead_id, depth);
+
+    // Go `withEnvelope` merges the envelope OVER the payload into a
+    // `map[string]json.RawMessage`, which `encoding/json` then marshals in
+    // sorted key order. The envelope carries generated_at/data_hash (and the
+    // source-authority fields), so the payload's own copies of the first two
+    // are replaced; everything else in the payload — network, depth, stats,
+    // top_clusters, top_connected — survives. `bead_id` and `top_clusters` are
+    // `omitempty` in Go and are dropped here when empty.
+    //
+    // The envelope is built with the LOADER's hash, not the report's: Go's
+    // `ctx.SourceAuthority` describes the file that was read, so
+    // `source_authority.sources[0].data_hash` (and therefore `authority_hash`)
+    // are the file hash, while the top-level `data_hash` and `scope_hash` are
+    // the report's own bead fingerprint (`EnvelopeWithHash(report.DataHash)`).
+    let file_hash = bv_core::data_hash::compute_data_hash(&issues);
+    let mut payload = full_envelope_for(&file_hash, &issues);
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("data_hash".into(), serde_json::json!(report.data_hash));
+        let (label, recipe, repo) = active_scope_flags();
+        let (mut candidate_ids, _) = bv_analysis::label_health::label_scope_ids(&label, &issues);
+        candidate_ids.sort();
+        let scope_hash =
+            bv_robot::scope_hash(&label, &recipe, &repo, &report.data_hash, &candidate_ids);
+        if !scope_hash.is_empty() {
+            obj.insert("scope_hash".into(), serde_json::json!(scope_hash));
+        }
+        obj.insert(
+            "depth".into(),
+            if depth == 0 {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(depth)
+            },
+        );
+        if !bead_id.is_empty() {
+            obj.insert("bead_id".into(), serde_json::json!(bead_id));
+        }
+        obj.insert("network".into(), result.network.to_json());
+        obj.insert("stats".into(), result.stats.to_json());
+        if !result.top_clusters.is_empty() {
+            obj.insert(
+                "top_clusters".into(),
+                serde_json::Value::Array(
+                    result
+                        .top_clusters
+                        .iter()
+                        .map(impact_network::Cluster::to_json)
+                        .collect(),
+                ),
+            );
+        }
+        if !result.top_connected.is_empty() {
+            obj.insert(
+                "top_connected".into(),
+                serde_json::Value::Array(
+                    result
+                        .top_connected
+                        .iter()
+                        .map(impact_network::Node::to_json)
+                        .collect(),
+                ),
+            );
+        }
+    }
+    emit_json(&emit_sorted_object(&payload))
+}
+
+/// Go marshals the `withEnvelope` map with `encoding/json`, which emits object
+/// keys in sorted order. `serde_json` is built with `preserve_order`, so the
+/// handler's insertion order would otherwise leak into the bytes. Rebuilds the
+/// top level sorted, leaving nested values untouched — Go only re-sorts the one
+/// map it actually owns.
+fn emit_sorted_object(value: &serde_json::Value) -> serde_json::Value {
+    let Some(map) = value.as_object() else {
+        return value.clone();
+    };
+    let mut keys: Vec<&String> = map.keys().collect();
+    keys.sort();
+    let mut out = serde_json::Map::new();
+    for key in keys {
+        out.insert(key.clone(), map[key].clone());
+    }
+    serde_json::Value::Object(out)
+}
+
+/// Go's `map[string]interface{}` literals sort at EVERY level, not just the
+/// top one — `generateRobotDocs` (main.go:8143) builds the topic, the guide,
+/// `guide.output_modes`, each example, the env-var table and the exit-code
+/// table as maps, so `encoding/json` reorders each of them.
+///
+/// The one exception is `commands`: Go types it `map[string]robotCommandDoc`
+/// (main.go:7612), so the command NAMES sort but each doc is a struct and
+/// keeps its declaration order (`flag`, `description`, `key_fields`, `params`,
+/// then the five booleans). Sorting those values would be a byte diff on every
+/// command, so they are passed through untouched.
+fn sort_json_maps_like_go(value: &serde_json::Value) -> serde_json::Value {
+    sort_json_maps_like_go_inner(value, false)
+}
+
+fn sort_json_maps_like_go_inner(
+    value: &serde_json::Value,
+    skip_children: bool,
+) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let mut out = serde_json::Map::new();
+            for key in keys {
+                out.insert(
+                    key.clone(),
+                    if skip_children {
+                        map[key].clone()
+                    } else {
+                        sort_json_maps_like_go_inner(&map[key], key == "commands")
+                    },
+                );
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(items) if !skip_children => {
+            serde_json::Value::Array(items.iter().map(sort_json_maps_like_go_inner_fn).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+fn sort_json_maps_like_go_inner_fn(item: &serde_json::Value) -> serde_json::Value {
+    sort_json_maps_like_go_inner(item, false)
 }
 
 /// Go `robot-sprint-list` — loads `.beads/sprints.jsonl` and emits all sprints.
@@ -10725,20 +11696,6 @@ fn run_robot_capacity(args: &[String]) -> ExitCode {
         obj.insert(k, v);
     }
     emit_json(&payload)
-}
-
-/// Shared loader for the correlator-backed commands: issues + a full
-/// correlation report (`bv_correlation::correlator::correlate`). Walks up
-/// to 1000 commits — Go's default `--history-limit` is 500; doubled here
-/// since file-hotspots/file-relations benefit from more history and this
-/// pipeline has no caching layer yet (see plan doc §11).
-fn load_correlation_report(
-    cwd: &std::path::Path,
-) -> Result<(Vec<bv_core::model::Issue>, String, CorrelationReport), String> {
-    let (issues, hash, _as_of_commit) = load_issues_auto(cwd, None)?;
-    let commits = bv_correlation::correlator::walk_commits(cwd, 1000)?;
-    let report = bv_correlation::correlator::correlate(&issues, &commits);
-    Ok((issues, hash, report))
 }
 
 /// Go `loadCorrelationFeedbackStore` (robot_registry.go:2744-2754) — the store
@@ -12451,7 +13408,7 @@ fn run_robot_docs(args: &[String]) -> ExitCode {
         .cloned()
         .unwrap_or_else(|| "guide".to_string());
     let payload = bv_robot::docs::generate_robot_docs(&topic, GO_APP_VERSION, &jiff_now());
-    emit_json(&payload)
+    emit_json(&sort_json_maps_like_go(&payload))
 }
 
 /// Go `Analyzer.GetBlockerChain` — `--robot-blocker-chain <issue-id>`.

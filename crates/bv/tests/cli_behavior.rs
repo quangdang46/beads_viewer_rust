@@ -341,7 +341,15 @@ fn robot_impact_network_all_returns_full_network() {
     assert_eq!(code, 0);
     assert!(stdout.contains("\"network\""));
     let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
-    assert!(parsed["node_count"].as_u64().unwrap() > 0);
+    // Go's `ImpactNetworkResult` (network.go:845) counts in `stats`, not in a
+    // top-level `node_count` / `edge_count`.
+    assert!(parsed["stats"]["total_nodes"].as_u64().unwrap() > 0);
+    assert!(parsed["stats"]["total_edges"].as_u64().unwrap() > 0);
+    assert_eq!(
+        parsed["stats"]["total_nodes"],
+        parsed["network"]["nodes"].as_object().unwrap().len() as u64,
+        "stats.total_nodes counts the emitted nodes"
+    );
 }
 
 #[test]
