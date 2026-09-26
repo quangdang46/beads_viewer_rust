@@ -65,7 +65,7 @@ fn format_required(required: &[&str]) -> String {
     }
 }
 
-/// Validate modifier-requires rules. Returns list of violations.
+/// Validate modifier-requires rules. Returns the first violation, if any.
 /// `args` is the raw argv when the caller has it.
 ///
 /// Go's rule for a REQUIRED flag is `isFlagActive` (main.go:196-207), and for
@@ -78,11 +78,17 @@ fn format_required(required: &[&str]) -> String {
 ///
 /// When `args` is available, string requirements are re-checked with
 /// [`crate::argv::go_string_flag_active`], which is Go's TrimSpace test.
+///
+/// Singular return, not a list: `validateModifierFlags` builds the message
+/// inside its loop and `return`s on the first broken rule
+/// (cmd/bv/main.go:230-232), so `--watch-export --no-live-reload` reports only
+/// the `--watch-export` row. Collecting every violation made a second error
+/// appear that Go never prints, which is what an agent parsing stderr has to
+/// reconcile.
 pub fn validate_modifier_requires_with(
     present: &Presence,
     args: Option<&[String]>,
-) -> Vec<ValidationError> {
-    let mut violations = Vec::new();
+) -> Option<ValidationError> {
     let requirement_active = |r: &&str| -> bool {
         if let Some(a) = args {
             if crate::flags::flag_is_string(r) && !crate::argv::go_string_flag_active(a, r) {
@@ -94,7 +100,7 @@ pub fn validate_modifier_requires_with(
     for (modifier, required) in MODIFIER_REQUIRES {
         if present.has(modifier) && !required.iter().any(requirement_active) {
             let rendered = format_required(required);
-            violations.push(ValidationError::MissingRequirement {
+            return Some(ValidationError::MissingRequirement {
                 modifier: (*modifier).to_string(),
                 required: rendered.clone(),
                 // Go appends the recovery examples to the same message
@@ -112,17 +118,17 @@ pub fn validate_modifier_requires_with(
             });
         }
     }
-    violations
+    None
 }
 
 /// Validate exclusive primary groups. Returns violation when >1 primary set.
 ///
-/// Also carries the `--watch-export`/`--as-of` cross-flag rejection, which Go
-/// runs as a separate check immediately after the primary-group one
-/// (cmd/bv/main.go:1898-1906). It lives here so `main` stays the only caller:
-/// the check has to fire before the export-pages handler writes anything, and
-/// folding it into an already-dispatched validation pass is what keeps it
-/// ordered correctly without a second call site.
+/// This is Go's third stage (`validateExclusivePrimaryCommands`,
+/// cmd/bv/main.go:1898-1901). It deliberately does NOT carry the
+/// `--watch-export`/`--as-of` check: Go runs that as a fourth stage at
+/// main.go:1903-1906, and every stage exits on its own. Folding two stages
+/// into one call made the later message print even when an earlier stage had
+/// already rejected the run.
 pub fn validate_exclusive_primaries(present: &Presence) -> Vec<ValidationError> {
     let mut group_counts: HashMap<&str, Vec<&str>> = HashMap::new();
     for f in ROBOT_PRIMARIES {
@@ -141,10 +147,22 @@ pub fn validate_exclusive_primaries(present: &Presence) -> Vec<ValidationError> 
             });
         }
     }
-    if present.has("watch-export") && present.has("as-of") {
-        violations.push(ValidationError::WatchExportWithAsOf);
-    }
     violations
+}
+
+/// Go's fourth and last validation stage (cmd/bv/main.go:1903-1906): reject
+/// `--watch-export` alongside `--as-of`. Watching would re-export the snapshot
+/// on every change instead of exporting the one fixed ref the caller asked for.
+///
+/// Separate from [`validate_exclusive_primaries`] because Go's four stages each
+/// end in their own `os.Exit(1)`; a caller that merges stages reports messages
+/// for stages the oracle never reached.
+pub fn validate_watch_export_as_of(present: &Presence) -> Vec<ValidationError> {
+    if present.has("watch-export") && present.has("as-of") {
+        vec![ValidationError::WatchExportWithAsOf]
+    } else {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]
@@ -152,12 +170,22 @@ mod tests {
     use super::*;
     use crate::argv::rewrite_args;
 
+    /// Reproduce Go's four-stage chain (main.go:1890-1906): each stage exits
+    /// on its own, so `check` returns the first stage that produced a message.
     fn check(args: &[&str]) -> Vec<ValidationError> {
         let rewritten = rewrite_args(&args.iter().map(|x| x.to_string()).collect::<Vec<_>>());
         let p = Presence::from_args(&rewritten);
-        let mut v = validate_modifier_requires_with(&p, Some(&rewritten));
-        v.extend(validate_exclusive_primaries(&p));
-        v
+        let stages = [
+            validate_modifier_requires_with(&p, Some(&rewritten))
+                .map(|e| vec![e])
+                .unwrap_or_default(),
+            validate_exclusive_primaries(&p),
+            validate_watch_export_as_of(&p),
+        ];
+        stages
+            .into_iter()
+            .find(|stage| !stage.is_empty())
+            .unwrap_or_default()
     }
 
     #[test]

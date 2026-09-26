@@ -1108,9 +1108,30 @@ fn main() -> ExitCode {
         bv_correlation::explicit::set_custom_id_patterns(compiled);
     }
 
-    // Validation order mirrors Go: modifier-requires then exclusive primaries.
-    let mut violations = validation::validate_modifier_requires_with(&presence, Some(&args));
-    violations.extend(validation::validate_exclusive_primaries(&presence));
+    // Go runs four validation stages and each one exits on its own
+    // (cmd/bv/main.go:1890-1906): modifier-requires, then enum, then
+    // exclusive-primaries, then the `--watch-export`/`--as-of` pair. They are
+    // reproduced as separate early returns rather than one merged list,
+    // because a merged list reports stages the oracle never reached — a
+    // dangling `--watch-export` printed the as-of message on top of the
+    // modifier message Go stops at.
+    //
+    // Within a stage Go exits on the first broken rule, so at most one message
+    // is printed here; `reject_stage` keeps that shape for the stages that can
+    // still produce several (the exclusive-primary groups).
+    let reject_stage = |stage: Vec<validation::ValidationError>| -> Option<ExitCode> {
+        if stage.is_empty() {
+            return None;
+        }
+        for v in &stage {
+            eprintln!("Error: {v}");
+        }
+        Some(ExitCode::from(1))
+    };
+    if let Some(v) = validation::validate_modifier_requires_with(&presence, Some(&args)) {
+        eprintln!("Error: {v}");
+        return ExitCode::from(1);
+    }
 
     // Enum-valued flags (--graph-format, --script-format) were registered and
     // ported but never checked, so an invalid value was accepted and only
@@ -1131,11 +1152,11 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
-    if !violations.is_empty() {
-        for v in &violations {
-            eprintln!("Error: {v}");
-        }
-        return ExitCode::from(1);
+    if let Some(code) = reject_stage(validation::validate_exclusive_primaries(&presence)) {
+        return code;
+    }
+    if let Some(code) = reject_stage(validation::validate_watch_export_as_of(&presence)) {
+        return code;
     }
 
     // Go main.go:1908-1933 opens the file and starts the sampler right after
