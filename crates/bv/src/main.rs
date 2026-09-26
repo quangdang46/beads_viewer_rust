@@ -1136,6 +1136,21 @@ fn main() -> ExitCode {
         eprintln!("{v}");
         return ExitCode::from(1);
     }
+    // An undefined long flag is a parse error in Go, not something that falls
+    // through to the TUI (cmd/bv/main.go:1273-1295). `bvr --robot-triagee`
+    // used to print "Loaded N issues — launching TUI" and block forever.
+    if let Some(unknown) = argv::unknown_long_flag(&args) {
+        match argv::suggest_closest_flag(&unknown) {
+            Some(suggestion) => {
+                eprintln!(
+                    "unknown flag: --{unknown}\nDid you mean `{}`?\nRun `bv --help` for all flags or `bv --robot-help` for agent-focused docs.",
+                    argv::corrected_unknown_flag_command(&args, &unknown, &suggestion)
+                );
+            }
+            None => eprintln!("unknown flag: --{unknown}"),
+        }
+        return ExitCode::from(1);
+    }
     if let Some(v) = validation::validate_modifier_requires_with(&presence, Some(&args)) {
         eprintln!("Error: {v}");
         return ExitCode::from(1);
@@ -1743,20 +1758,13 @@ fn main() -> ExitCode {
     if presence.has("robot-search") {
         return run_robot_search(&args);
     }
-    // A bare `--search Q` with no `--robot-*` primary. Go prints tab-separated
-    // results here and returns (cmd/bv/main.go:3028-3035); reaching this
-    // point instead launched the interactive TUI, which an agent caller
-    // cannot drive — it just hangs, and blocks CI. Fail fast and scriptable
-    // until the text-mode output path is ported.
-    if let Some(q) = search_flag(&args, "search").filter(|q| !q.trim().is_empty()) {
-        if !flags::ROBOT_PRIMARIES.iter().any(|f| presence.has(f.name)) {
-            eprintln!(
-                "Error: --search without --robot-search is not supported yet; \
-                 use --robot-search for JSON output"
-            );
-            let _ = q;
-            return ExitCode::from(2);
-        }
+    // A bare `--search Q` with no `--robot-*` primary. Go runs the same search
+    // and prints the tab-separated text table (cmd/bv/main.go:2963, :3028-3035),
+    // so it goes through the identical code path and differs only in output.
+    if search_flag(&args, "search").is_some_and(|q| !q.trim().is_empty())
+        && !flags::ROBOT_PRIMARIES.iter().any(|f| presence.has(f.name))
+    {
+        return run_robot_search(&args);
     }
     if presence.has("robot-causality") {
         return run_robot_causality(&args);
@@ -11562,6 +11570,33 @@ fn run_robot_search(args: &[String]) -> ExitCode {
                 return ExitCode::from(1);
             }
         }
+    }
+
+    // Go's human-readable branch (cmd/bv/main.go:2963, :3028-3035): the JSON
+    // envelope is dispatched only when `--robot-search` is present, so a bare
+    // `--search Q` prints one tab-separated row per hit and exits 0. This is
+    // the path a human or a shell pipeline uses — before the robot flag
+    // existed it was the only thing `--search` did.
+    let robot_mode = args
+        .iter()
+        .any(|a| a == "--robot-search" || a.starts_with("--robot-search="));
+    if !robot_mode {
+        let title_of = |id: &str| title_by_id.get(id).cloned().unwrap_or_default();
+        if hybrid_mode {
+            for r in &hybrid_rows {
+                println!(
+                    "{:.4}\t{}\t{}",
+                    r.final_score,
+                    r.issue_id,
+                    title_of(&r.issue_id)
+                );
+            }
+        } else {
+            for r in &results {
+                println!("{:.4}\t{}\t{}", r.score, r.issue_id, title_of(&r.issue_id));
+            }
+        }
+        return ExitCode::from(0);
     }
 
     let index_data_hash = bv_core::data_hash::compute_data_hash(&issues_for_search);

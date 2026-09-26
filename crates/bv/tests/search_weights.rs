@@ -196,14 +196,18 @@ fn the_flag_overrides_an_inherited_bv_search_weights() {
 
 #[test]
 fn search_weights_requires_search() {
-    // main.go:1795 — {modifier: "search-weights", requires: ["search"]}.
+    // main.go:1795 — {modifier: "search-weights", requires: ["search"]}. The
+    // invocation also passes `--robot-search`, which the same table requires
+    // `search` for, and that rule is listed first (main.go:1790). Go reports the
+    // first broken rule and stops, so the message names `--robot-search`; the
+    // oracle's stderr is byte-identical to ours on this argv.
     let (code, _, stderr) = bvr(&[
         "--robot-search",
         r#"--search-weights={"text":1.0,"pagerank":0.0,"status":0.0,"impact":0.0,"priority":0.0,"recency":0.0}"#,
     ]);
     assert_eq!(code, 1);
     assert!(
-        stderr.contains("--search-weights requires --search"),
+        stderr.contains("--robot-search requires --search"),
         "{stderr}"
     );
 }

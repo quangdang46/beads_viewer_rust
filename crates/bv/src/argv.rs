@@ -743,10 +743,134 @@ pub fn unconsumed_positional(rewritten: &[String]) -> Option<String> {
     None
 }
 
+/// The first long flag Go's `flag` package would reject as undefined.
+///
+/// Go's parse walks argv left to right and stops at the first non-flag word,
+/// so anything after a positional is not this function's business. Short
+/// flags are out of scope for the same reason `unknownLongFlagName` is: the
+/// oracle's message and suggestion path are both written for `--long`.
+///
+/// The guard this feeds is not cosmetic. Without it a typo like
+/// `--robot-triagee` fell through to the interactive TUI, which an agent or CI
+/// caller cannot drive — the process blocks until it is killed.
+pub fn unknown_long_flag(args: &[String]) -> Option<String> {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if !arg.starts_with('-') || arg == "-" || arg == "--" {
+            return None;
+        }
+        let (name, has_inline_value) = match arg.split_once('=') {
+            Some((n, _)) => (n, true),
+            None => (arg.as_str(), false),
+        };
+        let bare = name.trim_start_matches('-');
+        // `-` prefixes of any length name the same flag in Go (`-label` and
+        // `--label` are equivalent), and Go does not define a bare `--`.
+        let known = !bare.is_empty() && crate::flags::flag_kind(bare).is_some();
+        if !known {
+            return Some(bare.to_string());
+        }
+        let takes_value = !has_inline_value
+            && !matches!(
+                crate::flags::flag_kind(bare),
+                Some(crate::flags::FlagKind::Bool) | None
+            );
+        i += if takes_value { 2 } else { 1 };
+    }
+    None
+}
+
+/// Go `maxSuggestionDistance` (cmd/bv/main.go:411-420): a longer name may sit
+/// further from its match before the suggestion stops being useful.
+fn max_suggestion_distance(value: &str) -> usize {
+    match value.len() {
+        0..=4 => 2,
+        5..=10 => 3,
+        _ => 4,
+    }
+}
+
+/// Go `levenshteinDistance` (cmd/bv/main.go), the standard edit distance.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// Go `suggestClosest` (cmd/bv/main.go:389-409) over the registered flag names.
+///
+/// The tie-break is load-bearing and easy to get backwards: Go keeps a
+/// candidate when `dist <= bestDist` and then prefers the strictly-closer one,
+/// or the lexicographically smaller name at equal distance. Reusing `bestDist`
+/// as the running threshold is what makes a later equal-distance candidate win.
+pub fn suggest_closest_flag(value: &str) -> Option<String> {
+    let value = value.trim().to_lowercase();
+    if value.is_empty() {
+        return None;
+    }
+    let mut best: Option<(String, usize)> = None;
+    for name in crate::flags::flag_names() {
+        let normalized = name.trim().to_lowercase();
+        if normalized.is_empty() {
+            continue;
+        }
+        let dist = levenshtein(&value, &normalized);
+        let within = dist <= max_suggestion_distance(&value);
+        let better = match &best {
+            None => within,
+            Some((best_name, best_dist)) => {
+                within && (dist < *best_dist || (dist == *best_dist && normalized < *best_name))
+            }
+        };
+        if better {
+            best = Some((normalized, dist));
+        }
+    }
+    best.map(|(name, _)| name)
+}
+
+/// Go `correctedUnknownFlagCommand` (cmd/bv/main.go:1299-1323): the whole
+/// invocation with the unknown flag swapped for the suggestion, so the reader
+/// can copy it. Only reached when the unknown flag actually appears in argv.
+pub fn corrected_unknown_flag_command(args: &[String], unknown: &str, suggestion: &str) -> String {
+    let target = format!("--{unknown}");
+    let replacement = format!("--{suggestion}");
+    let mut corrected: Vec<String> = Vec::with_capacity(args.len() + 1);
+    let mut replaced = false;
+    for arg in args {
+        if arg == &target {
+            corrected.push(replacement.clone());
+            replaced = true;
+        } else if let Some(rest) = arg.strip_prefix(&format!("{target}=")) {
+            corrected.push(format!("{replacement}={rest}"));
+            replaced = true;
+        } else {
+            corrected.push(arg.clone());
+        }
+    }
+    if !replaced {
+        corrected.push(replacement);
+    }
+    std::iter::once("bv".to_string())
+        .chain(corrected)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Go `strconv.ParseBool` — the parser pflag's `boolValue.Set` calls for the
 /// optional `=` value of a boolean flag (cmd/bv's registry is a pflag set;
 /// `github.com/spf13/pflag v1.0.10`, go.mod:27).
-///
 /// The accepted set is Go's, not a looser shell convention: `1 t T TRUE
 /// true True` and `0 f F FALSE false False`. In particular `y`, `yes`, `n`,
 /// `no` and `on` are syntax errors — verified against the v0.25.0 oracle,
