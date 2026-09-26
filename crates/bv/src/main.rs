@@ -10357,6 +10357,70 @@ fn run_robot_correlation_stats() -> ExitCode {
 }
 
 /// Go `handleRobotFileBeads` — `--robot-file-beads <path>`.
+/// Shared plumbing for the four file-index-backed robot commands
+/// (`--robot-file-beads`, `--robot-file-relations`, `--robot-impact`,
+/// `--robot-file-hotspots`).
+///
+/// Go builds a `*HistoryReport` through the shared `generateCorrelationReport`
+/// (limit 500, overridable by `--history-limit`) and hands it to
+/// `correlation.NewFileLookup`. Feeding these commands the sha-only
+/// `correlate()` map instead is why they used to return nothing: that map has
+/// no per-file history and no per-commit numstat, so there is no index to
+/// build one from.
+///
+/// The second half is Go's `ctx.EnvelopeWithHash(report.DataHash)`, which
+/// overrides only the envelope's own `data_hash` and `scope_hash` —
+/// `source_authority` and the `authority_hash` derived from it still carry the
+/// *loader's* full-file sha256. Build the envelope with the file hash, then
+/// substitute the two report-derived fields.
+fn file_lookup_envelope(
+    args: &[String],
+    issues: &[bv_core::model::Issue],
+) -> Result<
+    (
+        bv_correlation::history::HistoryReport,
+        bv_correlation::file_index::FileLookup,
+    ),
+    String,
+> {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    validate_correlation_repository(&cwd).map_err(|e| e.to_string())?;
+    let mut opts = bv_correlation::history::HistoryOptions {
+        limit: 500,
+        ..Default::default()
+    };
+    if let Some(raw) = flag_value(args, "history-limit") {
+        if let Ok(v) = go_parse_int_base0(raw.trim()) {
+            opts.limit = v;
+        }
+    }
+    let report = generate_correlation_report(&cwd, issues, &opts, jiff_now(), true)
+        .map_err(|e| e.to_string())?;
+    let lookup = bv_correlation::file_index::FileLookup::new(&report);
+    Ok((report, lookup))
+}
+
+/// Go's envelope for a file-index command: the loader's file hash, with the
+/// report's `data_hash` and a `scope_hash` recomputed over it.
+fn file_index_payload(
+    issues: &[bv_core::model::Issue],
+    report: &bv_correlation::history::HistoryReport,
+) -> serde_json::Value {
+    let file_hash = bv_core::data_hash::compute_data_hash(issues);
+    let mut payload = full_envelope_for(&file_hash, issues);
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("data_hash".into(), serde_json::json!(report.data_hash));
+        let mut ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
+        ids.sort();
+        let scope_hash = bv_robot::scope_hash("", "", "", &report.data_hash, &ids);
+        if !scope_hash.is_empty() {
+            obj.insert("scope_hash".into(), serde_json::json!(scope_hash));
+        }
+    }
+    payload
+}
+
+/// Go `handleRobotFileBeads` — `--robot-file-beads <path>`.
 fn run_robot_file_beads(args: &[String]) -> ExitCode {
     let path = args
         .iter()
@@ -10374,63 +10438,36 @@ fn run_robot_file_beads(args: &[String]) -> ExitCode {
         .unwrap_or(20)
         .max(0);
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (_issues, hash, report) = match load_correlation_report(&cwd) {
+    let issues = match load_issues_auto(&cwd, None) {
+        Ok((issues, _, _)) => issues,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let (report, file_lookup) = match file_lookup_envelope(args, &issues) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
             return ExitCode::from(1);
         }
     };
-    // Go builds the split open/closed view through `correlation.NewFileLookup`
-    // (robot_registry.go:3139-3140). That needs a `HistoryReport`, which this
-    // path does not build: `correlate()` yields sha/timestamp/files but not
-    // the per-commit numstat that `BeadReference.total_changes` sums, so that
-    // one field stays 0 here rather than being invented. Everything else in
-    // the reference (id, title, status, commit shas, last touch) comes from
-    // the correlation map plus the loaded issues.
-    let mut by_id: std::collections::HashMap<&str, (&str, &str)> = std::collections::HashMap::new();
-    for i in &_issues {
-        by_id.insert(i.id.as_str(), (i.title.as_str(), i.status.as_str()));
-    }
-    let mut open_beads: Vec<serde_json::Value> = Vec::new();
-    let mut closed_beads: Vec<serde_json::Value> = Vec::new();
-    for (bead_id, commits) in &report {
-        let touching: Vec<&bv_correlation::correlator::CorrelatedCommit> = commits
-            .iter()
-            .filter(|c| c.files.iter().any(|f| f == &path))
-            .collect();
-        if touching.is_empty() {
-            continue;
-        }
-        let (title, status) = by_id.get(bead_id.as_str()).copied().unwrap_or(("", ""));
-        let last_touch = touching
-            .iter()
-            .map(|c| c.timestamp.as_str())
-            .max()
-            .unwrap_or_default();
-        let entry = serde_json::json!({
-            "bead_id": bead_id,
-            "title": title,
-            "status": status,
-            "commit_shas": touching.iter().map(|c| c.sha.clone()).collect::<Vec<_>>(),
-            "last_touch": last_touch,
-            "total_changes": 0,
-        });
-        // Go splits on the bead's normalized status, not on the commit.
-        match bv_correlation::file_index::classify_bead_status(status) {
-            (_, true) => closed_beads.push(entry),
-            _ => open_beads.push(entry),
-        }
-    }
+    let result = file_lookup.lookup_by_file(&path);
+    // Go reads `TotalBeads` off the lookup result BEFORE truncating
+    // `ClosedBeads` (robot_registry.go:3149-3153), so the total counts beads
+    // the payload then omits. Computing it after the truncation would understate
+    // it by up to the limit.
+    let total_beads = result.total_beads;
+    let mut closed_beads = result.closed_beads;
     if closed_beads.len() > closed_limit as usize {
         closed_beads.truncate(closed_limit as usize);
     }
-    let total_beads = open_beads.len() + closed_beads.len();
-    let mut payload = full_envelope_for(&hash, &_issues);
+    let mut payload = file_index_payload(&issues, &report);
     payload["file_path"] = serde_json::json!(path);
     payload["total_beads"] = serde_json::json!(total_beads);
-    payload["open_beads"] = serde_json::Value::Array(open_beads);
-    payload["closed_beads"] = serde_json::Value::Array(closed_beads);
+    payload["open_beads"] = serde_json::to_value(&result.open_beads).unwrap_or(serde_json::Value::Null);
+    payload["closed_beads"] =
+        serde_json::to_value(&closed_beads).unwrap_or(serde_json::Value::Null);
     emit_json(&payload)
 }
 
@@ -10519,7 +10556,14 @@ fn run_robot_file_relations(args: &[String]) -> ExitCode {
         .cloned()
         .unwrap_or_default();
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (_issues, hash, report) = match load_correlation_report(&cwd) {
+    let issues = match load_issues_auto(&cwd, None) {
+        Ok((issues, _, _)) => issues,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let (report, file_lookup) = match file_lookup_envelope(args, &issues) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -10529,6 +10573,8 @@ fn run_robot_file_relations(args: &[String]) -> ExitCode {
     // Go main.go:1571 registers `--relations-threshold` with default 0.5, and
     // file_index.go:484-486 re-applies the same 0.5 whenever the value is
     // <= 0, so a 0 or a negative means "50% co-occurrence", not "no filter".
+    // Go re-applies it inside `GetRelatedFiles`; the local mirror keeps the
+    // echoed `threshold` field consistent with what was actually filtered on.
     let mut relations_threshold: f64 = flag_value(args, "relations-threshold")
         .and_then(|raw| raw.trim().parse::<f64>().ok())
         .unwrap_or(0.5);
@@ -10548,69 +10594,20 @@ fn run_robot_file_relations(args: &[String]) -> ExitCode {
         10
     } as usize;
 
-    // Go's `CoChangeMatrix` records, per file, how many distinct commits
-    // touched it and which of those also touched each neighbour. The
-    // correlation score is count / total_commits, which is what the
-    // threshold filters on — the previous raw-count ranking ignored both the
-    // denominator and the threshold entirely.
-    let mut total_commits: u64 = 0;
-    let mut co_change: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
-    let mut samples: std::collections::BTreeMap<String, Vec<String>> =
-        std::collections::BTreeMap::new();
-    let mut seen_shas: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-    for commits in report.values() {
-        for c in commits {
-            if !c.files.iter().any(|f| f == &path) || !seen_shas.insert(c.sha.as_str()) {
-                continue;
-            }
-            total_commits += 1;
-            for other in &c.files {
-                if other != &path {
-                    *co_change.entry(other.clone()).or_insert(0) += 1;
-                    samples
-                        .entry(other.clone())
-                        .or_default()
-                        .push(c.sha.clone());
-                }
-            }
-        }
-    }
-    let mut related: Vec<serde_json::Value> = Vec::new();
-    if total_commits > 0 {
-        for (f, count) in co_change {
-            let correlation = count as f64 / total_commits as f64;
-            if correlation < relations_threshold {
-                continue;
-            }
-            // Go file_index.go:519-521 collects then sorts the sample commits
-            // and keeps the first three; taking them straight from a map made
-            // the output vary between runs.
-            let mut shas = samples.remove(&f).unwrap_or_default();
-            shas.sort();
-            shas.truncate(3);
-            related.push(serde_json::json!({
-                "file_path": f,
-                "co_change_count": count,
-                "total_commits": total_commits,
-                "correlation": correlation,
-                "sample_commits": shas,
-            }));
-        }
-    }
-    related.sort_by(|a, b| {
-        b["co_change_count"]
-            .as_u64()
-            .cmp(&a["co_change_count"].as_u64())
-            .then_with(|| a["file_path"].as_str().cmp(&b["file_path"].as_str()))
-    });
-    related.truncate(relations_limit);
-    let mut payload = full_envelope_for(&hash, &_issues);
+    // Go builds the co-change matrix inside `NewFileLookup` and filters it in
+    // `GetRelatedFiles` (file_index.go:484-521): the score is
+    // co_change_count / total_commits, sample commits are sorted then capped
+    // at three, and the sort is count DESC then path ASC. The previous Rust
+    // version rebuilt all of that by hand off the sha-only correlation map.
+    let result = file_lookup.get_related_files(&path, relations_threshold, relations_limit);
+    let mut payload = file_index_payload(&issues, &report);
     // Go `CoChangeResult` (file_index.go:495-500) — an unknown file short-
     // circuits with an empty list but still reports these two.
     payload["file_path"] = serde_json::json!(path);
-    payload["total_commits"] = serde_json::json!(total_commits);
+    payload["total_commits"] = serde_json::json!(result.total_commits);
     payload["threshold"] = serde_json::json!(relations_threshold);
-    payload["related_files"] = serde_json::Value::Array(related);
+    payload["related_files"] =
+        serde_json::to_value(&result.related_files).unwrap_or(serde_json::Value::Null);
     emit_json(&payload)
 }
 
@@ -11147,30 +11144,48 @@ fn run_robot_impact(args: &[String]) -> ExitCode {
         .and_then(|i| args.get(i + 1))
         .cloned()
         .unwrap_or_default();
-    let files: Vec<String> = files_str
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if files.is_empty() {
+    // Go (robot_registry.go:3183-3186) splits on "," and trims each segment.
+    // It does NOT drop empty ones, so `--robot-impact "a,,b"` yields three
+    // entries with the middle one blank; the old filter silently turned that
+    // into two and shifted every index after it.
+    let files: Vec<String> = files_str.split(',').map(|s| s.trim().to_string()).collect();
+    if files_str.trim().is_empty() {
         eprintln!("Error: --robot-impact requires comma-separated file paths");
         return ExitCode::from(2);
     }
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (_issues, hash, report) = match load_correlation_report(&cwd) {
+    let issues = match load_issues_auto(&cwd, None) {
+        Ok((issues, _, _)) => issues,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let (report, file_lookup) = match file_lookup_envelope(args, &issues) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("Error: {e}");
             return ExitCode::from(1);
         }
     };
-    let result = bv_analysis::file_impact::compute_file_impact(&files, &report);
-    let mut payload = full_envelope_for(&hash, &[]);
+    // Go calls `ImpactAnalysisAt(files, robotNow())`. The previous Rust path
+    // called `bv_analysis::file_impact::compute_file_impact`, an invented
+    // heuristic over the sha-only correlation map with a ">10 beads -> high"
+    // risk ladder and a "0 beads affected across 1 files" summary that appears
+    // nowhere in Go. `robot_now()` keeps the recency window deterministic.
+    let result = file_lookup.impact_analysis_at(&files, robot_now());
+    let mut payload = file_index_payload(&issues, &report);
+    // Go's emit order is files, risk_level, risk_score, summary, warnings,
+    // affected_beads — the order of the anonymous struct at
+    // robot_registry.go:3177-3183, which is not the order ImpactResult
+    // declares its own fields in.
     payload["files"] = serde_json::json!(result.files);
     payload["risk_level"] = serde_json::json!(result.risk_level);
     payload["risk_score"] = serde_json::json!(result.risk_score);
     payload["summary"] = serde_json::json!(result.summary);
-    payload["affected_beads"] = serde_json::to_value(&result.affected_beads).unwrap_or_default();
+    payload["warnings"] = serde_json::json!(result.warnings);
+    payload["affected_beads"] =
+        serde_json::to_value(&result.affected_beads).unwrap_or(serde_json::Value::Null);
     emit_json(&payload)
 }
 
