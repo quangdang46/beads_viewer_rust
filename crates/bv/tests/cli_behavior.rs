@@ -88,16 +88,64 @@ fn robot_help_lists_primaries() {
     assert!(stdout.contains("exit 0=success"));
 }
 
+/// Go `generateRobotCapabilities` (cmd/bv/main.go:7903-7953) emits a manifest of
+/// what each command NEEDS, not a status ledger.
+///
+/// This test used to assert `implemented_count` and `total_count` — Rust-only
+/// inventions, since removed. Asserting them meant the test could not pass
+/// against Go's actual shape, the same defect as the old
+/// `robot_related_builds_dependency_edges`, which asserted a `related` field
+/// that `RelatedWorkResult` has never had.
 #[test]
-fn robot_capabilities_reports_real_implementation_status() {
+fn robot_capabilities_reports_the_fields_go_emits() {
     let (code, stdout, _) = run(&["--robot-capabilities"]);
     assert_eq!(code, 0);
-    assert!(stdout.contains("\"implemented_count\""));
-    assert!(stdout.contains("\"total_count\""));
-    // robot-triage is dispatched; robot-drift is not (yet) — both must be
-    // present with their real status, not a blanket "implemented".
-    assert!(stdout.contains("robot-triage"));
-    assert!(stdout.contains("robot-drift"));
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
+
+    // Go's manifest-level keys (main.go:7944-7952).
+    for key in [
+        "tool",
+        "version",
+        "contract_version",
+        "default_robot_command",
+        "output_formats",
+        "commands",
+        "docs_topics",
+        "schema_command",
+        "agent_intent_aliases",
+        "environment_variables",
+        "exit_codes",
+        "stream_contract",
+    ] {
+        assert!(parsed.get(key).is_some(), "missing manifest key: {key}");
+    }
+    // `tool` is the Go binary name; the port must not rename it to bvr.
+    assert_eq!(parsed["tool"], "bv", "Go's manifest says bv");
+
+    let commands = parsed["commands"].as_array().expect("commands array");
+    assert!(!commands.is_empty());
+    for c in commands {
+        for key in [
+            "name",
+            "flag",
+            "description",
+            "preferred_invocation",
+            "accepted_invocations",
+            "needs_issues",
+            "needs_git",
+            "needs_sprint",
+            "needs_baseline",
+            "mutates_state",
+        ] {
+            assert!(c.get(key).is_some(), "command missing {key}: {c}");
+        }
+        // `status` is a Rust invention with no Go counterpart.
+        assert!(c.get("status").is_none(), "invented field `status` on {c}");
+    }
+
+    let names: Vec<&str> = commands.iter().filter_map(|c| c["name"].as_str()).collect();
+    assert!(names.contains(&"robot-triage"), "{names:?}");
+    assert!(names.contains(&"robot-drift"), "{names:?}");
 }
 
 #[test]

@@ -1,0 +1,970 @@
+{
+  "agent_intent_aliases": [
+    {
+      "agent_instinct": "bv --json",
+      "canonical": "bv --robot-triage --format json"
+    },
+    {
+      "agent_instinct": "bv robot-triage --json",
+      "canonical": "bv --robot-triage --format json"
+    },
+    {
+      "agent_instinct": "bv triage --json",
+      "canonical": "bv --robot-triage --format json"
+    },
+    {
+      "agent_instinct": "bv next --json",
+      "canonical": "bv --robot-next --format json"
+    },
+    {
+      "agent_instinct": "bv plan --json",
+      "canonical": "bv --robot-plan --format json"
+    },
+    {
+      "agent_instinct": "bv insights --json",
+      "canonical": "bv --robot-insights --format json"
+    },
+    {
+      "agent_instinct": "bv robot-capabilities --json",
+      "canonical": "bv --robot-capabilities --format json"
+    },
+    {
+      "agent_instinct": "bv capabilities --json",
+      "canonical": "bv --robot-capabilities --format json"
+    },
+    {
+      "agent_instinct": "bv robot-docs guide --json",
+      "canonical": "bv --robot-docs guide --format json"
+    },
+    {
+      "agent_instinct": "bv docs guide --json",
+      "canonical": "bv --robot-docs guide --format json"
+    },
+    {
+      "agent_instinct": "bv robot-schema triage --json",
+      "canonical": "bv --robot-schema --schema-command robot-triage --format json"
+    },
+    {
+      "agent_instinct": "bv schema triage --json",
+      "canonical": "bv --robot-schema --schema-command robot-triage --format json"
+    },
+    {
+      "agent_instinct": "bv robot-search login oauth --json --limit 5",
+      "canonical": "bv --search 'login oauth' --robot-search --format json --search-limit 5"
+    },
+    {
+      "agent_instinct": "bv search login oauth --json --limit 5",
+      "canonical": "bv --search 'login oauth' --robot-search --format json --search-limit 5"
+    },
+    {
+      "agent_instinct": "bv robot-graph mermaid --json",
+      "canonical": "bv --robot-graph --graph-format mermaid --format json"
+    },
+    {
+      "agent_instinct": "bv graph mermaid --json",
+      "canonical": "bv --robot-graph --graph-format mermaid --format json"
+    },
+    {
+      "agent_instinct": "bv robot-related bv-123 --json",
+      "canonical": "bv --robot-related bv-123 --format json"
+    },
+    {
+      "agent_instinct": "bv --name backend --json",
+      "canonical": "bv --label backend --robot-triage --format json"
+    }
+  ],
+  "commands": [
+    {
+      "accepted_invocations": [
+        "bv --robot-alerts --format json",
+        "bv robot-alerts --severity critical --json"
+      ],
+      "description": "Stale issues, blocking cascades, priority mismatches.",
+      "flag": "--robot-alerts",
+      "key_fields": [
+        "alerts",
+        "severity",
+        "affected_issues"
+      ],
+      "mutates_state": false,
+      "name": "robot-alerts",
+      "needs_baseline": false,
+      "needs_git": false,
+      "needs_issues": true,
+      "needs_sprint": false,
+      "params": [
+        "--severity info|warning|critical",
+        "--alert-type critical",
+        "--alert-label backend"
+      ],
+      "preferred_invocation": "bv robot-alerts --severity critical --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-blocker-chain ISSUE_ID --format json",
+        "bv robot-blocker-chain ISSUE_ID --json"
+      ],
+      "description": "Full blocker chain analysis for an issue.",
+      "flag": "--robot-blocker-chain ISSUE_ID",
+      "key_fields": [
+        "result.target_id",
+        "result.is_blocked",
+        "result.root_blockers",
+        "result.chain",
+        "result.has_cycle"
+      ],
+      "mutates_state": false,
+      "name": "robot-blocker-chain",
+      "needs_baseline": false,
+      "needs_git": false,
+      "needs_issues": true,
+      "needs_sprint": false,
+      "preferred_invocation": "bv robot-blocker-chain ISSUE_ID --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-burndown current --format json",
+        "bv robot-burndown current --json"
+      ],
+      "description": "Sprint burndown data.",
+      "flag": "--robot-burndown current",
+      "mutates_state": false,
+      "name": "robot-burndown",
+      "needs_baseline": false,
+      "needs_git": false,
+      "needs_issues": true,
+      "needs_sprint": true,
+      "preferred_invocation": "bv robot-burndown current --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-capabilities --format json",
+        "bv robot-capabilities --json"
+      ],
+      "description": "Machine-readable capability manifest: version, contract, commands, env vars, exit codes, and output formats.",
+      "flag": "--robot-capabilities",
+      "key_fields": [
+        "tool",
+        "version",
+        "contract_version",
+        "commands",
+        "environment_variables",
+        "exit_codes"
+      ],
+      "mutates_state": false,
+      "name": "robot-capabilities",
+      "needs_baseline": false,
+      "needs_git": false,
+      "needs_issues": false,
+      "needs_sprint": false,
+      "preferred_invocation": "bv robot-capabilities --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-capacity --format json",
+        "bv robot-capacity --json"
+      ],
+      "description": "Capacity simulation and completion projections.",
+      "flag": "--robot-capacity",
+      "mutates_state": false,
+      "name": "robot-capacity",
+      "needs_baseline": false,
+      "needs_git": false,
+      "needs_issues": true,
+      "needs_sprint": false,
+      "params": [
+        "--agents 10",
+        "--capacity-label backend"
+      ],
+      "preferred_invocation": "bv robot-capacity --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-causality ISSUE_ID --format json",
+        "bv robot-causality ISSUE_ID --json"
+      ],
+      "description": "Causal chain analysis for a bead.",
+      "flag": "--robot-causality ISSUE_ID",
+      "key_fields": [
+        "chain.bead_id",
+        "chain.events",
+        "insights.summary",
+        "insights.critical_path",
+        "insights.recommendations"
+      ],
+      "mutates_state": false,
+      "name": "robot-causality",
+      "needs_baseline": false,
+      "needs_git": true,
+      "needs_issues": true,
+      "needs_sprint": false,
+      "preferred_invocation": "bv robot-causality ISSUE_ID --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-confirm-correlation deadbeef:ISSUE_ID --format json",
+        "bv robot-confirm-correlation deadbeef:ISSUE_ID --correlation-by agent --json"
+      ],
+      "description": "Record positive feedback for a commit-to-bead correlation.",
+      "flag": "--robot-confirm-correlation deadbeef:ISSUE_ID",
+      "mutates_state": true,
+      "name": "robot-confirm-correlation",
+      "needs_baseline": false,
+      "needs_git": true,
+      "needs_issues": true,
+      "needs_sprint": false,
+      "params": [
+        "--correlation-by agent",
+        "--correlation-reason verified"
+      ],
+      "preferred_invocation": "bv robot-confirm-correlation deadbeef:ISSUE_ID --correlation-by agent --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-correlation-stats --format json",
+        "bv robot-correlation-stats --json"
+      ],
+      "description": "Summary counts for saved correlation feedback.",
+      "flag": "--robot-correlation-stats",
+      "key_fields": [
+        "total_feedback",
+        "confirmed",
+        "rejected",
+        "ignored",
+        "accuracy_rate"
+      ],
+      "mutates_state": false,
+      "name": "robot-correlation-stats",
+      "needs_baseline": false,
+      "needs_git": false,
+      "needs_issues": false,
+      "needs_sprint": false,
+      "preferred_invocation": "bv robot-correlation-stats --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-diff --diff-since HEAD~1 --format json",
+        "bv robot-diff HEAD~1 --json"
+      ],
+      "description": "Changes since a historical point (commit, branch, tag, or date).",
+      "flag": "--robot-diff",
+      "mutates_state": false,
+      "name": "robot-diff",
+      "needs_baseline": false,
+      "needs_git": true,
+      "needs_issues": true,
+      "needs_sprint": false,
+      "params": [
+        "--diff-since HEAD~1"
+      ],
+      "preferred_invocation": "bv robot-diff HEAD~1 --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-docs guide --format json",
+        "bv robot-docs guide --json"
+      ],
+      "description": "Machine-readable JSON documentation. Topics: guide, commands, examples, env, exit-codes, all.",
+      "flag": "--robot-docs guide",
+      "mutates_state": false,
+      "name": "robot-docs",
+      "needs_baseline": false,
+      "needs_git": false,
+      "needs_issues": false,
+      "needs_sprint": false,
+      "preferred_invocation": "bv robot-docs guide --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --check-drift --robot-drift --format json",
+        "bv robot-drift --json"
+      ],
+      "description": "Drift detection from saved baseline.",
+      "flag": "--robot-drift",
+      "mutates_state": false,
+      "name": "robot-drift",
+      "needs_baseline": true,
+      "needs_git": false,
+      "needs_issues": true,
+      "needs_sprint": false,
+      "preferred_invocation": "bv --check-drift --robot-drift --format json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-explain-correlation deadbeef:ISSUE_ID --format json",
+        "bv robot-explain-correlation deadbeef:ISSUE_ID --json"
+      ],
+      "description": "Explain why a commit is linked to a bead.",
+      "flag": "--robot-explain-correlation deadbeef:ISSUE_ID",
+      "key_fields": [
+        "commit",
+        "bead",
+        "score",
+        "reasons"
+      ],
+      "mutates_state": false,
+      "name": "robot-explain-correlation",
+      "needs_baseline": false,
+      "needs_git": true,
+      "needs_issues": true,
+      "needs_sprint": false,
+      "preferred_invocation": "bv robot-explain-correlation deadbeef:ISSUE_ID --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-file-beads README.md --format json",
+        "bv robot-file-beads README.md --json"
+      ],
+      "description": "Beads that touched a specific file path.",
+      "flag": "--robot-file-beads README.md",
+      "key_fields": [
+        "file_path",
+        "total_beads",
+        "open_beads",
+        "closed_beads"
+      ],
+      "mutates_state": false,
+      "name": "robot-file-beads",
+      "needs_baseline": false,
+      "needs_git": true,
+      "needs_issues": true,
+      "needs_sprint": false,
+      "params": [
+        "--file-beads-limit 10"
+      ],
+      "preferred_invocation": "bv robot-file-beads README.md --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-file-hotspots --format json",
+        "bv robot-file-hotspots --json"
+      ],
+      "description": "Files touched by the most beads.",
+      "flag": "--robot-file-hotspots",
+      "key_fields": [
+        "hotspots",
+        "stats.total_files",
+        "stats.total_bead_links",
+        "stats.files_with_multiple_beads"
+      ],
+      "mutates_state": false,
+      "name": "robot-file-hotspots",
+      "needs_baseline": false,
+      "needs_git": true,
+      "needs_issues": true,
+      "needs_sprint": false,
+      "params": [
+        "--hotspots-limit 10"
+      ],
+      "preferred_invocation": "bv robot-file-hotspots --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-file-relations README.md --format json",
+        "bv robot-file-relations README.md --json"
+      ],
+      "description": "Files that frequently co-change with a given file.",
+      "flag": "--robot-file-relations README.md",
+      "key_fields": [
+        "file_path",
+        "total_commits",
+        "threshold",
+        "related_files"
+      ],
+      "mutates_state": false,
+      "name": "robot-file-relations",
+      "needs_baseline": false,
+      "needs_git": true,
+      "needs_issues": true,
+      "needs_sprint": false,
+      "params": [
+        "--relations-threshold 0.0-1.0",
+        "--relations-limit 10"
+      ],
+      "preferred_invocation": "bv robot-file-relations README.md --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-forecast all --format json",
+        "bv robot-forecast all --json"
+      ],
+      "description": "ETA predictions for bead completion.",
+      "flag": "--robot-forecast all",
+      "mutates_state": false,
+      "name": "robot-forecast",
+      "needs_baseline": false,
+      "needs_git": false,
+      "needs_issues": true,
+      "needs_sprint": false,
+      "params": [
+        "--forecast-label backend",
+        "--forecast-sprint SPRINT_ID",
+        "--forecast-agents 10"
+      ],
+      "preferred_invocation": "bv robot-forecast all --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-graph --format json",
+        "bv robot-graph mermaid --json"
+      ],
+      "description": "Dependency graph export in JSON, DOT, or Mermaid format.",
+      "flag": "--robot-graph",
+      "mutates_state": false,
+      "name": "robot-graph",
+      "needs_baseline": false,
+      "needs_git": false,
+      "needs_issues": true,
+      "needs_sprint": false,
+      "params": [
+        "--graph-format json|dot|mermaid",
+        "--graph-root ISSUE_ID",
+        "--graph-depth 10"
+      ],
+      "preferred_invocation": "bv robot-graph mermaid --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv robot-help --json",
+        "bv robot-docs guide --json"
+      ],
+      "description": "Agent-focused command help. Use robot-docs guide for structured JSON documentation.",
+      "flag": "--robot-help",
+      "mutates_state": false,
+      "name": "robot-help",
+      "needs_baseline": false,
+      "needs_git": false,
+      "needs_issues": false,
+      "needs_sprint": false,
+      "preferred_invocation": "bv robot-help --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-history --format json",
+        "bv robot-history --history-limit 20 --json"
+      ],
+      "description": "Bead-to-commit correlations from git history.",
+      "flag": "--robot-history",
+      "key_fields": [
+        "correlations",
+        "confidence",
+        "commit_sha",
+        "bead_id"
+      ],
+      "mutates_state": false,
+      "name": "robot-history",
+      "needs_baseline": false,
+      "needs_git": true,
+      "needs_issues": true,
+      "needs_sprint": false,
+      "params": [
+        "--bead-history ISSUE_ID",
+        "--history-since \"30 days ago\"",
+        "--history-limit 10",
+        "--min-confidence 0.0-1.0"
+      ],
+      "preferred_invocation": "bv robot-history --history-limit 20 --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-impact README.md --format json",
+        "bv robot-impact README.md --json"
+      ],
+      "description": "Analyze bead impact for files that may be modified.",
+      "flag": "--robot-impact README.md",
+      "key_fields": [
+        "files",
+        "risk_level",
+        "risk_score",
+        "warnings",
+        "affected_beads"
+      ],
+      "mutates_state": false,
+      "name": "robot-impact",
+      "needs_baseline": false,
+      "needs_git": true,
+      "needs_issues": true,
+      "needs_sprint": false,
+      "preferred_invocation": "bv robot-impact README.md --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-impact-network all --format json",
+        "bv robot-impact-network all --json"
+      ],
+      "description": "Impact network graph (full or subnetwork for a bead).",
+      "flag": "--robot-impact-network all",
+      "key_fields": [
+        "network.nodes",
+        "network.edges",
+        "stats.total_nodes",
+        "top_clusters",
+        "top_connected"
+      ],
+      "mutates_state": false,
+      "name": "robot-impact-network",
+      "needs_baseline": false,
+      "needs_git": true,
+      "needs_issues": true,
+      "needs_sprint": false,
+      "params": [
+        "--network-depth 1-3"
+      ],
+      "preferred_invocation": "bv robot-impact-network all --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-insights --format json",
+        "bv robot-insights --json"
+      ],
+      "description": "Deep graph analysis: PageRank, betweenness, HITS, eigenvector, k-core, cycle detection.",
+      "flag": "--robot-insights",
+      "key_fields": [
+        "pagerank",
+        "betweenness",
+        "hits",
+        "eigenvector",
+        "k_core",
+        "cycles"
+      ],
+      "mutates_state": false,
+      "name": "robot-insights",
+      "needs_baseline": false,
+      "needs_git": false,
+      "needs_issues": true,
+      "needs_sprint": false,
+      "preferred_invocation": "bv robot-insights --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-label-attention --format json",
+        "bv robot-label-attention --attention-limit 5 --json"
+      ],
+      "description": "Attention-ranked labels requiring focus.",
+      "flag": "--robot-label-attention",
+      "mutates_state": false,
+      "name": "robot-label-attention",
+      "needs_baseline": false,
+      "needs_git": false,
+      "needs_issues": true,
+      "needs_sprint": false,
+      "params": [
+        "--attention-limit 10"
+      ],
+      "preferred_invocation": "bv robot-label-attention --attention-limit 5 --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-label-flow --format json",
+        "bv robot-label-flow --json"
+      ],
+      "description": "Cross-label dependency flow analysis.",
+      "flag": "--robot-label-flow",
+      "mutates_state": false,
+      "name": "robot-label-flow",
+      "needs_baseline": false,
+      "needs_git": false,
+      "needs_issues": true,
+      "needs_sprint": false,
+      "preferred_invocation": "bv robot-label-flow --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-label-health --format json",
+        "bv robot-label-health --json"
+      ],
+      "description": "Per-label health metrics: open/closed counts, velocity, staleness.",
+      "flag": "--robot-label-health",
+      "mutates_state": false,
+      "name": "robot-label-health",
+      "needs_baseline": false,
+      "needs_git": false,
+      "needs_issues": true,
+      "needs_sprint": false,
+      "preferred_invocation": "bv robot-label-health --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-metrics --format json",
+        "bv robot-metrics --json"
+      ],
+      "description": "Performance metrics: timing, cache hit rates, memory usage.",
+      "flag": "--robot-metrics",
+      "mutates_state": false,
+      "name": "robot-metrics",
+      "needs_baseline": false,
+      "needs_git": false,
+      "needs_issues": true,
+      "needs_sprint": false,
+      "preferred_invocation": "bv robot-metrics --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-next --format json",
+        "bv robot-next --json"
+      ],
+      "description": "Single top recommendation with claim/show commands.",
+      "flag": "--robot-next",
+      "key_fields": [
+        "id",
+        "title",
+        "score",
+        "reasons",
+        "unblocks",
+        "claim_command",
+        "show_command"
+      ],
+      "mutates_state": false,
+      "name": "robot-next",
+      "needs_baseline": false,
+      "needs_git": false,
+      "needs_issues": true,
+      "needs_sprint": false,
+      "params": [
+        "--graph-root ISSUE_ID"
+      ],
+      "preferred_invocation": "bv robot-next --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-orphans --format json",
+        "bv robot-orphans --orphans-min-score 30 --json"
+      ],
+      "description": "Orphan commit candidates that should be linked to beads.",
+      "flag": "--robot-orphans",
+      "key_fields": [
+        "git_range",
+        "stats.candidate_count",
+        "candidates",
+        "candidates[].probable_beads",
+        "by_bead"
+      ],
+      "mutates_state": false,
+      "name": "robot-orphans",
+      "needs_baseline": false,
+      "needs_git": true,
+      "needs_issues": true,
+      "needs_sprint": false,
+      "params": [
+        "--orphans-min-score 0-100",
+        "--label backend"
+      ],
+      "preferred_invocation": "bv robot-orphans --orphans-min-score 30 --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-plan --format json",
+        "bv robot-plan --json"
+      ],
+      "description": "Dependency-respecting execution plan with parallel tracks.",
+      "flag": "--robot-plan",
+      "key_fields": [
+        "tracks",
+        "items",
+        "unblocks",
+        "summary"
+      ],
+      "mutates_state": false,
+      "name": "robot-plan",
+      "needs_baseline": false,
+      "needs_git": false,
+      "needs_issues": true,
+      "needs_sprint": false,
+      "preferred_invocation": "bv robot-plan --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-priority --format json",
+        "bv robot-priority --json"
+      ],
+      "description": "Priority misalignment detection: items whose graph importance differs from assigned priority.",
+      "flag": "--robot-priority",
+      "key_fields": [
+        "misalignments",
+        "suggestions"
+      ],
+      "mutates_state": false,
+      "name": "robot-priority",
+      "needs_baseline": false,
+      "needs_git": false,
+      "needs_issues": true,
+      "needs_sprint": false,
+      "preferred_invocation": "bv robot-priority --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-recipes --format json",
+        "bv robot-recipes --json"
+      ],
+      "description": "Recipe names, descriptions, and usage hints for pre-filtering work.",
+      "flag": "--robot-recipes",
+      "key_fields": [
+        "recipes"
+      ],
+      "mutates_state": false,
+      "name": "robot-recipes",
+      "needs_baseline": false,
+      "needs_git": false,
+      "needs_issues": false,
+      "needs_sprint": false,
+      "preferred_invocation": "bv robot-recipes --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-reject-correlation deadbeef:ISSUE_ID --format json",
+        "bv robot-reject-correlation deadbeef:ISSUE_ID --correlation-by agent --json"
+      ],
+      "description": "Record negative feedback for a commit-to-bead correlation.",
+      "flag": "--robot-reject-correlation deadbeef:ISSUE_ID",
+      "mutates_state": true,
+      "name": "robot-reject-correlation",
+      "needs_baseline": false,
+      "needs_git": true,
+      "needs_issues": true,
+      "needs_sprint": false,
+      "params": [
+        "--correlation-by agent",
+        "--correlation-reason unrelated"
+      ],
+      "preferred_invocation": "bv robot-reject-correlation deadbeef:ISSUE_ID --correlation-by agent --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-related ISSUE_ID --format json",
+        "bv robot-related ISSUE_ID --json"
+      ],
+      "description": "Beads related to a specific bead ID.",
+      "flag": "--robot-related ISSUE_ID",
+      "key_fields": [
+        "target_bead_id",
+        "total_related",
+        "file_overlap",
+        "commit_overlap",
+        "dependency_cluster",
+        "concurrent"
+      ],
+      "mutates_state": false,
+      "name": "robot-related",
+      "needs_baseline": false,
+      "needs_git": true,
+      "needs_issues": true,
+      "needs_sprint": false,
+      "params": [
+        "--related-min-relevance 0-100 or 0.0-1.0",
+        "--related-max-results 10",
+        "--related-include-closed"
+      ],
+      "preferred_invocation": "bv robot-related ISSUE_ID --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-schema --format json",
+        "bv robot-schema --json"
+      ],
+      "description": "JSON Schema definitions for all robot command outputs.",
+      "flag": "--robot-schema",
+      "key_fields": [
+        "schema_version",
+        "envelope",
+        "commands"
+      ],
+      "mutates_state": false,
+      "name": "robot-schema",
+      "needs_baseline": false,
+      "needs_git": false,
+      "needs_issues": false,
+      "needs_sprint": false,
+      "params": [
+        "--schema-command robot-triage"
+      ],
+      "preferred_invocation": "bv robot-schema --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --search \"login oauth\" --robot-search --format json",
+        "bv robot-search \"login oauth\" --json",
+        "bv search \"login oauth\" --json"
+      ],
+      "description": "Hashed keyword or graph-weighted hybrid search over issue text.",
+      "flag": "--robot-search",
+      "mutates_state": false,
+      "name": "robot-search",
+      "needs_baseline": false,
+      "needs_git": false,
+      "needs_issues": true,
+      "needs_sprint": false,
+      "params": [
+        "--search \"login oauth\"",
+        "--search-limit 10",
+        "--search-min-score SCORE",
+        "--search-mode text|hybrid"
+      ],
+      "preferred_invocation": "bv robot-search \"login oauth\" --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-sprint-list --format json",
+        "bv robot-sprint-list --json"
+      ],
+      "description": "List all sprints as JSON.",
+      "flag": "--robot-sprint-list",
+      "mutates_state": false,
+      "name": "robot-sprint-list",
+      "needs_baseline": false,
+      "needs_git": false,
+      "needs_issues": true,
+      "needs_sprint": true,
+      "preferred_invocation": "bv robot-sprint-list --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-sprint-show SPRINT_ID --format json",
+        "bv robot-sprint-show SPRINT_ID --json"
+      ],
+      "description": "Show details for a specific sprint.",
+      "flag": "--robot-sprint-show SPRINT_ID",
+      "mutates_state": false,
+      "name": "robot-sprint-show",
+      "needs_baseline": false,
+      "needs_git": false,
+      "needs_issues": true,
+      "needs_sprint": true,
+      "preferred_invocation": "bv robot-sprint-show SPRINT_ID --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-suggest --format json",
+        "bv robot-suggest --suggest-type duplicate --json"
+      ],
+      "description": "Smart suggestions: potential duplicates, missing dependencies, label assignments, cycle warnings.",
+      "flag": "--robot-suggest",
+      "key_fields": [
+        "suggestions",
+        "type",
+        "confidence"
+      ],
+      "mutates_state": false,
+      "name": "robot-suggest",
+      "needs_baseline": false,
+      "needs_git": false,
+      "needs_issues": true,
+      "needs_sprint": false,
+      "params": [
+        "--suggest-type duplicate|dependency|label|cycle",
+        "--suggest-confidence 0.0-1.0",
+        "--suggest-bead ISSUE_ID"
+      ],
+      "preferred_invocation": "bv robot-suggest --suggest-type duplicate --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-triage --format json",
+        "bv robot-triage --json"
+      ],
+      "description": "Unified triage: top picks, recommendations, quick wins, blockers, project health, velocity.",
+      "flag": "--robot-triage",
+      "key_fields": [
+        "triage.quick_ref.top_picks",
+        "triage.recommendations",
+        "triage.quick_wins",
+        "triage.blockers_to_clear",
+        "triage.project_health"
+      ],
+      "mutates_state": false,
+      "name": "robot-triage",
+      "needs_baseline": false,
+      "needs_git": false,
+      "needs_issues": true,
+      "needs_sprint": false,
+      "params": [
+        "--graph-root ISSUE_ID"
+      ],
+      "preferred_invocation": "bv robot-triage --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-triage-by-label --format json",
+        "bv robot-triage-by-label --json"
+      ],
+      "description": "Triage grouped by label for area-focused agents.",
+      "flag": "--robot-triage-by-label",
+      "key_fields": [
+        "triage.recommendations_by_label[].label",
+        "triage.recommendations_by_label[].top_pick",
+        "triage.recommendations_by_label[].claim_command"
+      ],
+      "mutates_state": false,
+      "name": "robot-triage-by-label",
+      "needs_baseline": false,
+      "needs_git": false,
+      "needs_issues": true,
+      "needs_sprint": false,
+      "params": [
+        "--graph-root ISSUE_ID"
+      ],
+      "preferred_invocation": "bv robot-triage-by-label --json"
+    },
+    {
+      "accepted_invocations": [
+        "bv --robot-triage-by-track --format json",
+        "bv robot-triage-by-track --json"
+      ],
+      "description": "Triage grouped by independent parallel execution tracks.",
+      "flag": "--robot-triage-by-track",
+      "key_fields": [
+        "triage.recommendations_by_track[].track_id",
+        "triage.recommendations_by_track[].top_pick",
+        "triage.recommendations_by_track[].claim_command"
+      ],
+      "mutates_state": false,
+      "name": "robot-triage-by-track",
+      "needs_baseline": false,
+      "needs_git": false,
+      "needs_issues": true,
+      "needs_sprint": false,
+      "params": [
+        "--graph-root ISSUE_ID"
+      ],
+      "preferred_invocation": "bv robot-triage-by-track --json"
+    }
+  ],
+  "contract_version": "1.0.0",
+  "default_robot_command": "bv --robot-triage",
+  "docs_topics": [
+    "guide",
+    "commands",
+    "examples",
+    "env",
+    "exit-codes",
+    "all"
+  ],
+  "environment_variables": {
+    "BEADS_DB": "Path to beads database file or .beads directory (overrides BEADS_DIR; overridden by --db flag)",
+    "BEADS_DIR": "Path to .beads directory (fallback when BEADS_DB and --db are not set)",
+    "BV_OUTPUT_FORMAT": "Default output format: json or toon (overridden by --format)",
+    "BV_PRETTY_JSON": "Set to 1 for indented JSON output",
+    "BV_ROBOT": "Set to 1 to force robot mode (clean stdout)",
+    "BV_SEARCH_MODE": "Search mode: text or hybrid",
+    "BV_SEARCH_PRESET": "Hybrid search preset name",
+    "TOON_DEFAULT_FORMAT": "Fallback format if BV_OUTPUT_FORMAT not set",
+    "TOON_INDENT": "TOON indentation level (0-16)",
+    "TOON_KEY_FOLDING": "TOON key folding mode",
+    "TOON_STATS": "Set to 1 to show JSON vs TOON token estimates on stderr"
+  },
+  "exit_codes": {
+    "0": "Success",
+    "1": "Error (general failure, drift critical)",
+    "2": "Invalid arguments or drift warning"
+  },
+  "output_formats": [
+    "json",
+    "toon"
+  ],
+  "schema_command": "bv --robot-schema",
+  "stream_contract": {
+    "stderr": "Diagnostics, warnings, and actionable errors.",
+    "stdout": "Structured robot data only for robot commands."
+  },
+  "tool": "bv",
+  "version": "v0.25.0"
+}

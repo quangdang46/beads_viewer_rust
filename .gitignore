@@ -61,3 +61,7 @@ tests/fixtures/*/.beads/*.db*
 handoff.txt
 .claude/worktrees/
 tests/fixtures/small_chain/.beads/.bv.lock
+
+# Editor/agent scratch backups. Never source; an agent left these mid-edit.
+*.bak
+*.bak2

@@ -26,3 +26,13 @@ bv-update = { path = "../bv-update" }
 # `--id-pattern` hands each value to regex::Regex::compile before registering
 # it with bv-correlation (Go main.go:1772-1782), so the CLI needs the type.
 regex = "1"
+# `--cpu-profile` (Go main.go:1908-1933) samples the process and writes the
+# pprof protobuf, the same artifact Go's `runtime/pprof` produces. Rust has no
+# stdlib equivalent, so the sampling comes from tikv/pprof-rs; `protobuf-codec`
+# is the feature that turns its `Report` into a `protos::Profile` to encode.
+# The protobuf-codegen half is a pure-Rust `.proto` parser, so this needs no
+# `protoc` on the build machine (the prost-codec alternative would).
+pprof = { version = "0.15.0", features = ["protobuf-codec"] }
+# Go's `pprof.StartCPUProfile` gzips what it writes; pprof-rs hands back a bare
+# `Profile` and leaves serialization to the caller, so the gzip wrapper is ours.
+flate2 = "1"

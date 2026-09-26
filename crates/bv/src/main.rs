@@ -8,7 +8,13 @@ mod argv;
 mod flags;
 mod validation;
 
+use std::io::Write as _;
 use std::process::ExitCode;
+
+// `--cpu-profile` serialises pprof-rs's `Report` into the same
+// `perftools.profiles.Profile` protobuf Go's `runtime/pprof` writes, then
+// gzips it. The trait supplies `Profile::encode_to_vec`.
+use pprof::protos::Message as _;
 
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -212,6 +218,17 @@ fn main() -> ExitCode {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let args = argv::rewrite_args(&raw);
 
+    // Go's pflag parses every registered flag for every command, so a value it
+    // cannot read fails before cobra reaches the help flag, `--version`, or the
+    // modifier-requires table: `bv --help --related-max-results=abc` exits 1
+    // with the parse error, not with the help text. Reproduce that ordering
+    // here rather than leaving the check inside the `--robot-related` handler,
+    // where it would run too late to be observed.
+    if let Err(msg) = parse_related_max_results(&args) {
+        eprintln!("{msg}");
+        return ExitCode::from(1);
+    }
+
     // --help/-h short-circuits everything else (Go parity): cobra's help flag
     // is consulted before the root command runs, so `--help` wins over
     // `--version`, over modifier-requires violations, over exclusive-primary
@@ -300,6 +317,22 @@ fn main() -> ExitCode {
         }
         return ExitCode::from(1);
     }
+
+    // Go main.go:1908-1933 opens the file and starts the sampler right after
+    // the exclusive-primary and `--watch-export`/`--as-of` checks, so a run
+    // rejected by either of those never creates the file. The guard drops when
+    // `main` returns, which is what reproduces Go's `defer stopCPUProfile()`
+    // together with `RobotContext.FinalizeBeforeExit` (main.go:2050) — Go
+    // needs the second hook because robot dispatch calls `os.Exit` and skips
+    // defers, whereas this crate never calls `process::exit`, so a local in
+    // `main` covers every one of the exit paths below.
+    let _cpu_profile = match start_cpu_profile(flag_value(&args, "cpu-profile")) {
+        Ok(guard) => guard,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::from(1);
+        }
+    };
 
     // Go main.go:1937-1944 — `--db` is the TOP of the discovery chain
     // ("--db flag > BEADS_DB env > BEADS_DIR env > auto-discovery", the
@@ -3714,6 +3747,141 @@ fn run_agents_commands(presence: &validation::Presence, _args: &[String]) -> Exi
     // Default: should not reach here
     eprintln!("No agents action specified. Use --agents-add, --agents-remove, --agents-update, or --agents-check.");
     ExitCode::from(1)
+}
+
+/// Go's CPU-profile sample rate. `runtime/pprof.StartCPUProfile` calls
+/// `SetCPUProfileRate(100)` when the caller has not set one, so 100 Hz is what
+/// a Go `bv --cpu-profile out.pprof` run records. pprof-rs defaults to 99, so
+/// the rate is pinned rather than inherited.
+const GO_CPU_PROFILE_HZ: i32 = 100;
+
+/// Keeps the sampler running and owns the destination file for as long as the
+/// binding in `main` lives. Go spells the same lifetime with a `defer` plus a
+/// closure handed to `RobotContext.FinalizeBeforeExit`; `Drop` fires exactly
+/// once, which is the `profileActive` latch in Go's `stopCPUProfile` closure
+/// (main.go:1919-1928) stated in a form the compiler enforces.
+struct CpuProfileGuard {
+    /// The sampler. Reporting has to happen while this is still alive —
+    /// pprof-rs reads the sample buffer off the guard, and the guard's own
+    /// `Drop` is what stops the signal handler.
+    profiler: pprof::ProfilerGuard<'static>,
+    file: std::fs::File,
+    path: String,
+}
+
+impl Drop for CpuProfileGuard {
+    fn drop(&mut self) {
+        // Go's order (main.go:1924-1929): stop the sampler, then close the
+        // file, and a close failure is a warning that leaves the exit code
+        // alone. Stopping first is what makes the profile complete, so the
+        // report is taken from the guard before the guard goes away.
+        let built = self
+            .profiler
+            .report()
+            .build()
+            .and_then(|report| report.pprof());
+
+        let profile = match built {
+            Ok(profile) => profile,
+            // Go has no equivalent branch — `pprof.StopCPUProfile()` returns
+            // nothing and writes through the file it was handed — so this one
+            // carries its own wording, at the same severity as Go's close
+            // failure: on stderr, without touching the exit code, which `main`
+            // has already decided by the time the guard drops.
+            Err(e) => {
+                eprintln!("Could not write CPU profile {}: {e}", self.path);
+                return;
+            }
+        };
+
+        // Scoped so the encoder releases its `&mut self.file` borrow before
+        // the file itself is flushed. Serialising straight into the gzip
+        // encoder mirrors Go, which streams `StopCPUProfile`'s output into the
+        // file it was handed at `StartCPUProfile` time. `finish()` writes the
+        // gzip trailer and is the last thing that can fail before the profile
+        // is on disk, so its failure is the one Go reports as a close failure.
+        {
+            let mut gz =
+                flate2::write::GzEncoder::new(&mut self.file, flate2::Compression::default());
+            if let Err(e) = profile.write_to_writer(&mut gz) {
+                eprintln!("Could not close CPU profile {}: {e}", self.path);
+                return;
+            }
+            if let Err(e) = gz.finish() {
+                eprintln!("Could not close CPU profile {}: {e}", self.path);
+                return;
+            }
+        }
+        if let Err(e) = self.file.flush() {
+            eprintln!("Could not close CPU profile {}: {e}", self.path);
+        }
+    }
+}
+
+/// Go's `*fs.PathError.Error()` — `<op> <path>: <err>`, with `err` the bare
+/// errno description.
+///
+/// `io::Error`'s own `Display` is the same description but capitalised and with
+/// `(os error N)` glued on, so the two are not interchangeable: Go prints
+/// `open /x: no such file or directory` where Rust would print
+/// `open /x: No such file or directory (os error 2)`. Trimming the numeric
+/// tail and lower-casing the first character reproduces Go's wording for the
+/// errno strings both systems share, which is every one a failed `os.Create`
+/// can produce here.
+fn go_path_error(op: &str, path: &str, e: &std::io::Error) -> String {
+    let mut msg = e.to_string();
+    if e.raw_os_error().is_some() {
+        if let Some(cut) = msg.rfind(" (os error ") {
+            msg.truncate(cut);
+        }
+    }
+    if let Some(first) = msg.get_mut(0..1) {
+        first.make_ascii_lowercase();
+    }
+    format!("{op} {path}: {msg}")
+}
+
+/// Go main.go:1910-1933 — `os.Create` the path, start the sampler, and return
+/// something that stops both on the way out.
+///
+/// An absent or empty `--cpu-profile` is the unset case and returns `Ok(None)`,
+/// so a normal run never touches a profiler. Both failure branches are the
+/// ones Go exits 1 on, with Go's message text: a create failure is
+/// `Could not create CPU profile: %v`, a start failure is
+/// `Could not start CPU profile: %v` after the file has been closed again.
+fn start_cpu_profile(path: Option<&str>) -> Result<Option<CpuProfileGuard>, String> {
+    let path = match path.filter(|p| !p.is_empty()) {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+
+    // `os.Create` is `O_RDWR|O_CREATE|O_TRUNC`, which truncates an existing
+    // profile — the same as Rust's `File::create`.
+    let file = std::fs::File::create(path).map_err(|e| {
+        format!(
+            "Could not create CPU profile: {}",
+            go_path_error("open", path, &e)
+        )
+    })?;
+
+    let profiler = match pprof::ProfilerGuardBuilder::default()
+        .frequency(GO_CPU_PROFILE_HZ)
+        .build()
+    {
+        Ok(profiler) => profiler,
+        Err(e) => {
+            // Go main.go:1917-1920 closes the file before reporting, so a
+            // failed start leaves nothing behind to be cleaned up.
+            drop(file);
+            return Err(format!("Could not start CPU profile: {e}"));
+        }
+    };
+
+    Ok(Some(CpuProfileGuard {
+        profiler,
+        file,
+        path: path.to_string(),
+    }))
 }
 
 fn run_check_drift() -> ExitCode {
@@ -7714,6 +7882,26 @@ fn go_underscore_ok(s: &str) -> bool {
     saw != b'_'
 }
 
+/// Go registers `--related-max-results` as a pflag `flag.Int` (main.go:1584,
+/// default 10) and hands it to `RelatedWorkOptions.MaxResults`
+/// (robot_registry.go:3280-3281), which caps each of the four categories
+/// independently — `file_overlap`, `commit_overlap`, `dependency_cluster` and
+/// `concurrent` (related.go:216-218, 287-289, 383-385, 500-502).
+///
+/// pflag converts the value with `strconv.ParseInt(s, 0, 64)` while parsing
+/// flags, so a value it cannot read is a PARSE error and not a silent fall back
+/// to the default: `invalid argument %q for "--related-max-results" flag: %v`
+/// at exit 1 (main.go:4542-4550). `Ok(None)` is the flag's absence, which
+/// leaves the default to the caller.
+fn parse_related_max_results(args: &[String]) -> Result<Option<i64>, String> {
+    let Some(raw) = flag_value(args, "related-max-results") else {
+        return Ok(None);
+    };
+    go_parse_int_base0(raw).map(Some).map_err(|detail| {
+        format!("invalid argument {raw:?} for \"--related-max-results\" flag: {detail}")
+    })
+}
+
 /// Go `strconv.ParseInt(s, 0, 64)` — the conversion pflag runs for every
 /// `flag.Int` value (`intValue.Set` calls it with base 0). Go's base-0 literal
 /// rules reach the wire, so they are reproduced rather than approximated: an
@@ -7770,6 +7958,327 @@ fn go_parse_int_base0(raw: &str) -> Result<i64, String> {
             return Err(out_of_range());
         }
         Ok(magnitude as i64)
+    }
+}
+
+/// Go `strconv.ParseFloat(s, 64)` — the conversion pflag runs for every
+/// `flag.Float64` value (`float64Value.Set`, `main.go:1571` for
+/// `--relations-threshold`). Rust's `str::parse::<f64>` diverges in three
+/// directions and all three are reachable through this flag:
+///
+///   * it rejects every hexadecimal float Go accepts (`0x1p-2`, `0x1.8p1`);
+///   * it rejects Go's underscore separators and, on a signed exponent, the
+///     sign itself, so `1e-5` — the natural way to spell a low threshold —
+///     and `1_0` are both syntax errors;
+///   * it returns `inf` where Go returns `value out of range` (`1e400`).
+///
+/// Go returns `(±Inf, ErrRange)` on overflow and `(0, nil)` on underflow, so
+/// only overflow is an error: `1e-400` parses successfully as zero and is then
+/// floored to the 0.5 default by `GetRelatedFiles`.
+///
+/// The error text is Go's own `NumError` wording, which is what `main.go:4549`
+/// prints after pflag's `invalid argument %q for %q flag: %v`.
+///
+/// `inf`/`nan` parse successfully here exactly as they do in Go; Go rejects
+/// them later, when the value fails JSON encoding, not here.
+fn go_parse_float(raw: &str) -> Result<f64, String> {
+    let syntax = || format!("strconv.ParseFloat: parsing {raw:?}: invalid syntax");
+    let out_of_range = || format!("strconv.ParseFloat: parsing {raw:?}: value out of range");
+
+    // Go `special` (internal/strconv/atof.go:37) reports how many bytes it
+    // consumed next to the value, and `ParseFloat` rejects the literal unless
+    // that is the whole string — which is what makes `infin` a syntax error
+    // even though it starts with a valid `inf`.
+    if let Some((value, consumed)) = go_float_special(raw) {
+        return if consumed == raw.len() {
+            Ok(value)
+        } else {
+            Err(syntax())
+        };
+    }
+
+    // Go `readFloat` (internal/strconv/atof.go:171).
+    let Some(lit) = go_read_float(raw) else {
+        return Err(syntax());
+    };
+    if lit.consumed != raw.len() {
+        return Err(syntax());
+    }
+    // Go checks underscores against the consumed prefix, and `underscoreOK`
+    // strips the optional sign itself — so the sign stays out of the slice.
+    let sign_len = usize::from(matches!(raw.as_bytes().first(), Some(b'+') | Some(b'-')));
+    if lit.has_underscore && !go_underscore_ok(&raw[sign_len..lit.consumed]) {
+        return Err(syntax());
+    }
+
+    if lit.hex {
+        // Go `atofHex` is bit-exact, and Rust cannot delegate: its parser has
+        // no hexadecimal-float support at all.
+        return go_atof_hex(&lit).map_err(|()| out_of_range());
+    }
+
+    // The decimal form is one Rust already reads identically; underscores were
+    // the only thing standing between the two grammars and Go has vouched for
+    // them by this point.
+    let digits: String = raw.chars().filter(|c| *c != '_').collect();
+    match digits.parse::<f64>() {
+        // A finite literal that lands on an infinity overflowed f64. Go calls
+        // that ErrRange; an underflow to zero is an ordinary success.
+        Ok(v) if v.is_infinite() => Err(out_of_range()),
+        Ok(v) => Ok(v),
+        Err(_) => Err(syntax()),
+    }
+}
+
+/// Go `special` (internal/strconv/atof.go:37) — the `inf`/`infinity`/`nan`
+/// literals, returned with the byte count `ParseFloat` compares against the
+/// input length. `nan` is reported as 3 bytes even behind a sign, so `-nan`
+/// and `+nan` are syntax errors while `-inf` parses.
+fn go_float_special(s: &str) -> Option<(f64, usize)> {
+    let bytes = s.as_bytes();
+    let (sign, offset) = match bytes.first() {
+        Some(b'-') => (-1.0f64, 1usize),
+        Some(b'+') => (1.0f64, 1usize),
+        _ => (1.0f64, 0usize),
+    };
+    let body = &s[offset..];
+    let n = common_prefix_len_ignore_case(body, "infinity");
+    // "Anything longer than inf is ok, but if we don't have infinity, only
+    // consume inf": a partial match such as "infin" collapses back to 3 and
+    // then fails the whole-string check in the caller.
+    let n = if (3..8).contains(&n) { 3 } else { n };
+    if n == 3 || n == 8 {
+        return Some((sign * f64::INFINITY, offset + n));
+    }
+    if common_prefix_len_ignore_case(body, "nan") == 3 {
+        return Some((f64::NAN, 3));
+    }
+    None
+}
+
+/// Go `commonPrefixLenIgnoreCase` (internal/strconv/atoi.go:216).
+fn common_prefix_len_ignore_case(s: &str, prefix: &str) -> usize {
+    s.as_bytes()
+        .iter()
+        .zip(prefix.as_bytes())
+        .take_while(|(a, b)| a.eq_ignore_ascii_case(b))
+        .count()
+}
+
+/// The fields Go's `atofHex` consumes out of `readFloat`.
+struct GoFloatLiteral {
+    mantissa: u64,
+    exp: i32,
+    neg: bool,
+    trunc: bool,
+    hex: bool,
+    has_underscore: bool,
+    /// Bytes consumed; `ParseFloat` insists this is the whole input.
+    consumed: usize,
+}
+
+/// Go `readFloat` (internal/strconv/atof.go:171) — the syntax recogniser.
+/// `None` is Go's `!ok`, which `atof64` turns into `ErrSyntax`. It is not a
+/// value parser: it accepts the shape and defers the arithmetic.
+fn go_read_float(s: &str) -> Option<GoFloatLiteral> {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    let mut neg = false;
+    match bytes.first() {
+        Some(b'+') => i = 1,
+        Some(b'-') => {
+            neg = true;
+            i = 1;
+        }
+        _ => {}
+    }
+
+    let mut base = 10u64;
+    let mut max_mant_digits = 19usize; // 10^19 fits in u64
+    let mut exp_char = b'e';
+    let mut hex = false;
+    // Go tests `i+2 < len(s)`, so a bare "0x" never enters hex mode and is
+    // rejected as a syntax error by the trailing-garbage check instead.
+    if i + 2 < bytes.len() && bytes[i] == b'0' && bytes[i + 1].eq_ignore_ascii_case(&b'x') {
+        base = 16;
+        max_mant_digits = 16; // 16^16 fits in u64
+        i += 2;
+        exp_char = b'p';
+        hex = true;
+    }
+
+    let mut mantissa = 0u64;
+    let mut sawdot = false;
+    let mut sawdigits = false;
+    let mut nd = 0i32;
+    let mut nd_mant = 0i32;
+    let mut dp = 0i32;
+    let mut trunc = false;
+    let mut has_underscore = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'_' {
+            has_underscore = true;
+        } else if c == b'.' {
+            if sawdot {
+                break;
+            }
+            sawdot = true;
+            dp = nd;
+        } else if c.is_ascii_digit() {
+            sawdigits = true;
+            if c == b'0' && nd == 0 {
+                dp -= 1; // ignore leading zeros
+            } else {
+                nd += 1;
+                if nd_mant < max_mant_digits as i32 {
+                    mantissa *= base;
+                    mantissa += u64::from(c - b'0');
+                    nd_mant += 1;
+                } else if c != b'0' {
+                    trunc = true;
+                }
+            }
+        } else if base == 16 && (b'a'..=b'f').contains(&c.to_ascii_lowercase()) {
+            sawdigits = true;
+            nd += 1;
+            if nd_mant < max_mant_digits as i32 {
+                mantissa *= 16;
+                mantissa += u64::from(c.to_ascii_lowercase() - b'a' + 10);
+                nd_mant += 1;
+            } else {
+                trunc = true;
+            }
+        } else {
+            break;
+        }
+        i += 1;
+    }
+    if !sawdigits {
+        return None;
+    }
+    if !sawdot {
+        dp = nd;
+    }
+    if hex {
+        dp *= 4;
+        nd_mant *= 4;
+    }
+
+    if i < bytes.len() && bytes[i].to_ascii_lowercase() == exp_char {
+        i += 1;
+        if i >= bytes.len() {
+            return None;
+        }
+        let mut esign = 1i32;
+        match bytes[i] {
+            b'+' => i += 1,
+            b'-' => {
+                esign = -1;
+                i += 1;
+            }
+            _ => {}
+        }
+        if i >= bytes.len() || !bytes[i].is_ascii_digit() {
+            return None;
+        }
+        let mut e = 0i32;
+        while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'_') {
+            if bytes[i] == b'_' {
+                has_underscore = true;
+            } else if e < 10000 {
+                e = e * 10 + i32::from(bytes[i] - b'0');
+            }
+            i += 1;
+        }
+        dp += e * esign;
+    } else if hex {
+        return None; // Go: "Must have exponent."
+    }
+
+    let exp = if mantissa != 0 { dp - nd_mant } else { 0 };
+    Some(GoFloatLiteral {
+        mantissa,
+        exp,
+        neg,
+        trunc,
+        hex,
+        has_underscore,
+        consumed: i,
+    })
+}
+
+/// Go `atofHex` (internal/strconv/atof.go:496) specialised to `float64` —
+/// the bit-exact hexadecimal-float conversion. `Err` is Go's `ErrRange`: the
+/// magnitude overflowed, so the value is ±Inf and pflag rejects the flag.
+fn go_atof_hex(lit: &GoFloatLiteral) -> Result<f64, ()> {
+    const MANT_BITS: u32 = 52;
+    const EXP_BITS: u32 = 11;
+    // Go's `float64info.bias` (ftoa.go:30) is *negative*: it is the signed
+    // offset between a stored biased exponent and the real one, and every
+    // comparison below (`minExp`, `maxExp`, `exp - flt.bias`) is written in
+    // terms of it.
+    const BIAS: i32 = -1023;
+    const MAX_EXP: i32 = (1 << EXP_BITS) + BIAS - 2;
+    const MIN_EXP: i32 = BIAS + 1;
+
+    let mut mantissa = lit.mantissa;
+    // "mantissa now implicitly divided by 2^mantbits"
+    let mut exp = lit.exp + MANT_BITS as i32;
+
+    // Shift into float range, carrying the two rounding bits (the lowest of
+    // which stands for "this or any later bit was non-zero").
+    while mantissa != 0 && (mantissa >> (MANT_BITS + 2)) == 0 {
+        mantissa <<= 1;
+        exp -= 1;
+    }
+    if lit.trunc {
+        mantissa |= 1;
+    }
+    while (mantissa >> (1 + MANT_BITS + 2)) != 0 {
+        mantissa = mantissa >> 1 | mantissa & 1;
+        exp += 1;
+    }
+    // Denormalize, hoping to make the value representable.
+    while mantissa > 1 && exp < MIN_EXP - 2 {
+        mantissa = mantissa >> 1 | mantissa & 1;
+        exp += 1;
+    }
+
+    // Round using the two bottom bits, half to even.
+    let mut round = mantissa & 3;
+    mantissa >>= 2;
+    round |= mantissa & 1;
+    exp += 2;
+    if round == 3 {
+        mantissa += 1;
+        if mantissa == 1 << (1 + MANT_BITS) {
+            mantissa >>= 1;
+            exp += 1;
+        }
+    }
+
+    if (mantissa >> MANT_BITS) == 0 {
+        exp = BIAS; // denormal or zero
+    }
+    let mut out_of_range = false;
+    if exp > MAX_EXP {
+        mantissa = 1 << MANT_BITS;
+        exp = MAX_EXP + 1;
+        out_of_range = true;
+    }
+
+    let mut bits = mantissa & ((1u64 << MANT_BITS) - 1);
+    // Go masks the possibly-negative `exp - bias` into the exponent field, so
+    // a sign-extending `as u64` reproduces the same low bits.
+    bits |= ((exp - BIAS) as u64 & ((1u64 << EXP_BITS) - 1)) << MANT_BITS;
+    if lit.neg {
+        bits |= 1 << (MANT_BITS + EXP_BITS);
+    }
+    if out_of_range {
+        Err(())
+    } else {
+        Ok(f64::from_bits(bits))
     }
 }
 
@@ -8142,11 +8651,21 @@ fn search_adjust_weights_for_query(
 /// `Weights` has no `Deserialize` impl (its own `Serialize` uses Rust field
 /// names), so the payload is decoded here and the emitted object is assembled
 /// by hand in Go's struct order.
+///
+/// The map's value type is `Option<f64>` because Go decodes into
+/// `map[string]float64` (config.go:130) and `encoding/json` treats a JSON
+/// `null` for a map element as a no-op that leaves the entry at its zero
+/// value. So `{"text":null,...}` yields `TextRelevance == 0.0` and still
+/// reaches `Validate`, where it passes as long as the other five components
+/// sum to 1.0. `serde_json` rejects `null` for `f64` outright, which turned a
+/// payload Go accepts into an "invalid weights JSON" error. `Option<f64>`
+/// accepts `null` and a number and nothing else, so a string, bool or array
+/// for a weight is still a type error exactly as in Go.
 fn search_parse_weights_json(raw: &str) -> Result<bv_search::hybrid::Weights, String> {
     const REQUIRED: [&str; 6] = [
         "text", "pagerank", "status", "impact", "priority", "recency",
     ];
-    let payload: std::collections::BTreeMap<String, f64> =
+    let payload: std::collections::BTreeMap<String, Option<f64>> =
         serde_json::from_str(raw).map_err(|e| format!("invalid weights JSON: {e}"))?;
     for key in REQUIRED {
         if !payload.contains_key(key) {
@@ -8158,13 +8677,14 @@ fn search_parse_weights_json(raw: &str) -> Result<bv_search::hybrid::Weights, St
             return Err(format!("weights JSON has unknown key {key:?}"));
         }
     }
+    let component = |key: &str| payload[key].unwrap_or(0.0);
     let weights = bv_search::hybrid::Weights {
-        text_relevance: payload["text"],
-        pagerank: payload["pagerank"],
-        status: payload["status"],
-        impact: payload["impact"],
-        priority: payload["priority"],
-        recency: payload["recency"],
+        text_relevance: component("text"),
+        pagerank: component("pagerank"),
+        status: component("status"),
+        impact: component("impact"),
+        priority: component("priority"),
+        recency: component("recency"),
     };
     search_weights_validate(&weights)?;
     Ok(weights)
@@ -9202,10 +9722,43 @@ fn run_robot_causality(args: &[String]) -> ExitCode {
     emit_json(&sorted)
 }
 
-/// Go `percentOrFraction.Set` (cmd/bv/flag_types.go:67-96) — accepts an int
+/// Go `fmt.Sprintf("%g", v)` — the verb `percentOrFraction.Set` uses to render
+/// the offending float (cmd/bv/flag_types.go:80). fmt picks `%e` when the
+/// decimal exponent is `< -4` or `>= 6` (the `eprec = 6` shortest-case rule
+/// in fmt/format.go) and `%f` otherwise, and pads the exponent to two digits.
+/// Rust's `{:e}` is already the shortest round-tripping mantissa plus that
+/// same exponent, so only the branch decision and the padding are new.
+fn go_format_g(v: f64) -> String {
+    if v.is_nan() {
+        return "NaN".into();
+    }
+    if v.is_infinite() {
+        return if v > 0.0 { "+Inf" } else { "-Inf" }.into();
+    }
+    let scientific = format!("{v:e}");
+    let (mantissa, exponent) = scientific
+        .split_once('e')
+        .expect("LowerExp always emits an 'e'");
+    let exponent: i32 = exponent
+        .parse()
+        .expect("LowerExp always emits a decimal exponent");
+    if !(-4..6).contains(&exponent) {
+        let sign = if exponent < 0 { '-' } else { '+' };
+        return format!("{mantissa}e{sign}{:02}", exponent.abs());
+    }
+    // Inside the fixed-notation band fmt falls through to `%f` at the same
+    // shortest precision, which is exactly Rust's `Display`.
+    format!("{v}")
+}
+
+/// Go `percentOrFraction.Set` (cmd/bv/flag_types.go:66-95) — accepts an int
 /// 0-100 (percent) or a float 0.0-1.0 (fraction), canonicalized to int percent.
 /// A `.` anywhere signals fractional intent; `int(f*100 + 0.5)` rounds to
 /// nearest so 0.235 becomes 24 and 0.999 becomes 100.
+///
+/// Every message quotes the TRIMMED value, because Go rebinds its parameter
+/// (`s = strings.TrimSpace(s)`) before formatting; only pflag's outer
+/// `invalid argument %q` wrapper, built by the caller, sees the raw argv token.
 fn parse_percent_or_fraction(flag: &str, raw: &str) -> Result<i64, String> {
     let s = raw.trim();
     if s.is_empty() {
@@ -9214,21 +9767,30 @@ fn parse_percent_or_fraction(flag: &str, raw: &str) -> Result<i64, String> {
         ));
     }
     if s.contains('.') {
-        let f: f64 = s.parse().map_err(|_| {
+        // Go calls `strconv.ParseFloat(s, 64)`; `go_parse_float` is that
+        // function, hex literals and digit underscores included. `str::parse`
+        // is not: it rejected `1_0.5` and `0x1.8p1` (Go: 10.5 and 3) and let
+        // `1.7976931348623159e309` through as `inf` (Go: a range error, hence
+        // "is not a number").
+        let f = go_parse_float(s).map_err(|_| {
             format!(
-                "--{flag}: {raw:?} is not a number (expected int 0-100 percent OR float 0.0-1.0 fraction)"
+                "--{flag}: {s:?} is not a number (expected int 0-100 percent OR float 0.0-1.0 fraction)"
             )
         })?;
         if !(0.0..=1.0).contains(&f) {
             return Err(format!(
-                "--{flag}: float {f} out of range (expected 0.0-1.0 fraction; for percent use int 0-100)"
+                "--{flag}: float {} out of range (expected 0.0-1.0 fraction; for percent use int 0-100)",
+                go_format_g(f)
             ));
         }
         return Ok((f * 100.0 + 0.5) as i64);
     }
+    // `strconv.Atoi` is base 10 with no underscore support, so `str::parse`
+    // (not `go_parse_int_base0`) is the faithful match: both accept a leading
+    // `+` and both reject `0x10`/`1_0` and anything past the 64-bit range.
     let n: i64 = s.parse().map_err(|_| {
         format!(
-            "--{flag}: {raw:?} is not an integer (expected int 0-100 percent OR float 0.0-1.0 fraction)"
+            "--{flag}: {s:?} is not an integer (expected int 0-100 percent OR float 0.0-1.0 fraction)"
         )
     })?;
     if !(0..=100).contains(&n) {
@@ -9248,21 +9810,36 @@ fn run_robot_related(args: &[String]) -> ExitCode {
         .cloned()
         .unwrap_or_default();
     // Go main.go:1578 registers `--related-min-relevance` as a
-    // percentOrFraction defaulting to 20 (flag_types.go:61).
+    // percentOrFraction defaulting to 20 (flag_types.go:31-38).
+    //
+    // A value `Set` rejects is a pflag PARSE error, not a usage error: cobra
+    // surfaces it through `FlagErrorFunc` → `enrichFlagParseError`, which
+    // passes a bare `Set` message straight through (it only rewrites
+    // missing-argument and unknown-flag errors), and main.go:4548-4550 prints
+    // it and exits 1. So the message carries pflag's
+    // `invalid argument %q for %q flag: %v` wrapper — with the RAW argv token,
+    // unlike the trimmed value inside — and the code is 1, not 2.
     let min_relevance: i64 = match flag_value(args, "related-min-relevance") {
         Some(raw) => match parse_percent_or_fraction("related-min-relevance", raw) {
             Ok(v) => v,
-            Err(e) => {
-                eprintln!("{e}");
-                return ExitCode::from(2);
+            Err(detail) => {
+                eprintln!(
+                    "invalid argument {raw:?} for \"--related-min-relevance\" flag: {detail}"
+                );
+                return ExitCode::from(1);
             }
         },
         None => 20,
     };
     // Go main.go:1584 — default 10. The cap is guarded by `MaxResults > 0`
-    // (related.go:216-218), so 0 means UNLIMITED rather than "emit nothing".
-    let max_results: usize = flag_value(args, "related-max-results")
-        .and_then(|raw| go_parse_int_base0(raw).ok())
+    // (related.go:216-218), so 0 means UNLIMITED rather than "emit nothing";
+    // a negative value fails the same guard and is likewise unlimited, so
+    // flooring to 0 here changes no output and only keeps the `usize` cast
+    // in range. An unparsable value never reaches this line: `main` rejects it
+    // during flag parsing, matching Go's global pflag pass.
+    let max_results: usize = parse_related_max_results(args)
+        .ok()
+        .flatten()
         .map(|v| v.max(0) as usize)
         .unwrap_or(10);
     // Go main.go:1585 — default false. Tombstones are skipped either way
@@ -9275,10 +9852,18 @@ fn run_robot_related(args: &[String]) -> ExitCode {
     // include-closed")` matched neither, so every valued form silently fell
     // back to the default. See `argv::go_bool_flag` (Go isFlagActive,
     // cmd/bv/main.go:471-486).
+    // A value `Set` rejects is a pflag PARSE error, not a usage error: cobra
+    // routes it through `FlagErrorFunc` → `enrichFlagParseError`, which passes
+    // a bare `Set` message straight through (it only rewrites missing-argument
+    // and unknown-flag errors), and main.go:4548-4550 prints it with a bare
+    // `fmt.Fprintln(os.Stderr, ...)` and exits 1. So the line is pflag's
+    // `invalid argument %q for %q flag: %v` wrapper with NO `Error: ` prefix
+    // and the code is 1, not 2 — the same convention as the sibling
+    // `--related-max-results` and `--related-min-relevance` arms above.
     let include_closed = match argv::go_bool_flag(args, "related-include-closed", false) {
         Ok(v) => v,
         Err(msg) => {
-            eprintln!("Error: {msg}");
+            eprintln!("{msg}");
             return ExitCode::from(1);
         }
     };
@@ -10629,14 +11214,29 @@ fn run_robot_file_relations(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    // Go main.go:1571 registers `--relations-threshold` with default 0.5, and
-    // file_index.go:484-486 re-applies the same 0.5 whenever the value is
-    // <= 0, so a 0 or a negative means "50% co-occurrence", not "no filter".
-    // Go re-applies it inside `GetRelatedFiles`; the local mirror keeps the
-    // echoed `threshold` field consistent with what was actually filtered on.
-    let mut relations_threshold: f64 = flag_value(args, "relations-threshold")
-        .and_then(|raw| raw.trim().parse::<f64>().ok())
-        .unwrap_or(0.5);
+    // Go main.go:1571 registers `--relations-threshold` as a pflag
+    // `flag.Float64` with default 0.5, and file_index.go:484-486 re-applies
+    // the same 0.5 whenever the value is <= 0, so a 0 or a negative means
+    // "50% co-occurrence", not "no filter". Go re-applies it inside
+    // `GetRelatedFiles`; the local mirror keeps the echoed `threshold` field
+    // consistent with what was actually filtered on.
+    //
+    // A value pflag cannot parse as `strconv.ParseFloat(s, 64)` is a PARSE
+    // error, not a silent fallback to 0.5: Go reports `invalid argument %q
+    // for "--relations-threshold" flag: %v` and exits 1 (main.go:4548-4550).
+    // Rust used `.trim().parse().ok().unwrap_or(0.5)`, which both swallowed
+    // those inputs and trimmed surrounding whitespace Go rejects, so
+    // `--relations-threshold abc` answered with 0.5 and exit 0 where Go fails.
+    let mut relations_threshold: f64 = match flag_value(args, "relations-threshold") {
+        Some(raw) => match go_parse_float(raw) {
+            Ok(v) => v,
+            Err(detail) => {
+                eprintln!("invalid argument {raw:?} for \"--relations-threshold\" flag: {detail}");
+                return ExitCode::from(1);
+            }
+        },
+        None => 0.5,
+    };
     if relations_threshold <= 0.0 {
         relations_threshold = 0.5;
     }
@@ -10659,6 +11259,23 @@ fn run_robot_file_relations(args: &[String]) -> ExitCode {
     // at three, and the sort is count DESC then path ASC. The previous Rust
     // version rebuilt all of that by hand off the sha-only correlation map.
     let result = file_lookup.get_related_files(&path, relations_threshold, relations_limit);
+    // Go encodes the `Threshold float64` field through `json.Marshal`
+    // (robot_registry.go:3028-3032), and a non-finite float is an encoding
+    // error there — `strconv.ParseFloat` accepted `inf`/`nan` as literals, and
+    // neither survives `threshold <= 0`, so they reach the encoder unchanged
+    // and Go writes `Error handling --robot-file-relations: encoding file
+    // relations: json: unsupported value: +Inf` to stderr and exits 1. Rust's
+    // `serde_json::json!` quietly turns a non-finite f64 into `null` and
+    // carries on, so the guard has to be explicit. `-inf` is unreachable here:
+    // it is caught by the `<= 0` floor above.
+    if !relations_threshold.is_finite() {
+        eprintln!(
+            "Error handling --robot-file-relations: \
+             encoding file relations: json: unsupported value: {}",
+            go_format_float(relations_threshold)
+        );
+        return ExitCode::from(1);
+    }
     let mut payload = file_index_payload(&issues, &report);
     // Go `CoChangeResult` (file_index.go:495-500) — an unknown file short-
     // circuits with an empty list but still reports these two.
@@ -10670,106 +11287,1078 @@ fn run_robot_file_relations(args: &[String]) -> ExitCode {
     emit_json(&payload)
 }
 
-/// The subset of `flags::ROBOT_PRIMARIES` that actually has a dispatch
-/// handler wired up in this binary today. Kept as an explicit list (rather
-/// than derived from control flow) so `robot-capabilities`/`robot-schema`
-/// report real status instead of guessing — update this when wiring a new
-/// command. Source of truth cross-checked against the dispatch chain above.
-const DISPATCHED_ROBOT_COMMANDS: &[&str] = &[
-    "robot-help",
-    "robot-capabilities",
-    "robot-schema",
-    "robot-metrics",
-    "robot-docs",
-    "robot-triage",
-    "robot-next",
-    "robot-triage-by-track",
-    "robot-triage-by-label",
-    "robot-history",
-    "bead-history",
-    "robot-orphans",
-    "robot-insights",
-    "robot-plan",
-    "robot-priority",
-    "robot-suggest",
-    "robot-alerts",
-    "robot-drift",
-    "robot-graph",
-    "robot-recipes",
-    "robot-label-health",
-    "robot-label-flow",
-    "robot-label-attention",
-    "robot-blocker-chain",
-    "robot-confirm-correlation",
-    "robot-reject-correlation",
-    "robot-explain-correlation",
-    "robot-correlation-stats",
-    "robot-file-beads",
-    "robot-file-hotspots",
-    "robot-file-relations",
-    "robot-search",
-    "robot-causality",
-    "robot-related",
-    "robot-impact-network",
-    "robot-sprint-list",
-    "robot-sprint-show",
-    "robot-burndown",
-    "robot-forecast",
-    "robot-capacity",
-    "robot-impact",
-    "robot-diff",
-    "robot-not-ready-labels",
+/// Go `strconv.FormatFloat(v, 'g', -1, 64)`, which is what
+/// `json.UnsupportedValueError` embeds in its message. Only the three
+/// non-finite spellings are ever asked for; every finite value has already
+/// been encoded by the time the guard runs.
+fn go_format_float(v: f64) -> &'static str {
+    if v.is_nan() {
+        "NaN"
+    } else if v > 0.0 {
+        "+Inf"
+    } else {
+        "-Inf"
+    }
+}
+
+/// One row of Go's `robotCommandDoc` table (`cmd/bv/main.go:7612`).
+///
+/// The Go struct carries `json:"..."` tags because `robot-docs` marshals the
+/// table directly; here the fields are assembled into the manifest by
+/// `robot_command_entry`, the only caller.
+struct RobotCommandDoc {
+    /// The flag exactly as authored in the Go table, placeholders and all.
+    /// Every emitted spelling — `flag`, `params`, both invocations — goes
+    /// through `robot_flag_example_form_for_command` first.
+    flag: &'static str,
+    description: &'static str,
+    key_fields: &'static [&'static str],
+    params: &'static [&'static str],
+    needs_issues: bool,
+    needs_git: bool,
+    needs_sprint: bool,
+    needs_baseline: bool,
+    mutates_state: bool,
+}
+
+/// Go `robotCommandDocs` (`cmd/bv/main.go:7652`) transcribed row for row, in
+/// the Go literal's own order so it can be diffed against the oracle line by
+/// line. Go stores this in a map and sorts the names before emitting; this is
+/// a fixed array and the sort happens in `run_robot_capabilities`.
+const ROBOT_COMMAND_DOCS: &[(&str, RobotCommandDoc)] = &[
+    (
+        "robot-help",
+        RobotCommandDoc {
+            flag: "--robot-help",
+            description: "Agent-focused command help. Use robot-docs guide for structured JSON documentation.",
+            key_fields: &[],
+            params: &[],
+            needs_issues: false,
+            needs_git: false,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-triage",
+        RobotCommandDoc {
+            flag: "--robot-triage",
+            description: "Unified triage: top picks, recommendations, quick wins, blockers, project health, velocity.",
+            key_fields: &[
+                "triage.quick_ref.top_picks",
+                "triage.recommendations",
+                "triage.quick_wins",
+                "triage.blockers_to_clear",
+                "triage.project_health",
+            ],
+            params: &["--graph-root <id>"],
+            needs_issues: true,
+            needs_git: false,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-next",
+        RobotCommandDoc {
+            flag: "--robot-next",
+            description: "Single top recommendation with claim/show commands.",
+            key_fields: &[
+                "id",
+                "title",
+                "score",
+                "reasons",
+                "unblocks",
+                "claim_command",
+                "show_command",
+            ],
+            params: &["--graph-root <id>"],
+            needs_issues: true,
+            needs_git: false,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-plan",
+        RobotCommandDoc {
+            flag: "--robot-plan",
+            description: "Dependency-respecting execution plan with parallel tracks.",
+            key_fields: &["tracks", "items", "unblocks", "summary"],
+            params: &[],
+            needs_issues: true,
+            needs_git: false,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-insights",
+        RobotCommandDoc {
+            flag: "--robot-insights",
+            description: "Deep graph analysis: PageRank, betweenness, HITS, eigenvector, k-core, cycle detection.",
+            key_fields: &[
+                "pagerank",
+                "betweenness",
+                "hits",
+                "eigenvector",
+                "k_core",
+                "cycles",
+            ],
+            params: &[],
+            needs_issues: true,
+            needs_git: false,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-priority",
+        RobotCommandDoc {
+            flag: "--robot-priority",
+            description: "Priority misalignment detection: items whose graph importance differs from assigned priority.",
+            key_fields: &["misalignments", "suggestions"],
+            params: &[],
+            needs_issues: true,
+            needs_git: false,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-triage-by-track",
+        RobotCommandDoc {
+            flag: "--robot-triage-by-track",
+            description: "Triage grouped by independent parallel execution tracks.",
+            key_fields: &[
+                "triage.recommendations_by_track[].track_id",
+                "triage.recommendations_by_track[].top_pick",
+                "triage.recommendations_by_track[].claim_command",
+            ],
+            params: &["--graph-root <id>"],
+            needs_issues: true,
+            needs_git: false,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-triage-by-label",
+        RobotCommandDoc {
+            flag: "--robot-triage-by-label",
+            description: "Triage grouped by label for area-focused agents.",
+            key_fields: &[
+                "triage.recommendations_by_label[].label",
+                "triage.recommendations_by_label[].top_pick",
+                "triage.recommendations_by_label[].claim_command",
+            ],
+            params: &["--graph-root <id>"],
+            needs_issues: true,
+            needs_git: false,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-alerts",
+        RobotCommandDoc {
+            flag: "--robot-alerts",
+            description: "Stale issues, blocking cascades, priority mismatches.",
+            key_fields: &["alerts", "severity", "affected_issues"],
+            params: &[
+                "--severity info|warning|critical",
+                "--alert-type <type>",
+                "--alert-label <label>",
+            ],
+            needs_issues: true,
+            needs_git: false,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-suggest",
+        RobotCommandDoc {
+            flag: "--robot-suggest",
+            description: "Smart suggestions: potential duplicates, missing dependencies, label assignments, cycle warnings.",
+            key_fields: &["suggestions", "type", "confidence"],
+            params: &[
+                "--suggest-type duplicate|dependency|label|cycle",
+                "--suggest-confidence 0.0-1.0",
+                "--suggest-bead <id>",
+            ],
+            needs_issues: true,
+            needs_git: false,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-capabilities",
+        RobotCommandDoc {
+            flag: "--robot-capabilities",
+            description: "Machine-readable capability manifest: version, contract, commands, env vars, exit codes, and output formats.",
+            key_fields: &[
+                "tool",
+                "version",
+                "contract_version",
+                "commands",
+                "environment_variables",
+                "exit_codes",
+            ],
+            params: &[],
+            needs_issues: false,
+            needs_git: false,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-recipes",
+        RobotCommandDoc {
+            flag: "--robot-recipes",
+            description: "Recipe names, descriptions, and usage hints for pre-filtering work.",
+            key_fields: &["recipes"],
+            params: &[],
+            needs_issues: false,
+            needs_git: false,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-schema",
+        RobotCommandDoc {
+            flag: "--robot-schema",
+            description: "JSON Schema definitions for all robot command outputs.",
+            key_fields: &["schema_version", "envelope", "commands"],
+            params: &["--schema-command <cmd>"],
+            needs_issues: false,
+            needs_git: false,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-docs",
+        RobotCommandDoc {
+            flag: "--robot-docs <topic>",
+            description: "Machine-readable JSON documentation. Topics: guide, commands, examples, env, exit-codes, all.",
+            key_fields: &[],
+            params: &[],
+            needs_issues: false,
+            needs_git: false,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-history",
+        RobotCommandDoc {
+            flag: "--robot-history",
+            description: "Bead-to-commit correlations from git history.",
+            key_fields: &["correlations", "confidence", "commit_sha", "bead_id"],
+            params: &[
+                "--bead-history <id>",
+                "--history-since <date>",
+                "--history-limit <n>",
+                "--min-confidence 0.0-1.0",
+            ],
+            needs_issues: true,
+            needs_git: true,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-diff",
+        RobotCommandDoc {
+            flag: "--robot-diff",
+            description: "Changes since a historical point (commit, branch, tag, or date).",
+            key_fields: &[],
+            params: &["--diff-since <ref>"],
+            needs_issues: true,
+            needs_git: true,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-correlation-stats",
+        RobotCommandDoc {
+            flag: "--robot-correlation-stats",
+            description: "Summary counts for saved correlation feedback.",
+            key_fields: &[
+                "total_feedback",
+                "confirmed",
+                "rejected",
+                "ignored",
+                "accuracy_rate",
+            ],
+            params: &[],
+            needs_issues: false,
+            needs_git: false,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-explain-correlation",
+        RobotCommandDoc {
+            flag: "--robot-explain-correlation <sha:bead>",
+            description: "Explain why a commit is linked to a bead.",
+            key_fields: &["commit", "bead", "score", "reasons"],
+            params: &[],
+            needs_issues: true,
+            needs_git: true,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-confirm-correlation",
+        RobotCommandDoc {
+            flag: "--robot-confirm-correlation <sha:bead>",
+            description: "Record positive feedback for a commit-to-bead correlation.",
+            key_fields: &[],
+            params: &["--correlation-by agent", "--correlation-reason verified"],
+            needs_issues: true,
+            needs_git: true,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: true,
+        },
+    ),
+    (
+        "robot-reject-correlation",
+        RobotCommandDoc {
+            flag: "--robot-reject-correlation <sha:bead>",
+            description: "Record negative feedback for a commit-to-bead correlation.",
+            key_fields: &[],
+            params: &["--correlation-by agent", "--correlation-reason unrelated"],
+            needs_issues: true,
+            needs_git: true,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: true,
+        },
+    ),
+    (
+        "robot-search",
+        RobotCommandDoc {
+            flag: "--robot-search",
+            description: "Hashed keyword or graph-weighted hybrid search over issue text.",
+            key_fields: &[],
+            params: &[
+                "--search <query>",
+                "--search-limit <n>",
+                "--search-min-score SCORE",
+                "--search-mode text|hybrid",
+            ],
+            needs_issues: true,
+            needs_git: false,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-label-health",
+        RobotCommandDoc {
+            flag: "--robot-label-health",
+            description: "Per-label health metrics: open/closed counts, velocity, staleness.",
+            key_fields: &[],
+            params: &[],
+            needs_issues: true,
+            needs_git: false,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-label-flow",
+        RobotCommandDoc {
+            flag: "--robot-label-flow",
+            description: "Cross-label dependency flow analysis.",
+            key_fields: &[],
+            params: &[],
+            needs_issues: true,
+            needs_git: false,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-label-attention",
+        RobotCommandDoc {
+            flag: "--robot-label-attention",
+            description: "Attention-ranked labels requiring focus.",
+            key_fields: &[],
+            params: &["--attention-limit <n>"],
+            needs_issues: true,
+            needs_git: false,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-graph",
+        RobotCommandDoc {
+            flag: "--robot-graph",
+            description: "Dependency graph export in JSON, DOT, or Mermaid format.",
+            key_fields: &[],
+            params: &[
+                "--graph-format json|dot|mermaid",
+                "--graph-root <id>",
+                "--graph-depth <n>",
+            ],
+            needs_issues: true,
+            needs_git: false,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-metrics",
+        RobotCommandDoc {
+            flag: "--robot-metrics",
+            description: "Performance metrics: timing, cache hit rates, memory usage.",
+            key_fields: &[],
+            params: &[],
+            needs_issues: true,
+            needs_git: false,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-orphans",
+        RobotCommandDoc {
+            flag: "--robot-orphans",
+            description: "Orphan commit candidates that should be linked to beads.",
+            key_fields: &[
+                "git_range",
+                "stats.candidate_count",
+                "candidates",
+                "candidates[].probable_beads",
+                "by_bead",
+            ],
+            params: &["--orphans-min-score 0-100", "--label <label>"],
+            needs_issues: true,
+            needs_git: true,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-file-beads",
+        RobotCommandDoc {
+            flag: "--robot-file-beads <path>",
+            description: "Beads that touched a specific file path.",
+            key_fields: &["file_path", "total_beads", "open_beads", "closed_beads"],
+            params: &["--file-beads-limit <n>"],
+            needs_issues: true,
+            needs_git: true,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-file-hotspots",
+        RobotCommandDoc {
+            flag: "--robot-file-hotspots",
+            description: "Files touched by the most beads.",
+            key_fields: &[
+                "hotspots",
+                "stats.total_files",
+                "stats.total_bead_links",
+                "stats.files_with_multiple_beads",
+            ],
+            params: &["--hotspots-limit <n>"],
+            needs_issues: true,
+            needs_git: true,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-file-relations",
+        RobotCommandDoc {
+            flag: "--robot-file-relations <path>",
+            description: "Files that frequently co-change with a given file.",
+            key_fields: &["file_path", "total_commits", "threshold", "related_files"],
+            params: &["--relations-threshold 0.0-1.0", "--relations-limit <n>"],
+            needs_issues: true,
+            needs_git: true,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-related",
+        RobotCommandDoc {
+            flag: "--robot-related <id>",
+            description: "Beads related to a specific bead ID.",
+            key_fields: &[
+                "target_bead_id",
+                "total_related",
+                "file_overlap",
+                "commit_overlap",
+                "dependency_cluster",
+                "concurrent",
+            ],
+            params: &[
+                "--related-min-relevance 0-100 or 0.0-1.0",
+                "--related-max-results <n>",
+                "--related-include-closed",
+            ],
+            needs_issues: true,
+            needs_git: true,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-blocker-chain",
+        RobotCommandDoc {
+            flag: "--robot-blocker-chain <id>",
+            description: "Full blocker chain analysis for an issue.",
+            key_fields: &[
+                "result.target_id",
+                "result.is_blocked",
+                "result.root_blockers",
+                "result.chain",
+                "result.has_cycle",
+            ],
+            params: &[],
+            needs_issues: true,
+            needs_git: false,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-impact-network",
+        RobotCommandDoc {
+            flag: "--robot-impact-network [<id>|all]",
+            description: "Impact network graph (full or subnetwork for a bead).",
+            key_fields: &[
+                "network.nodes",
+                "network.edges",
+                "stats.total_nodes",
+                "top_clusters",
+                "top_connected",
+            ],
+            params: &["--network-depth 1-3"],
+            needs_issues: true,
+            needs_git: true,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-causality",
+        RobotCommandDoc {
+            flag: "--robot-causality <id>",
+            description: "Causal chain analysis for a bead.",
+            key_fields: &[
+                "chain.bead_id",
+                "chain.events",
+                "insights.summary",
+                "insights.critical_path",
+                "insights.recommendations",
+            ],
+            params: &[],
+            needs_issues: true,
+            needs_git: true,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-sprint-list",
+        RobotCommandDoc {
+            flag: "--robot-sprint-list",
+            description: "List all sprints as JSON.",
+            key_fields: &[],
+            params: &[],
+            needs_issues: true,
+            needs_git: false,
+            needs_sprint: true,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-sprint-show",
+        RobotCommandDoc {
+            flag: "--robot-sprint-show <id>",
+            description: "Show details for a specific sprint.",
+            key_fields: &[],
+            params: &[],
+            needs_issues: true,
+            needs_git: false,
+            needs_sprint: true,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-forecast",
+        RobotCommandDoc {
+            flag: "--robot-forecast <id|all>",
+            description: "ETA predictions for bead completion.",
+            key_fields: &[],
+            params: &[
+                "--forecast-label <label>",
+                "--forecast-sprint <id>",
+                "--forecast-agents <n>",
+            ],
+            needs_issues: true,
+            needs_git: false,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-capacity",
+        RobotCommandDoc {
+            flag: "--robot-capacity",
+            description: "Capacity simulation and completion projections.",
+            key_fields: &[],
+            params: &["--agents <n>", "--capacity-label <label>"],
+            needs_issues: true,
+            needs_git: false,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-burndown",
+        RobotCommandDoc {
+            flag: "--robot-burndown <sprint|current>",
+            description: "Sprint burndown data.",
+            key_fields: &[],
+            params: &[],
+            needs_issues: true,
+            needs_git: false,
+            needs_sprint: true,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-drift",
+        RobotCommandDoc {
+            flag: "--robot-drift",
+            description: "Drift detection from saved baseline.",
+            key_fields: &[],
+            params: &[],
+            needs_issues: true,
+            needs_git: false,
+            needs_sprint: false,
+            needs_baseline: true,
+            mutates_state: false,
+        },
+    ),
+    (
+        "robot-impact",
+        RobotCommandDoc {
+            flag: "--robot-impact <path[,path...]>",
+            description: "Analyze bead impact for files that may be modified.",
+            key_fields: &[
+                "files",
+                "risk_level",
+                "risk_score",
+                "warnings",
+                "affected_beads",
+            ],
+            params: &[],
+            needs_issues: true,
+            needs_git: true,
+            needs_sprint: false,
+            needs_baseline: false,
+            mutates_state: false,
+        },
+    ),
 ];
 
-/// Go `generateRobotCapabilities` (lower-fidelity first pass — see plan
-/// doc §11: Go's version embeds a large hand-authored per-command doc map
-/// with param schemas, key_fields, needs_git/needs_sprint flags etc. that
-/// isn't ported. This reports real, verified implementation status per
-/// command from `flags::ROBOT_PRIMARIES` cross-referenced against
-/// `DISPATCHED_ROBOT_COMMANDS` — not fabricated).
-fn run_robot_capabilities() -> ExitCode {
-    let mut commands: Vec<serde_json::Value> = flags::ROBOT_PRIMARIES
+/// Go `robotFlagExampleForm` (`cmd/bv/main.go:8095`).
+///
+/// Order is load-bearing: a longer placeholder has to be rewritten before any
+/// shorter placeholder it contains, or `<path[,path...]>` would decay into
+/// `<path>` and pick up a second substitution.
+fn robot_flag_example_form(flag: &str) -> String {
+    const REPLACEMENTS: &[(&str, &str)] = &[
+        ("[<id>|all]", "all"),
+        ("<path[,path...]>", "README.md"),
+        ("<sprint|current>", "current"),
+        ("<sha:bead>", "deadbeef:ISSUE_ID"),
+        ("<id|all>", "all"),
+        ("<query>", "\"login oauth\""),
+        ("<topic>", "guide"),
+        ("<cmd>", "robot-triage"),
+        ("<date>", "\"30 days ago\""),
+        ("<label>", "backend"),
+        ("<path>", "README.md"),
+        ("<type>", "critical"),
+        ("<ref>", "HEAD~1"),
+        ("<id>", "ISSUE_ID"),
+        ("<n>", "10"),
+    ];
+    let mut out = flag.to_string();
+    for (old, new) in REPLACEMENTS {
+        out = out.replace(old, new);
+    }
+    out
+}
+
+/// Go `robotFlagExampleFormForCommand` (`cmd/bv/main.go:8079`). Three
+/// commands rewrite their placeholder before the generic table runs, because
+/// the generic table's answer would name the wrong kind of identifier.
+fn robot_flag_example_form_for_command(command_name: &str, flag: &str) -> String {
+    let flag = match command_name {
+        "robot-sprint-show" => flag.replace("<id>", "SPRINT_ID"),
+        "robot-burndown" => flag.replace("<sprint|current>", "current"),
+        "robot-forecast" => flag.replace("--forecast-sprint <id>", "--forecast-sprint SPRINT_ID"),
+        _ => flag.to_string(),
+    };
+    robot_flag_example_form(&flag)
+}
+
+/// Go `robotCommandArgumentSuffix` (`cmd/bv/main.go:8050`): everything in the
+/// example flag after the flag itself, which the preferred invocation splices
+/// in front of `--json`.
+fn robot_command_argument_suffix(command_name: &str, doc: &RobotCommandDoc) -> String {
+    let form = robot_flag_example_form_for_command(command_name, doc.flag);
+    let parts: Vec<&str> = form.split_whitespace().collect();
+    if parts.len() <= 1 {
+        return String::new();
+    }
+    format!(" {}", parts[1..].join(" "))
+}
+
+/// Go `preferredRobotInvocationOverride` (`cmd/bv/main.go:7973`). `None` is
+/// Go's `""` — the zero value meaning "fall through to the default form".
+fn preferred_robot_invocation_override(command_name: &str) -> Option<&'static str> {
+    Some(match command_name {
+        "robot-help" => "bv robot-help --json",
+        "robot-search" => "bv robot-search \"login oauth\" --json",
+        "robot-diff" => "bv robot-diff HEAD~1 --json",
+        "robot-history" => "bv robot-history --history-limit 20 --json",
+        "robot-alerts" => "bv robot-alerts --severity critical --json",
+        "robot-suggest" => "bv robot-suggest --suggest-type duplicate --json",
+        "robot-label-attention" => "bv robot-label-attention --attention-limit 5 --json",
+        "robot-graph" => "bv robot-graph mermaid --json",
+        "robot-orphans" => "bv robot-orphans --orphans-min-score 30 --json",
+        "robot-explain-correlation" => "bv robot-explain-correlation deadbeef:ISSUE_ID --json",
+        "robot-confirm-correlation" => {
+            "bv robot-confirm-correlation deadbeef:ISSUE_ID --correlation-by agent --json"
+        }
+        "robot-reject-correlation" => {
+            "bv robot-reject-correlation deadbeef:ISSUE_ID --correlation-by agent --json"
+        }
+        "robot-file-beads" => "bv robot-file-beads README.md --json",
+        "robot-file-relations" => "bv robot-file-relations README.md --json",
+        "robot-related" => "bv robot-related ISSUE_ID --json",
+        "robot-blocker-chain" => "bv robot-blocker-chain ISSUE_ID --json",
+        "robot-causality" => "bv robot-causality ISSUE_ID --json",
+        "robot-forecast" => "bv robot-forecast all --json",
+        "robot-burndown" => "bv robot-burndown current --json",
+        "robot-drift" => "bv --check-drift --robot-drift --format json",
+        "robot-impact" => "bv robot-impact README.md --json",
+        _ => return None,
+    })
+}
+
+/// Go `acceptedRobotInvocationOverrides` (`cmd/bv/main.go:8022`). Commands
+/// listed here bypass the two-element default entirely, so the count differs
+/// from every other entry (`robot-search` has three, `robot-help` has two
+/// neither of which is the `--flag --format json` form).
+fn accepted_robot_invocation_overrides(command_name: &str) -> Option<&'static [&'static str]> {
+    Some(match command_name {
+        "robot-help" => &["bv robot-help --json", "bv robot-docs guide --json"],
+        "robot-search" => &[
+            "bv --search \"login oauth\" --robot-search --format json",
+            "bv robot-search \"login oauth\" --json",
+            "bv search \"login oauth\" --json",
+        ],
+        "robot-diff" => &[
+            "bv --robot-diff --diff-since HEAD~1 --format json",
+            "bv robot-diff HEAD~1 --json",
+        ],
+        "robot-drift" => &[
+            "bv --check-drift --robot-drift --format json",
+            "bv robot-drift --json",
+        ],
+        _ => return None,
+    })
+}
+
+/// Go `preferredRobotInvocation` (`cmd/bv/main.go:7963`).
+fn preferred_robot_invocation(command_name: &str, doc: &RobotCommandDoc) -> String {
+    if let Some(override_invocation) = preferred_robot_invocation_override(command_name) {
+        return override_invocation.to_string();
+    }
+    format!(
+        "bv {}{} --json",
+        command_name,
+        robot_command_argument_suffix(command_name, doc)
+    )
+}
+
+/// Go `acceptedRobotInvocations` (`cmd/bv/main.go:7971`).
+fn accepted_robot_invocations(command_name: &str, doc: &RobotCommandDoc) -> Vec<String> {
+    if let Some(overrides) = accepted_robot_invocation_overrides(command_name) {
+        return overrides.iter().map(|s| s.to_string()).collect();
+    }
+    vec![
+        format!(
+            "bv {} --format json",
+            robot_flag_example_form_for_command(command_name, doc.flag)
+        ),
+        preferred_robot_invocation(command_name, doc),
+    ]
+}
+
+/// Go `robotExampleFormsForCommand` (`cmd/bv/main.go:8058`).
+fn robot_example_forms_for_command(command_name: &str, values: &[&str]) -> Vec<String> {
+    values
         .iter()
-        .map(|f| {
-            let implemented = DISPATCHED_ROBOT_COMMANDS.contains(&f.name);
-            let mut entry = serde_json::json!({
-                "name": f.name,
-                "flag": format!("--{}", f.name),
-                "status": if implemented { "implemented" } else { "not_implemented" },
-                "preferred_invocation": format!("bvr --{} --json", f.name),
-                "accepted_invocations": [
-                    format!("bvr --{} --format json", f.name),
-                    format!("bvr --{} --json", f.name),
-                ],
-            });
-            // Add needs_* flags matching Go.
-            let obj = entry.as_object_mut().unwrap();
-            obj.insert("needs_issues".into(), serde_json::json!(true));
-            obj.insert("needs_git".into(), serde_json::json!(false));
-            obj.insert("needs_sprint".into(), serde_json::json!(false));
-            obj.insert("needs_baseline".into(), serde_json::json!(false));
-            obj.insert("mutates_state".into(), serde_json::json!(false));
-            entry
+        .map(|value| robot_flag_example_form_for_command(command_name, value))
+        .collect()
+}
+
+/// Go `agentIntentAliasDocs` (`cmd/bv/main.go:8118`): the near-miss spellings
+/// an agent is likely to try, each mapped to its canonical form.
+fn agent_intent_alias_docs() -> Vec<serde_json::Value> {
+    const ALIASES: &[(&str, &str)] = &[
+        ("bv --json", "bv --robot-triage --format json"),
+        ("bv robot-triage --json", "bv --robot-triage --format json"),
+        ("bv triage --json", "bv --robot-triage --format json"),
+        ("bv next --json", "bv --robot-next --format json"),
+        ("bv plan --json", "bv --robot-plan --format json"),
+        ("bv insights --json", "bv --robot-insights --format json"),
+        (
+            "bv robot-capabilities --json",
+            "bv --robot-capabilities --format json",
+        ),
+        (
+            "bv capabilities --json",
+            "bv --robot-capabilities --format json",
+        ),
+        (
+            "bv robot-docs guide --json",
+            "bv --robot-docs guide --format json",
+        ),
+        (
+            "bv docs guide --json",
+            "bv --robot-docs guide --format json",
+        ),
+        (
+            "bv robot-schema triage --json",
+            "bv --robot-schema --schema-command robot-triage --format json",
+        ),
+        (
+            "bv schema triage --json",
+            "bv --robot-schema --schema-command robot-triage --format json",
+        ),
+        (
+            "bv robot-search login oauth --json --limit 5",
+            "bv --search 'login oauth' --robot-search --format json --search-limit 5",
+        ),
+        (
+            "bv search login oauth --json --limit 5",
+            "bv --search 'login oauth' --robot-search --format json --search-limit 5",
+        ),
+        (
+            "bv robot-graph mermaid --json",
+            "bv --robot-graph --graph-format mermaid --format json",
+        ),
+        (
+            "bv graph mermaid --json",
+            "bv --robot-graph --graph-format mermaid --format json",
+        ),
+        (
+            "bv robot-related bv-123 --json",
+            "bv --robot-related bv-123 --format json",
+        ),
+        (
+            "bv --name backend --json",
+            "bv --label backend --robot-triage --format json",
+        ),
+    ];
+    ALIASES
+        .iter()
+        .map(|(agent_instinct, canonical)| {
+            // Go marshals a map[string]string, so the keys are alphabetical.
+            serde_json::json!({ "agent_instinct": agent_instinct, "canonical": canonical })
+        })
+        .collect()
+}
+
+/// Go `robotDocsTopics` (`cmd/bv/main.go:7624`).
+fn robot_docs_topics() -> &'static [&'static str] {
+    &["guide", "commands", "examples", "env", "exit-codes", "all"]
+}
+
+/// Go `robotEnvVars` (`cmd/bv/main.go:7628`), already in the alphabetical
+/// order Go's `encoding/json` emits a map in.
+fn robot_env_vars() -> serde_json::Value {
+    serde_json::json!({
+        "BEADS_DB": "Path to beads database file or .beads directory (overrides BEADS_DIR; overridden by --db flag)",
+        "BEADS_DIR": "Path to .beads directory (fallback when BEADS_DB and --db are not set)",
+        "BV_OUTPUT_FORMAT": "Default output format: json or toon (overridden by --format)",
+        "BV_PRETTY_JSON": "Set to 1 for indented JSON output",
+        "BV_ROBOT": "Set to 1 to force robot mode (clean stdout)",
+        "BV_SEARCH_MODE": "Search mode: text or hybrid",
+        "BV_SEARCH_PRESET": "Hybrid search preset name",
+        "TOON_DEFAULT_FORMAT": "Fallback format if BV_OUTPUT_FORMAT not set",
+        "TOON_INDENT": "TOON indentation level (0-16)",
+        "TOON_KEY_FOLDING": "TOON key folding mode",
+        "TOON_STATS": "Set to 1 to show JSON vs TOON token estimates on stderr",
+    })
+}
+
+/// Go `robotExitCodes` (`cmd/bv/main.go:7644`).
+fn robot_exit_codes() -> serde_json::Value {
+    serde_json::json!({
+        "0": "Success",
+        "1": "Error (general failure, drift critical)",
+        "2": "Invalid arguments or drift warning",
+    })
+}
+
+/// One `.commands[]` entry of the manifest, built per Go `main.go:7913-7927`.
+///
+/// Insertion order is the emitted key order: Go marshals `map[string]interface{}`
+/// with sorted keys, so the alphabetical inserts below are what puts
+/// `key_fields` between `flag` and `mutates_state` rather than at the end.
+fn robot_command_entry(name: &str, doc: &RobotCommandDoc) -> serde_json::Value {
+    let mut entry = serde_json::Map::new();
+    entry.insert(
+        "accepted_invocations".into(),
+        serde_json::json!(accepted_robot_invocations(name, doc)),
+    );
+    entry.insert("description".into(), serde_json::json!(doc.description));
+    entry.insert(
+        "flag".into(),
+        serde_json::json!(robot_flag_example_form_for_command(name, doc.flag)),
+    );
+    // `if len(doc.KeyFields) > 0` — main.go:7921. A command with no key
+    // fields omits the key; it does not emit an empty array.
+    if !doc.key_fields.is_empty() {
+        entry.insert("key_fields".into(), serde_json::json!(doc.key_fields));
+    }
+    entry.insert("mutates_state".into(), serde_json::json!(doc.mutates_state));
+    entry.insert("name".into(), serde_json::json!(name));
+    entry.insert(
+        "needs_baseline".into(),
+        serde_json::json!(doc.needs_baseline),
+    );
+    entry.insert("needs_git".into(), serde_json::json!(doc.needs_git));
+    entry.insert("needs_issues".into(), serde_json::json!(doc.needs_issues));
+    entry.insert("needs_sprint".into(), serde_json::json!(doc.needs_sprint));
+    // `if len(doc.Params) > 0` — main.go:7924, same omit-don't-empty rule.
+    if !doc.params.is_empty() {
+        entry.insert(
+            "params".into(),
+            serde_json::json!(robot_example_forms_for_command(name, doc.params)),
+        );
+    }
+    entry.insert(
+        "preferred_invocation".into(),
+        serde_json::json!(preferred_robot_invocation(name, doc)),
+    );
+    serde_json::Value::Object(entry)
+}
+
+/// Go `generateRobotCapabilities` (`cmd/bv/main.go:7903`).
+///
+/// Go's `tool` is the literal `"bv"` — the Rust binary is a drop-in
+/// replacement, so every self-description it emits names the Go tool.
+fn run_robot_capabilities() -> ExitCode {
+    let mut names: Vec<&str> = ROBOT_COMMAND_DOCS.iter().map(|(name, _)| *name).collect();
+    names.sort_unstable();
+
+    let commands: Vec<serde_json::Value> = names
+        .iter()
+        .map(|name| {
+            let doc = ROBOT_COMMAND_DOCS
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, doc)| doc)
+                .expect("name came from this table");
+            robot_command_entry(name, doc)
         })
         .collect();
-    commands.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-    let payload = serde_json::json!({
-        "generated_at": jiff_now(),
-        "tool": "bvr",
-        "version": env!("CARGO_PKG_VERSION"),
-        "contract_version": bv_robot::ROBOT_CONTRACT_VERSION,
-        "default_robot_command": "bvr --robot-triage",
-        "output_formats": ["json", "toon"],
-        "commands": commands,
-        "implemented_count": DISPATCHED_ROBOT_COMMANDS.len(),
-        "total_count": flags::ROBOT_PRIMARIES.len(),
-        "schema_command": "bvr --robot-schema",
-        "stream_contract": {
-            "stdout": "Structured robot data only for robot commands.",
+
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "agent_intent_aliases".into(),
+        serde_json::json!(agent_intent_alias_docs()),
+    );
+    payload.insert("commands".into(), serde_json::json!(commands));
+    payload.insert(
+        "contract_version".into(),
+        serde_json::json!(bv_robot::ROBOT_CONTRACT_VERSION),
+    );
+    payload.insert(
+        "default_robot_command".into(),
+        serde_json::json!("bv --robot-triage"),
+    );
+    payload.insert("docs_topics".into(), serde_json::json!(robot_docs_topics()));
+    payload.insert("environment_variables".into(), robot_env_vars());
+    payload.insert("exit_codes".into(), robot_exit_codes());
+    payload.insert("generated_at".into(), serde_json::json!(jiff_now()));
+    payload.insert("output_formats".into(), serde_json::json!(["json", "toon"]));
+    payload.insert(
+        "schema_command".into(),
+        serde_json::json!("bv --robot-schema"),
+    );
+    payload.insert(
+        "stream_contract".into(),
+        serde_json::json!({
             "stderr": "Diagnostics, warnings, and actionable errors.",
-        },
-    });
-    emit_json(&payload)
+            "stdout": "Structured robot data only for robot commands.",
+        }),
+    );
+    payload.insert("tool".into(), serde_json::json!("bv"));
+    payload.insert("version".into(), serde_json::json!(GO_APP_VERSION));
+    emit_json(&serde_json::Value::Object(payload))
 }
 
 /// Go `handleRobotSchema` (`--robot-schema`, optional `--schema-command NAME`).
