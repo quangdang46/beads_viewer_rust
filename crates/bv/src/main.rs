@@ -1231,6 +1231,130 @@ fn main() -> ExitCode {
     if presence.has("robot-capabilities") {
         return run_robot_capabilities();
     }
+
+    /// Go `analysis.NewAnalyzer(issues).ComputeImpactScores()` (main.go:2505-2506)
+    /// — the same graph and metric maps `priority_recommendations` builds, kept as
+    /// its own helper so `--feedback-accept`/`--feedback-ignore` can reach the
+    /// per-issue `Breakdown` that `ScoreContributions` is derived from.
+    fn impact_scores_with_breakdown(
+        issues: &[bv_core::model::Issue],
+    ) -> Vec<bv_analysis::impact::IssueImpact> {
+        let g = bv_analysis::build_graph(issues);
+        let pr = bv_graph_core::pagerank_default(&g);
+        let bw = bv_graph_core::betweenness(&g);
+        let cp = bv_graph_core::critical_path_heights(&g);
+        let to_map = |v: &[f64]| -> std::collections::BTreeMap<String, f64> {
+            v.iter()
+                .enumerate()
+                .map(|(i, x)| (g.node_id(i).unwrap_or_default().to_string(), *x))
+                .collect()
+        };
+        let (pr_map, bw_map, cp_map) = (to_map(&pr), to_map(&bw), to_map(&cp));
+        bv_analysis::impact::compute_impact_scores(&bv_analysis::impact::ImpactInputs {
+            issues,
+            pagerank: &pr_map,
+            betweenness: &bw_map,
+            critical_path: Some(&cp_map),
+            g: &g,
+            now: robot_now(),
+        })
+    }
+
+    // Go main.go:2441-2530 — the four `--feedback-*` flags form one early
+    // block, and each branch exits. Precedence is reset > show > record, and
+    // `--feedback-ignore` wins over `--feedback-accept` for the issue id when
+    // both are given (main.go:2473-2477).
+    //
+    // POSITION is load-bearing and was wrong here until this block moved. Go
+    // dispatches `--robot-help`/`--version`/`--robot-capabilities` at
+    // main.go:2052-2054, then the agents block at :2425, then feedback at
+    // :2441, and only then `--robot-recipes` (:2544), `--robot-schema`
+    // (:2547), `--robot-metrics` (:4305) and every other primary (:3456+). So
+    // a feedback flag paired with any of those is answered as a feedback
+    // query in Go, while running it after the robot dispatch answered it as a
+    // triage payload and never wrote `feedback.json` at all.
+    let fb_accept = flag_value(&args, "feedback-accept").unwrap_or_default();
+    let fb_ignore = flag_value(&args, "feedback-ignore").unwrap_or_default();
+    let fb_reset = presence.has("feedback-reset");
+    let fb_show = presence.has("feedback-show");
+    if !fb_accept.is_empty() || !fb_ignore.is_empty() || fb_reset || fb_show {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let beads_dir = match bv_core::discovery::get_beads_dir(&cwd) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("Error getting beads directory: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        let mut feedback = match bv_analysis::feedback::load_feedback(&beads_dir) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("Error loading feedback: {e}");
+                return ExitCode::from(1);
+            }
+        };
+
+        if fb_reset {
+            feedback.reset();
+            if let Err(e) = feedback.save(&beads_dir) {
+                eprintln!("Error saving feedback: {e}");
+                return ExitCode::from(1);
+            }
+            println!("Feedback data reset to defaults.");
+            return ExitCode::from(0);
+        }
+
+        if fb_show {
+            // Go main.go:2464-2469 — `ToJSON` re-indented with two spaces and
+            // printed, deliberately NOT wrapped in the robot envelope.
+            match serde_json::to_string_pretty(&feedback.to_json()) {
+                Ok(s) => println!("{s}"),
+                Err(e) => {
+                    eprintln!("Error encoding feedback: {e}");
+                    return ExitCode::from(1);
+                }
+            }
+            return ExitCode::from(0);
+        }
+
+        let (issue_id, action) = if !fb_ignore.is_empty() {
+            (fb_ignore, "ignore")
+        } else {
+            (fb_accept, "accept")
+        };
+        // Go main.go:2494-2512 needs the issue's impact score and breakdown, so
+        // the issues have to load for accept/ignore even though reset/show do
+        // not.
+        let issues = match bv_core::discovery::load_issues_from_repo(&cwd) {
+            Ok((issues, _)) => issues,
+            Err(e) => {
+                eprintln!("Error loading issues: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        if !issues.iter().any(|i| i.id == issue_id) {
+            eprintln!("Issue not found: {issue_id}");
+            return ExitCode::from(1);
+        }
+        let scores = impact_scores_with_breakdown(&issues);
+        let hit = scores.iter().find(|s| s.id == issue_id);
+        let score = hit.map(|s| s.score).unwrap_or(0.0);
+        let contributions = hit
+            .map(|s| bv_analysis::feedback::ScoreContributions::from(&s.breakdown))
+            .unwrap_or_default();
+        if let Err(e) = feedback.record_feedback(issue_id, action, score, contributions) {
+            eprintln!("Error recording feedback: {e}");
+            return ExitCode::from(1);
+        }
+        if let Err(e) = feedback.save(&beads_dir) {
+            eprintln!("Error saving feedback: {e}");
+            return ExitCode::from(1);
+        }
+        println!("Recorded {action} feedback for {issue_id} (score: {score:.3})");
+        println!("{}", feedback.summary());
+        return ExitCode::from(0);
+    }
+
     if presence.has("robot-schema") {
         return run_robot_schema(&args);
     }
@@ -1852,122 +1976,6 @@ th {{ background: #44475a; }}
                 return ExitCode::from(1);
             }
         }
-    }
-
-    /// Go `analysis.NewAnalyzer(issues).ComputeImpactScores()` (main.go:2505-2506)
-    /// — the same graph and metric maps `priority_recommendations` builds, kept as
-    /// its own helper so `--feedback-accept`/`--feedback-ignore` can reach the
-    /// per-issue `Breakdown` that `ScoreContributions` is derived from.
-    fn impact_scores_with_breakdown(
-        issues: &[bv_core::model::Issue],
-    ) -> Vec<bv_analysis::impact::IssueImpact> {
-        let g = bv_analysis::build_graph(issues);
-        let pr = bv_graph_core::pagerank_default(&g);
-        let bw = bv_graph_core::betweenness(&g);
-        let cp = bv_graph_core::critical_path_heights(&g);
-        let to_map = |v: &[f64]| -> std::collections::BTreeMap<String, f64> {
-            v.iter()
-                .enumerate()
-                .map(|(i, x)| (g.node_id(i).unwrap_or_default().to_string(), *x))
-                .collect()
-        };
-        let (pr_map, bw_map, cp_map) = (to_map(&pr), to_map(&bw), to_map(&cp));
-        bv_analysis::impact::compute_impact_scores(&bv_analysis::impact::ImpactInputs {
-            issues,
-            pagerank: &pr_map,
-            betweenness: &bw_map,
-            critical_path: Some(&cp_map),
-            g: &g,
-            now: robot_now(),
-        })
-    }
-
-    // Go main.go:2441-2530 — the four `--feedback-*` flags form one early
-    // block that runs before recipes and before any robot dispatch, and each
-    // branch exits. Precedence is reset > show > record, and `--feedback-ignore`
-    // wins over `--feedback-accept` for the issue id when both are given
-    // (main.go:2473-2477).
-    let fb_accept = flag_value(&args, "feedback-accept").unwrap_or_default();
-    let fb_ignore = flag_value(&args, "feedback-ignore").unwrap_or_default();
-    let fb_reset = presence.has("feedback-reset");
-    let fb_show = presence.has("feedback-show");
-    if !fb_accept.is_empty() || !fb_ignore.is_empty() || fb_reset || fb_show {
-        let cwd = std::env::current_dir().unwrap_or_default();
-        let beads_dir = match bv_core::discovery::get_beads_dir(&cwd) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("Error getting beads directory: {e}");
-                return ExitCode::from(1);
-            }
-        };
-        let mut feedback = match bv_analysis::feedback::load_feedback(&beads_dir) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("Error loading feedback: {e}");
-                return ExitCode::from(1);
-            }
-        };
-
-        if fb_reset {
-            feedback.reset();
-            if let Err(e) = feedback.save(&beads_dir) {
-                eprintln!("Error saving feedback: {e}");
-                return ExitCode::from(1);
-            }
-            println!("Feedback data reset to defaults.");
-            return ExitCode::from(0);
-        }
-
-        if fb_show {
-            // Go main.go:2464-2469 — `ToJSON` re-indented with two spaces and
-            // printed, deliberately NOT wrapped in the robot envelope.
-            match serde_json::to_string_pretty(&feedback.to_json()) {
-                Ok(s) => println!("{s}"),
-                Err(e) => {
-                    eprintln!("Error encoding feedback: {e}");
-                    return ExitCode::from(1);
-                }
-            }
-            return ExitCode::from(0);
-        }
-
-        let (issue_id, action) = if !fb_ignore.is_empty() {
-            (fb_ignore, "ignore")
-        } else {
-            (fb_accept, "accept")
-        };
-        // Go main.go:2494-2512 needs the issue's impact score and breakdown, so
-        // the issues have to load for accept/ignore even though reset/show do
-        // not.
-        let issues = match bv_core::discovery::load_issues_from_repo(&cwd) {
-            Ok((issues, _)) => issues,
-            Err(e) => {
-                eprintln!("Error loading issues: {e}");
-                return ExitCode::from(1);
-            }
-        };
-        let Some(found) = issues.iter().find(|i| i.id == issue_id) else {
-            eprintln!("Issue not found: {issue_id}");
-            return ExitCode::from(1);
-        };
-        let _ = found;
-        let scores = impact_scores_with_breakdown(&issues);
-        let hit = scores.iter().find(|s| s.id == issue_id);
-        let score = hit.map(|s| s.score).unwrap_or(0.0);
-        let contributions = hit
-            .map(|s| bv_analysis::feedback::ScoreContributions::from(&s.breakdown))
-            .unwrap_or_default();
-        if let Err(e) = feedback.record_feedback(issue_id, action, score, contributions) {
-            eprintln!("Error recording feedback: {e}");
-            return ExitCode::from(1);
-        }
-        if let Err(e) = feedback.save(&beads_dir) {
-            eprintln!("Error saving feedback: {e}");
-            return ExitCode::from(1);
-        }
-        println!("Recorded {action} feedback for {issue_id} (score: {score:.3})");
-        println!("{}", feedback.summary());
-        return ExitCode::from(0);
     }
 
     // Any recognized `--robot-*` primary that reached this point is a real
@@ -9256,18 +9264,25 @@ fn run_robot_recipes() -> ExitCode {
 /// the `=` form (see `history_flag_value`).
 /// Value of a `--name value` / `--name=value` flag, borrowed from `args`.
 /// Same scan as `search_flag`; this one avoids allocating.
+///
+/// The scan runs to the END of argv and keeps the last match, because Go's
+/// `flag` parser assigns through `Set` on every occurrence
+/// (`stringValue.Set` overwrites the pointer), so a repeated flag keeps the
+/// LAST value. Returning on the first match scored the wrong item for
+/// `--feedback-accept d1 --feedback-accept hub`: it recorded `d1` where the
+/// oracle recorded `hub`.
 fn flag_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     let long = format!("--{name}");
     let with_eq = format!("--{name}=");
+    let mut found = None;
     for (i, a) in args.iter().enumerate() {
         if let Some(v) = a.strip_prefix(&with_eq) {
-            return Some(v);
-        }
-        if a == &long {
-            return args.get(i + 1).map(|s| s.as_str());
+            found = Some(v);
+        } else if a == &long {
+            found = args.get(i + 1).map(|s| s.as_str());
         }
     }
-    None
+    found
 }
 
 /// Go `strconv.underscoreOK` — an underscore must follow a digit or a base
