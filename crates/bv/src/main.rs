@@ -10473,15 +10473,28 @@ fn run_robot_file_beads(args: &[String]) -> ExitCode {
         .and_then(|i| args.get(i + 1))
         .cloned()
         .unwrap_or_default();
-    // Go main.go:1564 registers `--file-beads-limit` with default 20, read at
-    // robot_registry.go:3141-3148. A negative value clamps to 0 (emit none),
-    // which is the opposite of `--relations-limit` — Go's guard there is
-    // `if len(...) > closedLimit`, so a negative limit cannot be passed on to
-    // the slice and must be floored first or the truncation would panic.
-    let closed_limit: i64 = flag_value(args, "file-beads-limit")
-        .and_then(|raw| go_parse_int_base0(raw).ok())
-        .unwrap_or(20)
-        .max(0);
+    // Go main.go:1564 registers `--file-beads-limit` as a pflag `flag.Int`
+    // with default 20, read at robot_registry.go:3140-3148. A negative value
+    // clamps to 0 (emit none), which is the opposite of `--relations-limit` —
+    // Go's guard there is `if len(...) > closedLimit`, so a negative limit
+    // cannot be passed on to the slice and must be floored first or the
+    // truncation would panic.
+    //
+    // A value pflag cannot parse as `strconv.ParseInt(s, 0, 64)` is a PARSE
+    // error, not a silent fallback to 20: Go reports
+    // `invalid argument %q for "--file-beads-limit" flag: %v` and exits 1
+    // (main.go:4548), for both the space form `--file-beads-limit=` and any
+    // unparsable value, including the empty string and out-of-range integers.
+    let closed_limit: i64 = match flag_value(args, "file-beads-limit") {
+        Some(raw) => match go_parse_int_base0(raw) {
+            Ok(v) => v.max(0),
+            Err(detail) => {
+                eprintln!("invalid argument {raw:?} for \"--file-beads-limit\" flag: {detail}");
+                return ExitCode::from(1);
+            }
+        },
+        None => 20,
+    };
     let cwd = std::env::current_dir().unwrap_or_default();
     let issues = match load_issues_auto(&cwd, None) {
         Ok((issues, _, _)) => issues,
