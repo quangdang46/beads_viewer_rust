@@ -2054,16 +2054,27 @@ th {{ background: #44475a; }}
                     .filter(|r| r.error.is_none())
                     .map(|r| r.repo_name.clone())
                     .collect();
+                let repo_count = repo_names.len();
                 // Go main.go:2792 — the TUI receives the SCOPED set, same as
                 // every robot consumer and every export.
                 let (issues, _) = apply_scope(&issues);
+                if let Some(code) = exit_if_no_issues(&issues) {
+                    return code;
+                }
+                let mut app = bv_tui::App::new(issues.clone());
+                app.workspace_repos = Some(repo_names);
+                // Go main.go:4526-4531 — the debug-render check sits AFTER
+                // `EnableWorkspaceMode`, so it is reachable from workspace mode
+                // too. Checking only in the single-repo arm left
+                // `bvr --debug-render <view>` opening a TUI here.
+                if let Some(code) = run_debug_render(&mut app, &issues, &args) {
+                    return code;
+                }
                 eprintln!(
                     "Workspace: loaded {} issues from {} repos — launching TUI",
                     issues.len(),
-                    repo_names.len()
+                    repo_count
                 );
-                let mut app = bv_tui::App::new(issues.clone());
-                app.workspace_repos = Some(repo_names);
                 return launch_tui(&mut app, &issues);
             }
             Err(e) => {
@@ -2076,32 +2087,14 @@ th {{ background: #44475a; }}
         Ok((issues, _)) => {
             // Go main.go:2792 — the TUI is scoped like everything else.
             let (issues, _) = apply_scope(&issues);
-            eprintln!("Loaded {} issues — launching TUI", issues.len());
-            let mut app = bv_tui::App::new(issues.clone());
-            // Go main.go:4526-4531 — `--debug-render` REPLACES the TUI: render
-            // one view, print it, exit 0. The flag help says "output to file"
-            // but Go prints to stdout, so the print is what is faithful.
-            if let Some(view) = flag_value(&args, "debug-render").filter(|v| !v.is_empty()) {
-                // Go main.go:1631-1632 register 180x50. A non-numeric value is
-                // pflag's parse error, not a silent fallback to the default.
-                let mut dims = [180u16, 50u16];
-                for (i, name) in ["debug-width", "debug-height"].iter().enumerate() {
-                    if let Some(raw) = flag_value(&args, name) {
-                        match go_parse_int_base0(raw) {
-                            Ok(v) if (0..=u16::MAX as i64).contains(&v) => dims[i] = v as u16,
-                            _ => {
-                                eprintln!(
-                                    "invalid argument {raw:?} for \"--{name}\" flag: parse error"
-                                );
-                                return ExitCode::from(1);
-                            }
-                        }
-                    }
-                }
-                let rendered = bv_tui::render_debug_view(&mut app, view, dims[0], dims[1]);
-                println!("{rendered}");
-                return ExitCode::from(0);
+            if let Some(code) = exit_if_no_issues(&issues) {
+                return code;
             }
+            let mut app = bv_tui::App::new(issues.clone());
+            if let Some(code) = run_debug_render(&mut app, &issues, &args) {
+                return code;
+            }
+            eprintln!("Loaded {} issues — launching TUI", issues.len());
             launch_tui(&mut app, &issues)
         }
         Err(e) => {
@@ -2150,7 +2143,13 @@ fn insights_map_limit() -> usize {
         .unwrap_or(200)
 }
 
-fn launch_tui(app: &mut bv_tui::App, issues: &[bv_core::model::Issue]) -> ExitCode {
+/// Attach the graph metrics `bv_tui` reads when it draws the insights view.
+///
+/// Go does this inside `ui.NewModel` (`pkg/ui/model.go`), so every consumer of
+/// a freshly built model — the live TUI and `RenderDebugView` alike — sees a
+/// populated panel. Ours was folded into `launch_tui`, which left
+/// `--debug-render insights` drawing an empty dashboard.
+fn apply_graph_metrics(app: &mut bv_tui::App, issues: &[bv_core::model::Issue]) {
     let g = bv_analysis::build_graph(issues);
     let pr = bv_graph_core::pagerank_default(&g);
     let bw = bv_graph_core::betweenness(&g);
@@ -2172,6 +2171,71 @@ fn launch_tui(app: &mut bv_tui::App, issues: &[bv_core::model::Issue]) -> ExitCo
         hubs: to_map(&hits_result.hubs),
         authorities: to_map(&hits_result.authorities),
     });
+}
+
+/// Go main.go:4527 — `if *debugRender != ""`. An absent flag and an explicitly
+/// empty value are the same thing to Go: both fall through to the TUI.
+fn debug_render_view(args: &[String]) -> Option<&str> {
+    flag_value(args, "debug-render").filter(|v| !v.is_empty())
+}
+
+/// Go main.go:4526-4531 — render one view, print it, exit 0.
+///
+/// Returns `None` when `--debug-render` was not requested, so the caller keeps
+/// its normal TUI path. Go's help text says "output to file" but the code does
+/// `fmt.Println(output)`, so the print is what is faithful.
+fn run_debug_render(
+    app: &mut bv_tui::App,
+    issues: &[bv_core::model::Issue],
+    args: &[String],
+) -> Option<ExitCode> {
+    let view = debug_render_view(args)?;
+    apply_graph_metrics(app, issues);
+
+    // Go main.go:1631-1632 register 180x50. A value pflag cannot convert is
+    // pflag's parse error at exit 1, not a silent fallback to the default.
+    let mut dims = [180u16, 50u16];
+    for (i, name) in ["debug-width", "debug-height"].iter().enumerate() {
+        let Some(raw) = flag_value(args, name) else {
+            continue;
+        };
+        match go_parse_int_base0(raw) {
+            Ok(v) if (0..=u16::MAX as i64).contains(&v) => dims[i] = v as u16,
+            // Out of `u16` range parses fine in Go, which then asks its view
+            // for a buffer this many columns wide. Report the conversion
+            // failure rather than pretend a default was used.
+            Ok(_) => {
+                eprintln!(
+                    "invalid argument {raw:?} for \"--{name}\" flag: strconv.ParseInt: parsing {raw:?}: value out of range"
+                );
+                return Some(ExitCode::from(1));
+            }
+            Err(detail) => {
+                eprintln!("invalid argument {raw:?} for \"--{name}\" flag: {detail}");
+                return Some(ExitCode::from(1));
+            }
+        }
+    }
+
+    let rendered = bv_tui::render_debug_view(app, view, dims[0], dims[1]);
+    println!("{rendered}");
+    Some(ExitCode::from(0))
+}
+
+/// Go main.go:4482-4485 — the empty-set guard runs after the workspace and
+/// single-repo loads converge and before `ui.NewModel`, so it covers both and
+/// `--debug-render` never reaches an empty model.
+fn exit_if_no_issues(issues: &[bv_core::model::Issue]) -> Option<ExitCode> {
+    if issues.is_empty() {
+        println!("No issues found. Create some with 'br create'!");
+        Some(ExitCode::from(0))
+    } else {
+        None
+    }
+}
+
+fn launch_tui(app: &mut bv_tui::App, issues: &[bv_core::model::Issue]) -> ExitCode {
+    apply_graph_metrics(app, issues);
 
     match bv_tui::run_tui(app) {
         Ok(_) => ExitCode::from(0),
