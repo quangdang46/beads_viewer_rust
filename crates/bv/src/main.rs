@@ -1538,6 +1538,13 @@ fn main() -> ExitCode {
     if presence.has("robot-suggest") {
         return run_robot_suggest(&args);
     }
+    // Go main.go:3566-3570 — `--profile-startup` is dispatched on presence and
+    // exits 0. `--profile-json` only selects the output shape and is not a
+    // primary of its own; the modifier-requires rule (flags.rs:1750) has
+    // already rejected it standing alone by the time control reaches here.
+    if presence.has("profile-startup") {
+        return run_profile_startup(presence.has("profile-json"));
+    }
     if presence.has("robot-alerts") {
         return run_robot_alerts();
     }
@@ -8139,6 +8146,337 @@ fn run_robot_suggest(args: &[String]) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Go `runProfileStartup` (cmd/bv/main.go:4969-5030).
+///
+/// Go hands this handler the already-loaded `issues` and the `loadDuration`
+/// that `main` measured around `datasource.LoadIssues` (main.go:2609-2755).
+/// bvr's handlers each load their own issues, so the same span is timed here
+/// around this handler's own load — same quantity, measured at the point where
+/// the work happens.
+fn run_profile_startup(json_output: bool) -> ExitCode {
+    use std::time::Instant;
+
+    let cwd = std::env::current_dir().unwrap_or_default();
+
+    let load_start = Instant::now();
+    let (issues, _hash, _as_of_commit) = match load_issues_auto(&cwd, None) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let load_duration = load_start.elapsed();
+
+    // Go main.go:4971-4976 — `GetBeadsDir("")` (empty repo path = cwd, and
+    // BEADS_DB first, which `main` has already published from `--db`) then
+    // `FindJSONLPath`. Go discards both errors and falls back to the beads
+    // directory itself, so an unreadable directory reports the directory.
+    let beads_dir = bv_core::discovery::get_beads_dir(&cwd).unwrap_or_else(|_| cwd.clone());
+    let data_path = match bv_core::discovery::find_jsonl_path_with_warnings(&beads_dir, |_| {}) {
+        Ok(Some(p)) => p,
+        _ => beads_dir.clone(),
+    };
+
+    // Go main.go:4978-4981 — `NewAnalyzer(issues)` is where the graph is
+    // built; `profile.BuildGraph` is that construction time, and it
+    // OVERWRITES the value the analysis pass would have left there (Go's
+    // `AnalyzeWithProfile` never sets it — see bv-analysis's
+    // `analyze_with_profile` contract).
+    let build_start = Instant::now();
+    let g = std::sync::Arc::new(bv_analysis::analyzer::build_graph(&issues));
+    let build_duration = build_start.elapsed();
+
+    // Go main.go:4983-4994 — `ConfigForSize(len(issues), Σ len(deps))`.
+    // Both counts come from the ISSUE list, not the graph: `build_graph` only
+    // keeps blocking dependency kinds, so the graph's edge count is strictly
+    // smaller. Go derives density inside `ConfigForSize` (config.go:99-105),
+    // so the formula is reproduced here rather than read off the graph.
+    let node_count = issues.len();
+    let edge_count: usize = issues.iter().map(|i| i.dependencies.len()).sum();
+    let config = if force_full_analysis() {
+        bv_analysis::analyzer::full_analysis_config()
+    } else {
+        let density = if node_count > 1 {
+            edge_count as f64 / (node_count as f64 * (node_count - 1) as f64)
+        } else {
+            0.0
+        };
+        bv_analysis::analyzer::config_for_size(node_count, edge_count, density)
+    };
+
+    // Go main.go:4996-5001.
+    let (_stats, mut profile) = bv_analysis::analyzer::analyze_with_profile(g, &config);
+    profile.build_graph = build_duration;
+    let total_with_load = load_duration + profile.total;
+
+    if json_output {
+        let recs = profile_recommendations(&profile, total_with_load);
+        // Go's `Recommendations []string` is a nil slice when empty, and
+        // `encoding/json` renders nil as `null` — not `[]`. The timing check
+        // always contributes exactly one entry, so the empty case is
+        // unreachable in practice; emit `null` anyway so the shape matches if
+        // that ever changes.
+        let recs = if recs.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::to_value(&recs).unwrap_or(serde_json::Value::Null)
+        };
+        // Key order is Go's struct declaration order (main.go:5005-5012):
+        // encoding/json emits struct fields in the order they are declared.
+        let out = serde_json::json!({
+            "generated_at": jiff_now(),
+            "data_path": data_path.to_string_lossy(),
+            "load_jsonl": bv_export::hooks::go_duration_string(load_duration),
+            "profile": serde_json::to_value(&profile).unwrap_or(serde_json::Value::Null),
+            "total_with_load": bv_export::hooks::go_duration_string(total_with_load),
+            "recommendations": recs,
+        });
+        emit_json(&out)
+    } else {
+        print_profile_report(&profile, load_duration, total_with_load);
+        ExitCode::from(0)
+    }
+}
+
+/// Go `printProfileReport` (cmd/bv/main.go:5035-5073). Every literal here is a
+/// contract: the headings, the per-metric labels `printMetricLine` left-pads to
+/// 14 columns, and the two-space indent are all compared against the oracle.
+fn print_profile_report(
+    profile: &bv_analysis::analyzer::StartupProfile,
+    load_duration: std::time::Duration,
+    total_with_load: std::time::Duration,
+) {
+    println!("Startup Profile");
+    println!("===============");
+    println!(
+        "Data: {} issues, {} dependencies, density={:.4}",
+        profile.node_count, profile.edge_count, profile.density
+    );
+    println!();
+
+    println!("Phase 1 (blocking):");
+    println!(
+        "  Load JSONL:      {}",
+        profile_format_duration(load_duration)
+    );
+    println!(
+        "  Build graph:     {}",
+        profile_format_duration(profile.build_graph)
+    );
+    println!(
+        "  Degree:          {}",
+        profile_format_duration(profile.degree)
+    );
+    println!(
+        "  TopoSort:        {}",
+        profile_format_duration(profile.topo_sort)
+    );
+    println!(
+        "  Total Phase 1:   {}\n",
+        profile_format_duration(load_duration + profile.build_graph + profile.phase1)
+    );
+
+    println!("Phase 2 (async in normal mode, sync for profiling):");
+    print_profile_metric_line(
+        "PageRank",
+        profile.pagerank,
+        profile.pagerank_timeout,
+        profile.config.compute_page_rank,
+    );
+    print_profile_metric_line(
+        "Betweenness",
+        profile.betweenness,
+        profile.betweenness_timeout,
+        profile.config.compute_betweenness,
+    );
+    print_profile_metric_line(
+        "Eigenvector",
+        profile.eigenvector,
+        false,
+        profile.config.compute_eigenvector,
+    );
+    print_profile_metric_line(
+        "HITS",
+        profile.hits,
+        profile.hits_timeout,
+        profile.config.compute_hits,
+    );
+    print_profile_metric_line(
+        "Critical Path",
+        profile.critical_path,
+        false,
+        profile.config.compute_critical_path,
+    );
+    print_profile_cycles_line(profile);
+    println!(
+        "  Total Phase 2:   {}\n",
+        profile_format_duration(profile.phase2)
+    );
+
+    println!(
+        "Total startup:     {}\n",
+        profile_format_duration(total_with_load)
+    );
+
+    println!("Configuration:");
+    println!("  Size tier: {}", profile_size_tier(profile.node_count));
+    let skipped = profile.config.skipped_metrics();
+    if skipped.is_empty() {
+        println!("  All metrics computed");
+    } else {
+        let names: Vec<&str> = skipped.iter().map(|s| s.name).collect();
+        println!("  Skipped metrics: {}", names.join(", "));
+    }
+    println!();
+
+    let recommendations = profile_recommendations(profile, total_with_load);
+    if !recommendations.is_empty() {
+        println!("Recommendations:");
+        for rec in &recommendations {
+            println!("  {rec}");
+        }
+    }
+}
+
+/// Go `printMetricLine` (main.go:5075-5086). `%-14s` left-justifies the
+/// `name + ":"` label in 14 columns, so the duration column lines up whether
+/// the label is `HITS:` or `Critical Path:`.
+fn print_profile_metric_line(
+    name: &str,
+    duration: std::time::Duration,
+    timed_out: bool,
+    computed: bool,
+) {
+    let label = format!("{name}:");
+    if !computed {
+        println!("  {label:<14} [Skipped]");
+        return;
+    }
+    let suffix = if timed_out { " (TIMEOUT)" } else { "" };
+    println!(
+        "  {label:<14} {}{suffix}",
+        profile_format_duration(duration)
+    );
+}
+
+/// Go `printCyclesLine` (main.go:5089-5103). The suffix carries the cycle count
+/// rather than a timeout flag alone, so it is spelled out here.
+fn print_profile_cycles_line(profile: &bv_analysis::analyzer::StartupProfile) {
+    if !profile.config.compute_cycles {
+        println!("  {:<14} [Skipped]", "Cycles:");
+        return;
+    }
+    let suffix = if profile.cycles_timeout {
+        " (TIMEOUT)".to_string()
+    } else if profile.cycle_count > 0 {
+        format!(" (found: {})", profile.cycle_count)
+    } else {
+        " (none)".to_string()
+    };
+    println!(
+        "  {:<14} {}{}",
+        "Cycles:",
+        profile_format_duration(profile.cycles),
+        suffix
+    );
+}
+
+/// Go `formatDuration` (main.go:5118-5124) — sub-millisecond durations render
+/// with two decimals in a 6-wide field, everything else as whole milliseconds
+/// in the same 6-wide field. The width is what keeps the Phase 1 / Phase 2
+/// blocks aligned.
+fn profile_format_duration(d: std::time::Duration) -> String {
+    use std::time::Duration;
+    if d < Duration::from_millis(1) {
+        // Go truncates to whole microseconds first (`d.Microseconds()`), then
+        // divides by 1000 — so 1.5µs reads "0.00ms", not "0.0015ms".
+        return format!("{:>6.2}ms", d.as_micros() as f64 / 1000.0);
+    }
+    format!("{:>6}ms", d.as_millis())
+}
+
+/// Go `getSizeTier` (main.go:5126-5138). Keyed on the ISSUE count, which is the
+/// same number the config tier was keyed on.
+fn profile_size_tier(node_count: usize) -> &'static str {
+    match node_count {
+        n if n < 100 => "Small (<100 issues)",
+        n if n < 500 => "Medium (100-500 issues)",
+        n if n < 2000 => "Large (500-2000 issues)",
+        _ => "XL (>2000 issues)",
+    }
+}
+
+/// Go `generateProfileRecommendations` (main.go:5140-5191). The thresholds are
+/// on `totalWithLoad` (load + analysis), and the 1-2s branch is the only one
+/// that consults the config: an unskipped profile on a >=500-node graph means
+/// `--force-full-analysis` is doing the work.
+fn profile_recommendations(
+    profile: &bv_analysis::analyzer::StartupProfile,
+    total_with_load: std::time::Duration,
+) -> Vec<String> {
+    use std::time::Duration;
+
+    let mut recs: Vec<String> = Vec::new();
+    if total_with_load < Duration::from_millis(500) {
+        recs.push("✓ Startup within acceptable range (<500ms)".to_string());
+    } else if total_with_load < Duration::from_secs(1) {
+        recs.push("✓ Startup acceptable (<1s)".to_string());
+    } else if total_with_load < Duration::from_secs(2) {
+        if profile.config.skipped_metrics().is_empty() && profile.node_count >= 500 {
+            recs.push(
+                "⚠ Startup is slow (1-2s) - if using --force-full-analysis, consider removing it"
+                    .to_string(),
+            );
+        } else {
+            recs.push("⚠ Startup is slow (1-2s)".to_string());
+        }
+    } else {
+        recs.push("⚠ Startup is very slow (>2s) - optimization recommended".to_string());
+    }
+
+    if profile.pagerank_timeout {
+        recs.push("⚠ PageRank timed out - graph may be too large or dense".to_string());
+    }
+    if profile.betweenness_timeout {
+        recs.push(
+            "⚠ Betweenness timed out - this is expected for large graphs (>500 nodes)".to_string(),
+        );
+    }
+    if profile.hits_timeout {
+        recs.push("⚠ HITS timed out - graph may have convergence issues".to_string());
+    }
+    if profile.cycles_timeout {
+        recs.push(
+            "⚠ Cycle detection timed out - graph may have many overlapping cycles".to_string(),
+        );
+    }
+
+    // Go main.go:5171-5180 — the share only exists when betweenness ran and
+    // Phase 2 has a non-zero denominator to divide by.
+    if profile.config.compute_betweenness
+        && profile.betweenness > Duration::ZERO
+        && profile.phase2 > Duration::ZERO
+    {
+        let betweenness_percent =
+            profile.betweenness.as_nanos() as f64 / profile.phase2.as_nanos() as f64 * 100.0;
+        if betweenness_percent > 50.0 {
+            recs.push(format!(
+                "⚠ Betweenness taking {betweenness_percent:.0}% of Phase 2 time - consider skipping for large graphs"
+            ));
+        }
+    }
+
+    if profile.cycle_count > 0 {
+        recs.push(format!(
+            "⚠ Found {} circular dependencies - resolve to improve graph health",
+            profile.cycle_count
+        ));
+    }
+
+    recs
 }
 
 fn run_robot_alerts() -> ExitCode {
