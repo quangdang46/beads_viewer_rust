@@ -380,6 +380,164 @@ impl FileLookup {
         &self.co_change
     }
 
+    /// Go `ImpactAnalysis` — impact of modifying `files`, evaluated at the wall
+    /// clock.
+    pub fn impact_analysis(&self, files: &[String]) -> ImpactResult {
+        self.impact_analysis_at(files, jiff::Timestamp::now())
+    }
+
+    /// Go `ImpactAnalysisAt` (file_index.go:595) — the same analysis evaluated
+    /// at a caller-owned instant, which is what keeps the recency filter and
+    /// the derived `relevance` scores deterministic for robot callers.
+    pub fn impact_analysis_at(&self, files: &[String], now: jiff::Timestamp) -> ImpactResult {
+        // Go file_index.go:596-603 — note the pre-seeded `Files: []string{}`
+        // and `Warnings: []string{}`, which is why the early returns below emit
+        // `[]` rather than `null`.
+        let mut result = ImpactResult {
+            files: Vec::new(),
+            affected_beads: Vec::new(),
+            risk_level: "low".to_string(),
+            risk_score: 0.0,
+            warnings: Vec::new(),
+            summary: String::new(),
+        };
+
+        if files.is_empty() {
+            result.summary = "No files to analyze".to_string();
+            return result;
+        }
+
+        // Go file_index.go:610-621 — normalize, drop blank paths, dedupe while
+        // preserving first-occurrence order. `normalizePath` runs BEFORE
+        // `TrimSpace`, so a path that is only whitespace normalizes to "" and is
+        // dropped; a path with a leading space keeps it until the trim.
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut normalized_files: Vec<String> = Vec::with_capacity(files.len());
+        for f in files {
+            let norm = normalize_path(f).trim().to_string();
+            if norm.is_empty() {
+                continue;
+            }
+            if seen.insert(norm.clone()) {
+                normalized_files.push(norm);
+            }
+        }
+
+        if normalized_files.is_empty() {
+            result.summary = "No valid files to analyze".to_string();
+            return result;
+        }
+
+        result.files = normalized_files.clone();
+        let mut bead_map: BTreeMap<String, AffectedBead> = BTreeMap::new();
+
+        // Go file_index.go:630 does `now = now.UTC()`. It has no effect on what
+        // follows — every remaining use of `now` is a `Sub` against another
+        // instant — so it is deliberately not reproduced here.
+
+        for file_path in &normalized_files {
+            let lookup = self.lookup_by_file(file_path);
+
+            for reference in lookup.open_beads {
+                accumulate_affected_bead(&mut bead_map, &reference, file_path);
+            }
+
+            for reference in lookup.closed_beads {
+                // Go file_index.go:656 — a closed bead drops out of the impact
+                // analysis once it has been untouched for a week.
+                if is_older_than(&reference.last_touch, now, SEVEN_DAYS) {
+                    continue;
+                }
+                accumulate_affected_bead(&mut bead_map, &reference, file_path);
+            }
+        }
+
+        let mut open_count = 0usize;
+        let mut in_progress_count = 0usize;
+        let mut recent_closed_count = 0usize;
+
+        for ab in bead_map.values_mut() {
+            // Go file_index.go:684-686 — recency over a 7-day window, clamped.
+            let days_since = days_since(&ab.last_activity, now);
+            let recency_score = (1.0 - (days_since / 7.0)).clamp(0.0, 1.0);
+            let overlap_score = ab.overlap_count as f64 / normalized_files.len() as f64;
+            // Go compares the status with `==` here (file_index.go:693-701) —
+            // no trimming or lowercasing, unlike the sort priority below. That
+            // asymmetry is preserved: anything that is not exactly "open" or
+            // "in_progress" counts as recently closed.
+            let status_multiplier = match ab.status.as_str() {
+                "in_progress" => {
+                    in_progress_count += 1;
+                    1.0
+                }
+                "open" => {
+                    open_count += 1;
+                    0.8
+                }
+                _ => {
+                    recent_closed_count += 1;
+                    0.5
+                }
+            };
+            ab.relevance = recency_score * 0.4 + overlap_score * 0.4 + status_multiplier * 0.2;
+        }
+
+        result.affected_beads = bead_map.into_values().collect();
+
+        // Go file_index.go:706-715. The comparator is total — bead IDs are
+        // unique — so the result does not depend on map iteration order, which
+        // is what lets this port iterate a BTreeMap where Go ranges a map.
+        result.affected_beads.sort_by(|a, b| {
+            affected_bead_status_priority(&a.status)
+                .cmp(&affected_bead_status_priority(&b.status))
+                .then_with(|| {
+                    b.relevance
+                        .partial_cmp(&a.relevance)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| a.bead_id.cmp(&b.bead_id))
+        });
+
+        // Go file_index.go:717-723. The expression order is preserved exactly:
+        // summing the three weighted counts left to right is what makes
+        // `3 closed` land on 0.15000000000000002 rather than 0.15.
+        result.risk_score = in_progress_count as f64 * 0.4
+            + open_count as f64 * 0.2
+            + recent_closed_count as f64 * 0.05;
+        if normalized_files.len() > 3 {
+            result.risk_score += 0.1;
+        }
+        if result.risk_score > 1.0 {
+            result.risk_score = 1.0;
+        }
+
+        result.risk_level = if result.risk_score >= 0.7 {
+            "critical"
+        } else if result.risk_score >= 0.4 {
+            "high"
+        } else if result.risk_score >= 0.2 {
+            "medium"
+        } else {
+            "low"
+        }
+        .to_string();
+
+        if in_progress_count > 0 {
+            result.warnings.push(
+                "Active work in progress on these files - coordinate before making changes"
+                    .to_string(),
+            );
+        }
+        if open_count > 0 {
+            result
+                .warnings
+                .push("Open beads touch these files - review before modifying".to_string());
+        }
+
+        result.summary = build_impact_summary(in_progress_count, open_count, recent_closed_count);
+        result
+    }
+
     /// Re-read a bead's title/status from the report, which may have moved on
     /// since the index was built (Go's inline `fl.beads[ref.BeadID]` refresh).
     fn refresh(&self, reference: &BeadReference) -> BeadReference {
@@ -456,6 +614,171 @@ pub fn build_file_index(report: &HistoryReport) -> FileBeadIndex {
         file_to_beads,
         stats,
     }
+}
+
+/// Go `ImpactResult` (file_index.go:567-574) — what beads might be affected if
+/// the analyzed files are modified.
+///
+/// Field order matches Go's declaration, which is the wire order of the
+/// library-level result. The Go handler re-projects these into its own struct
+/// in a different order, so a robot payload built from this type is not
+/// necessarily in the handler's order.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ImpactResult {
+    pub files: Vec<String>,
+    pub affected_beads: Vec<AffectedBead>,
+    pub risk_level: String,
+    pub risk_score: f64,
+    pub warnings: Vec<String>,
+    pub summary: String,
+}
+
+/// Go `AffectedBead` (file_index.go:577-586) — a bead that touches one or more
+/// of the analyzed files.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AffectedBead {
+    pub bead_id: String,
+    pub title: String,
+    pub status: String,
+    pub overlap_files: Vec<String>,
+    pub overlap_count: usize,
+    /// Most recent `last_touch` across every overlapping file, as stored in
+    /// the report (Go marshals its `time.Time` to the same RFC3339 text).
+    pub last_activity: String,
+    pub relevance: f64,
+    /// Sum of the per-file `total_changes` of every overlapping file.
+    pub total_changes: i64,
+}
+
+/// Go's `7*24*time.Hour` recency window in [`FileLookup::impact_analysis_at`].
+const SEVEN_DAYS: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Nanoseconds from `then` to `now` — Go's `now.Sub(t)`, negative when `then`
+/// is in the future.
+fn age_ns(then: &str, now: jiff::Timestamp) -> Option<i128> {
+    history::parse_ts(then).map(|t| now.as_nanosecond() - t.as_nanosecond())
+}
+
+/// Days between `then` and `now`, as Go's `now.Sub(t).Hours() / 24`.
+///
+/// The two divisions are kept separate because Go's `Duration.Hours()` is
+/// `float64(d) / float64(time.Hour)` and the `/ 24` is a second, separate
+/// division at the call site. Folding them into one `ns / 86_400e9` can land a
+/// ULP away from Go's answer and change a printed `relevance`.
+///
+/// A timestamp that does not parse falls back to 0.0 — the most recent
+/// possible position — so a malformed `last_touch` inflates rather than
+/// suppresses impact. Go cannot reach this arm: it reads a `time.Time` that
+/// git already parsed.
+fn days_since(then: &str, now: jiff::Timestamp) -> f64 {
+    match age_ns(then, now) {
+        Some(age) => (age as f64 / 3_600e9) / 24.0,
+        None => 0.0,
+    }
+}
+
+/// Whether `then` is more than `window` older than `now`.
+///
+/// A `then` in the *future* is not older, so the bead is kept — Go's
+/// `now.Sub(t)` goes negative there and a negative duration is never greater
+/// than the window. Reading the age as unsigned would instead drop the bead,
+/// which is the opposite of Go.
+///
+/// See [`days_since`] for the unparseable-timestamp policy.
+fn is_older_than(then: &str, now: jiff::Timestamp, window: std::time::Duration) -> bool {
+    match age_ns(then, now) {
+        Some(age) => age > window.as_nanos() as i128,
+        None => false,
+    }
+}
+
+/// Go's per-file `ab.OverlapFiles = append(...)` / `TotalChanges +=` block
+/// (file_index.go:636-652), shared by the open and closed arms.
+///
+/// The first sighting seeds title, status and `last_activity`; later sightings
+/// only widen the overlap, add up changes, and push `last_activity` forward.
+fn accumulate_affected_bead(
+    bead_map: &mut BTreeMap<String, AffectedBead>,
+    reference: &BeadReference,
+    file_path: &str,
+) {
+    let ab = bead_map
+        .entry(reference.bead_id.clone())
+        .or_insert_with(|| AffectedBead {
+            bead_id: reference.bead_id.clone(),
+            title: reference.title.clone(),
+            status: reference.status.clone(),
+            overlap_files: Vec::new(),
+            overlap_count: 0,
+            last_activity: reference.last_touch.clone(),
+            relevance: 0.0,
+            total_changes: 0,
+        });
+    ab.overlap_files.push(file_path.to_string());
+    ab.overlap_count = ab.overlap_files.len();
+    ab.total_changes += reference.total_changes;
+    if ts_cmp_str(&reference.last_touch, &ab.last_activity) == std::cmp::Ordering::Greater {
+        ab.last_activity = reference.last_touch.clone();
+    }
+}
+
+/// Go `affectedBeadStatusPriority` (file_index.go:795-804) — sort key, lower
+/// first: in-progress, then everything else, then closed.
+///
+/// Unlike the status *multiplier* in `impact_analysis_at`, this one does
+/// normalize case and whitespace.
+pub fn affected_bead_status_priority(status: &str) -> u8 {
+    match status.trim().to_lowercase().as_str() {
+        "in_progress" => 0,
+        "closed" => 2,
+        _ => 1,
+    }
+}
+
+/// Go `pluralize` (file_index.go:849-854).
+fn pluralize(count: usize, singular: &str) -> String {
+    if count == 1 {
+        singular.to_string()
+    } else {
+        format!("{singular}s")
+    }
+}
+
+/// Go's summary assembly (file_index.go:743-762), lifted out of the handler so
+/// it is unit-testable on its own.
+fn build_impact_summary(
+    in_progress_count: usize,
+    open_count: usize,
+    recent_closed_count: usize,
+) -> String {
+    if in_progress_count + open_count + recent_closed_count == 0 {
+        return "No beads found touching these files - safe to proceed".to_string();
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if in_progress_count > 0 {
+        parts.push(format!(
+            "{in_progress_count} {} in progress",
+            pluralize(in_progress_count, "bead")
+        ));
+    }
+    if open_count > 0 {
+        parts.push(format!(
+            "{open_count} open {}",
+            pluralize(open_count, "bead")
+        ));
+    }
+    if recent_closed_count > 0 {
+        parts.push(format!(
+            "{recent_closed_count} recently closed {}",
+            pluralize(recent_closed_count, "bead")
+        ));
+    }
+    let prefix = if in_progress_count > 0 {
+        "⚠️ Conflict risk: "
+    } else {
+        "Found "
+    };
+    format!("{prefix}{} touching these files", parts.join(", "))
 }
 
 /// Go `CoChangeEntry` — a file that frequently co-changes with another file.
@@ -1057,5 +1380,459 @@ mod tests {
         assert!(glob_match("[ab].rs", "b.rs"));
         assert!(!glob_match("[!ab].rs", "b.rs"));
         assert!(glob_match("[a-c].rs", "b.rs"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Impact analysis (Go file_index.go:566-765, 795-804, 849-854)
+    // -----------------------------------------------------------------------
+
+    fn ts(s: &str) -> jiff::Timestamp {
+        s.parse::<jiff::Timestamp>().expect("fixture timestamp")
+    }
+
+    /// A report with one bead per status, so each branch of the relevance
+    /// multiplier and of the risk-score weighting is hit at least once.
+    ///
+    /// `now` below is 2026-01-10T00:00:00Z; every commit is inside the 7-day
+    /// recency window, so no closed bead is dropped.
+    fn impact_report() -> HistoryReport {
+        let mut histories = BTreeMap::new();
+        histories.insert(
+            "bd-closed".into(),
+            history(
+                "bd-closed",
+                "closed bead",
+                "closed",
+                vec![commit(
+                    "cc000011",
+                    "2026-01-09T00:00:00Z",
+                    &[("src/a.rs", 10, 2), ("src/b.rs", 4, 3)],
+                )],
+            ),
+        );
+        histories.insert(
+            "bd-open".into(),
+            history(
+                "bd-open",
+                "open bead",
+                "open",
+                vec![commit(
+                    "oo000011",
+                    "2026-01-08T00:00:00Z",
+                    &[("src/a.rs", 1, 1)],
+                )],
+            ),
+        );
+        histories.insert(
+            "bd-wip".into(),
+            history(
+                "bd-wip",
+                "in-progress bead",
+                "in_progress",
+                vec![commit(
+                    "ii000011",
+                    "2026-01-08T00:00:00Z",
+                    &[("src/a.rs", 2, 0), ("src/b.rs", 5, 5)],
+                )],
+            ),
+        );
+        report(histories)
+    }
+
+    #[test]
+    fn impact_analysis_empty_input_reports_go_summary() {
+        let lookup = FileLookup::new(&impact_report());
+        let result = lookup.impact_analysis_at(&[], ts("2026-01-10T00:00:00Z"));
+        assert_eq!(result.summary, "No files to analyze");
+        // Go seeds these before the early return, so they are `[]` not `null`.
+        assert!(result.files.is_empty());
+        assert!(result.affected_beads.is_empty());
+        assert!(result.warnings.is_empty());
+        assert_eq!(result.risk_score, 0.0);
+        assert_eq!(result.risk_level, "low");
+    }
+
+    #[test]
+    fn impact_analysis_blank_paths_reports_no_valid_files() {
+        let lookup = FileLookup::new(&impact_report());
+        let result = lookup.impact_analysis_at(
+            &["".to_string(), "   ".to_string(), "./".to_string()],
+            ts("2026-01-10T00:00:00Z"),
+        );
+        assert_eq!(result.summary, "No valid files to analyze");
+        assert!(result.files.is_empty());
+    }
+
+    #[test]
+    fn impact_analysis_normalizes_and_dedupes_input_paths() {
+        let lookup = FileLookup::new(&impact_report());
+        let result = lookup.impact_analysis_at(
+            &[
+                "./src/a.rs".to_string(),
+                "src/a.rs".to_string(), // duplicate after normalization
+                " src/b.rs ".to_string(),
+                String::new(),
+            ],
+            ts("2026-01-10T00:00:00Z"),
+        );
+        assert_eq!(result.files, vec!["src/a.rs", "src/b.rs"]);
+    }
+
+    #[test]
+    fn impact_analysis_sorts_in_progress_first_then_relevance_then_id() {
+        let lookup = FileLookup::new(&impact_report());
+        let result =
+            lookup.impact_analysis_at(&["src/a.rs".to_string()], ts("2026-01-10T00:00:00Z"));
+        let ids: Vec<&str> = result
+            .affected_beads
+            .iter()
+            .map(|b| b.bead_id.as_str())
+            .collect();
+        // bd-wip is in_progress → priority 0. bd-open is not closed and not
+        // in_progress → priority 1. bd-closed → priority 2.
+        assert_eq!(ids, vec!["bd-wip", "bd-open", "bd-closed"]);
+    }
+
+    #[test]
+    fn impact_analysis_weights_status_into_risk_score() {
+        let lookup = FileLookup::new(&impact_report());
+        let result =
+            lookup.impact_analysis_at(&["src/a.rs".to_string()], ts("2026-01-10T00:00:00Z"));
+        // 1 in progress, 1 open, 1 closed, and only one file so no +0.1 for
+        // breadth. The order of the additions is Go's and is load-bearing:
+        // 3 * 0.05 alone is not 0.15 in binary floating point.
+        assert_eq!(result.risk_score, 0.4 + 0.2 + 0.05);
+        assert_eq!(result.risk_level, "high");
+        assert_eq!(
+            result.warnings,
+            vec![
+                "Active work in progress on these files - coordinate before making changes",
+                "Open beads touch these files - review before modifying",
+            ]
+        );
+        assert_eq!(
+            result.summary,
+            // The prefix is the conflict-risk one, not "Found": bd-wip is
+            // in progress, and file_index.go:757-761 replaces the whole prefix
+            // rather than appending to it.
+            "⚠️ Conflict risk: 1 bead in progress, 1 open bead, 1 recently closed bead touching these files"
+        );
+    }
+
+    #[test]
+    fn impact_analysis_conflict_prefix_when_work_is_in_progress() {
+        let lookup = FileLookup::new(&impact_report());
+        let result =
+            lookup.impact_analysis_at(&["src/b.rs".to_string()], ts("2026-01-10T00:00:00Z"));
+        assert!(result
+            .summary
+            .starts_with("⚠️ Conflict risk: 1 bead in progress"));
+    }
+
+    #[test]
+    fn impact_analysis_empty_overlap_is_safe_to_proceed() {
+        let lookup = FileLookup::new(&impact_report());
+        let result =
+            lookup.impact_analysis_at(&["src/absent.rs".to_string()], ts("2026-01-10T00:00:00Z"));
+        assert_eq!(
+            result.summary,
+            "No beads found touching these files - safe to proceed"
+        );
+        assert!(result.affected_beads.is_empty());
+        assert!(result.warnings.is_empty());
+        assert_eq!(result.risk_score, 0.0);
+    }
+
+    #[test]
+    fn impact_analysis_drops_closed_beads_older_than_a_week() {
+        // bd-closed's only commit is 2026-01-01, which is 30 days before `now`.
+        let mut histories = BTreeMap::new();
+        histories.insert(
+            "bd-old".into(),
+            history(
+                "bd-old",
+                "ancient",
+                "closed",
+                vec![commit(
+                    "cc000011",
+                    "2026-01-01T00:00:00Z",
+                    &[("src/a.rs", 6, 4)],
+                )],
+            ),
+        );
+        let lookup = FileLookup::new(&report(histories));
+
+        // Nine days out: filtered, so the file reads as untouched.
+        let stale =
+            lookup.impact_analysis_at(&["src/a.rs".to_string()], ts("2026-01-10T00:00:00Z"));
+        assert!(stale.affected_beads.is_empty());
+        assert_eq!(stale.risk_score, 0.0);
+
+        // Six days out: inside the window, so it contributes 0.05.
+        let fresh =
+            lookup.impact_analysis_at(&["src/a.rs".to_string()], ts("2026-01-07T00:00:00Z"));
+        assert_eq!(fresh.affected_beads.len(), 1);
+        assert_eq!(fresh.risk_score, 0.05);
+    }
+
+    #[test]
+    fn impact_analysis_keeps_a_closed_bead_with_a_future_timestamp() {
+        // Clock skew or a rebased commit can date a commit after `now`. Go's
+        // `now.Sub(t)` is then negative, and a negative duration is not greater
+        // than the 7-day window, so the bead stays in the analysis.
+        let mut histories = BTreeMap::new();
+        histories.insert(
+            "bd-future".into(),
+            history(
+                "bd-future",
+                "dated ahead",
+                "closed",
+                vec![commit(
+                    "ff000011",
+                    "2027-01-01T00:00:00Z",
+                    &[("src/a.rs", 3, 1)],
+                )],
+            ),
+        );
+        let lookup = FileLookup::new(&report(histories));
+        let result =
+            lookup.impact_analysis_at(&["src/a.rs".to_string()], ts("2026-01-10T00:00:00Z"));
+        assert_eq!(result.affected_beads.len(), 1);
+        assert_eq!(result.risk_score, 0.05);
+        // Recency is negative, so it clamps at 1 rather than going negative.
+        assert_eq!(result.affected_beads[0].relevance, 0.4 + 0.4 + 0.5 * 0.2);
+    }
+
+    #[test]
+    fn impact_analysis_never_drops_open_beads_by_age() {
+        // The recency window is a closed-bead-only rule (file_index.go:655-658).
+        let mut histories = BTreeMap::new();
+        histories.insert(
+            "bd-stale-open".into(),
+            history(
+                "bd-stale-open",
+                "ancient but open",
+                "open",
+                vec![commit(
+                    "oo000011",
+                    "2020-01-01T00:00:00Z",
+                    &[("src/a.rs", 1, 0)],
+                )],
+            ),
+        );
+        let lookup = FileLookup::new(&report(histories));
+        let result =
+            lookup.impact_analysis_at(&["src/a.rs".to_string()], ts("2026-01-10T00:00:00Z"));
+        assert_eq!(result.affected_beads.len(), 1);
+        assert_eq!(result.affected_beads[0].relevance, 0.0 + 0.4 + 0.8 * 0.2);
+    }
+
+    #[test]
+    fn impact_analysis_relevance_blends_recency_overlap_and_status() {
+        let lookup = FileLookup::new(&impact_report());
+        // now − 2026-01-09T00:00:00Z is exactly one day, so
+        // recency = 1 − 1/7; overlap = 1/1; status multiplier 0.5.
+        let result =
+            lookup.impact_analysis_at(&["src/a.rs".to_string()], ts("2026-01-10T00:00:00Z"));
+        let closed = result
+            .affected_beads
+            .iter()
+            .find(|b| b.bead_id == "bd-closed")
+            .expect("bd-closed is in the result");
+        let expected = (1.0 - 1.0 / 7.0) * 0.4 + 1.0 * 0.4 + 0.5 * 0.2;
+        assert_eq!(closed.relevance, expected);
+    }
+
+    #[test]
+    fn impact_analysis_status_multiplier_is_1_0_for_wip_and_0_8_for_open() {
+        // The two non-default multipliers are pinned per status. bd-open and
+        // bd-wip share a timestamp, so their recency and overlap terms are
+        // identical and the only thing separating their relevance is the
+        // status multiplier.
+        let lookup = FileLookup::new(&impact_report());
+        let result =
+            lookup.impact_analysis_at(&["src/a.rs".to_string()], ts("2026-01-10T00:00:00Z"));
+        let recency_overlap = (1.0 - 2.0 / 7.0) * 0.4 + 1.0 * 0.4;
+        let open = result
+            .affected_beads
+            .iter()
+            .find(|b| b.bead_id == "bd-open")
+            .expect("bd-open is in the result");
+        let wip = result
+            .affected_beads
+            .iter()
+            .find(|b| b.bead_id == "bd-wip")
+            .expect("bd-wip is in the result");
+        assert_eq!(open.relevance, recency_overlap + 0.8 * 0.2);
+        assert_eq!(wip.relevance, recency_overlap + 1.0 * 0.2);
+    }
+
+    #[test]
+    fn impact_analysis_accumulates_overlap_and_changes_across_files() {
+        // bd-wip touches both files. Its per-file `total_changes` are 2 and 10,
+        // and each is looked up through its own `lookup_by_file` call, so both
+        // overlap entries and both change counts must land on one bead.
+        let lookup = FileLookup::new(&impact_report());
+        let result = lookup.impact_analysis_at(
+            &["src/a.rs".to_string(), "src/b.rs".to_string()],
+            ts("2026-01-10T00:00:00Z"),
+        );
+        let wip = result
+            .affected_beads
+            .iter()
+            .find(|b| b.bead_id == "bd-wip")
+            .expect("bd-wip is in the result");
+        assert_eq!(wip.overlap_files, vec!["src/a.rs", "src/b.rs"]);
+        assert_eq!(wip.overlap_count, 2);
+        assert_eq!(wip.total_changes, 2 + 10);
+        assert_eq!(wip.title, "in-progress bead");
+        assert_eq!(wip.status, "in_progress");
+        // Last activity is the later of the two commits.
+        assert_eq!(wip.last_activity, "2026-01-08T00:00:00Z");
+    }
+
+    #[test]
+    fn impact_analysis_adds_breadth_penalty_past_three_files() {
+        let lookup = FileLookup::new(&impact_report());
+        let narrow =
+            lookup.impact_analysis_at(&["src/a.rs".to_string()], ts("2026-01-10T00:00:00Z"));
+        let wide = lookup.impact_analysis_at(
+            &[
+                "src/a.rs".to_string(),
+                "src/b.rs".to_string(),
+                "src/c.rs".to_string(),
+                "src/d.rs".to_string(),
+            ],
+            ts("2026-01-10T00:00:00Z"),
+        );
+        // Same three beads either way; the fourth file only moves the score by
+        // the +0.1 breadth term, which is enough to cross into "critical".
+        assert_eq!(narrow.risk_score, 0.4 + 0.2 + 0.05);
+        assert_eq!(narrow.risk_level, "high");
+        assert_eq!(wide.risk_score, 0.4 + 0.2 + 0.05 + 0.1);
+        assert_eq!(wide.risk_level, "critical");
+    }
+
+    #[test]
+    fn impact_analysis_caps_risk_score_at_one() {
+        // 20 in-progress beads: 20 * 0.4 = 8.0, clamped to 1.0 → critical.
+        let mut histories = BTreeMap::new();
+        for i in 0..20 {
+            let id = format!("bd-wip-{i:02}");
+            histories.insert(
+                id.clone(),
+                history(
+                    &id,
+                    "wip",
+                    "in_progress",
+                    vec![commit(
+                        &format!("ii{i:06}11"),
+                        "2026-01-09T00:00:00Z",
+                        &[("src/a.rs", 1, 0)],
+                    )],
+                ),
+            );
+        }
+        let lookup = FileLookup::new(&report(histories));
+        let result =
+            lookup.impact_analysis_at(&["src/a.rs".to_string()], ts("2026-01-10T00:00:00Z"));
+        assert_eq!(result.risk_score, 1.0);
+        assert_eq!(result.risk_level, "critical");
+    }
+
+    #[test]
+    fn affected_bead_status_priority_normalizes_but_multiplier_does_not() {
+        assert_eq!(affected_bead_status_priority("IN_PROGRESS"), 0);
+        assert_eq!(affected_bead_status_priority(" closed "), 2);
+        assert_eq!(affected_bead_status_priority("open"), 1);
+        assert_eq!(affected_bead_status_priority(""), 1);
+
+        // A status with stray casing sorts as in-progress but is weighted as
+        // closed, because file_index.go:693 compares with `==` and does not
+        // normalize. Both halves of that asymmetry are asserted here so a
+        // "cleanup" that normalizes one of them fails.
+        let mut histories = BTreeMap::new();
+        histories.insert(
+            "bd-odd".into(),
+            history(
+                "bd-odd",
+                "odd casing",
+                "In_Progress",
+                vec![commit(
+                    "xx000011",
+                    "2026-01-09T00:00:00Z",
+                    &[("src/a.rs", 1, 0)],
+                )],
+            ),
+        );
+        let lookup = FileLookup::new(&report(histories));
+        let result =
+            lookup.impact_analysis_at(&["src/a.rs".to_string()], ts("2026-01-10T00:00:00Z"));
+        assert_eq!(
+            result.affected_beads[0].relevance,
+            (1.0 - 1.0 / 7.0) * 0.4 + 0.4 + 0.5 * 0.2
+        );
+        // Weighted as closed (0.05), and the in-progress warning is absent.
+        assert_eq!(result.risk_score, 0.05);
+        assert!(result.warnings.is_empty());
+        assert_eq!(
+            result.summary,
+            "Found 1 recently closed bead touching these files"
+        );
+    }
+
+    #[test]
+    fn impact_summary_pluralizes_singletons() {
+        assert_eq!(
+            build_impact_summary(1, 0, 0),
+            "⚠️ Conflict risk: 1 bead in progress touching these files"
+        );
+        assert_eq!(
+            build_impact_summary(0, 2, 0),
+            "Found 2 open beads touching these files"
+        );
+        assert_eq!(
+            build_impact_summary(0, 0, 0),
+            "No beads found touching these files - safe to proceed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The two queries the CLI could not answer before: --robot-file-beads and
+    // --robot-file-relations both go through this index, and both need the
+    // per-commit numstat that only a HistoryReport carries.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn lookup_by_file_sums_per_commit_numstat_into_total_changes() {
+        // This is the field --robot-file-beads reports as `total_changes`, and
+        // the reason the handler could not answer the query off a sha→commits
+        // map: the insertions/deletions live in FileChange, not in the map.
+        let lookup = FileLookup::new(&impact_report());
+        let result = lookup.lookup_by_file("src/a.rs");
+        let closed = &result.closed_beads[0];
+        assert_eq!(closed.bead_id, "bd-closed");
+        assert_eq!(closed.total_changes, 12);
+        assert_eq!(closed.commit_shas, vec!["cc00001"]);
+        assert_eq!(result.total_beads, 3);
+        assert_eq!(result.open_beads.len(), 2, "bd-open and bd-wip");
+    }
+
+    #[test]
+    fn get_related_files_answers_the_relations_query() {
+        // a.rs is in cc000011, oo000011 and ii000011; b.rs in cc000011 and
+        // ii000011. So b.rs co-changes with a.rs in 2 of 3 commits = 0.667,
+        // which clears neither the 0.5 default nor a 0.0 request differently.
+        let lookup = FileLookup::new(&impact_report());
+        let result = lookup.get_related_files("src/a.rs", 0.0, 10);
+        assert_eq!(result.file_path, "src/a.rs");
+        assert_eq!(result.total_commits, 3);
+        assert_eq!(result.threshold, 0.5);
+        assert_eq!(result.related_files.len(), 1);
+        let entry = &result.related_files[0];
+        assert_eq!(entry.file_path, "src/b.rs");
+        assert_eq!(entry.co_change_count, 2);
+        assert_eq!(entry.total_commits, 3);
+        assert_eq!(entry.sample_commits, vec!["cc000011", "ii000011"]);
     }
 }
