@@ -3,9 +3,11 @@
 //! `robot-label-flow`, `robot-label-attention`).
 //!
 //! Deliberate scope cut vs Go: the deep blockage-cascade tree
-//! (`ComputeBlockageCascade`), per-label subgraph critical-path
-//! (`ComputeLabelCriticalPath`), and multi-week historical velocity trends are
-//! not ported here — those back other, still-undispatched commands.
+//! (`ComputeBlockageCascade`) and per-label subgraph critical-path
+//! (`ComputeLabelCriticalPath`) are not ported here — those back other,
+//! still-undispatched commands. Multi-week historical velocity
+//! (`ComputeHistoricalVelocity`/`ComputeAllHistoricalVelocity`) *is* ported; see
+//! the "Historical velocity" section below.
 //!
 //! Per-label subgraph PageRank (`ComputeLabelSubgraph`/`ComputeLabelPageRank`)
 //! *is* ported: `compute_label_attention` extracts the label's subgraph and
@@ -1188,6 +1190,294 @@ pub fn compute_label_attention_scores(
     result
 }
 
+// ---------------------------------------------------------------------
+// Historical velocity
+// ---------------------------------------------------------------------
+
+/// Go `WeeklySnapshot` (label_health.go:59-66). `WeekStart`/`WeekEnd` are
+/// plain `time.Time` there, not pointers, so they are always serialized; the
+/// rendered form is Go's UTC RFC3339Nano.
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct WeeklySnapshot {
+    pub week_start: String,
+    pub week_end: String,
+    pub closed: i64,
+    pub weeks_ago: i64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub issue_ids: Vec<String>,
+    pub cumulative: i64,
+}
+
+/// Go's `omitempty` on a float field: the zero value is dropped from the JSON.
+fn is_zero_f64(v: &f64) -> bool {
+    *v == 0.0
+}
+
+/// Go `HistoricalVelocity` (label_health.go:48-60).
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct HistoricalVelocity {
+    pub label: String,
+    pub weekly_velocity: Vec<WeeklySnapshot>,
+    pub weeks_analyzed: i64,
+    pub moving_avg_4_week: f64,
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    pub moving_avg_8_week: f64,
+    pub peak_week: i64,
+    pub peak_velocity: i64,
+    pub trough_week: i64,
+    pub trough_velocity: i64,
+    pub variance: f64,
+    pub consistency_score: i64,
+}
+
+impl HistoricalVelocity {
+    /// Go `(*HistoricalVelocity).GetVelocityTrend` (label_health.go:2268):
+    /// splits the window in half — index 0 is the *most recent* week, so the
+    /// first half is the recent half — and compares the two sums.
+    pub fn get_velocity_trend(&self) -> &'static str {
+        let n = self.weekly_velocity.len() as i64;
+        if n < 4 {
+            return "insufficient_data";
+        }
+
+        let half_point = n / 2;
+        let mut recent_sum = 0i64;
+        let mut older_sum = 0i64;
+        for i in 0..half_point {
+            recent_sum += self.weekly_velocity[i as usize].closed;
+        }
+        for i in half_point..n {
+            older_sum += self.weekly_velocity[i as usize].closed;
+        }
+
+        if older_sum == 0 && recent_sum > 0 {
+            return "accelerating";
+        }
+        if older_sum == 0 && recent_sum == 0 {
+            return "stable";
+        }
+
+        let ratio = recent_sum as f64 / older_sum as f64;
+        if ratio > 1.3 {
+            "accelerating"
+        } else if ratio < 0.7 {
+            "decelerating"
+        } else if self.variance > self.peak_velocity as f64 * 0.5 {
+            "erratic"
+        } else {
+            "stable"
+        }
+    }
+
+    /// Go `(*HistoricalVelocity).GetWeeklyAverage` (label_health.go:2307).
+    pub fn get_weekly_average(&self) -> f64 {
+        if self.weeks_analyzed == 0 {
+            return 0.0;
+        }
+        let total: i64 = self.weekly_velocity.iter().map(|s| s.closed).sum();
+        total as f64 / self.weeks_analyzed as f64
+    }
+}
+
+/// Go's `int(now.Weekday())` is Sunday=0..Saturday=6. jiff's `Weekday` numbers
+/// Monday=1..Sunday=7, so the two only differ on Sunday.
+fn go_weekday(now: jiff::Timestamp) -> i64 {
+    use jiff::civil::Weekday;
+    match now.to_zoned(jiff::tz::TimeZone::UTC).date().weekday() {
+        Weekday::Monday => 1,
+        Weekday::Tuesday => 2,
+        Weekday::Wednesday => 3,
+        Weekday::Thursday => 4,
+        Weekday::Friday => 5,
+        Weekday::Saturday => 6,
+        Weekday::Sunday => 0,
+    }
+}
+
+/// Go `currentWeekStart := now.AddDate(0, 0, -(weekday - 1)).Truncate(24 * time.Hour)`
+/// (label_health.go:2133-2136) — the Monday of `now`'s week, at UTC midnight.
+/// `Truncate` floors the absolute instant to a multiple of 24h, and a UTC day is
+/// exactly 24h, so that is midnight UTC.
+fn current_week_start(now: jiff::Timestamp) -> jiff::Timestamp {
+    let mut weekday = go_weekday(now);
+    if weekday == 0 {
+        weekday = 7; // Sunday = 7
+    }
+    let monday = now
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .date()
+        .checked_sub(jiff::Span::new().days(weekday - 1))
+        .expect("subtracting at most 6 days from a civil date cannot overflow");
+    monday
+        .to_datetime(jiff::civil::Time::midnight())
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .expect("UTC has no DST, so midnight is never skipped or ambiguous")
+        .timestamp()
+}
+
+/// Go's `AddDate(0, 0, n)` on a `time.Time` — calendar days, not a fixed number
+/// of seconds. At UTC midnight the two coincide.
+fn add_days(ts: jiff::Timestamp, days: i64) -> jiff::Timestamp {
+    ts.to_zoned(jiff::tz::TimeZone::UTC)
+        .checked_add(jiff::Span::new().days(days))
+        .expect("shifting a UTC instant by a whole number of days cannot overflow")
+        .timestamp()
+}
+
+/// Go `ComputeHistoricalVelocity` (label_health.go:2109): closure counts bucketed
+/// into whole weeks, index 0 being the current week.
+pub fn compute_historical_velocity(
+    issues: &[Issue],
+    label: &str,
+    num_weeks: i64,
+    now: jiff::Timestamp,
+) -> HistoricalVelocity {
+    let num_weeks = if num_weeks <= 0 { 8 } else { num_weeks };
+
+    // Week buckets, newest first.
+    let this_week_start = current_week_start(now);
+    let mut week_bounds: Vec<(jiff::Timestamp, jiff::Timestamp)> = Vec::new();
+    let mut weekly: Vec<WeeklySnapshot> = Vec::new();
+    for i in 0..num_weeks {
+        let start = add_days(this_week_start, -7 * i);
+        let end = add_days(start, 7);
+        week_bounds.push((start, end));
+        weekly.push(WeeklySnapshot {
+            week_start: go_time_string(Some(start)),
+            week_end: go_time_string(Some(end)),
+            weeks_ago: i,
+            ..Default::default()
+        });
+    }
+
+    // Bucket closures. Only closed-like issues carrying the label and a
+    // ClosedAt count, and a closure outside the window is dropped entirely.
+    for iss in issues {
+        if !is_closed_like(iss.status) || !has_label(iss, label) {
+            continue;
+        }
+        let Some(closed_at) = parse_ts(&iss.closed_at) else {
+            continue;
+        };
+        for (i, (start, end)) in week_bounds.iter().enumerate() {
+            if closed_at >= *start && closed_at < *end {
+                weekly[i].closed += 1;
+                weekly[i].issue_ids.push(iss.id.clone());
+                break;
+            }
+        }
+    }
+
+    // Running total, oldest (highest index) to newest.
+    let mut cumulative = 0i64;
+    for i in (0..num_weeks).rev() {
+        cumulative += weekly[i as usize].closed;
+        weekly[i as usize].cumulative = cumulative;
+    }
+
+    // Peak is the highest week; trough is the lowest week *that has closures*
+    // (a zero week is skipped, not treated as the trough).
+    let mut peak_velocity = 0i64;
+    let mut trough_velocity = i64::MAX;
+    let mut peak_week = 0i64;
+    let mut trough_week = 0i64;
+    let mut has_non_zero = false;
+    for (i, snap) in weekly.iter().enumerate() {
+        if snap.closed > peak_velocity {
+            peak_velocity = snap.closed;
+            peak_week = i as i64;
+        }
+        if snap.closed > 0 && snap.closed < trough_velocity {
+            trough_velocity = snap.closed;
+            trough_week = i as i64;
+            has_non_zero = true;
+        }
+    }
+    if !has_non_zero {
+        // Go leaves both trough fields at their zero value when every week is 0.
+        trough_week = 0;
+        trough_velocity = 0;
+    }
+
+    let mut moving_avg_4_week = 0.0;
+    if num_weeks >= 4 {
+        let sum: i64 = weekly[..4].iter().map(|s| s.closed).sum();
+        moving_avg_4_week = sum as f64 / 4.0;
+    }
+    let mut moving_avg_8_week = 0.0;
+    if num_weeks >= 8 {
+        let sum: i64 = weekly[..8].iter().map(|s| s.closed).sum();
+        moving_avg_8_week = sum as f64 / 8.0;
+    }
+
+    // Population variance over the window, then a coefficient-of-variation
+    // consistency score: no closures at all scores 0, not 100.
+    let mut variance = 0.0f64;
+    let mut consistency_score = 0i64;
+    if num_weeks > 0 {
+        let mut sum = 0.0f64;
+        for snap in &weekly {
+            sum += snap.closed as f64;
+        }
+        let mean = sum / num_weeks as f64;
+
+        let mut accum = 0.0f64;
+        for snap in &weekly {
+            let diff = snap.closed as f64 - mean;
+            // Go writes `variance += diff * diff` (label_health.go:2228-2233) and
+            // its compiler contracts the mul+add into a single FMA, exactly as
+            // it does for the risk composite (see impact.rs). The unfused form
+            // lands one ULP low — a 3-week window of 4/2/1 closures gives
+            // 1.5555555555555554 where the oracle gives 1.5555555555555556 —
+            // so this has to be `mul_add` to match byte for byte.
+            accum = diff.mul_add(diff, accum);
+        }
+        variance = accum / num_weeks as f64;
+
+        consistency_score = if mean > 0.0 {
+            let cv = variance.sqrt() / mean;
+            clamp_score((100.0 * (1.0 - cv)) as i64)
+        } else {
+            0
+        };
+    }
+
+    HistoricalVelocity {
+        label: label.to_string(),
+        weekly_velocity: weekly,
+        weeks_analyzed: num_weeks,
+        moving_avg_4_week,
+        moving_avg_8_week,
+        peak_week,
+        peak_velocity,
+        trough_week,
+        trough_velocity,
+        variance,
+        consistency_score,
+    }
+}
+
+/// Go `ComputeAllHistoricalVelocity` (label_health.go:2255). A `BTreeMap`
+/// because Go's `encoding/json` sorts map keys, so this keeps the serialized
+/// key order identical to the oracle's.
+pub fn compute_all_historical_velocity(
+    issues: &[Issue],
+    num_weeks: i64,
+    now: jiff::Timestamp,
+) -> BTreeMap<String, HistoricalVelocity> {
+    let labels = extract_labels(issues);
+    let mut result = BTreeMap::new();
+    for label in &labels.labels {
+        result.insert(
+            label.clone(),
+            compute_historical_velocity(issues, label, num_weeks, now),
+        );
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1478,5 +1768,454 @@ mod tests {
         // scores 0.5 — the value the Go oracle reports for the real corpus.
         let sum = compute_label_pagerank_core_sum(&sg);
         assert!((sum - 0.5).abs() < 1e-5, "got {sum}, want 0.5");
+    }
+
+    // -----------------------------------------------------------------
+    // Historical velocity
+    // -----------------------------------------------------------------
+
+    /// Monday 2025-12-15 12:00 UTC — the anchor Go's own velocity tests use, so
+    /// week 0 is Dec 15-21, week 1 is Dec 8-14, week 2 is Dec 1-7 and week 3
+    /// is Nov 24-30.
+    fn now_monday() -> jiff::Timestamp {
+        "2025-12-15T12:00:00Z".parse().unwrap()
+    }
+
+    fn ts(s: &str) -> jiff::Timestamp {
+        s.parse().unwrap()
+    }
+
+    fn closed_on(id: &str, status: Status, labels: &[&str], closed_at: &str) -> Issue {
+        let mut i = issue(id, status, labels);
+        i.closed_at = Some(closed_at.to_string());
+        i
+    }
+
+    #[test]
+    fn historical_velocity_buckets_closures_into_weeks() {
+        // Go: TestComputeHistoricalVelocity_BasicCounting.
+        let issues = vec![
+            closed_on("bv-1", Status::Closed, &["api"], "2025-12-16T10:00:00Z"),
+            closed_on("bv-2", Status::Closed, &["api"], "2025-12-16T10:00:00Z"),
+            closed_on("bv-3", Status::Closed, &["api"], "2025-12-10T10:00:00Z"),
+            closed_on("bv-4", Status::Closed, &["api"], "2025-12-03T10:00:00Z"),
+            closed_on("bv-5", Status::Closed, &["api"], "2025-12-03T10:00:00Z"),
+            closed_on("bv-6", Status::Closed, &["api"], "2025-12-03T10:00:00Z"),
+            closed_on("bv-7", Status::Closed, &["api"], "2025-11-26T10:00:00Z"),
+            closed_on("bv-8", Status::Closed, &["ui"], "2025-12-16T10:00:00Z"),
+        ];
+
+        let r = compute_historical_velocity(&issues, "api", 4, now_monday());
+        assert_eq!(r.label, "api");
+        assert_eq!(r.weeks_analyzed, 4);
+        assert_eq!(r.weekly_velocity[0].closed, 2); // Dec 15-21
+        assert_eq!(r.weekly_velocity[1].closed, 1); // Dec 8-14
+        assert_eq!(r.weekly_velocity[2].closed, 3); // Dec 1-7
+        assert_eq!(r.weekly_velocity[3].closed, 1); // Nov 24-30
+
+        // Week boundaries are Monday midnight to the following Monday, and
+        // weeks_ago counts back from the current week.
+        assert_eq!(r.weekly_velocity[0].week_start, "2025-12-15T00:00:00Z");
+        assert_eq!(r.weekly_velocity[0].week_end, "2025-12-22T00:00:00Z");
+        assert_eq!(r.weekly_velocity[3].weeks_ago, 3);
+        assert_eq!(r.weekly_velocity[3].week_start, "2025-11-24T00:00:00Z");
+
+        // Cumulative accumulates oldest to newest, so it is smallest on the
+        // oldest bucket and largest on the newest.
+        assert_eq!(r.weekly_velocity[3].cumulative, 1); // Nov 24-30
+        assert_eq!(r.weekly_velocity[2].cumulative, 4); // + Dec 1-7
+        assert_eq!(r.weekly_velocity[1].cumulative, 5); // + Dec 8-14
+        assert_eq!(r.weekly_velocity[0].cumulative, 7); // + Dec 15-21
+    }
+
+    #[test]
+    fn historical_velocity_ignores_open_issues_that_carry_a_closed_at() {
+        // Go: TestComputeHistoricalVelocity_IgnoresNonClosedWithClosedAt.
+        let issues = vec![
+            closed_on(
+                "open-closedat",
+                Status::Open,
+                &["api"],
+                "2025-12-15T14:00:00Z",
+            ),
+            closed_on("closed", Status::Closed, &["api"], "2025-12-15T14:00:00Z"),
+        ];
+        let h = compute_historical_velocity(&issues, "api", 1, now_monday());
+        assert_eq!(h.weekly_velocity.len(), 1);
+        assert_eq!(h.weekly_velocity[0].closed, 1);
+        assert_eq!(h.weekly_velocity[0].issue_ids, vec!["closed".to_string()]);
+    }
+
+    #[test]
+    fn historical_velocity_peak_and_trough_skip_empty_weeks() {
+        // Go: TestComputeHistoricalVelocity_PeakAndTrough. Weeks 1 and 3 are the
+        // peak/trough, and the zeroed-out weeks never win the trough.
+        let mk = |id: &str, at: &str| closed_on(id, Status::Closed, &["test"], at);
+        let mut issues = vec![
+            mk("w0-1", "2025-12-16T10:00:00Z"),
+            mk("w0-2", "2025-12-16T10:00:00Z"),
+            mk("w1-1", "2025-12-10T10:00:00Z"),
+            mk("w1-2", "2025-12-10T10:00:00Z"),
+            mk("w1-3", "2025-12-10T10:00:00Z"),
+            mk("w1-4", "2025-12-10T10:00:00Z"),
+            mk("w1-5", "2025-12-10T10:00:00Z"),
+            mk("w2-1", "2025-12-03T10:00:00Z"),
+            mk("w3-1", "2025-11-26T10:00:00Z"),
+            mk("w3-2", "2025-11-26T10:00:00Z"),
+            mk("w3-3", "2025-11-26T10:00:00Z"),
+        ];
+        issues.shrink_to_fit();
+
+        let r = compute_historical_velocity(&issues, "test", 4, now_monday());
+        assert_eq!((r.peak_week, r.peak_velocity), (1, 5));
+        assert_eq!((r.trough_week, r.trough_velocity), (2, 1));
+    }
+
+    #[test]
+    fn historical_velocity_trough_stays_zero_when_nothing_closed() {
+        // Go's `hasNonZero` guard: a window with no closures leaves both trough
+        // fields at zero rather than reporting MaxInt or a spurious 0-week.
+        let r = compute_historical_velocity(
+            &[issue("bv-1", Status::Open, &["other"])],
+            "nonexistent",
+            4,
+            now_monday(),
+        );
+        assert_eq!(r.label, "nonexistent");
+        assert_eq!(r.peak_velocity, 0);
+        assert_eq!((r.trough_week, r.trough_velocity), (0, 0));
+        assert!(r.weekly_velocity.iter().all(|w| w.closed == 0));
+        assert_eq!(r.consistency_score, 0, "no closures means no score");
+    }
+
+    #[test]
+    fn historical_velocity_moving_averages_need_enough_weeks() {
+        // Go: TestComputeHistoricalVelocity_MovingAverages. Week w closes w+1
+        // issues, so weeks 0..=3 are 1,2,3,4 and weeks 0..=7 are 1..8.
+        let mut issues = Vec::new();
+        for w in 0..8i64 {
+            let at = add_days(current_week_start(now_monday()), -7 * w + 2);
+            for i in 0..=w {
+                issues.push(closed_on(
+                    &format!("w{w}-{i}"),
+                    Status::Closed,
+                    &["avg"],
+                    &go_time_string(Some(at)),
+                ));
+            }
+        }
+
+        let r = compute_historical_velocity(&issues, "avg", 8, now_monday());
+        assert_eq!(r.moving_avg_4_week, 2.5); // (1+2+3+4)/4
+        assert_eq!(r.moving_avg_8_week, 4.5); // (1+..+8)/8
+
+        // Three weeks is below both thresholds, so both averages stay 0 (and
+        // the omitempty on moving_avg_8_week drops it from the JSON).
+        let short = compute_historical_velocity(&issues, "avg", 3, now_monday());
+        assert_eq!(short.moving_avg_4_week, 0.0);
+        assert_eq!(short.moving_avg_8_week, 0.0);
+        let json = serde_json::to_string(&short).unwrap();
+        assert!(!json.contains("moving_avg_8_week"), "got {json}");
+        assert!(json.contains("\"moving_avg_4_week\":0"), "got {json}");
+
+        // Four weeks is exactly the 4-week threshold.
+        let four = compute_historical_velocity(&issues, "avg", 4, now_monday());
+        assert_eq!(four.moving_avg_4_week, 2.5);
+    }
+
+    #[test]
+    fn historical_velocity_defaults_to_eight_weeks() {
+        let r = compute_historical_velocity(&[], "api", 0, now_monday());
+        assert_eq!(r.weeks_analyzed, 8);
+        assert_eq!(r.weekly_velocity.len(), 8);
+        let neg = compute_historical_velocity(&[], "api", -3, now_monday());
+        assert_eq!(neg.weeks_analyzed, 8);
+    }
+
+    #[test]
+    fn historical_velocity_trend_needs_four_weeks() {
+        // Under the 4-week minimum there is no ratio to compare, so every
+        // window short of 4 is "insufficient_data" — including exactly 3.
+        for n in [0i64, 1, 2, 3] {
+            let hv = HistoricalVelocity {
+                weekly_velocity: (0..n)
+                    .map(|i| WeeklySnapshot {
+                        closed: 3,
+                        weeks_ago: i,
+                        ..Default::default()
+                    })
+                    .collect(),
+                weeks_analyzed: n,
+                ..Default::default()
+            };
+            assert_eq!(hv.get_velocity_trend(), "insufficient_data", "n={n}");
+        }
+    }
+
+    #[test]
+    fn historical_velocity_trend_boundary_is_four_weeks() {
+        // Exactly 4 is the first length that classifies: 2 recent vs 2 older
+        // weeks, so 4/1 is accelerating and 1/4 is decelerating. A perfectly
+        // even 2/2 split is stable (ratio 1.0 sits inside the 0.7..1.3 band).
+        let build = |recent: [i64; 2], older: [i64; 2]| {
+            let mut weekly_velocity: Vec<WeeklySnapshot> = recent
+                .iter()
+                .chain(older.iter())
+                .enumerate()
+                .map(|(i, c)| WeeklySnapshot {
+                    closed: *c,
+                    weeks_ago: i as i64,
+                    ..Default::default()
+                })
+                .collect();
+            weekly_velocity.shrink_to_fit();
+            HistoricalVelocity {
+                weekly_velocity,
+                weeks_analyzed: 4,
+                ..Default::default()
+            }
+        };
+        assert_eq!(build([4, 0], [1, 0]).get_velocity_trend(), "accelerating");
+        assert_eq!(build([1, 0], [4, 0]).get_velocity_trend(), "decelerating");
+        assert_eq!(build([2, 0], [2, 0]).get_velocity_trend(), "stable");
+        // 1.3 / 0.7 are strict bounds, so an exact 1.3 stays stable.
+        assert_eq!(build([13, 0], [10, 0]).get_velocity_trend(), "stable");
+        assert_eq!(build([10, 0], [13, 0]).get_velocity_trend(), "stable");
+        // Zero older with some recent is accelerating; zero on both is stable.
+        assert_eq!(build([1, 1], [0, 0]).get_velocity_trend(), "accelerating");
+        assert_eq!(build([0, 0], [0, 0]).get_velocity_trend(), "stable");
+    }
+
+    #[test]
+    fn historical_velocity_trend_rising_falling_and_flat() {
+        // Go: TestHistoricalVelocity_GetVelocityTrend. weekly[0] is the most
+        // recent week, so these are week-over-week sequences read backwards.
+        let build = |weekly: &[i64]| {
+            let hv = HistoricalVelocity {
+                weekly_velocity: weekly
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| WeeklySnapshot {
+                        closed: *c,
+                        weeks_ago: i as i64,
+                        ..Default::default()
+                    })
+                    .collect(),
+                weeks_analyzed: weekly.len() as i64,
+                ..Default::default()
+            };
+            let mut sum = 0.0f64;
+            for snap in &hv.weekly_velocity {
+                sum += snap.closed as f64;
+            }
+            let mean = sum / weekly.len() as f64;
+            let mut variance = 0.0f64;
+            for snap in &hv.weekly_velocity {
+                let d = snap.closed as f64 - mean;
+                variance += d * d;
+            }
+            let hv = HistoricalVelocity {
+                variance: variance / weekly.len() as f64,
+                ..hv
+            };
+            hv.get_velocity_trend()
+        };
+
+        // Rising: 1,1,2,2,4,4,5,5 newest-first.
+        assert_eq!(build(&[5, 4, 4, 2, 2, 1, 1, 0]), "accelerating");
+        assert_eq!(build(&[5, 4, 4, 3, 2, 2, 1, 1]), "accelerating");
+        // Falling: the mirror image.
+        assert_eq!(build(&[1, 1, 2, 2, 4, 4, 5, 5]), "decelerating");
+        // Flat.
+        assert_eq!(build(&[3, 3, 3, 3, 3, 3, 3, 3]), "stable");
+    }
+
+    #[test]
+    fn historical_velocity_trend_erratic_when_variance_dominates() {
+        // A ratio inside the stable band but a variance over half the peak
+        // week is "erratic" rather than "stable".
+        let hv = HistoricalVelocity {
+            weekly_velocity: vec![
+                WeeklySnapshot {
+                    closed: 5,
+                    weeks_ago: 0,
+                    ..Default::default()
+                },
+                WeeklySnapshot {
+                    closed: 3,
+                    weeks_ago: 1,
+                    ..Default::default()
+                },
+                WeeklySnapshot {
+                    closed: 5,
+                    weeks_ago: 2,
+                    ..Default::default()
+                },
+                WeeklySnapshot {
+                    closed: 3,
+                    weeks_ago: 3,
+                    ..Default::default()
+                },
+            ],
+            weeks_analyzed: 4,
+            // peak 5 -> threshold 2.5; a variance above it is erratic.
+            variance: 1.0,
+            peak_velocity: 5,
+            ..Default::default()
+        };
+        assert_eq!(hv.get_velocity_trend(), "stable");
+        let spiky = HistoricalVelocity {
+            variance: 2.6,
+            ..hv
+        };
+        assert_eq!(spiky.get_velocity_trend(), "erratic");
+    }
+
+    #[test]
+    fn historical_weekly_average_matches_go() {
+        // Go: TestHistoricalVelocity_GetWeeklyAverage.
+        let hv = HistoricalVelocity {
+            weeks_analyzed: 4,
+            weekly_velocity: [2, 4, 6, 8]
+                .iter()
+                .map(|c| WeeklySnapshot {
+                    closed: *c,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(hv.get_weekly_average(), 5.0);
+        let empty = HistoricalVelocity::default();
+        assert_eq!(empty.get_weekly_average(), 0.0);
+    }
+
+    #[test]
+    fn historical_velocity_consistency_scores_pure_and_lumpy() {
+        // Zero variance with a positive mean is a perfect 100; a lumpy window
+        // (one week carrying everything) drives the CV up and the score down.
+        let mk = |weekly: &[i64]| {
+            let issues: Vec<Issue> = weekly
+                .iter()
+                .enumerate()
+                .flat_map(|(w, count)| {
+                    let at = add_days(current_week_start(now_monday()), -7 * w as i64 + 2);
+                    (0..*count).map(move |i| {
+                        closed_on(
+                            &format!("w{w}-{i}"),
+                            Status::Closed,
+                            &["api"],
+                            &go_time_string(Some(at)),
+                        )
+                    })
+                })
+                .collect();
+            compute_historical_velocity(&issues, "api", weekly.len() as i64, now_monday())
+        };
+
+        let even = mk(&[2, 2, 2, 2]);
+        assert_eq!(even.variance, 0.0);
+        assert_eq!(even.consistency_score, 100);
+
+        let lumpy = mk(&[8, 0, 0, 0]);
+        assert_eq!(lumpy.variance, 12.0); // population variance of 8,0,0,0
+        assert_eq!(lumpy.consistency_score, 0); // CV = 1.0 -> 100*(1-1)
+    }
+
+    #[test]
+    fn historical_velocity_variance_matches_the_go_oracle_bit_for_bit() {
+        // Recorded from the Go v0.25.0 oracle (beads_viewer @ 18afafa) over a
+        // fixed issue set: 16 closures spread across the labels api/ui/backend
+        // and weeks Nov 24 - Dec 21 2025, anchored at 2025-12-15T12:00:00Z.
+        //
+        // These four windows are the ones where the FMA in `variance += diff *
+        // diff` changes the answer. A plain `accum + diff * diff` gives
+        // 1.5555555555555554 / 0.22222222222222224 / 0.24000000000000005 /
+        // 1.8400000000000003, so a reversion to the unfused form fails here
+        // rather than silently drifting a ULP.
+        let mk = |weekly: &[i64]| {
+            let issues: Vec<Issue> = weekly
+                .iter()
+                .enumerate()
+                .flat_map(|(w, count)| {
+                    let at = add_days(current_week_start(now_monday()), -7 * w as i64 + 2);
+                    (0..*count).map(move |i| {
+                        closed_on(
+                            &format!("w{w}-{i}"),
+                            Status::Closed,
+                            &["api"],
+                            &go_time_string(Some(at)),
+                        )
+                    })
+                })
+                .collect();
+            compute_historical_velocity(&issues, "api", weekly.len() as i64, now_monday())
+        };
+
+        for (weekly, variance, consistency) in [
+            (&[4i64, 2, 1][..], 1.5555555555555556f64, 46i64),
+            (&[1, 1, 0][..], 0.2222222222222222, 29),
+            (&[1, 1, 0, 0, 0][..], 0.24, 0),
+            (&[4, 2, 1, 1, 0][..], 1.8400000000000003, 15),
+        ] {
+            let r = mk(weekly);
+            assert_eq!(
+                r.variance.to_bits(),
+                variance.to_bits(),
+                "variance for {weekly:?}: got {variance:e} want oracle"
+            );
+            assert_eq!(r.consistency_score, consistency, "score for {weekly:?}");
+        }
+    }
+
+    #[test]
+    fn historical_velocity_ignores_closures_outside_the_window() {
+        // A closure older than the oldest bucket is dropped, not clamped into it.
+        let issues = vec![
+            closed_on("in", Status::Closed, &["api"], "2025-12-16T10:00:00Z"),
+            closed_on("out", Status::Closed, &["api"], "2025-11-01T10:00:00Z"),
+        ];
+        let r = compute_historical_velocity(&issues, "api", 4, now_monday());
+        assert_eq!(r.weekly_velocity[0].closed, 1);
+        assert_eq!(r.weekly_velocity.iter().map(|w| w.closed).sum::<i64>(), 1);
+    }
+
+    #[test]
+    fn historical_velocity_week_alignment_from_sunday() {
+        // `now` on a Sunday still belongs to the week that started the previous
+        // Monday — Go maps Sunday to 7 and steps back six days, not seven.
+        let sunday = ts("2025-12-21T09:00:00Z"); // Sunday
+        assert_eq!(go_weekday(sunday), 0);
+        let r = compute_historical_velocity(&[], "api", 2, sunday);
+        assert_eq!(r.weekly_velocity[0].week_start, "2025-12-15T00:00:00Z");
+        assert_eq!(r.weekly_velocity[0].week_end, "2025-12-22T00:00:00Z");
+
+        // A Wednesday steps back two days.
+        let wednesday = ts("2025-12-17T09:00:00Z");
+        assert_eq!(go_weekday(wednesday), 3);
+        let r = compute_historical_velocity(&[], "api", 1, wednesday);
+        assert_eq!(r.weekly_velocity[0].week_start, "2025-12-15T00:00:00Z");
+    }
+
+    #[test]
+    fn all_historical_velocity_covers_every_label() {
+        // Go: TestComputeAllHistoricalVelocity.
+        let issues = vec![
+            closed_on("bv-1", Status::Closed, &["api"], "2025-12-16T10:00:00Z"),
+            closed_on("bv-2", Status::Closed, &["ui"], "2025-12-16T10:00:00Z"),
+            closed_on(
+                "bv-3",
+                Status::Closed,
+                &["api", "ui"],
+                "2025-12-16T10:00:00Z",
+            ),
+            // An empty label is skipped by extract_labels and so never appears.
+            closed_on("bv-4", Status::Closed, &[""], "2025-12-16T10:00:00Z"),
+        ];
+        let all = compute_all_historical_velocity(&issues, 4, now_monday());
+        assert_eq!(all.len(), 2);
+        assert_eq!(all["api"].weekly_velocity[0].closed, 2);
+        assert_eq!(all["ui"].weekly_velocity[0].closed, 2);
+        assert_eq!(all["api"].weeks_analyzed, 4);
     }
 }

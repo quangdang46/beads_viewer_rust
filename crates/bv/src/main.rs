@@ -830,7 +830,21 @@ th {{ background: #44475a; }}
         // time-travel scrubber whenever it is on. Rust wrote only index.html,
         // so the DEFAULT invocation lost the history data — the flag being
         // unwired was not just an ignored modifier.
-        if !args.iter().any(|a| a == "--no-pages-include-history") {
+        //
+        // The gate is pflag's boolean, not a `--no-` prefix: Go has no
+        // auto-negation, so the one way to turn this off is
+        // `--pages-include-history=false` (verified against the v0.25.0
+        // oracle). The old test for the string `--no-pages-include-history`
+        // matched neither the bare flag nor Go's real disable spelling, and
+        // silently accepted a token Go rejects. See `argv::go_bool_flag`.
+        let include_history = match argv::go_bool_flag(&args, "pages-include-history", true) {
+            Ok(v) => v,
+            Err(msg) => {
+                eprintln!("Error: {msg}");
+                return ExitCode::from(1);
+            }
+        };
+        if include_history {
             let beads_file = cwd
                 .join(".beads")
                 .join("issues.jsonl")
@@ -3166,7 +3180,15 @@ fn go_rfc1123(rfc3339: &str) -> String {
 
 /// Handle `--check-update` (Go bv-182): report whether a newer release exists.
 fn run_check_update() -> ExitCode {
-    match bv_update::github::check_for_updates() {
+    report_check_update(bv_update::github::check_for_updates())
+}
+
+/// Reporting half of `--check-update` (Go cmd/bv/main.go:2057-2071), split
+/// from the fetch so the exact output can be asserted without network access.
+fn report_check_update(
+    result: Result<Option<bv_update::UpdateInfo>, bv_update::github::FetchError>,
+) -> ExitCode {
+    match result {
         Err(e) => {
             eprintln!("Error checking for updates: {e}");
             ExitCode::from(1)
@@ -3184,7 +3206,10 @@ fn run_check_update() -> ExitCode {
                 info.new_version,
                 bv_update::current_version()
             );
-            println!("Download: {}", info.release_url);
+            // Go main.go:2065 labels this line "Release:" — the value is the
+            // release *page* URL, so "Download:" was a mislabel that broke any
+            // byte comparison of `--check-update` output.
+            println!("Release: {}", info.release_url);
             println!("\nRun 'bvr --update' to update automatically");
             ExitCode::from(0)
         }
@@ -3200,38 +3225,85 @@ fn run_update_dry_run() -> ExitCode {
         }
         Ok(r) => r,
     };
-    if !bv_update::is_newer_than_current(&release.tag_name) {
+    report_update_dry_run(&release)
+}
+
+/// Reporting half of `--update-dry-run` (Go cmd/bv/main.go:2074-2105), split
+/// from the fetch so the plan and its failure paths can be asserted offline.
+fn report_update_dry_run(release: &bv_update::Release) -> ExitCode {
+    // Go main.go:2083-2086: a version-compare failure is a hard error, not an
+    // "already up to date" answer. `is_newer_than_current` collapses the
+    // Result to a bool, which is how this path used to disappear.
+    let newer = match bv_update::version::check_newer_than_current(&release.tag_name) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("Cannot compare release versions: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if !newer {
         println!(
             "bvr is already up to date (version {})",
             bv_update::current_version()
         );
         return ExitCode::from(0);
     }
+    // Go main.go:2091-2094 validates before printing a plan it could not
+    // carry out. Doing it here also makes both lookups below total, which is
+    // why Go can dereference `asset` and `FindChecksumAsset()` unguarded.
+    let (asset, checksum) = match bv_update::github::release_assets_for_update(release) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("Latest release cannot be installed automatically: {e}");
+            return ExitCode::from(1);
+        }
+    };
     println!(
         "[dry-run] Would update bvr from {} to {}",
         bv_update::current_version(),
         release.tag_name
     );
-    match release.find_platform_asset() {
-        Some(asset) => {
-            println!(
-                "[dry-run] Would download {} ({} bytes)",
-                asset.name, asset.size
-            );
-            println!("[dry-run] From: {}", asset.browser_download_url);
-        }
-        None => {
-            eprintln!("[dry-run] No matching release asset found for this platform");
-        }
-    }
-    match release.find_checksum_asset() {
-        Some(sum) => println!("[dry-run] Would verify SHA-256 checksum via {}", sum.name),
-        None => println!(
-            "[dry-run] Warning: no checksum file found; download integrity could not be verified"
-        ),
-    }
+    println!(
+        "[dry-run] Would download {} ({} bytes) for {}/{}",
+        asset.name,
+        asset.size,
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+    println!("[dry-run] From: {}", asset.browser_download_url);
+    println!(
+        "[dry-run] Would verify SHA-256 checksum via {}",
+        checksum.name
+    );
     println!("[dry-run] No changes made. Run 'bvr --update' to apply.");
     ExitCode::from(0)
+}
+
+/// Go `readUpdateConfirmation` (cmd/bv/main.go:1016-1030).
+///
+/// Go's `bufio.ReadString('\n')` returns the bytes it managed to read *and*
+/// `io.EOF` when the stream ends before a newline. `read_line` reports that
+/// same situation as `Ok(n > 0)` with no trailing newline, so Go's EOF flag is
+/// recovered here from the missing newline rather than from the return value.
+fn read_update_confirmation(input: &mut impl std::io::BufRead) -> Result<bool, String> {
+    let mut response = String::new();
+    if let Err(e) = input.read_line(&mut response) {
+        // main.go:1019-1021 — a non-EOF read failure is wrapped.
+        return Err(format!("read update confirmation: {e}"));
+    }
+    let hit_eof = !response.ends_with('\n');
+    let answer = response.trim().to_lowercase();
+    if answer.is_empty() {
+        // main.go:1024-1028 — an empty response means "confirmed" only when it
+        // actually arrived on a line. End-of-input with nothing read is an
+        // error, so `bvr --update < /dev/null` cannot self-update unattended.
+        return if hit_eof {
+            Err("no update confirmation received".to_string())
+        } else {
+            Ok(true)
+        };
+    }
+    Ok(answer == "y" || answer == "yes")
 }
 
 /// Handle `--update` (Go bv-182): confirm unless `--yes`, then self-update.
@@ -3243,12 +3315,28 @@ fn run_update(args: &[String]) -> ExitCode {
         }
         Ok(r) => r,
     };
-    if !bv_update::is_newer_than_current(&release.tag_name) {
+    // Go main.go:2117-2120: a version-compare failure is a hard error, not an
+    // "already up to date" answer.
+    let newer = match bv_update::version::check_newer_than_current(&release.tag_name) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("Cannot compare release versions: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if !newer {
         println!(
             "bvr is already up to date (version {})",
             bv_update::current_version()
         );
         return ExitCode::from(0);
+    }
+    // Go main.go:2124-2127: the release must be installable *before* the user
+    // is prompted, so a draft, prerelease, asset-less or digest-less release
+    // never asks for confirmation it cannot honour.
+    if let Err(e) = bv_update::github::validate_release_for_update(&release) {
+        eprintln!("Latest release cannot be installed automatically: {e}");
+        return ExitCode::from(1);
     }
     if !args.iter().any(|a| a == "--yes" || a == "-y") {
         print!(
@@ -3258,13 +3346,17 @@ fn run_update(args: &[String]) -> ExitCode {
         );
         use std::io::Write as _;
         let _ = std::io::stdout().flush();
-        let mut response = String::new();
-        if std::io::stdin().read_line(&mut response).is_ok() {
-            let r = response.trim().to_lowercase();
-            if !r.is_empty() && r != "y" && r != "yes" {
+        match read_update_confirmation(&mut std::io::stdin().lock()) {
+            // main.go:2135-2138 — a failed read, EOF included, is exit 1.
+            Err(e) => {
+                eprintln!("Cannot read update confirmation: {e}");
+                return ExitCode::from(1);
+            }
+            Ok(false) => {
                 println!("Update cancelled");
                 return ExitCode::from(0);
             }
+            Ok(true) => {}
         }
     }
     match bv_update::perform_update(&release, &|line| println!("{line}")) {
@@ -3278,6 +3370,12 @@ fn run_update(args: &[String]) -> ExitCode {
         }
         Err(e) => {
             eprintln!("Update failed: {e}");
+            // main.go:2145-2147 — the backup is written before the risky
+            // rename, so any failure past that point leaves a restorable copy
+            // that has to be named or it is never found again.
+            if let Some(backup) = e.backup_path() {
+                eprintln!("Backup preserved at: {backup}");
+            }
             ExitCode::from(1)
         }
     }
@@ -3285,11 +3383,11 @@ fn run_update(args: &[String]) -> ExitCode {
 
 /// Handle `--rollback` (Go bv-182): restore the previous binary from backup.
 fn run_rollback() -> ExitCode {
+    // `perform_rollback` owns both success lines (Go updater.go:1533 and
+    // 1561). Go's handler adds nothing on success, only "Rollback failed: %v"
+    // (main.go:2164); bvr printed "Rollback complete" a second time here.
     match bv_update::perform_rollback() {
-        Ok(()) => {
-            println!("Rollback complete");
-            ExitCode::from(0)
-        }
+        Ok(()) => ExitCode::from(0),
         Err(e) => {
             eprintln!("Rollback failed: {e}");
             ExitCode::from(1)
@@ -9124,7 +9222,21 @@ fn run_robot_related(args: &[String]) -> ExitCode {
         .unwrap_or(10);
     // Go main.go:1585 — default false. Tombstones are skipped either way
     // (related.go:509-518); only `closed` is gated on this flag.
-    let include_closed = args.iter().any(|a| a == "--related-include-closed");
+    //
+    // Read with pflag's boolean semantics rather than a presence scan: Go's
+    // `--related-include-closed` is a `flag.Bool`, so `--related-include-
+    // closed=true` and `=false` are both legal and the explicit `=false` form
+    // must stay false. The old `args.iter().any(|a| a == "--related-
+    // include-closed")` matched neither, so every valued form silently fell
+    // back to the default. See `argv::go_bool_flag` (Go isFlagActive,
+    // cmd/bv/main.go:471-486).
+    let include_closed = match argv::go_bool_flag(args, "related-include-closed", false) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("Error: {msg}");
+            return ExitCode::from(1);
+        }
+    };
 
     let cwd = std::env::current_dir().unwrap_or_default();
     if let Err(e) = validate_correlation_repository(&cwd) {

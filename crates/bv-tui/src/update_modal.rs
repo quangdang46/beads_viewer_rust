@@ -9,19 +9,13 @@
 //! `crossbeam_channel`, and [`UpdateModal::poll`] drains that channel and
 //! advances the elapsed clock in place of the tick.
 //!
-//! ## lib.rs wiring still required
-//!
-//! 1. `App` needs an `update_modal: Option<UpdateModal>` field (Go's
-//!    `m.updateModal`, `model.go:957`) and an `update_url: String`.
-//! 2. Replace the dismiss-any-key arm at `lib.rs:1397-1401` with a call to
-//!    [`UpdateModal::handle_key`] followed by
-//!    [`UpdateModal::close_policy`], and apply the returned
-//!    [`UpdateModalAction`].
-//! 3. The render arm at `lib.rs:3539-3544` should call
-//!    [`UpdateModal::render`]; [`render_update_modal`] is kept as a
-//!    compatibility shim so that call site keeps compiling until then.
-//! 4. [`UpdateModal::poll`] must be called on every event-loop iteration so
-//!    progress messages land and the spinner advances.
+//! Wired into `App` as `App::update_modal` (Go's `m.updateModal`,
+//! `model.go:957`). The parent drives it from three places, mirroring Go:
+//! [`UpdateModal::handle_key`] + [`UpdateModal::close_policy`] from the key
+//! dispatch (`model.go:3788-3821`), [`UpdateModal::render`] from the overlay
+//! pass (`model.go:6303`), and [`UpdateModal::poll`] from the event-loop tick
+//! in place of Go's `UpdateProgressMsg` / `UpdateCompleteMsg` arms
+//! (`model.go:2304-2333`).
 
 use std::time::{Duration, Instant};
 
@@ -224,6 +218,12 @@ pub struct UpdateModal {
     pub error_message: String,
     pub success_message: String,
     pub backup_path: String,
+    /// `UpdateCompleteMsg.NewVersion` (`update_modal.go:37-48`) — the tag the
+    /// install actually wrote. Go compares it against `Model.updateTag` to
+    /// decide whether a successful update retires the "update available"
+    /// notice (`model.go:2309-2314`); an empty string until the install
+    /// completes.
+    pub completed_version: String,
     pub width: u16,
     pub height: u16,
     /// Spinner/elapsed clock origin, set when the install starts.
@@ -256,6 +256,7 @@ impl UpdateModal {
             error_message: String::new(),
             success_message: String::new(),
             backup_path: String::new(),
+            completed_version: String::new(),
             width: 60,
             height: 20,
             start_time: Instant::now(),
@@ -384,6 +385,7 @@ impl UpdateModal {
                         self.state = UpdateState::Success;
                         self.success_message = c.message;
                         self.backup_path = c.backup_path;
+                        self.completed_version = c.new_version;
                     } else {
                         self.state = UpdateState::Error;
                         self.error_message = c.message;
@@ -603,14 +605,6 @@ fn format_elapsed(d: Duration) -> String {
     } else {
         format!("{}h{}m{}s", secs / 3600, (secs % 3600) / 60, secs % 60)
     }
-}
-
-/// Compatibility shim for `lib.rs:3539-3544`, which still calls the old free
-/// function. Renders the confirm state of a modal built on the fly.
-/// **Replace this call site with [`UpdateModal::render`].**
-pub fn render_update_modal(f: &mut Frame, current_version: &str, latest_version: &str, area: Rect) {
-    let modal = UpdateModal::new(current_version, latest_version, "");
-    modal.render(f, area);
 }
 
 #[cfg(test)]

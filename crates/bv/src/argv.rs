@@ -740,6 +740,99 @@ pub fn unconsumed_positional(rewritten: &[String]) -> Option<String> {
     None
 }
 
+/// Go `strconv.ParseBool` — the parser pflag's `boolValue.Set` calls for the
+/// optional `=` value of a boolean flag (cmd/bv's registry is a pflag set;
+/// `github.com/spf13/pflag v1.0.10`, go.mod:27).
+///
+/// The accepted set is Go's, not a looser shell convention: `1 t T TRUE
+/// true True` and `0 f F FALSE false False`. In particular `y`, `yes`, `n`,
+/// `no` and `on` are syntax errors — verified against the v0.25.0 oracle,
+/// where `bvr --pages-include-history=yes` prints
+/// `invalid argument "yes" for "--pages-include-history" flag: strconv.ParseBool: parsing "yes": invalid syntax`.
+pub fn go_parse_bool(raw: &str) -> Option<bool> {
+    match raw {
+        "1" | "t" | "T" | "TRUE" | "true" | "True" => Some(true),
+        "0" | "f" | "F" | "FALSE" | "false" | "False" => Some(false),
+        _ => None,
+    }
+}
+
+/// The pflag error text for a malformed boolean flag value, byte-for-byte
+/// (`pflag`'s `failf("invalid argument %q for %q flag: %v", value, flag, err)`
+/// wrapping Go's own `strconv.NumError`).
+pub fn go_bool_parse_error(flag: &str, raw: &str) -> String {
+    format!(
+        "invalid argument {raw:?} for \"--{flag}\" flag: strconv.ParseBool: parsing {raw:?}: invalid syntax"
+    )
+}
+
+/// Go `isFlagActive` (cmd/bv/main.go:471-486) for a **bool** flag, read
+/// straight off raw argv.
+///
+/// Go's version asks pflag for the already-parsed value:
+/// `v, err := flags.GetBool(name); return err == nil && v`. The parse itself
+/// happened in `boolValue.Set`, which rejects anything `strconv.ParseBool`
+/// refuses — so an active bool flag is one that was written bare, or with a
+/// truthy `=value`. `--flag=false` is present but *inactive*, which is the
+/// whole point: `--pages-include-history=false` is how Go turns off a
+/// default-true flag.
+///
+/// A presence scan (`args.iter().any(|a| a == "--flag")`) gets this exactly
+/// backwards — neither `--flag=false` nor `--flag=true` string-equals the bare
+/// name, so both read as absent and the flag falls back to its default.
+///
+/// `default` is Go's registered default, returned when the flag is absent.
+/// `Err` carries Go's rejection text for a malformed value, so the caller can
+/// print it and exit 1 the way pflag does.
+pub fn go_bool_flag(args: &[String], name: &str, default: bool) -> Result<bool, String> {
+    let long = format!("--{name}");
+    let with_eq = format!("--{name}=");
+    // pflag applies flags left to right and each `Set` overwrites, so the
+    // LAST occurrence is the effective one.
+    let mut raw: Option<&str> = None;
+    for a in args.iter() {
+        if let Some(v) = a.strip_prefix(&with_eq) {
+            raw = Some(v);
+        } else if a == &long {
+            // A bare bool switch never consumes the next token (pflag gives
+            // bools `NoOptDefVal = "true"`), so it is genuinely valueless and
+            // parses as the truthy default.
+            raw = Some("true");
+        }
+    }
+    match raw {
+        None => Ok(default),
+        Some(v) => go_parse_bool(v).ok_or_else(|| go_bool_parse_error(name, v)),
+    }
+}
+
+/// Go `isFlagActive`'s **string** arm (cmd/bv/main.go:479-481): a string flag
+/// is active only when its value survives `strings.TrimSpace`. So
+/// `--db ""` and `--db "  "` are both *inactive*.
+pub fn go_string_flag_active(args: &[String], name: &str) -> bool {
+    match go_string_flag_value(args, name) {
+        Some(v) => !v.trim().is_empty(),
+        None => false,
+    }
+}
+
+/// Read `--name value` / `--name=value` out of raw argv, borrowed. Same scan
+/// as `flag_value` in main.rs; lives here so the argv-level helpers that need
+/// it do not have to reach across crate modules.
+pub fn go_string_flag_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    let long = format!("--{name}");
+    let with_eq = format!("--{name}=");
+    for (i, a) in args.iter().enumerate() {
+        if let Some(v) = a.strip_prefix(&with_eq) {
+            return Some(v);
+        }
+        if a == &long {
+            return args.get(i + 1).map(|s| s.as_str());
+        }
+    }
+    None
+}
+
 /// Whether a `--flag` consumes the following token as its value.
 fn flag_takes_value(tok: &str) -> bool {
     let name = tok.split('=').next().unwrap_or(tok);

@@ -328,6 +328,16 @@ pub struct App {
     /// cass session count for selected bead (Go bv-y836)
     pub session_count: usize,
     pub update_tag: Option<String>,
+    /// Release page for `update_tag` (Go `Model.updateURL`,
+    /// `model.go:783`), carried from `UpdateInfo.release_url`. It is the link
+    /// target of the "⭐ **Update Available:** [tag](url)" line the detail
+    /// pane opens with (`model.go:8894-8895`).
+    pub update_url: Option<String>,
+    /// The self-update state machine (Go `Model.updateModal`,
+    /// `model.go:957`). `None` until `U` or the once-per-session auto-notify
+    /// opens it; retained after a close, exactly as Go keeps the value while
+    /// only clearing `showUpdateModal`.
+    pub update_modal: Option<crate::update_modal::UpdateModal>,
     /// Workspace mode: loaded repo names (Go workspaceMode)
     pub workspace_repos: Option<Vec<String>>,
     /// Active repo filter in workspace mode (None = all repos)
@@ -894,6 +904,8 @@ impl App {
             dataset_warning: dataset_warning_for(issues.len()),
             session_count: 0,
             update_tag: None,
+            update_url: None,
+            update_modal: None,
             workspace_repos: None,
             active_repo: None,
             cass_modal: None,
@@ -1475,6 +1487,74 @@ impl App {
         self.apply_filter();
     }
 
+    /// Go `showSelfUpdateModal` (`model.go:9653-9667`): open the self-update
+    /// modal for the pending release, or report that the binary is current.
+    /// `U` is not a toggle in Go — it always (re)opens, because the modal
+    /// itself consumes keys while it is up.
+    pub fn show_self_update_modal(&mut self) {
+        // Go tests both `!m.updateAvailable || m.updateTag == ""`; bvr has no
+        // separate `updateAvailable` flag, so the tag alone is the gate.
+        let Some(tag) = self.update_tag.as_deref().filter(|t| !t.is_empty()) else {
+            self.status_msg = "No update available - you're running the latest version".to_string();
+            return;
+        };
+        // `bv_update::current_version()` (not `env!("CARGO_PKG_VERSION")`) so the
+        // modal's "Current version:" row matches the `v`-prefixed rendering
+        // every other update surface uses — Go stamps `version.Version` with
+        // the prefix (`pkg/version/version.go` normalizeVersion) and
+        // `NewUpdateModal` reads it directly (`update_modal.go:80`).
+        let mut modal = crate::update_modal::UpdateModal::new(
+            &bv_update::current_version(),
+            tag,
+            self.update_url.as_deref().unwrap_or_default(),
+        );
+        modal.set_size(self.width, self.height);
+        self.update_modal = Some(modal);
+        self.show_update_modal = true;
+    }
+
+    /// Go's `if m.showUpdateModal` key block (`model.go:3788-3821`): hand the
+    /// key to the modal first, then apply the parent's close policy. Every
+    /// path returns consumed — a key can never fall through to the list while
+    /// the overlay is up.
+    fn handle_update_modal_key(&mut self, code: KeyCode) -> bool {
+        let Some(modal) = self.update_modal.as_mut() else {
+            // Nothing to drive; drop the flag rather than swallow keys.
+            self.show_update_modal = false;
+            return true;
+        };
+        let action = modal.handle_key(code);
+        if action == crate::update_modal::UpdateModalAction::Dismiss || modal.close_policy(&code) {
+            self.show_update_modal = false;
+        }
+        true
+    }
+
+    /// Go's `UpdateProgressMsg` / `UpdateCompleteMsg` arms
+    /// (`model.go:2304-2333`): drain the install thread on the event-loop
+    /// tick, and — the protection Go spells out at `model.go:2306-2314` —
+    /// retire the "update available" notice once the tag it advertises has
+    /// actually been installed. Without this the user could run the update a
+    /// second time and overwrite the useful pre-update backup with a backup of
+    /// the already-updated binary.
+    ///
+    /// The retire check is idempotent (Go gets to run it once per message),
+    /// so it is re-evaluated every tick. Returns true when the modal had new
+    /// messages and needs a redraw.
+    pub fn poll_update_modal(&mut self) -> bool {
+        let Some(modal) = self.update_modal.as_mut() else {
+            return false;
+        };
+        let changed = modal.poll();
+        if modal.state == crate::update_modal::UpdateState::Success
+            && self.update_tag.as_deref() == Some(modal.completed_version.as_str())
+        {
+            self.update_tag = None;
+            self.update_url = None;
+        }
+        changed
+    }
+
     /// Handle a key event; returns true if the event was consumed.
     pub fn handle_key(&mut self, code: KeyCode) -> bool {
         // Quit-confirmation overlay (Go `showQuitConfirm` block at the top of
@@ -1501,9 +1581,7 @@ impl App {
             return true;
         }
         if self.show_update_modal {
-            // Go: "Press any key to dismiss".
-            self.show_update_modal = false;
-            return true;
+            return self.handle_update_modal_key(code);
         }
         if matches!(self.label_picker, Some(ref p) if p.visible) {
             return self.handle_label_picker_key(code);
@@ -2084,11 +2162,7 @@ impl App {
                 true
             }
             KeyCode::Char('U') => {
-                if self.update_tag.is_some() {
-                    self.show_update_modal = !self.show_update_modal;
-                } else {
-                    self.status_msg = "No update available".to_string();
-                }
+                self.show_self_update_modal();
                 true
             }
             KeyCode::Char('p') => {
@@ -3956,7 +4030,7 @@ fn render_time_travel(f: &mut Frame, app: &App) {
 /// TUI_UX_PARITY_PLAN.md G8). Centralizing overlay rendering here and
 /// calling it from every early-return branch fixes that for all of them at
 /// once.
-fn render_overlays(f: &mut Frame, app: &App) {
+fn render_overlays(f: &mut Frame, app: &mut App) {
     // Help overlay (Go "?" help) — now generated from `key_registry`
     // instead of a separately hand-maintained literal list, so it can't
     // drift from the registry the way the old hardcoded text had (e.g. it
@@ -4008,8 +4082,14 @@ fn render_overlays(f: &mut Frame, app: &App) {
     }
 
     if app.show_update_modal {
-        if let Some(tag) = &app.update_tag {
-            crate::update_modal::render_update_modal(f, env!("CARGO_PKG_VERSION"), tag, f.area());
+        if let Some(modal) = app.update_modal.as_mut() {
+            // Go sizes from the live terminal (`m.updateModal.SetSize(m.width,
+            // m.height)`, model.go:9664). `App::width`/`height` are only
+            // written by `--debug-render`, so take the real size from the
+            // frame; re-applying it each frame also survives a resize.
+            let area = f.area();
+            modal.set_size(area.width, area.height);
+            modal.render(f, area);
         }
         return;
     }
@@ -4480,7 +4560,7 @@ fn render_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 }
 
 fn render_detail(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let content: Vec<Line> = match app.selected() {
+    let mut content: Vec<Line> = match app.selected() {
         Some(row) => {
             let graph_scores = app.graph_metrics.as_ref().and_then(|gm| {
                 gm.pagerank
@@ -4514,6 +4594,23 @@ fn render_detail(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             )),
         ],
     };
+    // Go's `updateViewportContent` (`model.go:8894-8895`) opens with the
+    // update notice, ahead of the title block, and closes with a blank line.
+    // The raw `[tag](url)` is deliberate: Go writes the same literal string
+    // into a plain viewport, so the link syntax is shown, not resolved.
+    if let Some(tag) = &app.update_tag {
+        let url = app.update_url.as_deref().unwrap_or_default();
+        content.insert(
+            0,
+            Line::from(Span::styled(
+                format!("\u{2b50} **Update Available:** [{tag}]({url})"),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+        );
+        content.insert(1, Line::from(""));
+    }
     let focused_border = if app.focus_detail {
         Color::Cyan
     } else {
@@ -4723,10 +4820,11 @@ fn render_status_bar(f: &mut Frame, app: &App) {
         ));
     }
 
-    // Update badge (Go: Update <tag>)
+    // Update badge — Go `updateSection` (`model.go:7649-7655`): U+2B50 WHITE
+    // MEDIUM STAR, then " Update <tag>", padded one space each side.
     if let Some(tag) = &app.update_tag {
         spans.push(Span::styled(
-            format!(" \u{2b06} Update {tag} "),
+            format!(" \u{2b50} Update {tag} "),
             Style::default()
                 .bg(Color::Green)
                 .fg(Color::Black)
@@ -4935,6 +5033,20 @@ fn buffer_to_lines(buf: &ratatui::buffer::Buffer) -> String {
     out
 }
 
+/// Go `updater.StartupCheckEnabled()` (`updater.go:160-162`), the gate `Init`
+/// uses before appending `CheckUpdateCmd` (`model.go:2076`).
+///
+/// `BV_NO_UPDATE_CHECK` is read for *truthiness*, not presence: Go's
+/// `envTruthy` (`updater.go:87-93`) treats `0` / `false` / `no` / `off` and
+/// the empty string as "not an opt-out", so those values leave the check
+/// running — `pkg/updater/network_test.go:398-404` pins exactly that case.
+/// The previous gate here was `std::env::var("BV_NO_UPDATE_CHECK").is_err()`,
+/// which opted out for every value including `0`. `config.yaml`'s
+/// `updates.check` is honoured by the same call.
+fn startup_update_check_enabled() -> bool {
+    bv_update::prefs::startup_check_enabled()
+}
+
 /// Run the TUI event loop. Returns when user quits.
 pub fn run_tui(app: &mut App) -> io::Result<()> {
     // Instance lock (Go bv-vrvn)
@@ -4944,14 +5056,14 @@ pub fn run_tui(app: &mut App) -> io::Result<()> {
         .unwrap_or_default();
     app.instance_pid = acquire_instance_lock(&beads_dir);
 
-    // Update check (Go updater.CheckUpdateCmd): background thread through
-    // bv-update (proper semver compare incl. dev-build rule), gated by
-    // BV_NO_UPDATE_CHECK.
-    let (update_tx, update_rx) = std::sync::mpsc::channel::<String>();
-    if std::env::var("BV_NO_UPDATE_CHECK").is_err() {
+    // Update check (Go `CheckUpdateCmd`, `model.go:497-506`, gated by
+    // `updater.StartupCheckEnabled()` at `model.go:2076`): background thread
+    // through bv-update (proper semver compare incl. dev-build rule).
+    let (update_tx, update_rx) = std::sync::mpsc::channel::<bv_update::github::UpdateInfo>();
+    if startup_update_check_enabled() {
         std::thread::spawn(move || {
             if let Ok(Some(info)) = bv_update::github::check_for_updates() {
-                let _ = update_tx.send(info.new_version);
+                let _ = update_tx.send(info);
             }
         });
     }
@@ -4975,7 +5087,7 @@ pub fn run_tui(app: &mut App) -> io::Result<()> {
 fn tui_event_loop(
     mut terminal: ratatui::Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
     app: &mut App,
-    update_rx: &std::sync::mpsc::Receiver<String>,
+    update_rx: &std::sync::mpsc::Receiver<bv_update::github::UpdateInfo>,
 ) -> io::Result<()> {
     // Go auto-shows the blurb prompt once at startup when the detected
     // agent file needs the blurb and prefs don't suppress it.
@@ -4999,17 +5111,23 @@ fn tui_event_loop(
         // Drain update-check channel (non-blocking). The tag was already
         // vetted by bv-update semver compare (incl. dev-build rule);
         // re-verify here in case the binary version changed mid-session.
-        if let Ok(tag) = update_rx.try_recv() {
-            if bv_update::is_newer_than_current(&tag) {
-                app.update_tag = Some(tag.clone());
+        // Go's `UpdateMsg` arm (`model.go:2290-2302`) stores the tag and the
+        // release URL together and drops the notice when the tag is not newer.
+        if let Ok(info) = update_rx.try_recv() {
+            if bv_update::is_newer_than_current(&info.new_version) {
+                app.update_tag = Some(info.new_version.clone());
+                app.update_url = Some(info.release_url.clone());
                 // Auto-notify once per session (Go: update badge + prompt);
-                // `U` toggles afterwards.
+                // `U` reopens afterwards.
                 if !app.update_modal_auto_shown {
                     app.update_modal_auto_shown = true;
-                    app.show_update_modal = true;
+                    app.show_self_update_modal();
                 }
             }
         }
+        // Drain the self-update install thread (Go's `UpdateProgressMsg` /
+        // `UpdateCompleteMsg` arms, `model.go:2304-2333`).
+        app.poll_update_modal();
         // Live reload (Go fsnotify; TUI_UX_PARITY_PLAN.md Phase F): piggyback
         // on this same ~500ms tick instead of a background notify watcher.
         app.check_for_reload();
@@ -5665,6 +5783,298 @@ mod tests {
         app.update_tag = Some("v9.9.9".to_string());
         app.handle_key(KeyCode::Char('U'));
         assert!(app.show_update_modal);
+    }
+
+    // -- Go pkg/ui/update_keys_test.go + model.go:9653-9667 ---------------
+
+    /// Go's status string, byte for byte (`model.go:9656`).
+    const GO_NO_UPDATE: &str = "No update available - you're running the latest version";
+
+    #[test]
+    fn u_without_a_release_reports_the_go_status_string() {
+        // Go `showSelfUpdateModal` returns early on
+        // `!m.updateAvailable || m.updateTag == ""`, and Rust's
+        // `update_tag.is_some()` alone is not enough: an empty tag is the
+        // same condition.
+        for tag in [None, Some(String::new())] {
+            let mut app = make_app(2);
+            app.update_tag = tag;
+            app.handle_key(KeyCode::Char('U'));
+            assert!(!app.show_update_modal, "modal must not open");
+            assert_eq!(app.status_msg, GO_NO_UPDATE);
+        }
+    }
+
+    #[test]
+    fn u_opens_a_confirm_modal_carrying_the_release_url() {
+        // Go `NewUpdateModal(m.updateTag, m.updateURL, m.theme)`
+        // (`model.go:9663`) — the URL is constructor input, not something the
+        // modal fetches.
+        let mut app = make_app(2);
+        app.update_tag = Some("v9.9.9".to_string());
+        app.update_url = Some("https://example/releases/tag/v9.9.9".to_string());
+        app.handle_key(KeyCode::Char('U'));
+        assert!(app.show_update_modal);
+        let modal = app.update_modal.as_ref().expect("modal built");
+        assert_eq!(modal.state, crate::update_modal::UpdateState::Confirm);
+        assert_eq!(modal.new_version, "v9.9.9");
+        assert_eq!(modal.release_url, "https://example/releases/tag/v9.9.9");
+        // Go `SetSize` on open (`model.go:9664`), which clamps to [50, 70]
+        // after subtracting 10. `make_app` is 120 columns wide.
+        assert_eq!(modal.width, 70);
+    }
+
+    #[test]
+    fn modal_current_version_carries_the_v_prefix() {
+        // Go stamps `version.Version` with a leading "v" (pkg/version
+        // normalizeVersion) and `NewUpdateModal` copies it straight into
+        // `currentVersion` (`update_modal.go:80`). Passing
+        // env!("CARGO_PKG_VERSION") here rendered "0.2.0" while every other
+        // surface showed "v0.2.0".
+        let mut app = make_app(2);
+        app.update_tag = Some("v9.9.9".to_string());
+        app.handle_key(KeyCode::Char('U'));
+        let modal = app.update_modal.as_ref().expect("modal built");
+        assert_eq!(modal.current_version, bv_update::current_version());
+        assert!(
+            modal.current_version.starts_with('v'),
+            "modal showed {:?}",
+            modal.current_version
+        );
+    }
+
+    #[test]
+    fn modal_keys_drive_the_state_machine_and_close_policy() {
+        // Go `model.go:3788-3821`: the modal sees the key first, then the
+        // parent applies its close policy; the key never reaches the list.
+        let mut app = make_app(2);
+        app.update_tag = Some("v9.9.9".to_string());
+        app.handle_key(KeyCode::Char('U'));
+        assert!(app.show_update_modal);
+
+        // `h`/`l` move the button focus without closing.
+        assert!(app.handle_key(KeyCode::Char('l')));
+        assert_eq!(app.update_modal.as_ref().unwrap().confirm_focus, 1);
+        assert!(app.show_update_modal);
+
+        // `n` cancels and closes.
+        assert!(app.handle_key(KeyCode::Char('n')));
+        assert!(!app.show_update_modal);
+    }
+
+    #[test]
+    fn successful_install_retires_the_notice_only_for_the_advertised_tag() {
+        // Go `UpdateCompleteMsg` arm (`model.go:2306-2314`): clear only when
+        // the install succeeded AND wrote the tag the notice advertises — a
+        // failed or stale completion must leave the retry notice in place.
+        let cases = [
+            ("successful install", true, "v9.9.9", true),
+            ("failed install", false, "v9.9.9", false),
+            ("stale successful install", true, "v9.9.8", false),
+        ];
+        for (name, success, version, want_clear) in cases {
+            let mut app = make_app(2);
+            app.update_tag = Some("v9.9.9".to_string());
+            app.update_url = Some("https://example/releases/tag/v9.9.9".to_string());
+            app.update_modal = Some(crate::update_modal::UpdateModal::new(
+                "v0.2.0", "v9.9.9", "",
+            ));
+            let modal = app.update_modal.as_mut().unwrap();
+            modal.state = if success {
+                crate::update_modal::UpdateState::Success
+            } else {
+                crate::update_modal::UpdateState::Error
+            };
+            modal.completed_version = version.to_string();
+            app.poll_update_modal();
+            if want_clear {
+                assert!(app.update_tag.is_none(), "{name}: notice not retired");
+                assert!(app.update_url.is_none(), "{name}: url not retired");
+            } else {
+                assert_eq!(app.update_tag.as_deref(), Some("v9.9.9"), "{name}");
+                assert_eq!(
+                    app.update_url.as_deref(),
+                    Some("https://example/releases/tag/v9.9.9"),
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn poll_update_modal_is_a_no_op_with_no_modal() {
+        let mut app = make_app(2);
+        app.update_tag = Some("v9.9.9".to_string());
+        assert!(!app.poll_update_modal());
+        assert_eq!(app.update_tag.as_deref(), Some("v9.9.9"));
+    }
+
+    // -- Go model.go:7649-7655 / 8894-8895 --------------------------------
+
+    /// The TUI's startup update check must be gated on Go's
+    /// `updater.StartupCheckEnabled()` (`model.go:2076`), not on whether
+    /// `BV_NO_UPDATE_CHECK` is *set*. Go's `envTruthy`
+    /// (`updater.go:87-93`) reads only a non-empty value that is not one of
+    /// `0/false/no/off`, and `pkg/updater/network_test.go:398-404` pins the
+    /// case that used to break: "BV_NO_UPDATE_CHECK=0 must not count as an
+    /// opt-out". The old gate, `std::env::var(...).is_err()`, opted out for
+    /// every value including `0`.
+    #[test]
+    fn startup_update_check_gate_is_truthiness_based_not_presence_based() {
+        use std::sync::{Mutex, MutexGuard, OnceLock};
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        // The environment is process-global; every mutation here is paired
+        // with a restore, and the lock keeps concurrent tests from reading a
+        // half-applied set.
+        let _guard: MutexGuard<'_, ()> = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let keys = [
+            "BV_NO_UPDATE_CHECK",
+            "BV_NO_SAVED_CONFIG",
+            "XDG_CONFIG_HOME",
+        ];
+        let saved: Vec<Option<String>> = keys.iter().map(|k| std::env::var(k).ok()).collect();
+        // Point at an empty config dir so a developer's real config.yaml
+        // cannot decide the result.
+        let empty_cfg = std::env::temp_dir().join("bvr_tui_update_gate_absent");
+        std::env::set_var("XDG_CONFIG_HOME", &empty_cfg);
+        std::env::set_var("BV_NO_SAVED_CONFIG", "");
+
+        let restore = || {
+            for (k, v) in keys.iter().zip(&saved) {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        };
+
+        for (value, want_check) in [
+            (None, true),
+            (Some("1"), false),
+            (Some("true"), false),
+            // Go's explicit non-opt-outs: the check still runs.
+            (Some("0"), true),
+            (Some("false"), true),
+            (Some("no"), true),
+            (Some("off"), true),
+            (Some(""), true),
+        ] {
+            match value {
+                Some(v) => std::env::set_var("BV_NO_UPDATE_CHECK", v),
+                None => std::env::remove_var("BV_NO_UPDATE_CHECK"),
+            }
+            assert_eq!(
+                startup_update_check_enabled(),
+                want_check,
+                "BV_NO_UPDATE_CHECK={value:?}"
+            );
+            // The old gate would have disabled the check for every Some case.
+            if value.is_some() {
+                assert!(
+                    std::env::var("BV_NO_UPDATE_CHECK").is_ok(),
+                    "sanity: the variable is actually set for {value:?}"
+                );
+            }
+        }
+        restore();
+    }
+
+    #[test]
+    fn update_modal_overlay_renders_the_confirm_body() {
+        let mut app = make_app(3);
+        app.update_tag = Some("v9.9.9".to_string());
+        app.handle_key(KeyCode::Char('U'));
+        let out = render_with(&mut app, 120, 30);
+        assert!(out.contains("Update Available"), "modal not drawn:\n{out}");
+        assert!(out.contains("v9.9.9"), "modal lacks the new tag:\n{out}");
+        assert!(out.contains("Current version: v"), "modal row:\n{out}");
+        assert!(
+            out.contains("[Y] Update"),
+            "confirm affordance missing:\n{out}"
+        );
+    }
+
+    fn render_with(app: &mut App, width: u16, height: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        app.width = width;
+        app.height = height;
+        terminal.draw(|f| render(f, app)).unwrap();
+        buffer_to_lines(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn update_badge_uses_the_go_glyph_and_text() {
+        // Go `updateSection` renders "⭐ Update %s" (`model.go:7655`),
+        // U+2B50 WHITE MEDIUM STAR. bvr shipped U+2B06 BLACK FOUR POINTED
+        // STAR instead.
+        //
+        // The star also decorates P0/P1 rows, so assertions are scoped to the
+        // status-bar row that carries the tag. A double-width cell renders
+        // with a filler space, so the glyph is matched as "immediately
+        // before the text" rather than as a literal substring.
+        let mut app = make_app(3);
+        let clean = render_with(&mut app, 120, 20);
+        assert!(
+            !clean.contains("Update v"),
+            "badge appeared with no pending update:\n{clean}"
+        );
+
+        app.update_tag = Some("v9.9.9".to_string());
+        let with = render_with(&mut app, 120, 20);
+        let badge = with
+            .lines()
+            .find(|l| l.contains("Update v9.9.9"))
+            .unwrap_or_else(|| panic!("badge row missing:\n{with}"));
+        let before = badge.split("Update v9.9.9").next().unwrap().trim_end();
+        assert!(
+            before.ends_with('\u{2b50}'),
+            "Go badge must read \"⭐ Update v9.9.9\": {badge:?}"
+        );
+        assert!(
+            !with.contains('\u{2b06}'),
+            "wrong star glyph still rendered:\n{with}"
+        );
+    }
+
+    #[test]
+    fn detail_pane_opens_with_the_go_update_line() {
+        // Go `updateViewportContent` (`model.go:8894-8895`) writes
+        // "⭐ **Update Available:** [%s](%s)\n\n" before the title block, raw
+        // link syntax included.
+        let mut app = make_app(3);
+        app.split_view = true;
+        app.show_detail = true;
+        let clean = render_with(&mut app, 140, 30);
+        assert!(!clean.contains("Update Available"), "unexpected:\n{clean}");
+
+        app.update_tag = Some("v9.9.9".to_string());
+        app.update_url = Some("https://example/releases/tag/v9.9.9".to_string());
+        let with = render_with(&mut app, 140, 30);
+        let notice = with
+            .lines()
+            .find(|l| l.contains("**Update Available:**"))
+            .unwrap_or_else(|| panic!("detail notice missing:\n{with}"));
+        assert!(
+            notice.contains("**Update Available:** [v9.9.9](https://example/releases/tag/v9.9.9)"),
+            "Go detail link malformed: {notice:?}"
+        );
+        // The star is the notice's first character; the split-view border
+        // sits in front of it and the double-width cell leaves a filler space,
+        // so match on "the glyph immediately precedes the bold text".
+        let before = notice
+            .split("**Update Available:**")
+            .next()
+            .unwrap()
+            .trim_end();
+        assert!(
+            before.ends_with('\u{2b50}'),
+            "detail notice must open with U+2B50: {notice:?}"
+        );
     }
 
     #[test]
